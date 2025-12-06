@@ -1,0 +1,92 @@
+#!/bin/bash
+# ============================================================================
+# Mirror Bridge - C++17 Code Generator
+# ============================================================================
+#
+# Generates standalone C++17 binding code from a codegen driver file.
+#
+# Usage:
+#   ./mirror_bridge_codegen <driver.cpp> [output.cpp]
+#
+# The driver file should look like:
+#   #include "python/mirror_bridge_codegen.hpp"
+#   #include "your_classes.hpp"
+#
+#   int main() {
+#       mirror_bridge::codegen::generate_module("mymodule",
+#           mirror_bridge::codegen::bind<YourClass>("YourClass")
+#       );
+#       return 0;
+#   }
+#
+# Example:
+#   ./mirror_bridge_codegen examples/codegen_driver.cpp > mymodule_bindings.cpp
+#   g++ -std=c++17 -shared -fPIC mymodule_bindings.cpp -o mymodule.so \
+#       $(python3-config --includes --ldflags)
+#
+# ============================================================================
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check arguments
+if [ $# -lt 1 ]; then
+    echo -e "${RED}Usage: $0 <driver.cpp> [output.cpp]${NC}"
+    echo ""
+    echo "Generates C++17 binding code from a codegen driver file."
+    echo ""
+    echo "Arguments:"
+    echo "  driver.cpp   - The codegen driver file (uses mirror_bridge_codegen.hpp)"
+    echo "  output.cpp   - Optional output file (defaults to stdout)"
+    exit 1
+fi
+
+DRIVER_FILE="$1"
+OUTPUT_FILE="${2:-}"
+
+# Check if driver file exists
+if [ ! -f "$DRIVER_FILE" ]; then
+    echo -e "${RED}Error: Driver file not found: $DRIVER_FILE${NC}" >&2
+    exit 1
+fi
+
+# Get the directory of the driver file for includes
+DRIVER_DIR="$(cd "$(dirname "$DRIVER_FILE")" && pwd)"
+
+# Create a temporary directory for compilation
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
+
+# Compile the driver with the reflection compiler
+echo -e "${YELLOW}Compiling codegen driver...${NC}" >&2
+
+CODEGEN_BINARY="$TEMP_DIR/codegen"
+
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I"$SCRIPT_DIR" \
+    -I"$DRIVER_DIR" \
+    "$DRIVER_FILE" \
+    -o "$CODEGEN_BINARY" 2>&1 | grep -v "mixture of designated\|warning.*__cpp_reflection" >&2 || true
+
+if [ ! -x "$CODEGEN_BINARY" ]; then
+    echo -e "${RED}Error: Failed to compile codegen driver${NC}" >&2
+    exit 1
+fi
+
+echo -e "${GREEN}Running code generator...${NC}" >&2
+
+# Run the codegen and capture output
+if [ -n "$OUTPUT_FILE" ]; then
+    "$CODEGEN_BINARY" > "$OUTPUT_FILE"
+    echo -e "${GREEN}Generated: $OUTPUT_FILE${NC}" >&2
+else
+    "$CODEGEN_BINARY"
+fi
