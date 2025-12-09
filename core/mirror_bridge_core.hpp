@@ -22,6 +22,7 @@
 #include <concepts>
 #include <memory>
 #include <unordered_map>
+#include <mutex>
 #include <typeindex>
 #include <shared_mutex>
 
@@ -145,30 +146,20 @@ public:
 };
 
 // ============================================================================
-// Global Type Registry - Cross-Module Type Sharing
+// Global Type Registry - Cross-Module Type Sharing (RTTI Required)
 // ============================================================================
 //
-// Problem: When C++ types are bound in separate shared libraries (.so files),
-// each library gets its own copy of template static variables. This means
-// TypeRegistry<Point>::py_type in point.so is different from the same variable
-// in rectangle.so - causing cross-module type lookups to fail.
+// NOTE: This C++ registry requires RTTI (typeid) and is NOT used for actual
+// cross-module type sharing in Python bindings. Python bindings use a
+// Python-based registry instead (stored in sys.modules) because C++ static
+// variables are per-shared-library.
 //
-// Solution: Use a truly global registry with std::type_index as the key.
-// The registry is shared across all shared libraries because:
-// 1. inline static variables in header-only code share the same address
-// 2. std::type_index provides stable type identity across translation units
+// This class is kept for potential future use cases where RTTI is available.
+// It is guarded by __cpp_rtti to avoid compilation errors in environments
+// where RTTI is disabled (e.g., Node.js N-API addons use -fno-rtti).
 //
-// Thread Safety: Uses std::shared_mutex for concurrent read access with
-// exclusive write access. Most operations are reads (type lookups), so
-// shared_mutex provides better concurrency than a regular mutex.
-//
-// Usage:
-//   // In bind_class<T>():
-//   GlobalTypeRegistry::register_type<T>(py_type_object);
-//
-//   // In to_python() for Bindable types:
-//   void* py_type = GlobalTypeRegistry::lookup<T>();
-//
+#if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
+
 class GlobalTypeRegistry {
 private:
     // The actual storage - inline static ensures single instance across all TUs
@@ -222,6 +213,8 @@ public:
         registry_.clear();
     }
 };
+
+#endif // RTTI check
 
 // ============================================================================
 // Reflection Utilities - Member Discovery

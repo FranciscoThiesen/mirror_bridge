@@ -3,6 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # Get Python include path
@@ -15,6 +16,7 @@ echo "Python include: $PYTHON_INCLUDE"
 
 clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
     -shared -fPIC \
+    -I"$PROJECT_ROOT" \
     -I"$PYTHON_INCLUDE" \
     -L"$PYTHON_LIB" \
     -o "vec3_test${PYTHON_EXT_SUFFIX}" \
