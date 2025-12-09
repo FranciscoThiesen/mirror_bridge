@@ -402,7 +402,7 @@ using NestedMemberType = typename [:std::meta::type_of(get_nested_member<T, I>()
 
 template<typename T>
 consteval std::size_t get_constructor_count() {
-    constexpr auto ctors = std::meta::members_of(^^T);
+    constexpr auto ctors = std::meta::members_of(^^T, std::meta::access_context::unchecked());
     std::size_t count = 0;
 
     for (auto ctor : ctors) {

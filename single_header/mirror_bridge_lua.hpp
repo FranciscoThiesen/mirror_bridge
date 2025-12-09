@@ -46,6 +46,9 @@
 #include <concepts>
 #include <memory>
 #include <unordered_map>
+#include <mutex>
+#include <typeindex>
+#include <shared_mutex>
 
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
@@ -161,6 +164,77 @@ public:
 };
 
 // ============================================================================
+// Global Type Registry - Cross-Module Type Sharing (RTTI Required)
+// ============================================================================
+//
+// NOTE: This C++ registry requires RTTI (typeid) and is NOT used for actual
+// cross-module type sharing in Python bindings. Python bindings use a
+// Python-based registry instead (stored in sys.modules) because C++ static
+// variables are per-shared-library.
+//
+// This class is kept for potential future use cases where RTTI is available.
+// It is guarded by __cpp_rtti to avoid compilation errors in environments
+// where RTTI is disabled (e.g., Node.js N-API addons use -fno-rtti).
+//
+#if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
+
+class GlobalTypeRegistry {
+private:
+    // The actual storage - inline static ensures single instance across all TUs
+    inline static std::unordered_map<std::type_index, void*> registry_;
+    inline static std::shared_mutex mutex_;
+
+public:
+    // Register a type with its language-specific type object (e.g., PyTypeObject*)
+    // Thread-safe: acquires exclusive lock
+    template<typename T>
+    static void register_type(void* type_object) {
+        std::unique_lock lock(mutex_);
+        registry_[std::type_index(typeid(T))] = type_object;
+    }
+
+    // Look up the type object for a given C++ type
+    // Thread-safe: acquires shared lock (allows concurrent reads)
+    // Returns nullptr if type is not registered
+    template<typename T>
+    static void* lookup() {
+        std::shared_lock lock(mutex_);
+        auto it = registry_.find(std::type_index(typeid(T)));
+        return it != registry_.end() ? it->second : nullptr;
+    }
+
+    // Check if a type is registered
+    // Thread-safe: acquires shared lock
+    template<typename T>
+    static bool is_registered() {
+        std::shared_lock lock(mutex_);
+        return registry_.find(std::type_index(typeid(T))) != registry_.end();
+    }
+
+    // Unregister a type (useful for cleanup in tests)
+    // Thread-safe: acquires exclusive lock
+    template<typename T>
+    static void unregister() {
+        std::unique_lock lock(mutex_);
+        registry_.erase(std::type_index(typeid(T)));
+    }
+
+    // Get the number of registered types (for debugging)
+    static size_t size() {
+        std::shared_lock lock(mutex_);
+        return registry_.size();
+    }
+
+    // Clear all registrations (for testing)
+    static void clear() {
+        std::unique_lock lock(mutex_);
+        registry_.clear();
+    }
+};
+
+#endif // RTTI check
+
+// ============================================================================
 // Reflection Utilities - Member Discovery
 // ============================================================================
 
@@ -176,7 +250,7 @@ consteval std::size_t get_data_member_count() {
     return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
 }
 
-// Member Function Cache - using members_of and filtering
+// Member Function Cache - using members_of and filtering (instance methods only)
 template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
@@ -215,6 +289,45 @@ struct MemberFunctionCache {
     static constexpr std::size_t count = compute_count();
 };
 
+// Static Member Function Cache - for class-level static methods
+template<typename T>
+struct StaticMemberFunctionCache {
+    static consteval bool is_bindable_static_method(std::meta::info member) {
+        return std::meta::is_function(member) &&
+               std::meta::is_static_member(member) &&
+               !std::meta::is_constructor(member) &&
+               !std::meta::is_special_member_function(member) &&
+               !std::meta::is_operator_function(member);
+    }
+
+    static consteval std::size_t compute_count() {
+        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+        std::size_t count = 0;
+        for (auto member : all_members) {
+            if (is_bindable_static_method(member)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    static consteval auto get_at_index(std::size_t Index) {
+        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+        std::size_t func_index = 0;
+        for (auto member : all_members) {
+            if (is_bindable_static_method(member)) {
+                if (func_index == Index) {
+                    return member;
+                }
+                func_index++;
+            }
+        }
+        return all_members[0];
+    }
+
+    static constexpr std::size_t count = compute_count();
+};
+
 template<typename T, std::size_t I>
 consteval auto get_member_function() {
     return MemberFunctionCache<T>::get_at_index(I);
@@ -223,6 +336,42 @@ consteval auto get_member_function() {
 template<typename T>
 consteval std::size_t get_member_function_count() {
     return MemberFunctionCache<T>::count;
+}
+
+template<typename T, std::size_t I>
+consteval auto get_static_member_function() {
+    return StaticMemberFunctionCache<T>::get_at_index(I);
+}
+
+template<typename T>
+consteval std::size_t get_static_member_function_count() {
+    return StaticMemberFunctionCache<T>::count;
+}
+
+template<typename T, std::size_t Index>
+consteval const char* get_static_member_function_name() {
+    constexpr auto func = get_static_member_function<T, Index>();
+    return std::meta::identifier_of(func).data();
+}
+
+// Static method parameter introspection
+template<typename T, std::size_t FuncIndex>
+consteval std::size_t get_static_method_param_count() {
+    constexpr auto func = get_static_member_function<T, FuncIndex>();
+    return std::meta::parameters_of(func).size();
+}
+
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+consteval auto get_static_method_param_type() {
+    constexpr auto func = get_static_member_function<T, FuncIndex>();
+    auto params = std::meta::parameters_of(func);
+    return std::meta::type_of(params[ParamIndex]);
+}
+
+template<typename T, std::size_t FuncIndex>
+consteval auto get_static_method_return_type() {
+    constexpr auto func = get_static_member_function<T, FuncIndex>();
+    return std::meta::return_type_of(func);
 }
 
 // Method parameter introspection
@@ -271,7 +420,7 @@ using NestedMemberType = typename [:std::meta::type_of(get_nested_member<T, I>()
 
 template<typename T>
 consteval std::size_t get_constructor_count() {
-    constexpr auto ctors = std::meta::members_of(^^T);
+    constexpr auto ctors = std::meta::members_of(^^T, std::meta::access_context::unchecked());
     std::size_t count = 0;
 
     for (auto ctor : ctors) {
@@ -349,8 +498,9 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Mirror Bridge Lua - Lua C API Bindings via C++26 Reflection
+// Mirror Bridge Lua - Lua Bindings for C++ Code via C++26 Reflection
 // ═══════════════════════════════════════════════════════════════════════════
+// Generates Lua bindings that expose C++ classes to Lua.
 
 extern "C" {
 #include <lua.h>
@@ -540,13 +690,68 @@ bool from_lua(lua_State* L, int idx, T& out) {
     return true;
 }
 
-// Forward declaration for Bindable types
+// Forward declaration for LuaWrapper (needed for from_lua with wrapped objects)
+template<typename T> struct LuaWrapper;
+
+// Type-based registry for looking up metatable name by C++ type
 template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
-    bool
->
-from_lua(lua_State* L, int idx, T& out);
+struct LuaTypeRegistry {
+    static inline const char* metatable_name = nullptr;
+};
+
+// Convert Lua wrapped objects or tables to C++ types
+// Handles const reference parameters like dot(const Vec3& other)
+// Also handles Lua tables for nested struct assignment
+template<typename T>
+    requires (std::is_class_v<std::remove_cvref_t<T>> &&
+              !Arithmetic<T> && !StringLike<T> && !SmartPointer<T> && !Container<T>)
+bool from_lua(lua_State* L, int idx, T& out) {
+    using CleanT = std::remove_cvref_t<T>;
+
+    // Get as userdata (wrapped C++ object)
+    if (lua_isuserdata(L, idx)) {
+        LuaWrapper<CleanT>* wrapper = static_cast<LuaWrapper<CleanT>*>(lua_touserdata(L, idx));
+        if (wrapper && wrapper->cpp_object) {
+            out = *wrapper->cpp_object;
+            return true;
+        }
+    }
+
+    // Also support Lua tables for nested struct assignment
+    // e.g., person.address = {street = "123 Main", city = "NYC", zip = 10001}
+    if (lua_istable(L, idx)) {
+        constexpr std::size_t member_count = core::get_data_member_count<CleanT>();
+        bool success = true;
+
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                if (!success) return;
+
+                constexpr auto member = core::get_data_member<CleanT, Is>();
+                constexpr auto member_name = std::meta::identifier_of(member);
+                using MemberType = typename [:std::meta::type_of(member):];
+
+                // Get field from Lua table
+                lua_getfield(L, idx, member_name.data());
+
+                if (!lua_isnil(L, -1)) {
+                    MemberType value;
+                    if (!from_lua(L, -1, value)) {
+                        success = false;
+                    } else {
+                        out.[:member:] = std::move(value);
+                    }
+                }
+
+                lua_pop(L, 1);
+            }(), ...);
+        }(std::make_index_sequence<member_count>{});
+
+        return success;
+    }
+
+    return false;
+}
 
 // ============================================================================
 // Forward Declarations
@@ -558,6 +763,8 @@ int lua_method(lua_State* L);
 // ============================================================================
 // Property Access via Metatables
 // ============================================================================
+
+// No optimized property accessors - keep using reflection-based __index/__newindex
 
 template<typename T>
 int lua_index(lua_State* L) {
@@ -709,6 +916,55 @@ int lua_method(lua_State* L) {
 }
 
 // ============================================================================
+// Static Method Binding
+// ============================================================================
+
+template<typename T, std::size_t FuncIndex, std::size_t... Is>
+int call_static_method_impl(lua_State* L, std::index_sequence<Is...>) {
+    constexpr auto member_func = get_static_member_function<T, FuncIndex>();
+    constexpr auto return_type = get_static_method_return_type<T, FuncIndex>();
+    using ReturnType = typename [:return_type:];
+
+    std::tuple<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+
+    bool success = true;
+    ([&] {
+        if (!success) return;
+        // Static methods: args start at index 1 (no self)
+        if (!from_lua(L, 1 + Is, std::get<Is>(cpp_args))) {
+            success = false;
+        }
+    }(), ...);
+
+    if (!success) {
+        return luaL_error(L, "Argument type conversion failed");
+    }
+
+    if constexpr (std::is_void_v<ReturnType>) {
+        [:member_func:](std::move(std::get<Is>(cpp_args))...);
+        return 0;
+    } else {
+        ReturnType result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
+        to_lua(L, result);
+        return 1;
+    }
+}
+
+template<typename T, std::size_t Index>
+int lua_static_method(lua_State* L) {
+    constexpr std::size_t param_count = get_static_method_param_count<T, Index>();
+
+    // Check argument count
+    int nargs = lua_gettop(L);
+    if (nargs != static_cast<int>(param_count)) {
+        return luaL_error(L, "Incorrect number of arguments (expected %d, got %d)",
+                          static_cast<int>(param_count), nargs);
+    }
+
+    return call_static_method_impl<T, Index>(L, std::make_index_sequence<param_count>{});
+}
+
+// ============================================================================
 // Garbage Collection
 // ============================================================================
 
@@ -803,6 +1059,26 @@ std::enable_if_t<
     Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>
 >
 to_lua(lua_State* L, const T& obj) {
+    using CleanT = std::remove_cvref_t<T>;
+
+    // Check if this type has been registered with bind_class
+    if (LuaTypeRegistry<CleanT>::metatable_name) {
+        // Create a new userdata wrapper
+        LuaWrapper<CleanT>* wrapper = static_cast<LuaWrapper<CleanT>*>(
+            lua_newuserdata(L, sizeof(LuaWrapper<CleanT>)));
+
+        // Copy the C++ object
+        wrapper->cpp_object = new CleanT(obj);
+        wrapper->owns_memory = true;
+
+        // Set the metatable
+        luaL_getmetatable(L, LuaTypeRegistry<CleanT>::metatable_name);
+        lua_setmetatable(L, -2);
+
+        return;
+    }
+
+    // Fall back to table conversion for unregistered types
     LuaConversionHelper<T>::to_lua_impl(L, obj);
 }
 
@@ -821,6 +1097,11 @@ from_lua(lua_State* L, int idx, T& out) {
 
 template<Bindable T>
 void bind_class(lua_State* L, const char* name) {
+    constexpr std::size_t static_method_count = get_static_member_function_count<T>();
+
+    // Store metatable name in type registry (for to_lua wrapper creation)
+    LuaTypeRegistry<T>::metatable_name = typeid(T).name();
+
     // Create metatable for this class
     luaL_newmetatable(L, typeid(T).name());
 
@@ -839,8 +1120,31 @@ void bind_class(lua_State* L, const char* name) {
     // Pop metatable
     lua_pop(L, 1);
 
-    // Register constructor in the module table (on top of stack)
+    // Create a table for the class (holds constructor and static methods)
+    lua_newtable(L);
+
+    // Add constructor as __call on a metatable for the class table
+    lua_newtable(L);  // metatable for class table
     lua_pushcfunction(L, lua_constructor<T>);
+    lua_setfield(L, -2, "__call");
+    lua_setmetatable(L, -2);  // set metatable on class table
+
+    // Also add constructor directly as "new" method
+    lua_pushcfunction(L, lua_constructor<T>);
+    lua_setfield(L, -2, "new");
+
+    // Add static methods to the class table
+    if constexpr (static_method_count > 0) {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                constexpr auto method_name = get_static_member_function_name<T, Is>();
+                lua_pushcclosure(L, lua_static_method<T, Is>, 0);
+                lua_setfield(L, -2, method_name);
+            }(), ...);
+        }(std::make_index_sequence<static_method_count>{});
+    }
+
+    // Set the class table in the module table
     lua_setfield(L, -2, name);
 }
 

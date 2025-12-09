@@ -203,8 +203,9 @@ struct LuaTypeRegistry {
     static inline const char* metatable_name = nullptr;
 };
 
-// Convert Lua wrapped objects to C++ types
+// Convert Lua wrapped objects or tables to C++ types
 // Handles const reference parameters like dot(const Vec3& other)
+// Also handles Lua tables for nested struct assignment
 template<typename T>
     requires (std::is_class_v<std::remove_cvref_t<T>> &&
               !Arithmetic<T> && !StringLike<T> && !SmartPointer<T> && !Container<T>)
@@ -218,6 +219,39 @@ bool from_lua(lua_State* L, int idx, T& out) {
             out = *wrapper->cpp_object;
             return true;
         }
+    }
+
+    // Also support Lua tables for nested struct assignment
+    // e.g., person.address = {street = "123 Main", city = "NYC", zip = 10001}
+    if (lua_istable(L, idx)) {
+        constexpr std::size_t member_count = core::get_data_member_count<CleanT>();
+        bool success = true;
+
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                if (!success) return;
+
+                constexpr auto member = core::get_data_member<CleanT, Is>();
+                constexpr auto member_name = std::meta::identifier_of(member);
+                using MemberType = typename [:std::meta::type_of(member):];
+
+                // Get field from Lua table
+                lua_getfield(L, idx, member_name.data());
+
+                if (!lua_isnil(L, -1)) {
+                    MemberType value;
+                    if (!from_lua(L, -1, value)) {
+                        success = false;
+                    } else {
+                        out.[:member:] = std::move(value);
+                    }
+                }
+
+                lua_pop(L, 1);
+            }(), ...);
+        }(std::make_index_sequence<member_count>{});
+
+        return success;
     }
 
     return false;
