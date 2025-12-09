@@ -156,7 +156,8 @@ while IFS= read -r -d '' binding_file; do
         fi
     fi
     echo ""
-done < <(find . -name "*.cpp" -type f -print0)
+# Exclude v8/ directory - V8 tests are built separately in Step 2d
+done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"
