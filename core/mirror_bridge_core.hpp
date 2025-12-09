@@ -22,6 +22,8 @@
 #include <concepts>
 #include <memory>
 #include <unordered_map>
+#include <typeindex>
+#include <shared_mutex>
 
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
@@ -139,6 +141,85 @@ public:
 
     bool is_registered(const std::string& name) const {
         return classes.find(name) != classes.end();
+    }
+};
+
+// ============================================================================
+// Global Type Registry - Cross-Module Type Sharing
+// ============================================================================
+//
+// Problem: When C++ types are bound in separate shared libraries (.so files),
+// each library gets its own copy of template static variables. This means
+// TypeRegistry<Point>::py_type in point.so is different from the same variable
+// in rectangle.so - causing cross-module type lookups to fail.
+//
+// Solution: Use a truly global registry with std::type_index as the key.
+// The registry is shared across all shared libraries because:
+// 1. inline static variables in header-only code share the same address
+// 2. std::type_index provides stable type identity across translation units
+//
+// Thread Safety: Uses std::shared_mutex for concurrent read access with
+// exclusive write access. Most operations are reads (type lookups), so
+// shared_mutex provides better concurrency than a regular mutex.
+//
+// Usage:
+//   // In bind_class<T>():
+//   GlobalTypeRegistry::register_type<T>(py_type_object);
+//
+//   // In to_python() for Bindable types:
+//   void* py_type = GlobalTypeRegistry::lookup<T>();
+//
+class GlobalTypeRegistry {
+private:
+    // The actual storage - inline static ensures single instance across all TUs
+    inline static std::unordered_map<std::type_index, void*> registry_;
+    inline static std::shared_mutex mutex_;
+
+public:
+    // Register a type with its language-specific type object (e.g., PyTypeObject*)
+    // Thread-safe: acquires exclusive lock
+    template<typename T>
+    static void register_type(void* type_object) {
+        std::unique_lock lock(mutex_);
+        registry_[std::type_index(typeid(T))] = type_object;
+    }
+
+    // Look up the type object for a given C++ type
+    // Thread-safe: acquires shared lock (allows concurrent reads)
+    // Returns nullptr if type is not registered
+    template<typename T>
+    static void* lookup() {
+        std::shared_lock lock(mutex_);
+        auto it = registry_.find(std::type_index(typeid(T)));
+        return it != registry_.end() ? it->second : nullptr;
+    }
+
+    // Check if a type is registered
+    // Thread-safe: acquires shared lock
+    template<typename T>
+    static bool is_registered() {
+        std::shared_lock lock(mutex_);
+        return registry_.find(std::type_index(typeid(T))) != registry_.end();
+    }
+
+    // Unregister a type (useful for cleanup in tests)
+    // Thread-safe: acquires exclusive lock
+    template<typename T>
+    static void unregister() {
+        std::unique_lock lock(mutex_);
+        registry_.erase(std::type_index(typeid(T)));
+    }
+
+    // Get the number of registered types (for debugging)
+    static size_t size() {
+        std::shared_lock lock(mutex_);
+        return registry_.size();
+    }
+
+    // Clear all registrations (for testing)
+    static void clear() {
+        std::unique_lock lock(mutex_);
+        registry_.clear();
     }
 };
 

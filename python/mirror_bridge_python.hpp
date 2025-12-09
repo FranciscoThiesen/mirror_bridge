@@ -56,6 +56,9 @@
 #include <unordered_map>
 #include <cstdio>   // For snprintf in simple repr functions
 
+// Include core header for GlobalTypeRegistry
+#include "core/mirror_bridge_core.hpp"
+
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
@@ -1656,11 +1659,124 @@ struct ConversionOverloadGenerator {
     }
 };
 
+// ============================================================================
+// Python-Based Global Type Registry
+// ============================================================================
+//
+// Problem: C++ inline static variables are per-shared-library, so types
+// registered in vertex.so can't be found by bbox.so's to_python().
+//
+// Solution: Use Python's sys.modules to store type information globally.
+// We create a hidden module "_mirror_bridge_types" that holds a dict mapping
+// C++ type names (via typeid) to Python type objects. This dict is shared
+// across all .so files since it lives in Python's runtime.
+
+// Get or create the global type registry dict in Python
+// This is NOT in an anonymous namespace so it can be used by the public API below
+inline PyObject* get_python_type_registry() {
+    // Get sys.modules
+    PyObject* sys_modules = PyImport_GetModuleDict();
+    if (!sys_modules) return nullptr;
+
+    // Check if our registry module exists
+    const char* registry_name = "_mirror_bridge_types";
+    PyObject* registry = PyDict_GetItemString(sys_modules, registry_name);
+
+    if (!registry) {
+        // Create a new dict to serve as our registry
+        registry = PyDict_New();
+        if (!registry) return nullptr;
+
+        // Store it in sys.modules so it persists across imports
+        PyDict_SetItemString(sys_modules, registry_name, registry);
+        Py_DECREF(registry);  // sys.modules now owns it
+
+        // Get it back (borrowed reference)
+        registry = PyDict_GetItemString(sys_modules, registry_name);
+    }
+
+    return registry;
+}
+
+namespace {
+    // Register a type in the Python-based global registry
+    template<typename T>
+    void register_type_in_python(PyTypeObject* py_type) {
+        PyObject* registry = get_python_type_registry();
+        if (!registry) return;
+
+        // Use typeid name as the key (unique per type across all modules)
+        const char* type_name = typeid(T).name();
+        PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
+    }
+
+    // Look up a type from the Python-based global registry
+    template<typename T>
+    PyTypeObject* lookup_type_in_python() {
+        PyObject* registry = get_python_type_registry();
+        if (!registry) return nullptr;
+
+        const char* type_name = typeid(T).name();
+        PyObject* py_type = PyDict_GetItemString(registry, type_name);
+
+        return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
+    }
+}
+
+// ============================================================================
+// Public API for Type Registry Management
+// ============================================================================
+//
+// The global type registry enables cross-module type sharing. These functions
+// allow inspection and cleanup of the registry.
+//
+// Usage:
+//   // In Python, you can also access directly:
+//   import sys
+//   registry = sys.modules.get('_mirror_bridge_types', {})
+//   print(f"Registered types: {len(registry)}")
+//
+//   // Or use the C++ API from binding code:
+//   mirror_bridge::clear_type_registry();  // Clear all registrations
+//
+
+// Clear all type registrations (useful for testing or module reloading)
+inline void clear_type_registry() {
+    PyObject* registry = get_python_type_registry();
+    if (registry) {
+        PyDict_Clear(registry);
+    }
+}
+
+// Get the number of registered types
+inline Py_ssize_t get_registered_type_count() {
+    PyObject* registry = get_python_type_registry();
+    return registry ? PyDict_Size(registry) : 0;
+}
+
+// Unregister a specific type (useful when reloading a module)
+template<typename T>
+void unregister_type() {
+    PyObject* registry = get_python_type_registry();
+    if (!registry) return;
+
+    const char* type_name = typeid(T).name();
+    PyDict_DelItemString(registry, type_name);
+    PyErr_Clear();  // Ignore KeyError if type wasn't registered
+}
+
 // Auto-generated conversion overloads using SFINAE (not requires clause)
 // SFINAE ensures clean template symbols without constraint mangling
 //
 // UPDATED: When a type is bound via bind_class<T>, we return a proper wrapper
 // object instead of a dict. This allows methods to work on returned objects.
+//
+// CROSS-MODULE SUPPORT: Uses Python-based global registry to look up types
+// that may have been registered in a different shared library (.so).
+// This enables scenarios like:
+//   - vertex.so binds Vertex class
+//   - bbox.so binds BoundingBox class that has Vertex members
+//   - BoundingBox.get_corner() returns a proper Vertex wrapper (not a dict)
 template<typename T>
 std::enable_if_t<
     Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
@@ -1669,8 +1785,14 @@ std::enable_if_t<
 to_python(const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Check if this type has been registered with bind_class
-    PyTypeObject* py_type = TypeRegistry<CleanT>::py_type;
+    // First check Python-based global registry (works across shared libraries)
+    PyTypeObject* py_type = lookup_type_in_python<CleanT>();
+
+    // Fall back to local TypeRegistry for single-module scenarios
+    if (!py_type) {
+        py_type = TypeRegistry<CleanT>::py_type;
+    }
+
     if (py_type) {
         // Create a wrapper object with a copy of the C++ object
         auto* wrapper = reinterpret_cast<PyWrapper<CleanT>*>(py_type->tp_alloc(py_type, 0));
@@ -1789,6 +1911,11 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
 
     // Register type in TypeRegistry for type-based lookup in to_python
     TypeRegistry<T>::py_type = &type_object;
+
+    // Register in Python-based global registry for cross-module type sharing
+    // This allows types bound in one .so file to be properly returned
+    // from methods in another .so file (C++ static variables are per-.so)
+    register_type_in_python<T>(&type_object);
 
     return &type_object;
 }

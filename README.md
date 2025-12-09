@@ -60,6 +60,7 @@ Mirror Bridge is a **header-only library** that uses C++26 reflection (P2996) to
 - ✅ **Method overloading** - automatic name mangling for overloads
 - ✅ **Smart pointers** - `std::unique_ptr`, `std::shared_ptr` with automatic conversion
 - ✅ **Nested classes** - recursive handling, cross-file dependencies
+- ✅ **Cross-module types** - types from separate `.so` files work together seamlessly
 - ✅ **Containers** - `std::vector`, `std::array` with bidirectional conversion
 - ✅ **Exception handling** - C++ exceptions → Python exceptions
 - ✅ **Enums** - automatic conversion to/from Python int
@@ -302,6 +303,56 @@ struct Person {
 ```python
 p = my_module.Person()
 p.addr = {'city': 'Boston'}  # Dict conversion
+```
+
+### Cross-Module Type Sharing
+
+Types bound in separate `.so` files can work together seamlessly. When a method returns a type that was bound in a different module, you get a proper wrapper object (not a dict):
+
+```cpp
+// vertex.hpp - bound in vertex.so
+struct Vertex {
+    double x, y;
+    double distance_from_origin() const;
+};
+
+// bbox.hpp - bound in bbox.so (separate module!)
+#include "vertex.hpp"
+struct BoundingBox {
+    Vertex top_left;
+    Vertex get_top_left() const { return top_left; }
+};
+```
+
+```python
+import vertex  # Must import first to register Vertex type
+import bbox
+
+box = bbox.BoundingBox()
+box.top_left = vertex.Vertex(1.0, 2.0)
+
+# Returns a proper Vertex wrapper, NOT a dict!
+corner = box.get_top_left()
+print(type(corner))  # <class 'vertex.Vertex'>
+print(corner.distance_from_origin())  # Methods work!
+```
+
+**Important:** Import the module containing the dependent type first (e.g., `import vertex` before `import bbox`).
+
+**Type Registry Management:**
+
+Mirror Bridge maintains a global type registry in `sys.modules['_mirror_bridge_types']`. For advanced use cases:
+
+```python
+import sys
+
+# Inspect registered types
+registry = sys.modules.get('_mirror_bridge_types', {})
+print(f"Registered types: {len(registry)}")
+
+# Clear registry (useful before reloading modules during development)
+if '_mirror_bridge_types' in sys.modules:
+    sys.modules['_mirror_bridge_types'].clear()
 ```
 
 ### Containers
