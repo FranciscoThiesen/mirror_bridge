@@ -49,7 +49,6 @@ class_hashes.db
 .docker-volumes/
 
 # AI guidance (not for public repo)
-claude.md
 CLAUDE.md
 
 # Benchmark results
