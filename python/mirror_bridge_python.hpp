@@ -1274,6 +1274,19 @@ consteval auto get_static_method_return_type() {
     return std::meta::return_type_of(static_func);
 }
 
+// Helper to conditionally forward arguments based on parameter type.
+// For lvalue reference parameters (T&), pass as lvalue (no move).
+// For value or rvalue reference parameters (T or T&&), use std::move.
+// This enables both ref parameters (like Body&) and move-only types (like unique_ptr).
+template<typename OriginalParamType, typename StoredType>
+decltype(auto) forward_arg(StoredType& arg) {
+    if constexpr (std::is_lvalue_reference_v<OriginalParamType>) {
+        return arg;  // Pass as lvalue for T& parameters
+    } else {
+        return std::move(arg);  // Move for T and T&& parameters
+    }
+}
+
 // Generate a type signature for a given class using reflection
 template<typename T>
 std::string generate_type_signature(const char* file_hash = nullptr) {
@@ -1634,15 +1647,17 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
 
     // Call the C++ method using reflection splicer and parameter pack expansion
     // [:member_func:] is injected as the actual member function (e.g., &T::foo)
-    // std::get<Is>(cpp_args)... expands to: get<0>(cpp_args), get<1>(cpp_args), ...
-    // Note: We pass by lvalue reference (not std::move) to support methods that take T& parameters.
-    // For value parameters, the compiler will copy; for ref parameters, it passes the ref.
+    // Use forward_arg to conditionally move: move for value/rvalue params, no move for lvalue ref params
     // Dereference pointer first to work around compiler bug with -> operator
     if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(std::get<Is>(cpp_args)...);
+        ((*wrapper->cpp_object).[:member_func:])(
+            forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+        );
         Py_RETURN_NONE;
     } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::get<Is>(cpp_args)...);
+        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
+            forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+        );
         return to_python(result);  // Convert C++ return value back to Python
     }
 }
@@ -1715,12 +1730,16 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     }
 
     // Call the static C++ method using reflection splicer
-    // Use lvalue refs (not std::move) to support T& parameters
+    // Use forward_arg to conditionally move: move for value/rvalue params, no move for lvalue ref params
     if constexpr (std::is_void_v<ReturnType>) {
-        [:static_func:](std::get<Is>(cpp_args)...);
+        [:static_func:](
+            forward_arg<typename [:get_static_method_param_type<T, Index, Is>():]>(std::get<Is>(cpp_args))...
+        );
         Py_RETURN_NONE;
     } else {
-        ReturnType result = [:static_func:](std::get<Is>(cpp_args)...);
+        ReturnType result = [:static_func:](
+            forward_arg<typename [:get_static_method_param_type<T, Index, Is>():]>(std::get<Is>(cpp_args))...
+        );
         return to_python(result);
     }
 }
