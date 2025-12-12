@@ -44,7 +44,7 @@ Change Detection:
 
 Auto-Discovery:
   Scans all .hpp/.h files in src_dir and automatically binds all
-  struct/class definitions found.
+  struct/class definitions found, including those inside namespaces.
 
   Opt-out: Add comment "MIRROR_BRIDGE_SKIP" before class:
     // MIRROR_BRIDGE_SKIP
@@ -198,12 +198,147 @@ fi
 echo ""
 echo -e "${YELLOW}Scanning for classes...${NC}"
 
-# Discover classes
-declare -a CLASSES
+# Discover classes with namespace support
+# Output format: "qualified_name|simple_name|header_path"
+# e.g., "imgproc::Color|Color|color.hpp"
+
+discover_classes() {
+    local header_file="$1"
+    local rel_path="$2"
+
+    # Use POSIX-compatible awk for namespace tracking
+    # Avoids gawk-specific features like match() with array capture
+    awk -v rel_path="$rel_path" '
+    BEGIN {
+        namespace_stack_size = 0
+        in_skip = 0
+        brace_depth = 0
+        pending_namespace = ""
+    }
+
+    # Helper to extract identifier after a keyword
+    # Works by removing everything up to and including the keyword,
+    # then extracting the first word
+    function extract_after(line, keyword) {
+        # Find position of keyword
+        pos = index(line, keyword)
+        if (pos == 0) return ""
+        # Get substring after keyword
+        rest = substr(line, pos + length(keyword))
+        # Skip whitespace
+        gsub(/^[[:space:]]+/, "", rest)
+        # Extract identifier (stop at non-identifier char)
+        result = ""
+        for (i = 1; i <= length(rest); i++) {
+            c = substr(rest, i, 1)
+            if (c ~ /[a-zA-Z0-9_]/) {
+                result = result c
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    # Track MIRROR_BRIDGE_SKIP comment
+    /MIRROR_BRIDGE_SKIP/ {
+        in_skip = 1
+        next
+    }
+
+    # Track namespace opening - handle "namespace foo {" on same line
+    /^[[:space:]]*namespace[[:space:]]+[a-zA-Z_]/ {
+        ns_name = extract_after($0, "namespace")
+        if (ns_name != "" && /\{/) {
+            namespace_stack[namespace_stack_size] = ns_name
+            namespace_stack_size++
+        } else if (ns_name != "") {
+            # Namespace without brace - save for next line
+            pending_namespace = ns_name
+        }
+    }
+
+    # Handle pending namespace brace on next line
+    pending_namespace != "" && /\{/ {
+        namespace_stack[namespace_stack_size] = pending_namespace
+        namespace_stack_size++
+        pending_namespace = ""
+    }
+
+    # Track struct/class definition (not forward declaration)
+    /^[[:space:]]*(struct|class)[[:space:]]+[a-zA-Z_]/ {
+        if (in_skip) {
+            in_skip = 0
+            next
+        }
+
+        # Skip forward declarations (line ends with ;)
+        if (/;[[:space:]]*$/) {
+            next
+        }
+
+        # Skip if no { or : (definition start)
+        if (!(/\{/ || /:/)) {
+            next
+        }
+
+        # Extract class name
+        class_name = ""
+        if (/struct[[:space:]]/) {
+            class_name = extract_after($0, "struct")
+        } else if (/class[[:space:]]/) {
+            class_name = extract_after($0, "class")
+        }
+
+        if (class_name != "") {
+            # Build qualified name
+            qualified = ""
+            for (i = 0; i < namespace_stack_size; i++) {
+                if (qualified != "") qualified = qualified "::"
+                qualified = qualified namespace_stack[i]
+            }
+            if (qualified != "") {
+                qualified = qualified "::" class_name
+            } else {
+                qualified = class_name
+            }
+
+            # Output: qualified_name|simple_name|header_path
+            print qualified "|" class_name "|" rel_path
+        }
+    }
+
+    # Track braces for namespace closing
+    {
+        # Count braces by iterating through characters
+        opens = 0
+        closes = 0
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "{") opens++
+            if (c == "}") closes++
+        }
+        brace_depth = brace_depth + opens - closes
+
+        # When brace depth decreases below namespace depth, pop namespace
+        while (namespace_stack_size > 0 && brace_depth < namespace_stack_size) {
+            namespace_stack_size--
+        }
+
+        # Reset skip flag on any non-skip line
+        if (!/MIRROR_BRIDGE_SKIP/) {
+            in_skip = 0
+        }
+    }
+    ' "$header_file"
+}
+
+declare -a QUALIFIED_NAMES
+declare -a SIMPLE_NAMES
 declare -a HEADERS
+declare -A NAMESPACES  # Track unique namespaces
 
 while IFS= read -r header_file; do
-    # Get relative path from SRC_DIR
     rel_path=$(realpath --relative-to="$SRC_DIR" "$header_file")
 
     # Check if file should be skipped entirely
@@ -214,58 +349,37 @@ while IFS= read -r header_file; do
         continue
     fi
 
-    # Extract class/struct definitions
-    # Look for: struct ClassName / class ClassName
-    # Skip if preceded by MIRROR_BRIDGE_SKIP comment
+    # Discover classes with namespace support
+    while IFS='|' read -r qualified simple header; do
+        if [ -n "$qualified" ]; then
+            QUALIFIED_NAMES+=("$qualified")
+            SIMPLE_NAMES+=("$simple")
+            HEADERS+=("$header")
 
-    # Read file content
-    content=$(cat "$header_file")
-
-    # Find all class/struct definitions
-    # Pattern: (struct|class) followed by identifier
-    while IFS= read -r line; do
-        # Check if line contains class or struct definition
-        if [[ "$line" =~ ^[[:space:]]*(struct|class)[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
-            class_name="${BASH_REMATCH[2]}"
-
-            # Check if this is a forward declaration (ends with ;)
-            if [[ "$line" =~ \;[[:space:]]*$ ]]; then
-                continue
+            # Extract namespace part
+            if [[ "$qualified" == *"::"* ]]; then
+                ns="${qualified%::*}"
+                NAMESPACES["$ns"]=1
             fi
 
-            # Check if previous lines contain MIRROR_BRIDGE_SKIP
-            line_num=$(grep -n "^[[:space:]]*\(struct\|class\)[[:space:]]\+$class_name" "$header_file" | head -1 | cut -d: -f1)
-            if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
-                prev_line=$((line_num - 1))
-                if sed -n "${prev_line}p" "$header_file" | grep -q "MIRROR_BRIDGE_SKIP"; then
-                    if [ $VERBOSE -eq 1 ]; then
-                        echo -e "${BLUE}  Skipping: $class_name (marked MIRROR_BRIDGE_SKIP)${NC}"
-                    fi
-                    continue
-                fi
-            fi
-
-            # Add to list
-            CLASSES+=("$class_name")
-            HEADERS+=("$rel_path")
-            echo -e "  ${GREEN}✓${NC} Found: $class_name in $rel_path"
+            echo -e "  ${GREEN}✓${NC} Found: $qualified in $header"
         fi
-    done < "$header_file"
+    done < <(discover_classes "$header_file" "$rel_path")
 
 done <<< "$HEADER_FILES"
 
 # Check if any classes found
-if [ ${#CLASSES[@]} -eq 0 ]; then
+if [ ${#QUALIFIED_NAMES[@]} -eq 0 ]; then
     echo -e "${RED}Error: No classes found in $SRC_DIR${NC}"
     echo -e "${YELLOW}Tip: Classes must be defined as 'struct ClassName' or 'class ClassName'${NC}"
     exit 1
 fi
 
 echo ""
-echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC}"
+echo -e "${GREEN}Discovered ${#QUALIFIED_NAMES[@]} classes${NC}"
 echo ""
 
-# Generate binding file (use _binding.cpp suffix so mirror_bridge_build extracts correct module name)
+# Generate binding file
 GENERATED_FILE="$OUTPUT_DIR/${MODULE_NAME}_binding.cpp"
 echo -e "${YELLOW}Generating binding file...${NC}"
 
@@ -291,9 +405,11 @@ echo "" >> "$GENERATED_FILE"
 # Generate module with all class bindings
 echo "MIRROR_BRIDGE_MODULE($MODULE_NAME," >> "$GENERATED_FILE"
 
-for i in "${!CLASSES[@]}"; do
-    class_name="${CLASSES[$i]}"
-    echo "    mirror_bridge::bind_class<$class_name>(m, \"$class_name\");" >> "$GENERATED_FILE"
+for i in "${!QUALIFIED_NAMES[@]}"; do
+    qualified_name="${QUALIFIED_NAMES[$i]}"
+    simple_name="${SIMPLE_NAMES[$i]}"
+    # Use qualified name for C++ type, simple name for Python exposure
+    echo "    mirror_bridge::bind_class<$qualified_name>(m, \"$simple_name\");" >> "$GENERATED_FILE"
 done
 
 echo ")" >> "$GENERATED_FILE"
@@ -373,7 +489,7 @@ fi
 
 echo ""
 echo -e "${GREEN}✓ Successfully auto-discovered and built: ${MODULE_NAME}.so${NC}"
-echo -e "${GREEN}  Classes bound: ${#CLASSES[@]}${NC}"
+echo -e "${GREEN}  Classes bound: ${#QUALIFIED_NAMES[@]}${NC}"
 echo ""
 echo -e "${BLUE}Usage from Python:${NC}"
 echo -e "  import sys"
@@ -381,7 +497,13 @@ echo -e "  sys.path.insert(0, '$OUTPUT_DIR')"
 echo -e "  import $MODULE_NAME"
 echo ""
 echo -e "  # Classes available:"
-for class_name in "${CLASSES[@]}"; do
-    echo -e "  # - $class_name"
+for i in "${!SIMPLE_NAMES[@]}"; do
+    simple_name="${SIMPLE_NAMES[$i]}"
+    qualified_name="${QUALIFIED_NAMES[$i]}"
+    if [ "$simple_name" != "$qualified_name" ]; then
+        echo -e "  # - $simple_name (C++: $qualified_name)"
+    else
+        echo -e "  # - $simple_name"
+    fi
 done
 echo ""

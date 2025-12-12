@@ -49,11 +49,13 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <array>
 #include <type_traits>
 #include <concepts>
 #include <memory>
 #include <functional>
 #include <unordered_map>
+#include <cstdint>  // For uint8_t, int32_t, etc.
 #include <cstdio>   // For snprintf in simple repr functions
 
 // Include core header for GlobalTypeRegistry
@@ -476,10 +478,359 @@ inline PyObject* to_python(const std::function<R(Args...)>& func) {
     return PyUnicode_FromString("<C++ std::function>");
 }
 
-// Optimized: Convert vector<unsigned char> to Python bytes (not list!)
-// This is ~50x faster than converting to a list
+// ============================================================================
+// Byte Vector Specialization
+// ============================================================================
+//
+// Convert vector<unsigned char> to Python bytes (not list!) for ~50x speedup.
+// Note: uint8_t may or may not be the same type as unsigned char depending on
+// platform. We use a single definition with unsigned char since that's the
+// canonical byte type, and static_assert that uint8_t is compatible.
+static_assert(sizeof(uint8_t) == sizeof(unsigned char),
+              "uint8_t and unsigned char must be same size for byte conversion");
+
 inline PyObject* to_python(const std::vector<unsigned char>& data) {
     return PyBytes_FromStringAndSize(reinterpret_cast<const char*>(data.data()), data.size());
+}
+
+inline bool from_python(PyObject* obj, std::vector<unsigned char>& out) {
+    if (PyBytes_Check(obj)) {
+        char* data;
+        Py_ssize_t size;
+        if (PyBytes_AsStringAndSize(obj, &data, &size) < 0) {
+            return false;
+        }
+        out.assign(reinterpret_cast<unsigned char*>(data),
+                   reinterpret_cast<unsigned char*>(data) + size);
+        return true;
+    }
+    // Also accept lists for compatibility
+    if (PyList_Check(obj)) {
+        Py_ssize_t size = PyList_Size(obj);
+        out.clear();
+        out.reserve(size);
+        for (Py_ssize_t i = 0; i < size; ++i) {
+            PyObject* item = PyList_GetItem(obj, i);
+            if (!PyLong_Check(item)) return false;
+            long val = PyLong_AsLong(item);
+            if (val < 0 || val > 255) return false;
+            out.push_back(static_cast<unsigned char>(val));
+        }
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// std::array Support - Fixed-size Arrays
+// ============================================================================
+
+// Trait to detect std::array
+template<typename T>
+struct is_std_array : std::false_type {};
+
+template<typename T, std::size_t N>
+struct is_std_array<std::array<T, N>> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_std_array_v = is_std_array<std::remove_cvref_t<T>>::value;
+
+// Convert std::array to Python list
+template<typename T, std::size_t N>
+PyObject* to_python(const std::array<T, N>& arr) {
+    PyObject* list = PyList_New(N);
+    if (!list) return nullptr;
+
+    for (std::size_t i = 0; i < N; ++i) {
+        PyObject* py_item = to_python(arr[i]);
+        if (!py_item) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        PyList_SET_ITEM(list, i, py_item);
+    }
+    return list;
+}
+
+// Convert Python list to std::array
+template<typename T, std::size_t N>
+bool from_python(PyObject* obj, std::array<T, N>& arr) {
+    if (!PyList_Check(obj)) return false;
+
+    Py_ssize_t size = PyList_Size(obj);
+    if (static_cast<std::size_t>(size) != N) {
+        PyErr_Format(PyExc_ValueError,
+                     "Expected list of size %zu, got %zd", N, size);
+        return false;
+    }
+
+    for (std::size_t i = 0; i < N; ++i) {
+        PyObject* py_item = PyList_GetItem(obj, i);
+        if (!from_python(py_item, arr[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Buffer Protocol Support - Zero-Copy NumPy Integration
+// ============================================================================
+//
+// The Python buffer protocol enables zero-copy access to C++ data from NumPy.
+// Instead of copying data between C++ and Python, NumPy arrays can directly
+// view the memory owned by C++ containers.
+//
+// Usage in Python:
+//   import numpy as np
+//   img = imgproc.Image(1920, 1080)
+//   # Zero-copy view of image data
+//   arr = np.asarray(img.data_view())
+//   # Modify directly in-place
+//   arr[0:100, 0:100] = 255
+//
+// SAFETY: The C++ object MUST outlive the NumPy array. Use with caution.
+//
+// This is implemented as a wrapper class that exposes buffer protocol,
+// rather than making every container support it (which would be invasive).
+
+// BufferView exposes a contiguous memory region via Python buffer protocol
+template<typename T>
+struct BufferView {
+    PyObject_HEAD
+    T* data;           // Pointer to start of buffer
+    Py_ssize_t size;   // Number of elements
+    PyObject* owner;   // Keep owner alive (prevents dangling pointer)
+};
+
+// Type trait to get numpy-compatible format string
+template<typename T>
+consteval const char* get_buffer_format() {
+    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, unsigned char>) {
+        return "B";  // unsigned byte
+    } else if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, char>) {
+        return "b";  // signed byte
+    } else if constexpr (std::is_same_v<T, int16_t> || std::is_same_v<T, short>) {
+        return "h";  // short
+    } else if constexpr (std::is_same_v<T, uint16_t> || std::is_same_v<T, unsigned short>) {
+        return "H";  // unsigned short
+    } else if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int>) {
+        return "i";  // int
+    } else if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, unsigned int>) {
+        return "I";  // unsigned int
+    } else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, long long>) {
+        return "q";  // long long
+    } else if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, unsigned long long>) {
+        return "Q";  // unsigned long long
+    } else if constexpr (std::is_same_v<T, float>) {
+        return "f";  // float
+    } else if constexpr (std::is_same_v<T, double>) {
+        return "d";  // double
+    } else {
+        return "B";  // Default to bytes
+    }
+}
+
+// Buffer protocol: getbuffer implementation
+template<typename T>
+int buffer_getbuffer(PyObject* self, Py_buffer* view, int flags) {
+    auto* buf = reinterpret_cast<BufferView<T>*>(self);
+
+    view->obj = self;
+    Py_INCREF(self);
+    view->buf = buf->data;
+    view->len = buf->size * sizeof(T);
+    view->itemsize = sizeof(T);
+    view->readonly = 0;  // Allow writes
+    view->ndim = 1;
+    view->format = const_cast<char*>(get_buffer_format<T>());
+    view->shape = &buf->size;
+    view->strides = &view->itemsize;
+    view->suboffsets = nullptr;
+    view->internal = nullptr;
+
+    return 0;
+}
+
+// Buffer protocol: releasebuffer (no-op since we don't allocate)
+template<typename T>
+void buffer_releasebuffer(PyObject* self, Py_buffer* view) {
+    // Nothing to release - memory is owned by C++ object
+}
+
+// Dealloc for BufferView
+template<typename T>
+void buffer_dealloc(PyObject* self) {
+    auto* buf = reinterpret_cast<BufferView<T>*>(self);
+    Py_XDECREF(buf->owner);
+    Py_TYPE(self)->tp_free(self);
+}
+
+// Create a BufferView PyTypeObject for a given element type
+template<typename T>
+PyTypeObject* get_buffer_view_type() {
+    static PyBufferProcs buffer_procs = {
+        .bf_getbuffer = buffer_getbuffer<T>,
+        .bf_releasebuffer = buffer_releasebuffer<T>,
+    };
+
+    static PyTypeObject type_object = {
+        PyVarObject_HEAD_INIT(nullptr, 0)
+        .tp_name = "BufferView",
+        .tp_basicsize = sizeof(BufferView<T>),
+        .tp_itemsize = 0,
+        .tp_dealloc = buffer_dealloc<T>,
+        .tp_as_buffer = &buffer_procs,
+        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_doc = "Zero-copy buffer view for C++ containers",
+    };
+
+    static bool initialized = false;
+    if (!initialized) {
+        if (PyType_Ready(&type_object) < 0) {
+            return nullptr;
+        }
+        initialized = true;
+    }
+
+    return &type_object;
+}
+
+// Create a BufferView from a vector, keeping owner alive
+template<typename T>
+PyObject* create_buffer_view(std::vector<T>& vec, PyObject* owner) {
+    PyTypeObject* type = get_buffer_view_type<T>();
+    if (!type) return nullptr;
+
+    auto* buf = reinterpret_cast<BufferView<T>*>(type->tp_alloc(type, 0));
+    if (!buf) return nullptr;
+
+    buf->data = vec.data();
+    buf->size = static_cast<Py_ssize_t>(vec.size());
+    buf->owner = owner;
+    Py_XINCREF(owner);
+
+    return reinterpret_cast<PyObject*>(buf);
+}
+
+// ============================================================================
+// Batch Processing API - Hot Loop Optimization
+// ============================================================================
+//
+// The batch processing API enables keeping iteration entirely in C++,
+// avoiding the overhead of crossing the Python/C++ boundary N times.
+//
+// Problem: Traditional Python->C++ calls have ~100-500ns overhead per call.
+// For 1M elements, that's 100-500ms of pure overhead!
+//
+// Solution: Process entire arrays/vectors in a single C++ call.
+//
+// Usage pattern (in C++ class definition):
+//
+//   // Old way (called N times from Python):
+//   double process(double x) { return std::sqrt(x); }
+//
+//   // New batch API (called once, processes N elements):
+//   std::vector<double> process_batch(const std::vector<double>& input) {
+//       std::vector<double> result;
+//       result.reserve(input.size());
+//       for (auto x : input) {
+//           result.push_back(std::sqrt(x));
+//       }
+//       return result;
+//   }
+//
+// From Python:
+//   # Old: ~500ms for 1M calls
+//   results = [sim.process(x) for x in data]
+//
+//   # New: ~5ms for 1M elements (100x faster!)
+//   results = sim.process_batch(data)
+//
+// The binding system automatically handles vector<T> conversion, so batch
+// methods work seamlessly with Python lists and NumPy arrays.
+
+// Helper to transform a vector element-wise using a functor
+// Returns a new vector - used for methods that return transformed data
+template<typename T, typename F>
+std::vector<decltype(std::declval<F>()(std::declval<T>()))>
+transform_batch(const std::vector<T>& input, F&& func) {
+    using ResultT = decltype(func(input[0]));
+    std::vector<ResultT> result;
+    result.reserve(input.size());
+    for (const auto& elem : input) {
+        result.push_back(func(elem));
+    }
+    return result;
+}
+
+// In-place batch transform - modifies the input vector
+template<typename T, typename F>
+void transform_batch_inplace(std::vector<T>& data, F&& func) {
+    for (auto& elem : data) {
+        elem = func(elem);
+    }
+}
+
+// Parallel batch transform using std::transform with execution policy
+// Requires C++17 parallel algorithms support
+// NOTE: Disabled for now due to experimental compiler compatibility issues
+// Uncomment when using a standard C++17/20 compiler with TBB support
+//
+// #if __has_include(<execution>) && defined(__cpp_lib_parallel_algorithm)
+// #include <execution>
+//
+// template<typename T, typename F>
+// std::vector<decltype(std::declval<F>()(std::declval<T>()))>
+// transform_batch_parallel(const std::vector<T>& input, F&& func) {
+//     using ResultT = decltype(func(input[0]));
+//     std::vector<ResultT> result(input.size());
+//     std::transform(std::execution::par_unseq, input.begin(), input.end(),
+//                    result.begin(), std::forward<F>(func));
+//     return result;
+// }
+//
+// template<typename T, typename F>
+// void transform_batch_parallel_inplace(std::vector<T>& data, F&& func) {
+//     std::for_each(std::execution::par_unseq, data.begin(), data.end(),
+//                   [&](T& elem) { elem = func(elem); });
+// }
+// #endif
+
+// Reduce operation - compute aggregate value from vector
+template<typename T, typename F, typename Init>
+Init reduce_batch(const std::vector<T>& input, Init init, F&& func) {
+    for (const auto& elem : input) {
+        init = func(init, elem);
+    }
+    return init;
+}
+
+// Filter operation - return elements matching predicate
+template<typename T, typename Pred>
+std::vector<T> filter_batch(const std::vector<T>& input, Pred&& pred) {
+    std::vector<T> result;
+    result.reserve(input.size() / 2);  // Heuristic
+    for (const auto& elem : input) {
+        if (pred(elem)) {
+            result.push_back(elem);
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// NumPy-Compatible Array View
+// ============================================================================
+//
+// For methods that return array data, this helper creates a view that numpy
+// can consume directly without copying.
+
+// Helper to wrap vector data for numpy access
+// The vector MUST outlive the returned numpy array!
+template<typename T>
+PyObject* vector_to_numpy_view(std::vector<T>& vec, PyObject* owner) {
+    return create_buffer_view(vec, owner);
 }
 
 // Convert C++ containers to Python lists
@@ -1081,11 +1432,16 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
 
     Py_ssize_t nargs = PyTuple_Size(args);
 
-    // Default constructor case
+    // Default constructor case - only if T is default constructible
     if (nargs == 0) {
-        wrapper->cpp_object = new T();
-        wrapper->owns = true;
-        return 0;
+        if constexpr (std::is_default_constructible_v<T>) {
+            wrapper->cpp_object = new T();
+            wrapper->owns = true;
+            return 0;
+        } else {
+            PyErr_SetString(PyExc_TypeError, "This class requires constructor arguments");
+            return -1;
+        }
     }
 
     // Try to find matching constructor by parameter count
@@ -1133,12 +1489,19 @@ PyObject* py_new_with_init(PyTypeObject* type, PyObject* args, PyObject* kwds) {
 }
 
 // Fallback constructor for classes without parameterized constructors
+// Only works for default-constructible types
 template<typename T>
 PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
     if (self) {
-        self->cpp_object = new T();
-        self->owns = true;
+        if constexpr (std::is_default_constructible_v<T>) {
+            self->cpp_object = new T();
+            self->owns = true;
+        } else {
+            // This path should not be reached if bind_class properly uses tp_init
+            self->cpp_object = nullptr;
+            self->owns = false;
+        }
     }
     return reinterpret_cast<PyObject*>(self);
 }
@@ -1272,12 +1635,14 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     // Call the C++ method using reflection splicer and parameter pack expansion
     // [:member_func:] is injected as the actual member function (e.g., &T::foo)
     // std::get<Is>(cpp_args)... expands to: get<0>(cpp_args), get<1>(cpp_args), ...
+    // Note: We pass by lvalue reference (not std::move) to support methods that take T& parameters.
+    // For value parameters, the compiler will copy; for ref parameters, it passes the ref.
     // Dereference pointer first to work around compiler bug with -> operator
     if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+        ((*wrapper->cpp_object).[:member_func:])(std::get<Is>(cpp_args)...);
         Py_RETURN_NONE;
     } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::get<Is>(cpp_args)...);
         return to_python(result);  // Convert C++ return value back to Python
     }
 }
@@ -1350,11 +1715,12 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     }
 
     // Call the static C++ method using reflection splicer
+    // Use lvalue refs (not std::move) to support T& parameters
     if constexpr (std::is_void_v<ReturnType>) {
-        [:static_func:](std::move(std::get<Is>(cpp_args))...);
+        [:static_func:](std::get<Is>(cpp_args)...);
         Py_RETURN_NONE;
     } else {
-        ReturnType result = [:static_func:](std::move(std::get<Is>(cpp_args))...);
+        ReturnType result = [:static_func:](std::get<Is>(cpp_args)...);
         return to_python(result);
     }
 }

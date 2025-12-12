@@ -11,9 +11,12 @@ namespace imgproc {
 class Kernel {
 private:
     std::vector<double> data_;
-    int size_;  // Kernels are always square and odd-sized
+    int size_ = 1;  // Kernels are always square and odd-sized
 
 public:
+    // Default constructor creates identity kernel (1x1, value 1.0)
+    Kernel() : data_({1.0}), size_(1) {}
+
     Kernel(int size, const std::vector<double>& values)
         : data_(values), size_(size) {
         if (size <= 0 || size % 2 == 0) {

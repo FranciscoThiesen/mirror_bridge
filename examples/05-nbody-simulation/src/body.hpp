@@ -3,6 +3,7 @@
 #include <string>
 #include <cmath>
 #include <numbers>
+#include <algorithm>  // For std::clamp
 
 namespace nbody {
 
