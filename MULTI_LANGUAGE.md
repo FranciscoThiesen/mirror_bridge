@@ -1,5 +1,8 @@
 # Mirror Bridge Multi-Language Support
 
+> **Note**: This document has moved to [docs/guides/multi-language.md](docs/guides/multi-language.md).
+> This file is kept for backward compatibility.
+
 ## Overview
 
 Mirror Bridge now supports **three languages** using a single, elegant reflection-based architecture:

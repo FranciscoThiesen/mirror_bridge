@@ -1,5 +1,8 @@
 # Mirror Bridge - Precompiled Header Guide
 
+> **Note**: This document has moved to [docs/guides/pch-optimization.md](docs/guides/pch-optimization.md).
+> This file is kept for backward compatibility.
+
 ## TL;DR - Quick Start
 
 **Want 66-84% faster compilation?** Use precompiled headers!

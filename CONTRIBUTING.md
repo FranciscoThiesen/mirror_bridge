@@ -1,5 +1,8 @@
 # Contributing to Mirror Bridge
 
+> **Note**: This document has moved to [docs/guides/contributing.md](docs/guides/contributing.md).
+> This file is kept for backward compatibility.
+
 This guide covers everything you need to develop, test, and contribute to Mirror Bridge.
 
 ## Development Environment

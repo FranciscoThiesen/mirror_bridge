@@ -1,5 +1,8 @@
 # Mirror Bridge - Quick Start (5 Minutes)
 
+> **Note**: This document has moved to [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
+> This file is kept for backward compatibility.
+
 Get C++ performance in Python/JavaScript/Lua with zero binding code.
 
 ## Step 1: Get the Environment

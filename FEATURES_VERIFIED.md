@@ -1,6 +1,9 @@
 # Mirror Bridge - Verified Features Across All Languages
 
-## ✅ ALL FEATURES TESTED AND WORKING
+> **Note**: This document has moved to [docs/internals/features.md](docs/internals/features.md).
+> This file is kept for backward compatibility.
+
+## ALL FEATURES TESTED AND WORKING
 
 Date: 2025-11-19
 Environment: Docker (Bloomberg clang-p2996)

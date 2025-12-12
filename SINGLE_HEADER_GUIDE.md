@@ -1,5 +1,8 @@
 # Mirror Bridge - Single-Header Distribution Guide
 
+> **Note**: This document has moved to [docs/guides/single-header.md](docs/guides/single-header.md).
+> This file is kept for backward compatibility.
+
 ## Overview
 
 Mirror Bridge now provides **single-header versions** for all three supported languages, making it incredibly easy to integrate into your projects. Just copy one file and start binding!

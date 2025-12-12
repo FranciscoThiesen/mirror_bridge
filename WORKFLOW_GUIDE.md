@@ -1,5 +1,8 @@
 # Mirror Bridge - Complete Workflow Guide
 
+> **Note**: This document has moved to [docs/guides/workflow.md](docs/guides/workflow.md).
+> This file is kept for backward compatibility.
+
 ## The Ideal Setup: Auto-Discovery + PCH
 
 This guide shows the **recommended workflow** for maximum productivity with Mirror Bridge:
