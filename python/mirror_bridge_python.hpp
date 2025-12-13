@@ -2474,6 +2474,119 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     return &type_object;
 }
 
+// ============================================================================
+// Free Function Binding
+// ============================================================================
+//
+// Bind namespace-level (free) functions to Python modules using the same
+// reflection-based approach as class methods.
+//
+// Usage:
+//   mirror_bridge::bind_function<&my_namespace::my_func>(module, "my_func");
+
+// Helper to extract function signature info from a function pointer type
+template<typename>
+struct FunctionTraits;
+
+template<typename R, typename... Args>
+struct FunctionTraits<R(*)(Args...)> {
+    using ReturnType = R;
+    using ArgsTuple = std::tuple<Args...>;
+    static constexpr std::size_t arity = sizeof...(Args);
+};
+
+// Helper to get the storage type for function arguments
+// References need to be stored as values, then passed as references
+template<typename T>
+using StorageType = std::remove_cvref_t<T>;
+
+// Wrapper for calling a free function with Python arguments
+template<auto FuncPtr, std::size_t... Is>
+PyObject* call_free_function_impl(PyObject* args, std::index_sequence<Is...>) {
+    using Traits = FunctionTraits<decltype(FuncPtr)>;
+    using ArgsTuple = typename Traits::ArgsTuple;
+    using ReturnType = typename Traits::ReturnType;
+    constexpr std::size_t arity = Traits::arity;
+
+    // Check argument count
+    Py_ssize_t nargs = PyTuple_Size(args);
+    if (nargs != static_cast<Py_ssize_t>(arity)) {
+        PyErr_Format(PyExc_TypeError,
+            "Function takes %zu argument(s) but %zd were given",
+            arity, nargs);
+        return nullptr;
+    }
+
+    // Storage tuple holds actual values (not references)
+    using StorageTuple = std::tuple<StorageType<std::tuple_element_t<Is, ArgsTuple>>...>;
+    StorageTuple cpp_args;
+    bool conversion_ok = true;
+
+    // Use fold expression to convert each argument
+    ([&] {
+        if (!conversion_ok) return;
+        using ArgType = std::tuple_element_t<Is, ArgsTuple>;
+        using CleanArgType = std::remove_cvref_t<ArgType>;
+        PyObject* py_arg = PyTuple_GetItem(args, Is);
+
+        CleanArgType value;
+        if (from_python(py_arg, value)) {
+            std::get<Is>(cpp_args) = std::move(value);
+        } else {
+            if (!PyErr_Occurred()) {
+                PyErr_Format(PyExc_TypeError, "Argument %zu: type conversion failed", Is + 1);
+            }
+            conversion_ok = false;
+        }
+    }(), ...);
+
+    if (!conversion_ok) {
+        return nullptr;
+    }
+
+    // Call the function - stored values are passed, references work because
+    // the storage tuple is still in scope
+    if constexpr (std::is_void_v<ReturnType>) {
+        FuncPtr(std::get<Is>(cpp_args)...);
+        Py_RETURN_NONE;
+    } else {
+        auto result = FuncPtr(std::get<Is>(cpp_args)...);
+        return to_python(result);
+    }
+}
+
+template<auto FuncPtr>
+PyObject* call_free_function(PyObject* /*self*/, PyObject* args) {
+    using Traits = FunctionTraits<decltype(FuncPtr)>;
+    return call_free_function_impl<FuncPtr>(args, std::make_index_sequence<Traits::arity>{});
+}
+
+// Bind a free function to a Python module
+// FuncPtr is a non-type template parameter (the actual function pointer)
+template<auto FuncPtr>
+bool bind_function(PyObject* module, const char* name) {
+    // Create a static PyMethodDef for this function
+    static PyMethodDef method_def = {
+        name,
+        reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>),
+        METH_VARARGS,
+        nullptr  // doc
+    };
+
+    // Create a function object and add to module
+    PyObject* func = PyCFunction_New(&method_def, nullptr);
+    if (!func) {
+        return false;
+    }
+
+    if (PyModule_AddObject(module, name, func) < 0) {
+        Py_DECREF(func);
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace mirror_bridge
 
 // ============================================================================
