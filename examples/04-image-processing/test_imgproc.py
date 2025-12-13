@@ -8,6 +8,9 @@ Demonstrates the imgproc C++ library from Python, showcasing:
 - Histogram analysis and equalization
 """
 
+import sys
+sys.path.insert(0, 'build')
+
 import imgproc
 
 

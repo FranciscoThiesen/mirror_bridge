@@ -4,10 +4,10 @@
 import sys
 sys.path.insert(0, 'build')
 
-import data_processor
+import containers
 
 def test_vector_double():
-    dp = data_processor.DataProcessor()
+    dp = containers.DataProcessor()
 
     # Add values via method
     dp.add_value(1.0)
@@ -25,7 +25,7 @@ def test_vector_double():
     print("✓ Vector<double> test passed")
 
 def test_vector_string():
-    dp = data_processor.DataProcessor()
+    dp = containers.DataProcessor()
 
     dp.add_label("alpha")
     dp.add_label("beta")
@@ -39,7 +39,7 @@ def test_vector_string():
     print("✓ Vector<string> test passed")
 
 def test_set_vector():
-    dp = data_processor.DataProcessor()
+    dp = containers.DataProcessor()
 
     # Set vector directly from Python list
     dp.values = [10.0, 20.0, 30.0, 40.0, 50.0]
@@ -51,7 +51,7 @@ def test_set_vector():
     print("✓ Set vector from list test passed")
 
 def test_array():
-    dp = data_processor.DataProcessor()
+    dp = containers.DataProcessor()
 
     # Set dimensions via method
     dp.set_dimensions(2, 3, 4)
@@ -64,7 +64,7 @@ def test_array():
     print("✓ Array test passed")
 
 def test_clear():
-    dp = data_processor.DataProcessor()
+    dp = containers.DataProcessor()
     dp.values = [1.0, 2.0, 3.0]
     dp.labels = ["a", "b"]
     dp.dimensions = [1, 2, 3]
