@@ -1766,61 +1766,146 @@ PyObject* py_static_method(PyObject* /* self */, PyObject* args) {
 }
 
 // ============================================================================
-// Method Overloading Support via Name Mangling
+// Method Overloading Dispatch (pybind11/nanobind style)
 // ============================================================================
+//
+// Instead of name-mangling overloaded methods, we use a dispatch system:
+// 1. Each unique method name gets ONE Python method entry
+// 2. That method dispatches to the correct C++ overload based on argument types
+// 3. Uses two-pass resolution: strict type match first, then with conversion
+//
+// This provides a Pythonic API: obj.add(1) instead of obj.add_int(1)
 
-// Generate a mangled name for a method based on its parameter types
-// E.g., "foo(int, double)" -> "foo_int_double"
-template<typename T, std::size_t FuncIndex>
-consteval auto generate_mangled_method_name() {
-    constexpr auto func = get_member_function<T, FuncIndex>();
-    constexpr auto base_name = std::meta::identifier_of(func);
-    constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
+// Sentinel value indicating "try next overload"
+// Using a value that can't be a valid PyObject* (odd address)
+inline PyObject* const OVERLOAD_TRY_NEXT = reinterpret_cast<PyObject*>(1);
 
-    // For zero parameters, no mangling needed
-    if constexpr (param_count == 0) {
-        return base_name;
-    } else {
-        // Build mangled name with parameter types
-        // Note: We return the base name here as the mangling happens at runtime
-        // in generate_methods() below
-        return base_name;
+// Check if method at Index is the first one with its name (canonical representative)
+// We only generate dispatch entries for canonical methods
+template<typename T, std::size_t Index>
+consteval bool is_canonical_method() {
+    constexpr auto target_name = get_member_function_name<T, Index>();
+
+    // Check all earlier indices - if any has the same name, Index is not canonical
+    return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
+        return (... && (std::string_view(get_member_function_name<T, Earlier>())
+                       != std::string_view(target_name)));
+    }(std::make_index_sequence<Index>{});
+}
+
+// Count unique method names (number of canonical methods)
+template<typename T>
+consteval std::size_t count_unique_method_names() {
+    constexpr std::size_t total = get_member_function_count<T>();
+
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return ((is_canonical_method<T, Is>() ? 1 : 0) + ...);
+    }(std::make_index_sequence<total>{});
+}
+
+// Try to call a method overload. Returns:
+// - Valid PyObject* on success
+// - nullptr with Python error set on C++ exception
+// - OVERLOAD_TRY_NEXT if argument count/types don't match (no error set)
+template<typename T, std::size_t FuncIndex, std::size_t... Is>
+PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_sequence<Is...>) {
+    constexpr auto member_func = get_member_function<T, FuncIndex>();
+    constexpr auto return_type = get_method_return_type<T, FuncIndex>();
+    using ReturnType = typename [:return_type:];
+
+    // Create tuple for C++ arguments
+    std::tuple<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+
+    // Try to convert each argument - if any fails, return TRY_NEXT
+    bool conversion_ok = true;
+    ([&] {
+        if (!conversion_ok) return;
+        PyObject* py_arg = PyTuple_GET_ITEM(args, Is);
+        if (!from_python(py_arg, std::get<Is>(cpp_args))) {
+            conversion_ok = false;
+        }
+    }(), ...);
+
+    if (!conversion_ok) {
+        // Clear any error that from_python may have set
+        PyErr_Clear();
+        return OVERLOAD_TRY_NEXT;
+    }
+
+    // Conversion succeeded - call the method
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            ((*wrapper->cpp_object).[:member_func:])(
+                forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+            );
+            Py_RETURN_NONE;
+        } else {
+            ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
+                forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+            );
+            return to_python(result);
+        }
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    } catch (...) {
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return nullptr;
     }
 }
 
-// Helper to generate type suffix for mangling
-// Uses simple string concatenation instead of ostringstream for faster compilation
 template<typename T, std::size_t FuncIndex>
-std::string get_method_type_suffix() {
+PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* args) {
     constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
 
-    if (param_count == 0) {
-        return "";
+    // Check argument count first
+    if (PyTuple_Size(args) != static_cast<Py_ssize_t>(param_count)) {
+        return OVERLOAD_TRY_NEXT;
     }
 
-    std::string result;
-    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-        ([&] {
-            constexpr auto param_type = get_method_param_type<T, FuncIndex, Is>();
-            auto type_str = std::meta::display_string_of(param_type);
+    return try_overload_impl<T, FuncIndex>(wrapper, args, std::make_index_sequence<param_count>{});
+}
 
-            // Simplify type name: strip namespaces, cv-qualifiers, references
-            std::string simplified;
-            bool in_template = false;
-            for (char c : std::string_view(type_str.data(), type_str.size())) {
-                if (c == '<') in_template = true;
-                if (c == '>') in_template = false;
-                if (!in_template && (c == ':' || c == ' ' || c == '&' || c == '*')) continue;
-                if (c == ',') c = '_';
-                simplified += c;
-            }
+// Dispatch function that tries all overloads with a given name
+// CanonicalIndex is the first method with this name; we try ALL methods with matching name
+template<typename T, std::size_t CanonicalIndex, std::size_t... AllIndices>
+PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, std::index_sequence<AllIndices...>) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
 
-            result += "_";
-            result += simplified;
-        }(), ...);
-    }(std::make_index_sequence<param_count>{});
+    constexpr auto target_name = get_member_function_name<T, CanonicalIndex>();
+    PyObject* result = OVERLOAD_TRY_NEXT;
+
+    // Try each method that has the same name as the canonical method
+    ([&] {
+        if (result != OVERLOAD_TRY_NEXT) return;  // Already found a match
+
+        constexpr auto this_name = get_member_function_name<T, AllIndices>();
+        if constexpr (std::string_view(this_name) == std::string_view(target_name)) {
+            result = try_overload<T, AllIndices>(wrapper, args);
+        }
+    }(), ...);
+
+    if (result == OVERLOAD_TRY_NEXT) {
+        // No matching overload - generate helpful error message
+        PyErr_Format(PyExc_TypeError,
+            "No matching overload for '%s' with %zd argument(s)",
+            target_name, PyTuple_Size(args));
+        return nullptr;
+    }
 
     return result;
+}
+
+// Wrapper that creates the index sequence for dispatch
+template<typename T, std::size_t CanonicalIndex>
+PyObject* py_method_dispatch(PyObject* self, PyObject* args) {
+    constexpr std::size_t total_methods = get_member_function_count<T>();
+    return py_method_dispatch_impl<T, CanonicalIndex>(
+        self, args, std::make_index_sequence<total_methods>{});
 }
 
 // ============================================================================
@@ -1857,44 +1942,37 @@ consteval auto generate_getsetters(std::index_sequence<Indices...>) {
 }
 
 // Generate Python methods for all member functions of a class
-// Handles overloading by mangling names with type suffixes
+// Uses dispatch system for overloading - one entry per unique name
 template<typename T, std::size_t... Indices>
 auto generate_methods(std::index_sequence<Indices...>) {
-    constexpr std::size_t count = sizeof...(Indices);
+    // Count unique method names (canonical methods only)
+    constexpr std::size_t unique_count = count_unique_method_names<T>();
 
-    // Pre-allocate storage for mangled names (if needed)
-    static std::array<std::string, count> mangled_names;
+    // Build methods array - one entry per unique name + sentinel
+    static std::array<PyMethodDef, unique_count + 1> methods{};
+    static bool initialized = false;
 
-    // Build methods array
-    std::array<PyMethodDef, count + 1> methods{};
+    if (!initialized) {
+        std::size_t method_idx = 0;
 
-    // Populate entries - check each method individually
-    ([&] {
-        constexpr auto base_name = get_member_function_name<T, Indices>();
-        constexpr bool is_overloaded = is_method_overloaded<T, Indices>();
+        // Only add entries for canonical methods (first occurrence of each name)
+        ([&] {
+            if constexpr (is_canonical_method<T, Indices>()) {
+                constexpr auto method_name = get_member_function_name<T, Indices>();
+                methods[method_idx] = PyMethodDef{
+                    .ml_name = method_name,
+                    .ml_meth = reinterpret_cast<PyCFunction>(py_method_dispatch<T, Indices>),
+                    .ml_flags = METH_VARARGS,
+                    .ml_doc = nullptr
+                };
+                method_idx++;
+            }
+        }(), ...);
 
-        if constexpr (is_overloaded) {
-            // Generate mangled name with type suffix
-            mangled_names[Indices] = std::string(base_name) + get_method_type_suffix<T, Indices>();
-            methods[Indices] = PyMethodDef{
-                .ml_name = mangled_names[Indices].c_str(),
-                .ml_meth = reinterpret_cast<PyCFunction>(py_method<T, Indices>),
-                .ml_flags = METH_VARARGS,
-                .ml_doc = nullptr
-            };
-        } else {
-            // No overload, use base name
-            methods[Indices] = PyMethodDef{
-                .ml_name = base_name,
-                .ml_meth = reinterpret_cast<PyCFunction>(py_method<T, Indices>),
-                .ml_flags = METH_VARARGS,
-                .ml_doc = nullptr
-            };
-        }
-    }(), ...);
-
-    // Sentinel entry
-    methods[count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
+        // Sentinel entry
+        methods[unique_count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
+        initialized = true;
+    }
 
     return methods;
 }
