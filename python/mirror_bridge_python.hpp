@@ -1178,6 +1178,46 @@ struct StaticMemberFunctionCache {
     static constexpr std::size_t count = compute_count();
 };
 
+// Cache for static data members (including constexpr) - instantiated once per type T
+template<typename T>
+struct StaticDataMemberCache {
+    // Helper to check if a member is a static data member (not a function)
+    static consteval bool is_static_data_member(std::meta::info member) {
+        return std::meta::is_variable(member) &&
+               std::meta::is_static_member(member);
+    }
+
+    // Count static data members - computed once at compile time
+    static consteval std::size_t compute_count() {
+        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+        std::size_t count = 0;
+        for (auto member : all_members) {
+            if (is_static_data_member(member)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // Get the Nth static data member - computed once per Index
+    static consteval auto get_at_index(std::size_t Index) {
+        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+        std::size_t member_index = 0;
+        for (auto member : all_members) {
+            if (is_static_data_member(member)) {
+                if (member_index == Index) {
+                    return member;
+                }
+                member_index++;
+            }
+        }
+        // Should never reach here if Index < count
+        return all_members[0];
+    }
+
+    static constexpr std::size_t count = compute_count();
+};
+
 // Helper templates for member function reflection
 // Now use the cache instead of calling members_of repeatedly
 template<typename T>
@@ -1189,6 +1229,38 @@ consteval std::size_t get_member_function_count() {
 template<typename T>
 consteval std::size_t get_static_member_function_count() {
     return StaticMemberFunctionCache<T>::count;
+}
+
+// Helper templates for static data member reflection
+template<typename T>
+consteval std::size_t get_static_data_member_count() {
+    return StaticDataMemberCache<T>::count;
+}
+
+// Get the Nth static data member by using cached lookup
+template<typename T, std::size_t Index>
+consteval auto get_static_data_member() {
+    return StaticDataMemberCache<T>::get_at_index(Index);
+}
+
+template<typename T, std::size_t Index>
+consteval const char* get_static_data_member_name() {
+    constexpr auto member = get_static_data_member<T, Index>();
+    return std::meta::identifier_of(member).data();
+}
+
+// Type of the Nth static data member
+template<typename T, std::size_t Index>
+using StaticDataMemberType = typename [:std::meta::type_of(get_static_data_member<T, Index>()):];
+
+// Get the value of a static data member and convert to Python
+template<typename T, std::size_t Index>
+PyObject* get_static_data_member_value() {
+    constexpr auto member = get_static_data_member<T, Index>();
+    using MemberType = std::remove_cvref_t<StaticDataMemberType<T, Index>>;
+    // Access the static member via splice
+    const auto& value = [:member:];
+    return to_python<MemberType>(value);
 }
 
 // Get the Nth member function by using cached lookup
@@ -2361,6 +2433,25 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
                 }
             }(), ...);
         }(std::make_index_sequence<static_method_count>{});
+    }
+
+    // Add static data members (including constexpr) to the type dictionary
+    // These are added as read-only class attributes
+    constexpr std::size_t static_data_member_count = get_static_data_member_count<T>();
+    if constexpr (static_data_member_count > 0) {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                constexpr auto member_name = get_static_data_member_name<T, Is>();
+                // Get the Python value for this static member
+                PyObject* py_value = get_static_data_member_value<T, Is>();
+                if (py_value) {
+                    // Add directly to type dict - Python will make it a class attribute
+                    PyObject* type_dict = type_object.tp_dict;
+                    PyDict_SetItemString(type_dict, member_name, py_value);
+                    Py_DECREF(py_value);
+                }
+            }(), ...);
+        }(std::make_index_sequence<static_data_member_count>{});
     }
 
     Py_INCREF(&type_object);
