@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test method overloading via name mangling"""
+"""Test method overloading via type-based dispatch (pybind11-style)"""
 
 import sys
 import os
@@ -11,76 +11,57 @@ print("=== Method Overloading Test ===\n")
 
 p = printer.Printer()
 
-# List available methods to see mangled names
+# List available methods
 print("Available methods:")
 methods = [m for m in dir(p) if not m.startswith('_')]
 for m in methods:
     print(f"  - {m}")
 print()
 
-# Test overloaded print methods
-print("Test 1: Overloaded print methods")
+# Test overloaded print methods - all use the same name 'print'
+print("Test 1: Overloaded print methods (dispatch by type)")
 
-# Check that mangled names exist
-assert hasattr(p, 'print_int') or hasattr(p, 'print'), "Should have print_int or print"
-assert hasattr(p, 'print_double') or hasattr(p, 'print'), "Should have print_double or print"
-# String variant may have complex mangled name
-string_prints = [m for m in dir(p) if 'print' in m and 'string' in m.lower() or m == 'print_stdstring']
-assert len(string_prints) > 0, f"Should have print_string variant. Available: {[m for m in dir(p) if 'print' in m]}"
+assert hasattr(p, 'print'), "Should have print method"
 
-# Use mangled names (reflection creates these automatically)
-if hasattr(p, 'print_int'):
-    p.print_int(42)
-    assert p.last_output == "int: 42"
-    print(f"  print_int(42) -> '{p.last_output}' ✓")
+# Test int overload
+p.print(42)
+assert p.last_output == "int: 42", f"Expected 'int: 42', got '{p.last_output}'"
+print(f"  print(42) -> '{p.last_output}' ✓")
 
-if hasattr(p, 'print_double'):
-    p.print_double(3.14)
-    assert "3.14" in p.last_output
-    print(f"  print_double(3.14) -> '{p.last_output}' ✓")
+# Test double overload
+p.print(3.14)
+assert "3.14" in p.last_output, f"Expected '3.14' in output, got '{p.last_output}'"
+print(f"  print(3.14) -> '{p.last_output}' ✓")
 
-# Find the string variant (name depends on type mangling)
-string_print = None
-for name in dir(p):
-    if 'print' in name and 'string' in name.lower() or name == 'print_stdstring':
-        string_print = name
-        break
-
-if string_print:
-    getattr(p, string_print)("hello")
-    assert p.last_output == "string: hello"
-    print(f"  {string_print}('hello') -> '{p.last_output}' ✓")
+# Test string overload
+p.print("hello")
+assert p.last_output == "string: hello", f"Expected 'string: hello', got '{p.last_output}'"
+print(f"  print('hello') -> '{p.last_output}' ✓")
 
 print()
 
-# Test overloaded format methods
+# Test overloaded format methods with return values
 print("Test 2: Overloaded format methods with return values")
 
-if hasattr(p, 'format_int_int') or hasattr(p, 'format'):
-    if hasattr(p, 'format_int_int'):
-        result = p.format_int_int(10, 20)
-        print(f"  format_int_int(10, 20) = '{result}'")
-        assert result == "10,20"
-        print("  ✓")
+assert hasattr(p, 'format'), "Should have format method"
 
-if hasattr(p, 'format_double_double'):
-    result = p.format_double_double(1.5, 2.5)
-    print(f"  format_double_double(1.5, 2.5) = '{result}'")
-    assert "1.5" in result and "2.5" in result
-    print("  ✓")
+# Test int,int overload
+result = p.format(10, 20)
+print(f"  format(10, 20) = '{result}'")
+assert result == "10,20", f"Expected '10,20', got '{result}'"
+print("  ✓")
 
-# Find string variant
-string_format = None
-for name in dir(p):
-    if 'format' in name and 'string' in name.lower():
-        string_format = name
-        break
+# Test double,double overload
+result = p.format(1.5, 2.5)
+print(f"  format(1.5, 2.5) = '{result}'")
+assert "1.5" in result and "2.5" in result
+print("  ✓")
 
-if string_format:
-    result = getattr(p, string_format)("foo", "bar")
-    print(f"  {string_format}('foo', 'bar') = '{result}'")
-    assert result == "foo + bar"
-    print("  ✓")
+# Test string,string overload
+result = p.format("foo", "bar")
+print(f"  format('foo', 'bar') = '{result}'")
+assert result == "foo + bar", f"Expected 'foo + bar', got '{result}'"
+print("  ✓")
 
 print()
 
@@ -92,6 +73,6 @@ print(f"  get_last() = '{result}'")
 print("  ✓ Non-overloaded method unchanged\n")
 
 print("="*40)
-print("✓ Method overloading via name mangling works!")
-print("  Overloaded methods get type suffixes automatically")
+print("✓ Method overloading via type-based dispatch works!")
+print("  Overloaded methods auto-dispatch based on argument types")
 print("="*40)
