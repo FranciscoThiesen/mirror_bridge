@@ -333,6 +333,196 @@ discover_classes() {
     ' "$header_file"
 }
 
+# Discover free functions in specified namespaces
+# Output format: "qualified_name|simple_name|header_path"
+# Only discovers non-template functions with definitions (not declarations)
+# Skips functions in "private" namespace patterns (detail, internal, impl, _)
+discover_functions() {
+    local header_file="$1"
+    local rel_path="$2"
+    local target_namespaces="$3"  # Pipe-separated list of namespaces to scan
+
+    awk -v rel_path="$rel_path" -v target_ns="$target_namespaces" '
+    BEGIN {
+        namespace_stack_size = 0
+        in_skip = 0
+        brace_depth = 0
+        pending_namespace = ""
+        in_class_or_struct = 0
+        class_brace_depth = 0
+
+        # Parse target namespaces into array
+        n_targets = split(target_ns, targets, "|")
+    }
+
+    # Helper to get current namespace
+    function get_current_namespace() {
+        ns = ""
+        for (ns_idx = 0; ns_idx < namespace_stack_size; ns_idx++) {
+            if (ns != "") ns = ns "::"
+            ns = ns namespace_stack[ns_idx]
+        }
+        return ns
+    }
+
+    # Check if current namespace matches any target or is a child of target
+    function namespace_matches_target() {
+        curr_ns = get_current_namespace()
+        if (curr_ns == "") return 0  # Skip global namespace for now
+
+        # Check for "private" patterns - skip these
+        if (match(curr_ns, /detail/) || match(curr_ns, /internal/) ||
+            match(curr_ns, /impl/) || match(curr_ns, /^_/) || match(curr_ns, /::_/)) {
+            return 0
+        }
+
+        for (tgt_idx = 1; tgt_idx <= n_targets; tgt_idx++) {
+            # Exact match or prefix match (child namespace)
+            if (curr_ns == targets[tgt_idx] || index(curr_ns, targets[tgt_idx] "::") == 1) {
+                return 1
+            }
+        }
+        return 0
+    }
+
+    # Helper to extract identifier after a keyword
+    function extract_after(line, keyword) {
+        pos = index(line, keyword)
+        if (pos == 0) return ""
+        rest = substr(line, pos + length(keyword))
+        gsub(/^[[:space:]]+/, "", rest)
+        result = ""
+        for (ext_idx = 1; ext_idx <= length(rest); ext_idx++) {
+            c = substr(rest, ext_idx, 1)
+            if (c ~ /[a-zA-Z0-9_]/) {
+                result = result c
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    # Track MIRROR_BRIDGE_SKIP comment
+    /MIRROR_BRIDGE_SKIP/ {
+        in_skip = 1
+        next
+    }
+
+    # Track namespace opening
+    /^[[:space:]]*namespace[[:space:]]+[a-zA-Z_]/ {
+        ns_name = extract_after($0, "namespace")
+        if (ns_name != "" && /\{/) {
+            namespace_stack[namespace_stack_size] = ns_name
+            namespace_stack_size++
+        } else if (ns_name != "") {
+            pending_namespace = ns_name
+        }
+    }
+
+    # Handle pending namespace brace
+    pending_namespace != "" && /\{/ {
+        namespace_stack[namespace_stack_size] = pending_namespace
+        namespace_stack_size++
+        pending_namespace = ""
+    }
+
+    # Track entering class/struct (skip member functions)
+    /^[[:space:]]*(struct|class)[[:space:]]+[a-zA-Z_]/ && (/\{/ || /:/) {
+        if (!/;[[:space:]]*$/) {
+            in_class_or_struct = 1
+            class_brace_depth = brace_depth
+        }
+    }
+
+    # Match function definitions (simplified pattern)
+    # Matches: [inline] [static] [constexpr] type name(args) [const] {
+    # Avoids: templates, forward declarations, macros
+    # NOTE: We use should_bind flag instead of next to ensure brace tracking still runs
+    /^[[:space:]]*(inline[[:space:]]+)?(static[[:space:]]+)?(constexpr[[:space:]]+)?[a-zA-Z_][a-zA-Z0-9_:*&<>, ]*[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\([^;]*\)[[:space:]]*(const)?[[:space:]]*\{/ {
+        # Only process if not skipped and meets criteria
+        should_bind = 1
+
+        if (in_skip) {
+            in_skip = 0
+            should_bind = 0
+        }
+
+        # Skip if inside a class/struct
+        if (in_class_or_struct) should_bind = 0
+
+        # Skip templates
+        if (/template[[:space:]]*</) should_bind = 0
+
+        # Skip if not in target namespace
+        if (!namespace_matches_target()) should_bind = 0
+
+        if (should_bind) {
+            # Extract function name - find the identifier before the (
+            line = $0
+            # Remove leading whitespace and keywords
+            gsub(/^[[:space:]]*(inline|static|constexpr)[[:space:]]+/, "", line)
+            gsub(/^[[:space:]]*(inline|static|constexpr)[[:space:]]+/, "", line)
+            gsub(/^[[:space:]]*(inline|static|constexpr)[[:space:]]+/, "", line)
+
+            # Find the ( and work backwards to get function name
+            paren_pos = index(line, "(")
+            if (paren_pos > 0) {
+                before_paren = substr(line, 1, paren_pos - 1)
+                gsub(/[[:space:]]+$/, "", before_paren)
+
+                # Get last word (the function name)
+                n = split(before_paren, parts, /[[:space:]]+/)
+                if (n > 0) {
+                    func_name = parts[n]
+                    # Clean up any pointer/reference symbols
+                    gsub(/^[*&]+/, "", func_name)
+
+                    # Skip operators and special names
+                    if (!(func_name ~ /^operator/ || func_name ~ /^~/ || func_name == "")) {
+                        # Build qualified name
+                        curr_ns = get_current_namespace()
+                        if (curr_ns != "") {
+                            qualified = curr_ns "::" func_name
+                        } else {
+                            qualified = func_name
+                        }
+
+                        print qualified "|" func_name "|" rel_path
+                    }
+                }
+            }
+        }
+    }
+
+    # Track braces
+    {
+        opens = 0
+        closes = 0
+        for (brace_idx = 1; brace_idx <= length($0); brace_idx++) {
+            c = substr($0, brace_idx, 1)
+            if (c == "{") opens++
+            if (c == "}") closes++
+        }
+        brace_depth = brace_depth + opens - closes
+
+        # Exit class/struct when braces close
+        if (in_class_or_struct && brace_depth <= class_brace_depth) {
+            in_class_or_struct = 0
+        }
+
+        # Pop namespaces
+        while (namespace_stack_size > 0 && brace_depth < namespace_stack_size) {
+            namespace_stack_size--
+        }
+
+        if (!/MIRROR_BRIDGE_SKIP/) {
+            in_skip = 0
+        }
+    }
+    ' "$header_file"
+}
+
 declare -a QUALIFIED_NAMES
 declare -a SIMPLE_NAMES
 declare -a HEADERS
@@ -377,6 +567,59 @@ fi
 
 echo ""
 echo -e "${GREEN}Discovered ${#QUALIFIED_NAMES[@]} classes${NC}"
+
+# Phase 2: Discover free functions in namespaces that contain classes
+declare -a FUNC_QUALIFIED_NAMES
+declare -a FUNC_SIMPLE_NAMES
+declare -a FUNC_HEADERS
+declare -A FUNC_SEEN  # Track unique functions to avoid duplicates
+
+if [ ${#NAMESPACES[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${YELLOW}Scanning for free functions in discovered namespaces...${NC}"
+
+    # Build pipe-separated list of namespaces
+    NS_LIST=""
+    for ns in "${!NAMESPACES[@]}"; do
+        if [ -n "$NS_LIST" ]; then
+            NS_LIST="$NS_LIST|$ns"
+        else
+            NS_LIST="$ns"
+        fi
+    done
+
+    if [ $VERBOSE -eq 1 ]; then
+        echo -e "${BLUE}  Target namespaces: $NS_LIST${NC}"
+    fi
+
+    # Scan all headers for functions
+    while IFS= read -r header_file; do
+        rel_path=$(realpath --relative-to="$SRC_DIR" "$header_file")
+
+        # Skip files marked to skip
+        if grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null; then
+            continue
+        fi
+
+        while IFS='|' read -r qualified simple header; do
+            if [ -n "$qualified" ] && [ -z "${FUNC_SEEN[$qualified]}" ]; then
+                FUNC_QUALIFIED_NAMES+=("$qualified")
+                FUNC_SIMPLE_NAMES+=("$simple")
+                FUNC_HEADERS+=("$header")
+                FUNC_SEEN["$qualified"]=1
+                echo -e "  ${GREEN}✓${NC} Found function: $qualified in $header"
+            fi
+        done < <(discover_functions "$header_file" "$rel_path" "$NS_LIST")
+
+    done <<< "$HEADER_FILES"
+
+    if [ ${#FUNC_QUALIFIED_NAMES[@]} -gt 0 ]; then
+        echo -e "${GREEN}Discovered ${#FUNC_QUALIFIED_NAMES[@]} free functions${NC}"
+    else
+        echo -e "${BLUE}No free functions found in discovered namespaces${NC}"
+    fi
+fi
+
 echo ""
 
 # Generate binding file
@@ -402,14 +645,22 @@ done
 
 echo "" >> "$GENERATED_FILE"
 
-# Generate module with all class bindings
+# Generate module with all class and function bindings
 echo "MIRROR_BRIDGE_MODULE($MODULE_NAME," >> "$GENERATED_FILE"
 
+# Bind classes first
 for i in "${!QUALIFIED_NAMES[@]}"; do
     qualified_name="${QUALIFIED_NAMES[$i]}"
     simple_name="${SIMPLE_NAMES[$i]}"
     # Use qualified name for C++ type, simple name for Python exposure
     echo "    mirror_bridge::bind_class<$qualified_name>(m, \"$simple_name\");" >> "$GENERATED_FILE"
+done
+
+# Bind free functions
+for i in "${!FUNC_QUALIFIED_NAMES[@]}"; do
+    qualified_name="${FUNC_QUALIFIED_NAMES[$i]}"
+    simple_name="${FUNC_SIMPLE_NAMES[$i]}"
+    echo "    mirror_bridge::bind_function<&$qualified_name>(m, \"$simple_name\");" >> "$GENERATED_FILE"
 done
 
 echo ")" >> "$GENERATED_FILE"
@@ -490,6 +741,9 @@ fi
 echo ""
 echo -e "${GREEN}✓ Successfully auto-discovered and built: ${MODULE_NAME}.so${NC}"
 echo -e "${GREEN}  Classes bound: ${#QUALIFIED_NAMES[@]}${NC}"
+if [ ${#FUNC_QUALIFIED_NAMES[@]} -gt 0 ]; then
+    echo -e "${GREEN}  Functions bound: ${#FUNC_QUALIFIED_NAMES[@]}${NC}"
+fi
 echo ""
 echo -e "${BLUE}Usage from Python:${NC}"
 echo -e "  import sys"
@@ -506,4 +760,17 @@ for i in "${!SIMPLE_NAMES[@]}"; do
         echo -e "  # - $simple_name"
     fi
 done
+if [ ${#FUNC_QUALIFIED_NAMES[@]} -gt 0 ]; then
+    echo ""
+    echo -e "  # Functions available:"
+    for i in "${!FUNC_SIMPLE_NAMES[@]}"; do
+        simple_name="${FUNC_SIMPLE_NAMES[$i]}"
+        qualified_name="${FUNC_QUALIFIED_NAMES[$i]}"
+        if [ "$simple_name" != "$qualified_name" ]; then
+            echo -e "  # - $simple_name() (C++: $qualified_name)"
+        else
+            echo -e "  # - $simple_name()"
+        fi
+    done
+fi
 echo ""

@@ -169,7 +169,8 @@ export PYTHONPATH="$BUILD_DIR:$PYTHONPATH"
 # Tests to skip (with reasons)
 # Format: "path_pattern:reason" - pattern matches against the full path
 SKIP_TESTS=(
-    # All tests should now pass!
+    # auto_discovery_funcs has its own shell script that builds and tests
+    "auto_discovery_funcs/test_funcs.py:Run via test_auto_discovery_funcs.sh instead"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)
