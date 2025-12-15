@@ -790,12 +790,7 @@ template<Bindable T>
             tpl->InstanceTemplate()->SetNativeDataProperty(
                 prop_name.As<v8::Name>(),
                 v8_getter<T, Is>,
-                v8_setter<T, Is>,
-                v8::Local<v8::Value>(),
-                v8::PropertyAttribute::None,
-                v8::AccessControl::DEFAULT,
-                v8::SideEffectType::kHasSideEffect,
-                v8::SideEffectType::kHasSideEffect
+                v8_setter<T, Is>
             );
         }(), ...);
     }(std::make_index_sequence<member_count>{});

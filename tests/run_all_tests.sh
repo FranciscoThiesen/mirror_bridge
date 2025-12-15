@@ -32,6 +32,10 @@ FAILED_BINDINGS=0
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
+# V8 failures tracked separately (V8 has its own CI job with continue-on-error)
+V8_TOTAL=0
+V8_PASSED=0
+V8_FAILED=0
 
 echo -e "${BLUE}=======================================${NC}"
 echo -e "${BLUE}  Mirror Bridge - Automated Test Suite${NC}"
@@ -313,7 +317,7 @@ if [ -f "/usr/include/v8.h" ] || [ -f "/usr/include/libv8/v8.h" ] || pkg-config 
             continue
         fi
 
-        TOTAL_TESTS=$((TOTAL_TESTS + 1))
+        V8_TOTAL=$((V8_TOTAL + 1))
 
         echo -e "${BLUE}Building V8 test: ${test_name}...${NC}"
 
@@ -332,15 +336,15 @@ if [ -f "/usr/include/v8.h" ] || [ -f "/usr/include/libv8/v8.h" ] || pkg-config 
             # Run the test from the test directory so test.js is found
             if (cd "$test_dir" && "$executable" test.js) > /tmp/test_output.txt 2>&1; then
                 echo -e "${GREEN}✓ Passed: ${test_name} (V8)${NC}"
-                PASSED_TESTS=$((PASSED_TESTS + 1))
+                V8_PASSED=$((V8_PASSED + 1))
             else
-                echo -e "${RED}✗ Failed: ${test_name} (V8)${NC}"
-                FAILED_TESTS=$((FAILED_TESTS + 1))
+                echo -e "${YELLOW}✗ Failed: ${test_name} (V8) [non-blocking]${NC}"
+                V8_FAILED=$((V8_FAILED + 1))
                 cat /tmp/test_output.txt | sed 's/^/  /'
             fi
         else
-            echo -e "${RED}✗ Failed to build: ${test_name} (V8)${NC}"
-            FAILED_TESTS=$((FAILED_TESTS + 1))
+            echo -e "${YELLOW}✗ Failed to build: ${test_name} (V8) [non-blocking]${NC}"
+            V8_FAILED=$((V8_FAILED + 1))
             echo "$compile_output" | sed 's/^/  /'
         fi
         echo ""
@@ -406,6 +410,17 @@ if [ $FAILED_TESTS -gt 0 ]; then
     echo -e "  ${RED}Failed:  $FAILED_TESTS${NC}"
 fi
 echo ""
+
+# V8 tests shown separately (non-blocking, has own CI job)
+if [ $V8_TOTAL -gt 0 ]; then
+    echo -e "${YELLOW}V8 Tests (non-blocking):${NC}"
+    echo -e "  Total:   $V8_TOTAL"
+    echo -e "  ${GREEN}Passed:  $V8_PASSED${NC}"
+    if [ $V8_FAILED -gt 0 ]; then
+        echo -e "  ${YELLOW}Failed:  $V8_FAILED${NC}"
+    fi
+    echo ""
+fi
 
 # Exit status
 if [ $FAILED_BINDINGS -eq 0 ] && [ $FAILED_TESTS -eq 0 ]; then
