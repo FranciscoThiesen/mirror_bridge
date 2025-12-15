@@ -19,15 +19,15 @@ PYTHON_INCLUDES=$(python3-config --includes)
 PYTHON_LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags)
 
 # Build the module
-echo "Building overload_test.so..."
+echo "Building overload.so..."
 $CXX $CXX_FLAGS -fPIC -shared \
     -I"$SCRIPT_DIR/../../../.." \
     $PYTHON_INCLUDES \
     overload_binding.cpp \
-    -o overload_test.so \
+    -o overload.so \
     $PYTHON_LDFLAGS
 
-echo "✓ Built overload_test.so"
+echo "✓ Built overload.so"
 
 # Run the test
 echo ""

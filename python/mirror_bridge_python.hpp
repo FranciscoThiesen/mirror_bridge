@@ -1871,7 +1871,8 @@ consteval std::size_t count_unique_method_names() {
     constexpr std::size_t total = get_member_function_count<T>();
 
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return ((is_canonical_method<T, Is>() ? 1 : 0) + ...);
+        // Need fallback value for empty pack (classes with 0 methods)
+        return ((is_canonical_method<T, Is>() ? 1 : 0) + ... + 0);
     }(std::make_index_sequence<total>{});
 }
 

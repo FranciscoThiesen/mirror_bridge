@@ -19,15 +19,15 @@ PYTHON_INCLUDES=$(python3-config --includes)
 PYTHON_LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags)
 
 # Build the module
-echo "Building freefunc_test.so..."
+echo "Building freefunc.so..."
 $CXX $CXX_FLAGS -fPIC -shared \
     -I"$SCRIPT_DIR/../../../.." \
     $PYTHON_INCLUDES \
     freefunc_binding.cpp \
-    -o freefunc_test.so \
+    -o freefunc.so \
     $PYTHON_LDFLAGS
 
-echo "✓ Built freefunc_test.so"
+echo "✓ Built freefunc.so"
 
 # Run the test
 echo ""
