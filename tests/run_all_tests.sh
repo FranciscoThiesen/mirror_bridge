@@ -289,14 +289,19 @@ echo -e "${YELLOW}[STEP 2d/5] Running V8 tests (embedded V8)...${NC}"
 echo ""
 
 # Check if V8 development files are available
-if [ -f "/usr/include/v8.h" ] || [ -f "/usr/include/libv8/v8.h" ] || pkg-config --exists v8 2>/dev/null; then
+if [ -f "/usr/include/v8.h" ] || [ -f "/usr/include/node/v8.h" ] || [ -f "/usr/include/libv8/v8.h" ] || pkg-config --exists v8 2>/dev/null; then
     # Find V8 compile flags
     if pkg-config --exists v8 2>/dev/null; then
         V8_CFLAGS=$(pkg-config --cflags v8)
         V8_LIBS=$(pkg-config --libs v8)
     else
-        # Fallback for Ubuntu's libv8-dev
-        V8_CFLAGS="-I/usr/include"
+        # Search for v8.h
+        V8_HEADER=$(find /usr/include /usr/local/include -name "v8.h" 2>/dev/null | head -1)
+        if [ -n "$V8_HEADER" ]; then
+            V8_CFLAGS="-I$(dirname "$V8_HEADER")"
+        else
+            V8_CFLAGS="-I/usr/include"
+        fi
         V8_LIBS="-lv8 -lv8_libplatform"
     fi
 

@@ -93,7 +93,7 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
                 echo ""
                 exit 1
             fi
-            ;;&  # Fall through to check if we need to build
+            ;;  # Fall through to check if we need to build
         2)
             if [ "$choice" = "2" ] || [ "$choice" = "1" ]; then
                 if [ "$choice" = "1" ] && docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
