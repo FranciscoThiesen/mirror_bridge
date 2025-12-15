@@ -4,10 +4,10 @@
 
 using namespace freefunc_test;
 
-PyMODINIT_FUNC PyInit_freefunc_test(void) {
+PyMODINIT_FUNC PyInit_freefunc(void) {
     static struct PyModuleDef module_def = {
         PyModuleDef_HEAD_INIT,
-        "freefunc_test",
+        "freefunc",
         "Test module for free function binding",
         -1,
         nullptr

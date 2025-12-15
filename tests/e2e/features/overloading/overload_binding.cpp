@@ -4,10 +4,10 @@
 
 using namespace overload_test;
 
-PyMODINIT_FUNC PyInit_overload_test(void) {
+PyMODINIT_FUNC PyInit_overload(void) {
     static struct PyModuleDef module_def = {
         PyModuleDef_HEAD_INIT,
-        "overload_test",
+        "overload",
         "Test module for method overloading dispatch",
         -1,
         nullptr

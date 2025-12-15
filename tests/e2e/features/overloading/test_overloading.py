@@ -4,11 +4,11 @@
 import sys
 sys.path.insert(0, '.')
 
-import overload_test
+import overload
 
 def test_single_arg_overloads():
     """Test overloaded methods with single argument of different types."""
-    calc = overload_test.Calculator()
+    calc = overload.Calculator()
 
     # add(int)
     calc.add(10)
@@ -23,7 +23,7 @@ def test_single_arg_overloads():
 
 def test_multi_arg_overloads():
     """Test overloaded methods with different argument counts."""
-    calc = overload_test.Calculator()
+    calc = overload.Calculator()
 
     # add(int)
     calc.add(5)
@@ -38,7 +38,7 @@ def test_multi_arg_overloads():
 
 def test_string_overload():
     """Test overload with string parameter."""
-    calc = overload_test.Calculator()
+    calc = overload.Calculator()
 
     # set(string) - parses string to double
     calc.set("42.5")
@@ -57,7 +57,7 @@ def test_string_overload():
 
 def test_non_overloaded_methods():
     """Test that non-overloaded methods still work."""
-    calc = overload_test.Calculator()
+    calc = overload.Calculator()
     calc.add(10)
 
     # get() - not overloaded
@@ -72,7 +72,7 @@ def test_non_overloaded_methods():
 
 def test_wrong_arguments():
     """Test error handling for wrong argument types/counts."""
-    calc = overload_test.Calculator()
+    calc = overload.Calculator()
 
     # Wrong number of arguments
     try:
@@ -94,13 +94,13 @@ def test_wrong_arguments():
 def test_static_methods():
     """Test static factory methods (not overloaded but testing they still work)."""
     # from_coords(double, double)
-    p1 = overload_test.Point.from_coords(3.0, 4.0)
+    p1 = overload.Point.from_coords(3.0, 4.0)
     assert p1.x == 3.0
     assert p1.y == 4.0
     assert p1.distance() == 5.0
 
     # from_single(double)
-    p2 = overload_test.Point.from_single(2.0)
+    p2 = overload.Point.from_single(2.0)
     assert p2.x == 2.0
     assert p2.y == 2.0
 
