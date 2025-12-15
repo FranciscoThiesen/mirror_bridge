@@ -4,10 +4,10 @@
 
 using namespace constexpr_test;
 
-PyMODINIT_FUNC PyInit_constexpr_test(void) {
+PyMODINIT_FUNC PyInit_constexpr(void) {
     static struct PyModuleDef module_def = {
         PyModuleDef_HEAD_INIT,
-        "constexpr_test",
+        "constexpr",
         "Test module for static constexpr member binding",
         -1,
         nullptr
