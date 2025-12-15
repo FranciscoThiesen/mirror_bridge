@@ -786,12 +786,14 @@ template<Bindable T>
                 static_cast<int>(name_sv.size())
             ).ToLocalChecked();
 
+            // Cast to Local<Name> to match v8_getter/v8_setter signatures
             tpl->InstanceTemplate()->SetNativeDataProperty(
-                prop_name,
+                prop_name.As<v8::Name>(),
                 v8_getter<T, Is>,
                 v8_setter<T, Is>,
                 v8::Local<v8::Value>(),
                 v8::PropertyAttribute::None,
+                v8::AccessControl::DEFAULT,
                 v8::SideEffectType::kHasSideEffect,
                 v8::SideEffectType::kHasSideEffect
             );
