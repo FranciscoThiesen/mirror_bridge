@@ -19,15 +19,15 @@ PYTHON_INCLUDES=$(python3-config --includes)
 PYTHON_LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags)
 
 # Build the module
-echo "Building constexpr_test.so..."
+echo "Building constexpr.so..."
 $CXX $CXX_FLAGS -fPIC -shared \
     -I"$SCRIPT_DIR/../../../.." \
     $PYTHON_INCLUDES \
     constexpr_binding.cpp \
-    -o constexpr_test.so \
+    -o constexpr.so \
     $PYTHON_LDFLAGS
 
-echo "✓ Built constexpr_test.so"
+echo "✓ Built constexpr.so"
 
 # Run the test
 echo ""
