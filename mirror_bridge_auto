@@ -20,6 +20,7 @@ KEEP_GENERATED=0
 USE_PCH=""
 PCH_PATH=""
 FORCE_REBUILD=0
+GENERATE_STUBS=0
 
 # Help message
 show_help() {
@@ -35,6 +36,7 @@ Options:
   -v, --verbose           Show compilation output
   --use-pch [PATH]        Use precompiled header (optional path to .gch file)
   -f, --force             Force rebuild even if sources haven't changed
+  --stubs                 Generate .pyi type stub file for IDE support
   -h, --help              Show this help message
 
 Change Detection:
@@ -106,6 +108,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -f|--force)
             FORCE_REBUILD=1
+            shift
+            ;;
+        --stubs)
+            GENERATE_STUBS=1
             shift
             ;;
         -*)
@@ -433,11 +439,35 @@ else
     echo -e "${BLUE}Generated file kept: $GENERATED_FILE${NC}"
 fi
 
+# Generate type stubs if requested
+if [ $GENERATE_STUBS -eq 1 ]; then
+    STUB_SCRIPT="$SCRIPT_DIR/scripts/generate_stubs.py"
+    if [ -f "$STUB_SCRIPT" ]; then
+        echo ""
+        echo -e "${YELLOW}Generating type stubs...${NC}"
+
+        # Find the compiled module
+        SO_FILE=$(find "$OUTPUT_DIR" -name "${MODULE_NAME}*.so" | head -1)
+        if [ -n "$SO_FILE" ]; then
+            if python3 "$STUB_SCRIPT" "$SO_FILE" --output "$OUTPUT_DIR" 2>/dev/null; then
+                echo -e "${GREEN}✓ Generated: $OUTPUT_DIR/${MODULE_NAME}.pyi${NC}"
+            else
+                echo -e "${YELLOW}Warning: Failed to generate stubs (module may need specific imports)${NC}"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}Warning: Stub generator not found: $STUB_SCRIPT${NC}"
+    fi
+fi
+
 echo ""
 echo -e "${GREEN}✓ Successfully auto-discovered and built: ${MODULE_NAME}.so${NC}"
 echo -e "${GREEN}  Classes bound: ${#QUALIFIED_NAMES[@]}${NC}"
 if [ ${#FUNC_QUALIFIED_NAMES[@]} -gt 0 ]; then
     echo -e "${GREEN}  Functions bound: ${#FUNC_QUALIFIED_NAMES[@]}${NC}"
+fi
+if [ $GENERATE_STUBS -eq 1 ] && [ -f "$OUTPUT_DIR/${MODULE_NAME}.pyi" ]; then
+    echo -e "${GREEN}  Type stubs: ${MODULE_NAME}.pyi${NC}"
 fi
 echo ""
 echo -e "${BLUE}Usage from Python:${NC}"
