@@ -128,17 +128,24 @@ PYBIND11_MODULE(mymodule, m) {
 
 ## Running Benchmarks
 
-### Quick Local Benchmark (No Docker)
+### Quick Benchmark (inside Docker container)
+
+The benchmark script requires the reflection-enabled clang compiler, which is only available inside the Docker container:
 
 ```bash
-cd benchmarks/compile_time
-./quick_benchmark.sh
+# From host - run inside container
+docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh
 
 # With PCH for incremental times
-./quick_benchmark.sh --pch
+docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh --pch
 
 # Save results to JSON
-./quick_benchmark.sh --output results.json
+docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh --output /workspace/results.json
+```
+
+Or if you're already inside the container:
+```bash
+./benchmarks/compile_time/quick_benchmark.sh
 ```
 
 ### Full Benchmark Suite (Docker)

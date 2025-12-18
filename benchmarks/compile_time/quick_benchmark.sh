@@ -1,6 +1,12 @@
 #!/bin/bash
-# Quick compile-time benchmark - runs locally without Docker
-# Compares mirror_bridge compilation times for simple and medium projects
+# Quick compile-time benchmark for Mirror Bridge
+# Runs inside Docker container (requires reflection-enabled clang)
+#
+# Usage from host:
+#   docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh
+#
+# Usage from inside container:
+#   ./benchmarks/compile_time/quick_benchmark.sh
 
 set -e
 
@@ -29,7 +35,14 @@ show_help() {
     cat << EOF
 Quick Compile-Time Benchmark for Mirror Bridge
 
-Usage: $(basename "$0") [options]
+IMPORTANT: This script requires the reflection-enabled clang compiler
+(Bloomberg clang-p2996) which is only available inside the Docker container.
+
+Usage from host:
+  docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh [options]
+
+Usage from inside container:
+  ./benchmarks/compile_time/quick_benchmark.sh [options]
 
 Options:
   -r, --runs N        Number of benchmark runs (default: 5)
@@ -40,17 +53,14 @@ Options:
   -h, --help          Show this help
 
 Examples:
-  # Basic benchmark
-  ./quick_benchmark.sh
+  # From host - run inside container
+  docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh
 
   # With PCH for realistic incremental compile times
-  ./quick_benchmark.sh --pch
+  docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh --pch
 
   # More runs for statistical confidence
-  ./quick_benchmark.sh --runs 10
-
-  # Save results
-  ./quick_benchmark.sh --output results.json
+  docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh --runs 10
 
 EOF
 }
@@ -98,12 +108,17 @@ done
 # Check for clang with reflection
 if ! command -v clang++ &> /dev/null; then
     echo -e "${RED}Error: clang++ not found${NC}"
+    echo -e "${YELLOW}This script must run inside the Docker container.${NC}"
+    echo -e "${YELLOW}Try: docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh${NC}"
     exit 1
 fi
 
 # Check for reflection support
 if ! clang++ --help 2>&1 | grep -q "freflection"; then
-    echo -e "${YELLOW}Warning: clang++ may not have reflection support${NC}"
+    echo -e "${RED}Error: clang++ does not have reflection support${NC}"
+    echo -e "${YELLOW}This script requires Bloomberg's clang-p2996 fork.${NC}"
+    echo -e "${YELLOW}Run inside Docker: docker exec mirror_bridge_dev /workspace/benchmarks/compile_time/quick_benchmark.sh${NC}"
+    exit 1
 fi
 
 mkdir -p "$BUILD_DIR"
