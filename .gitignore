@@ -51,6 +51,9 @@ class_hashes.db
 # AI guidance (not for public repo)
 CLAUDE.md
 
+# Local improvement tracking
+improvement_notes.md
+
 # Benchmark results
 benchmarks/runtime/python/runtime_results.json
 benchmarks/runtime/lua/runtime_results_lua.json

@@ -227,8 +227,24 @@ echo ""
 # Compile
 echo -e "${YELLOW}Compiling JavaScript module...${NC}"
 
+# Autodetect V8 include path
+V8_INCLUDES=""
+if command -v pkg-config &> /dev/null && pkg-config --exists v8 2>/dev/null; then
+    V8_INCLUDES=$(pkg-config --cflags v8)
+elif [ -d "/usr/include/v8" ]; then
+    V8_INCLUDES="-I/usr/include/v8"
+elif [ -d "/usr/local/include/v8" ]; then
+    V8_INCLUDES="-I/usr/local/include/v8"
+else
+    # Fallback: search for v8.h
+    V8_HEADER=$(find /usr/include /usr/local/include -name "v8.h" 2>/dev/null | head -1)
+    if [ -n "$V8_HEADER" ]; then
+        V8_INCLUDES="-I$(dirname "$V8_HEADER")"
+    fi
+fi
+
 COMPILE_CMD="clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
-    -I. -I$SRC_DIR -I/usr/include/node \
+    -I. -I$SRC_DIR -I/usr/include/node $V8_INCLUDES \
     -fPIC -shared \
     $GENERATED_FILE \
     -o $OUTPUT_DIR/$MODULE_NAME.node"

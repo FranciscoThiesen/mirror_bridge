@@ -483,7 +483,7 @@ template<typename T, std::size_t FuncIndex, std::size_t... Is>
 template<typename T, std::size_t Index>
 void v8_method(const ::v8::FunctionCallbackInfo<::v8::Value>& args) {
     ::v8::Isolate* isolate = args.GetIsolate();
-    ::v8::Local<::v8::Object> self = args.Holder();
+    ::v8::Local<::v8::Object> self = args.This();
 
     V8Wrapper<T>* wrapper = static_cast<V8Wrapper<T>*>(
         self->GetAlignedPointerFromInternalField(kWrapperFieldIndex)
@@ -728,8 +728,8 @@ from_v8(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, T& out) {
         }
     }
 
-    // Fall back to object conversion
-    return V8ConversionHelper<T>::from_v8_impl(isolate, value, out);
+    // Fall back - object wasn't a wrapped C++ object
+    return false;
 }
 
 // ============================================================================
