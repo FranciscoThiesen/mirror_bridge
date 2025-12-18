@@ -58,3 +58,4 @@ improvement_notes.md
 benchmarks/runtime/python/runtime_results.json
 benchmarks/runtime/lua/runtime_results_lua.json
 benchmarks/runtime/javascript/runtime_results_js.json
+blog/

@@ -8,6 +8,7 @@
 #include "../core/mirror_bridge_core.hpp"
 #include <node_api.h>
 #include <cstdio>
+#include <cstring>
 
 namespace mirror_bridge {
 namespace javascript {
@@ -65,8 +66,40 @@ napi_value to_javascript(napi_env env, const T& value) {
     return result;
 }
 
-// Containers → JavaScript arrays
+// ============================================================================
+// Byte Container Detection - for optimized bulk transfer
+// ============================================================================
+
+// Concept for containers of byte-like types (uint8_t, int8_t, char, std::byte)
+template<typename T>
+concept ByteContainer = Container<T> && requires {
+    requires sizeof(typename std::remove_cvref_t<T>::value_type) == 1;
+    requires std::is_trivially_copyable_v<typename std::remove_cvref_t<T>::value_type>;
+} && requires(T t) {
+    { t.data() } -> std::convertible_to<const void*>;  // Must have contiguous storage
+};
+
+// Optimized: Byte containers → JavaScript Uint8Array (bulk memcpy)
+template<ByteContainer T>
+napi_value to_javascript(napi_env env, const T& container) {
+    // Create an ArrayBuffer with a copy of the data
+    napi_value array_buffer;
+    void* buffer_data;
+    napi_create_arraybuffer(env, container.size(), &buffer_data, &array_buffer);
+
+    // Bulk copy - single memcpy instead of 1.44M individual calls
+    std::memcpy(buffer_data, container.data(), container.size());
+
+    // Create a Uint8Array view over the ArrayBuffer
+    napi_value uint8_array;
+    napi_create_typedarray(env, napi_uint8_array, container.size(), array_buffer, 0, &uint8_array);
+
+    return uint8_array;
+}
+
+// Generic containers → JavaScript arrays (element-by-element for non-byte types)
 template<Container T>
+    requires (!ByteContainer<T>)
 napi_value to_javascript(napi_env env, const T& container) {
     napi_value array;
     napi_create_array_with_length(env, container.size(), &array);
@@ -428,18 +461,142 @@ void js_finalizer(napi_env env, void* finalize_data, void* finalize_hint) {
 }
 
 // ============================================================================
+// Constructor Reflection Helpers
+// ============================================================================
+
+// Count parameterized constructors (exclude default, copy, move)
+template<typename T>
+consteval std::size_t get_js_constructor_count() {
+    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+    std::size_t count = 0;
+    for (auto member : all_members) {
+        if (std::meta::is_constructor(member) &&
+            !std::meta::is_copy_constructor(member) &&
+            !std::meta::is_move_constructor(member)) {
+            auto params = std::meta::parameters_of(member);
+            if (params.size() > 0) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// Get the Nth parameterized constructor
+template<typename T, std::size_t Index>
+consteval auto get_js_constructor() {
+    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+    std::size_t count = 0;
+    for (auto member : all_members) {
+        if (std::meta::is_constructor(member) &&
+            !std::meta::is_copy_constructor(member) &&
+            !std::meta::is_move_constructor(member)) {
+            auto params = std::meta::parameters_of(member);
+            if (params.size() > 0) {
+                if (count == Index) {
+                    return member;
+                }
+                count++;
+            }
+        }
+    }
+    return all_members[0]; // Should never reach here
+}
+
+// Get parameter count for a constructor
+template<typename T, std::size_t CtorIndex>
+consteval std::size_t get_js_constructor_param_count() {
+    constexpr auto ctor = get_js_constructor<T, CtorIndex>();
+    auto params = std::meta::parameters_of(ctor);
+    return params.size();
+}
+
+// Get parameter type for a constructor
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+consteval auto get_js_constructor_param_type() {
+    constexpr auto ctor = get_js_constructor<T, CtorIndex>();
+    auto params = std::meta::parameters_of(ctor);
+    return std::meta::type_of(params[ParamIndex]);
+}
+
+// Call constructor with JS arguments
+template<typename T, std::size_t CtorIndex, std::size_t... Is>
+T* call_js_constructor_impl(napi_env env, napi_value* args, std::index_sequence<Is...>, bool& success) {
+    std::tuple<std::remove_cvref_t<typename [:get_js_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+
+    success = true;
+    ([&] {
+        if (!success) return;
+        if (!from_javascript(env, args[Is], std::get<Is>(cpp_args))) {
+            success = false;
+        }
+    }(), ...);
+
+    if (!success) {
+        return nullptr;
+    }
+
+    return new T(std::move(std::get<Is>(cpp_args))...);
+}
+
+// Try to match constructor by parameter count and call it
+template<typename T, std::size_t CtorIndex>
+T* try_js_constructor(napi_env env, napi_value* args, std::size_t nargs, bool& matched) {
+    constexpr std::size_t param_count = get_js_constructor_param_count<T, CtorIndex>();
+    if (nargs == param_count) {
+        matched = true;
+        bool success = true;
+        T* result = call_js_constructor_impl<T, CtorIndex>(env, args, std::make_index_sequence<param_count>{}, success);
+        if (success) {
+            return result;
+        }
+    }
+    matched = false;
+    return nullptr;
+}
+
+// ============================================================================
 // Constructor
 // ============================================================================
 
 template<typename T>
 napi_value js_constructor(napi_env env, napi_callback_info info) {
     napi_value this_arg;
-    size_t argc = 0;
-    napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+    size_t argc = 16; // Max expected args
+    napi_value args[16];
+    napi_get_cb_info(env, info, &argc, args, &this_arg, nullptr);
 
-    // For now, only support default constructor
+    T* cpp_object = nullptr;
+
+    if (argc == 0) {
+        // Default constructor
+        cpp_object = new T();
+    } else {
+        // Try parameterized constructors
+        constexpr std::size_t ctor_count = get_js_constructor_count<T>();
+
+        if constexpr (ctor_count > 0) {
+            // Try each constructor
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ([&] {
+                    if (cpp_object != nullptr) return; // Already found a match
+                    bool matched = false;
+                    T* result = try_js_constructor<T, Is>(env, args, argc, matched);
+                    if (result != nullptr) {
+                        cpp_object = result;
+                    }
+                }(), ...);
+            }(std::make_index_sequence<ctor_count>{});
+        }
+
+        // If no constructor matched, fall back to default
+        if (cpp_object == nullptr) {
+            cpp_object = new T();
+        }
+    }
+
     JsWrapper<T>* wrapper = new JsWrapper<T>();
-    wrapper->cpp_object = new T();
+    wrapper->cpp_object = cpp_object;
     wrapper->owns_memory = true;
 
     napi_wrap(env, this_arg, wrapper, js_finalizer<T>, nullptr, &wrapper->js_ref);

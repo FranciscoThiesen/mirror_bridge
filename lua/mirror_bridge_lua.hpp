@@ -482,16 +482,155 @@ int lua_gc(lua_State* L) {
 }
 
 // ============================================================================
+// Constructor Support (Parameterized)
+// ============================================================================
+
+// Count constructors (exclude default, copy, move)
+template<typename T>
+consteval std::size_t get_lua_constructor_count() {
+    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+    std::size_t count = 0;
+    for (auto member : all_members) {
+        if (std::meta::is_constructor(member) &&
+            !std::meta::is_copy_constructor(member) &&
+            !std::meta::is_move_constructor(member)) {
+            auto params = std::meta::parameters_of(member);
+            if (params.size() > 0) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// Get the Nth non-default constructor
+template<typename T, std::size_t Index>
+consteval auto get_lua_constructor() {
+    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
+    std::size_t ctor_index = 0;
+    for (auto member : all_members) {
+        if (std::meta::is_constructor(member) &&
+            !std::meta::is_copy_constructor(member) &&
+            !std::meta::is_move_constructor(member)) {
+            auto params = std::meta::parameters_of(member);
+            if (params.size() > 0) {
+                if (ctor_index == Index) {
+                    return member;
+                }
+                ctor_index++;
+            }
+        }
+    }
+    return all_members[0];
+}
+
+// Get constructor parameter count
+template<typename T, std::size_t CtorIndex>
+consteval std::size_t get_lua_constructor_param_count() {
+    constexpr auto ctor = get_lua_constructor<T, CtorIndex>();
+    return std::meta::parameters_of(ctor).size();
+}
+
+// Get constructor parameter type
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+consteval auto get_lua_constructor_param_type() {
+    constexpr auto ctor = get_lua_constructor<T, CtorIndex>();
+    auto params = std::meta::parameters_of(ctor);
+    return std::meta::type_of(params[ParamIndex]);
+}
+
+// Call constructor with Lua arguments
+template<typename T, std::size_t CtorIndex, std::size_t... Is>
+T* call_lua_constructor_impl(lua_State* L, int arg_offset, std::index_sequence<Is...>) {
+    using ParamTypes = std::tuple<
+        std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...
+    >;
+
+    std::tuple<std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+
+    bool success = true;
+    ([&] {
+        if (!success) return;
+        // Lua stack indices are 1-based, and we skip the class table (arg_offset accounts for this)
+        int lua_idx = arg_offset + Is + 1;
+        if (!from_lua(L, lua_idx, std::get<Is>(cpp_args))) {
+            success = false;
+        }
+    }(), ...);
+
+    if (!success) {
+        return nullptr;
+    }
+
+    return new T(std::move(std::get<Is>(cpp_args))...);
+}
+
+// ============================================================================
 // Constructor
 // ============================================================================
 
 template<typename T>
 int lua_constructor(lua_State* L) {
+    // Get number of arguments (subtract 1 for the class table itself when called via __call)
+    int nargs = lua_gettop(L) - 1;
+
+    T* cpp_object = nullptr;
+
+    // Default constructor case
+    if (nargs == 0) {
+        if constexpr (std::is_default_constructible_v<T>) {
+            cpp_object = new T();
+        } else {
+            luaL_error(L, "This class requires constructor arguments");
+            return 0;
+        }
+    } else {
+        // Try to find matching constructor by parameter count
+        constexpr std::size_t ctor_count = get_lua_constructor_count<T>();
+
+        if constexpr (ctor_count > 0) {
+            bool found = false;
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ([&] {
+                    if (found) return;
+
+                    constexpr std::size_t param_count = get_lua_constructor_param_count<T, Is>();
+                    if (nargs == static_cast<int>(param_count)) {
+                        T* obj = call_lua_constructor_impl<T, Is>(L, 1,
+                            std::make_index_sequence<param_count>{});
+
+                        if (obj) {
+                            cpp_object = obj;
+                            found = true;
+                        }
+                    }
+                }(), ...);
+            }(std::make_index_sequence<ctor_count>{});
+
+            if (!found && !cpp_object) {
+                // Try default constructor as fallback if available
+                if constexpr (std::is_default_constructible_v<T>) {
+                    cpp_object = new T();
+                } else {
+                    luaL_error(L, "No matching constructor found for %d arguments", nargs);
+                    return 0;
+                }
+            }
+        } else {
+            // No parameterized constructors, try default
+            if constexpr (std::is_default_constructible_v<T>) {
+                cpp_object = new T();
+            } else {
+                luaL_error(L, "This class has no constructors accepting arguments");
+                return 0;
+            }
+        }
+    }
+
     // Allocate userdata for wrapper
     LuaWrapper<T>* wrapper = static_cast<LuaWrapper<T>*>(lua_newuserdata(L, sizeof(LuaWrapper<T>)));
 
-    // Initialize wrapper
-    wrapper->cpp_object = new T();
+    wrapper->cpp_object = cpp_object;
     wrapper->owns_memory = true;
 
     // Set metatable
