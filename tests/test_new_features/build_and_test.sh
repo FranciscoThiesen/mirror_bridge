@@ -35,7 +35,7 @@ echo "=============================================="
 echo
 
 # Run Python tests
-python3 test_features.py
+python3 run_test_features.py
 TEST_RESULT=$?
 
 if [ $TEST_RESULT -eq 0 ]; then
