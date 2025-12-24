@@ -9,10 +9,10 @@ sys.path.insert(0, 'build')
 import mandelbrot
 
 # Animation parameters
-WIDTH = 640
-HEIGHT = 480
+WIDTH = 800
+HEIGHT = 600
 MAX_ITER = 256
-NUM_FRAMES = 60
+NUM_FRAMES = 90
 
 # Start: full Mandelbrot view
 START_X_MIN, START_X_MAX = -2.5, 1.0
@@ -77,8 +77,8 @@ def generate_frames():
     print("To convert to GIF (on macOS):")
     print("  cd build/frames")
     print("  for f in *.ppm; do sips -s format png \"$f\" --out \"${f%.ppm}.png\"; done")
-    print("  ffmpeg -framerate 15 -i frame_%03d.png -vf 'palettegen' palette.png")
-    print("  ffmpeg -framerate 15 -i frame_%03d.png -i palette.png -lavfi 'paletteuse' ../mandelbrot_zoom.gif")
+    print("  ffmpeg -framerate 10 -i frame_%03d.png -vf 'palettegen' palette.png")
+    print("  ffmpeg -framerate 10 -i frame_%03d.png -i palette.png -lavfi 'paletteuse' ../mandelbrot_zoom.gif")
 
 if __name__ == "__main__":
     generate_frames()
