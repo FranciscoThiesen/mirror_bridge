@@ -61,6 +61,10 @@
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
 
+// Include P3394 annotations support for field-level binding control
+// Requires -freflection-latest with Bloomberg's clang-p2996
+#include "python/mirror_bridge_annotations.hpp"
+
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
@@ -1674,6 +1678,69 @@ int py_setter(PyObject* self, PyObject* value, void* closure) {
 }
 
 // ============================================================================
+// Visible Member Getter/Setter (P3394 Annotation-Aware)
+// ============================================================================
+//
+// These versions work with visible member indices (excluding fields marked with
+// [[=exclude{}]] annotation). Used by generate_visible_getsetters.
+
+// Get visible member info - returns the Nth non-excluded member
+template<typename T, std::size_t VisibleIndex>
+consteval auto get_visible_member_info() {
+    return annotations::get_visible_member<T>(VisibleIndex);
+}
+
+// Getter for visible class members (same logic as py_getter but uses visible index)
+template<typename T, std::size_t VisibleIndex>
+PyObject* py_visible_getter(PyObject* self, void* closure) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    constexpr auto member = get_visible_member_info<T, VisibleIndex>();
+    using MemberType = typename [:std::meta::type_of(member):];
+
+    auto& value = (*wrapper->cpp_object).[:member:];
+    return to_python(value);
+}
+
+// Setter for visible class members (same logic as py_setter but uses visible index)
+template<typename T, std::size_t VisibleIndex>
+int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return -1;
+    }
+
+    if (!value) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete attribute");
+        return -1;
+    }
+
+    constexpr auto member = get_visible_member_info<T, VisibleIndex>();
+    using MemberType = typename [:std::meta::type_of(member):];
+
+    MemberType cpp_value;
+    if (!from_python(value, cpp_value)) {
+        PyErr_SetString(PyExc_TypeError, "Type conversion failed");
+        return -1;
+    }
+
+    (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+    return 0;
+}
+
+// Readonly setter - always fails (used for readonly annotated members)
+template<typename T, std::size_t VisibleIndex>
+int py_readonly_setter(PyObject* self, PyObject* value, void* closure) {
+    PyErr_SetString(PyExc_AttributeError, "Attribute is read-only");
+    return -1;
+}
+
+// ============================================================================
 // Method Binding Support with Variadic Parameters
 // ============================================================================
 //
@@ -2009,6 +2076,32 @@ consteval auto generate_getsetters(std::index_sequence<Indices...>) {
     }), ...);
 
     // Sentinel entry (all nulls)
+    getsets[count] = PyGetSetDef{nullptr, nullptr, nullptr, nullptr, nullptr};
+
+    return getsets;
+}
+
+// Generate Python getters/setters for visible members only (P3394 annotation-aware)
+// Skips members marked with [[=exclude{}]] and uses readonly setter for [[=readonly{}]]
+template<typename T, std::size_t... VisibleIndices>
+consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...>) {
+    constexpr std::size_t count = sizeof...(VisibleIndices);
+
+    std::array<PyGetSetDef, count + 1> getsets{};
+
+    // Populate entries for visible members
+    ((getsets[VisibleIndices] = PyGetSetDef{
+        .name = annotations::get_visible_member_name<T, VisibleIndices>(),
+        .get = py_visible_getter<T, VisibleIndices>,
+        // Use readonly setter if member has [[=readonly{}]] annotation
+        .set = annotations::is_visible_member_readonly<T, VisibleIndices>()
+            ? py_readonly_setter<T, VisibleIndices>
+            : py_visible_setter<T, VisibleIndices>,
+        .doc = nullptr,
+        .closure = nullptr
+    }), ...);
+
+    // Sentinel entry
     getsets[count] = PyGetSetDef{nullptr, nullptr, nullptr, nullptr, nullptr};
 
     return getsets;
@@ -2363,11 +2456,12 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     // Register class in the global registry
     Registry::instance().register_class(name, signature);
 
-    // Get member count for generating getters/setters - use cache
-    constexpr std::size_t member_count = get_data_member_count<T>();
+    // Get visible member count (excludes fields marked with [[=exclude{}]])
+    constexpr std::size_t visible_member_count = annotations::count_visible_members<T>();
 
-    // Generate getters/setters using reflection
-    static auto getsetters = generate_getsetters<T>(std::make_index_sequence<member_count>{});
+    // Generate getters/setters for visible members only
+    // Readonly fields (marked with [[=readonly{}]]) get a setter that raises AttributeError
+    static auto getsetters = generate_visible_getsetters<T>(std::make_index_sequence<visible_member_count>{});
 
     // Generate instance methods using reflection
     constexpr std::size_t method_count = get_member_function_count<T>();
