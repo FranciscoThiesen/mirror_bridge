@@ -7,6 +7,10 @@
 #include <string>
 #include <iostream>
 
+// Import annotation types for clean syntax
+using mirror_bridge::exclude;
+using mirror_bridge::readonly;
+
 // ============================================================================
 // Test Struct with Annotations
 // ============================================================================
@@ -17,12 +21,12 @@ struct UserProfile {
     std::string email;
 
     // Excluded from Python binding
-    [[=mirror_bridge::exclude{}]] std::string password_hash;
-    [[=mirror_bridge::exclude{}]] int internal_flag = 0;
+    [[=exclude{}]] std::string password_hash;
+    [[=exclude{}]] int internal_flag = 0;
 
     // Read-only in Python (getter only, no setter)
-    [[=mirror_bridge::readonly{}]] std::string created_at;
-    [[=mirror_bridge::readonly{}]] int version = 1;
+    [[=readonly{}]] std::string created_at;
+    [[=readonly{}]] int version = 1;
 
     // Method to set readonly fields from C++
     void set_created_at(const std::string& ts) { created_at = ts; }

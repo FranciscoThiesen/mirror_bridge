@@ -7,11 +7,15 @@
 // This header provides annotation types for controlling binding behavior using
 // C++26 P3394 (Annotations for Reflection), accepted at the Sofia meeting.
 //
-// Usage:
+// Usage (recommended - import annotation types for clean syntax):
+//
+//   using mirror_bridge::exclude;
+//   using mirror_bridge::readonly;
+//
 //   struct UserProfile {
-//       int user_id;                                      // Bound normally
-//       [[=mirror_bridge::exclude{}]] std::string password_hash;  // Not bound
-//       [[=mirror_bridge::readonly{}]] std::string created_at;    // Read-only
+//       int user_id;                              // Bound normally
+//       [[=exclude{}]] std::string password_hash; // Not bound to Python
+//       [[=readonly{}]] std::string created_at;   // Read-only in Python
 //   };
 //
 // Requires: -freflection-latest with Bloomberg's clang-p2996

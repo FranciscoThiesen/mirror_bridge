@@ -5,6 +5,10 @@
 #include "../../python/mirror_bridge_annotations.hpp"
 #include <iostream>
 
+// Import for clean syntax
+using mirror_bridge::exclude;
+using mirror_bridge::readonly;
+
 // ============================================================================
 // Test Struct with Annotations
 // ============================================================================
@@ -13,11 +17,11 @@ struct TestUser {
     int id;
     std::string name;
 
-    [[=mirror_bridge::exclude{}]] std::string password_hash;
-    [[=mirror_bridge::exclude{}]] int internal_flag;
+    [[=exclude{}]] std::string password_hash;
+    [[=exclude{}]] int internal_flag;
 
-    [[=mirror_bridge::readonly{}]] std::string created_at;
-    [[=mirror_bridge::readonly{}]] int version;
+    [[=readonly{}]] std::string created_at;
+    [[=readonly{}]] int version;
 };
 
 // ============================================================================

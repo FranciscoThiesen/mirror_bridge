@@ -19,6 +19,10 @@ namespace mirror_bridge {
     };
 }
 
+// Import for clean syntax
+using mirror_bridge::exclude;
+using mirror_bridge::readonly;
+
 // ============================================================================
 // Example Struct
 // ============================================================================
@@ -27,11 +31,11 @@ struct UserProfile {
     int user_id;
     std::string username;
 
-    [[=mirror_bridge::exclude{}]] std::string password_hash;
-    [[=mirror_bridge::exclude{}]] int internal_id;
+    [[=exclude{}]] std::string password_hash;
+    [[=exclude{}]] int internal_id;
 
-    [[=mirror_bridge::readonly{}]] std::string created_at;
-    [[=mirror_bridge::readonly{}]] int version;
+    [[=readonly{}]] std::string created_at;
+    [[=readonly{}]] int version;
 };
 
 // ============================================================================
@@ -113,10 +117,12 @@ int main() {
     std::cout << "  Visible (not excluded): " << count_visible<UserProfile>() << "\n";
 
     std::cout << "\n=== Syntax ===\n\n";
+    std::cout << "using mirror_bridge::exclude;\n";
+    std::cout << "using mirror_bridge::readonly;\n\n";
     std::cout << "struct UserProfile {\n";
-    std::cout << "    int user_id;                                       // Bound normally\n";
-    std::cout << "    [[=mirror_bridge::exclude{}]] std::string password_hash;  // Excluded\n";
-    std::cout << "    [[=mirror_bridge::readonly{}]] std::string created_at;    // Read-only\n";
+    std::cout << "    int user_id;                           // Bound normally\n";
+    std::cout << "    [[=exclude{}]] std::string password_hash;  // Excluded\n";
+    std::cout << "    [[=readonly{}]] std::string created_at;    // Read-only\n";
     std::cout << "};\n";
 
     return 0;
