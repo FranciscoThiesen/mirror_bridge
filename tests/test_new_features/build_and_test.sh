@@ -17,9 +17,9 @@ INCLUDES="-I/workspace -I/workspace/tests/test_new_features"
 PYTHON_FLAGS=$(python3-config --includes)
 
 # Build
-echo "Compiling binding.cpp..."
+echo "Compiling test_features_binding.cpp..."
 $CXX $COMMON_FLAGS $INCLUDES $PYTHON_FLAGS \
-    binding.cpp -o test_features.so 2>&1
+    test_features_binding.cpp -o test_features.so 2>&1
 
 if [ -f "test_features.so" ]; then
     echo "✓ Build successful: test_features.so"
