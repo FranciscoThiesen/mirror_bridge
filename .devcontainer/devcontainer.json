@@ -16,8 +16,8 @@
         "dbaeumer.vscode-eslint"
       ],
       "settings": {
-        "C_Cpp.default.cppStandard": "c++23",
         "C_Cpp.default.compilerPath": "/usr/local/bin/clang++",
+        "C_Cpp.default.compilerArgs": ["-std=c++2c", "-freflection", "-freflection-latest", "-stdlib=libc++"],
         "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
         "cmake.configureOnOpen": false,
         "python.defaultInterpreterPath": "/usr/bin/python3",
