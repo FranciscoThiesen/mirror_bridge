@@ -1,0 +1,46 @@
+{
+  "name": "Mirror Bridge Development",
+  "image": "ghcr.io/franciscothiesen/mirror_bridge:latest",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "features": {},
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-python.python",
+        "sumneko.lua",
+        "dbaeumer.vscode-eslint"
+      ],
+      "settings": {
+        "C_Cpp.default.cppStandard": "c++23",
+        "C_Cpp.default.compilerPath": "/usr/local/bin/clang++",
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+        "cmake.configureOnOpen": false,
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "editor.formatOnSave": true
+      }
+    },
+    "codespaces": {
+      "openFiles": [
+        "README.md",
+        "examples/01-hello-world/src/greeter.hpp"
+      ]
+    }
+  },
+
+  "forwardPorts": [8888],
+  "portsAttributes": {
+    "8888": {
+      "label": "Jupyter Notebook",
+      "onAutoForward": "notify"
+    }
+  },
+
+  "postCreateCommand": "echo '✅ Mirror Bridge development environment ready!' && echo '' && echo 'Quick start:' && echo '  cd examples/01-hello-world' && echo '  ../../tools/mirror_bridge generate src/ --module greeter --lang python' && echo '  python3 test_greeter.py' && echo '' && echo 'Run all tests: ./tests/run_all_tests.sh'",
+
+  "remoteUser": "root"
+}

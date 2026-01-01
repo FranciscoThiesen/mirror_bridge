@@ -9,6 +9,8 @@
 #include <node_api.h>
 #include <cstdio>
 #include <cstring>
+#include <optional>
+#include <future>
 
 namespace mirror_bridge {
 namespace javascript {
@@ -241,6 +243,197 @@ bool from_javascript(napi_env env, napi_value value, T& out) {
         out = std::make_shared<ElementType>(std::move(cpp_value));
     }
     return true;
+}
+
+// ============================================================================
+// std::optional Type Conversion
+// ============================================================================
+
+// std::optional to JavaScript (null if empty, otherwise convert value)
+template<typename T>
+napi_value to_javascript(napi_env env, const std::optional<T>& opt) {
+    if (!opt.has_value()) {
+        napi_value result;
+        napi_get_null(env, &result);
+        return result;
+    }
+    return to_javascript(env, *opt);
+}
+
+// JavaScript to std::optional (null/undefined → nullopt, otherwise convert value)
+template<typename T>
+bool from_javascript(napi_env env, napi_value value, std::optional<T>& out) {
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok) return false;
+
+    if (type == napi_null || type == napi_undefined) {
+        out = std::nullopt;
+        return true;
+    }
+
+    T cpp_value;
+    if (!from_javascript(env, value, cpp_value)) {
+        return false;
+    }
+    out = std::move(cpp_value);
+    return true;
+}
+
+// ============================================================================
+// Async/Await Support - std::future<T> to JavaScript Promise
+// ============================================================================
+//
+// Enables C++ methods returning std::future<T> to return JavaScript Promises.
+//
+// Example C++ code:
+//   std::future<int> compute_async(int x) {
+//       return std::async(std::launch::async, [x]() {
+//           // Simulate async work
+//           return x * 2;
+//       });
+//   }
+//
+// JavaScript usage:
+//   const result = await obj.compute_async(21);
+//   console.log(result);  // 42
+//
+// The Promise wrapper uses N-API async work to poll the future without
+// blocking the main JavaScript thread.
+
+// Helper trait to detect std::future (if not already defined)
+template<typename T>
+struct is_js_std_future : std::false_type {};
+
+template<typename T>
+struct is_js_std_future<std::future<T>> : std::true_type {};
+
+template<typename T>
+struct is_js_std_future<std::shared_future<T>> : std::true_type {};
+
+// Async work context for future polling
+template<typename T>
+struct FutureAsyncContext {
+    napi_env env;
+    napi_deferred deferred;
+    napi_async_work work;
+    std::shared_future<T>* future;
+    T result;
+    bool has_error;
+    std::string error_message;
+};
+
+// Execute callback - runs on worker thread, waits for future
+template<typename T>
+void future_execute_callback(napi_env env, void* data) {
+    auto* ctx = reinterpret_cast<FutureAsyncContext<T>*>(data);
+    try {
+        if constexpr (!std::is_void_v<T>) {
+            ctx->result = ctx->future->get();
+        } else {
+            ctx->future->get();
+        }
+        ctx->has_error = false;
+    } catch (const std::exception& e) {
+        ctx->has_error = true;
+        ctx->error_message = e.what();
+    }
+}
+
+// Complete callback - runs on main thread, resolves/rejects promise
+template<typename T>
+void future_complete_callback(napi_env env, napi_status status, void* data) {
+    auto* ctx = reinterpret_cast<FutureAsyncContext<T>*>(data);
+
+    if (ctx->has_error) {
+        // Reject with error
+        napi_value error;
+        napi_create_string_utf8(env, ctx->error_message.c_str(), NAPI_AUTO_LENGTH, &error);
+        napi_reject_deferred(env, ctx->deferred, error);
+    } else {
+        // Resolve with result
+        napi_value js_result;
+        if constexpr (std::is_void_v<T>) {
+            napi_get_undefined(env, &js_result);
+        } else {
+            js_result = to_javascript(env, ctx->result);
+        }
+        napi_resolve_deferred(env, ctx->deferred, js_result);
+    }
+
+    // Cleanup
+    napi_delete_async_work(env, ctx->work);
+    delete ctx->future;
+    delete ctx;
+}
+
+// Convert std::future<T> to JavaScript Promise
+template<typename T>
+napi_value to_javascript(napi_env env, std::future<T>&& fut) {
+    // Create Promise
+    napi_value promise;
+    napi_deferred deferred;
+    napi_create_promise(env, &deferred, &promise);
+
+    // Create async context
+    auto* ctx = new FutureAsyncContext<T>();
+    ctx->env = env;
+    ctx->deferred = deferred;
+    ctx->future = new std::shared_future<T>(std::move(fut));
+    ctx->has_error = false;
+
+    // Create async work
+    napi_value resource_name;
+    napi_create_string_utf8(env, "FutureAwait", NAPI_AUTO_LENGTH, &resource_name);
+
+    napi_create_async_work(
+        env,
+        nullptr,
+        resource_name,
+        future_execute_callback<T>,
+        future_complete_callback<T>,
+        ctx,
+        &ctx->work
+    );
+
+    // Queue the work
+    napi_queue_async_work(env, ctx->work);
+
+    return promise;
+}
+
+// Convert std::shared_future<T> to JavaScript Promise
+template<typename T>
+napi_value to_javascript(napi_env env, const std::shared_future<T>& fut) {
+    // Create Promise
+    napi_value promise;
+    napi_deferred deferred;
+    napi_create_promise(env, &deferred, &promise);
+
+    // Create async context
+    auto* ctx = new FutureAsyncContext<T>();
+    ctx->env = env;
+    ctx->deferred = deferred;
+    ctx->future = new std::shared_future<T>(fut);
+    ctx->has_error = false;
+
+    // Create async work
+    napi_value resource_name;
+    napi_create_string_utf8(env, "FutureAwait", NAPI_AUTO_LENGTH, &resource_name);
+
+    napi_create_async_work(
+        env,
+        nullptr,
+        resource_name,
+        future_execute_callback<T>,
+        future_complete_callback<T>,
+        ctx,
+        &ctx->work
+    );
+
+    // Queue the work
+    napi_queue_async_work(env, ctx->work);
+
+    return promise;
 }
 
 // Forward declaration for JsWrapper (needed for from_javascript with wrapped objects)

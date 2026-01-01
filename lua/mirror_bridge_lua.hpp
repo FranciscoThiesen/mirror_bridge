@@ -13,6 +13,7 @@ extern "C" {
 }
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 namespace mirror_bridge {
 namespace lua {
@@ -191,6 +192,43 @@ bool from_lua(lua_State* L, int idx, T& out) {
     } else {
         out = std::make_shared<ElementType>(std::move(value));
     }
+    return true;
+}
+
+// ============================================================================
+// std::optional Type Conversion
+// ============================================================================
+
+// Helper trait to detect std::optional (if not already defined)
+template<typename T>
+struct is_lua_std_optional : std::false_type {};
+
+template<typename T>
+struct is_lua_std_optional<std::optional<T>> : std::true_type {};
+
+// std::optional to Lua (nil if empty, otherwise convert value)
+template<typename T>
+void to_lua(lua_State* L, const std::optional<T>& opt) {
+    if (!opt.has_value()) {
+        lua_pushnil(L);
+        return;
+    }
+    to_lua(L, *opt);
+}
+
+// Lua to std::optional (nil → nullopt, otherwise convert value)
+template<typename T>
+bool from_lua(lua_State* L, int idx, std::optional<T>& out) {
+    if (lua_isnil(L, idx)) {
+        out = std::nullopt;
+        return true;
+    }
+
+    T value;
+    if (!from_lua(L, idx, value)) {
+        return false;
+    }
+    out = std::move(value);
     return true;
 }
 

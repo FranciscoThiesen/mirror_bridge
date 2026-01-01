@@ -38,6 +38,8 @@ All features have been tested and verified across all supported languages.
 | **Inheritance** | Yes | Yes | Yes |
 | **Exception Handling** | Yes | No | No |
 | **Auto-Discovery** | Yes | Yes | Yes |
+| **Async/Await (std::future)** | Yes | No | Yes |
+| **std::optional** | Yes | Yes | Yes |
 
 ## Test Coverage
 
@@ -156,9 +158,9 @@ Python fully supports smart pointer conversion. Lua and JavaScript have partial 
 | Limitation | Status |
 |------------|--------|
 | Raw pointers (T*) | Not supported |
-| `std::optional` | Not yet implemented |
+| `std::optional` | Supported |
 | `std::variant` | Not yet implemented |
-| `std::function` | Not supported |
+| `std::function` | Python only (callbacks) |
 | Template classes | Must explicitly instantiate |
 
 ### Lua & JavaScript

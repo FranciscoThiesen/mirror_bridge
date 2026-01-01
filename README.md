@@ -47,23 +47,40 @@ python3 test_greeter.py
 
 ## Features
 
-| Feature | Status |
-|---------|--------|
-| Python bindings | Stable |
-| Lua bindings | Stable |
-| JavaScript (Node.js) | Stable |
-| Auto-discovery | `mirror_bridge generate src/` |
-| Precompiled headers | 3-6x faster builds |
+### Language Support
 
-**Automatically Bound:**
-- Data members (properties)
-- Methods (any parameters)
-- Constructors
-- Containers (`vector`, `array`)
-- Nested objects
-- Smart pointers
-- Enums
-- Exceptions
+| Language | Status | Auto-Discovery |
+|----------|--------|----------------|
+| Python | Stable | `--lang python` |
+| Lua | Stable | `--lang lua` |
+| JavaScript (Node.js) | Stable | `--lang js` |
+
+### Feature Matrix
+
+| Feature | Python | Lua | JavaScript |
+|---------|:------:|:---:|:----------:|
+| **Data Members** | ✅ | ✅ | ✅ |
+| **Methods (any arity)** | ✅ | ✅ | ✅ |
+| **Constructors** | ✅ | ✅ | ✅ |
+| **Containers (vector/array)** | ✅ | ✅ | ✅ |
+| **Nested Objects** | ✅ | ✅ | ✅ |
+| **Enums** | ✅ | ✅ | ✅ |
+| **Inheritance** | ✅ | ✅ | ✅ |
+| **Method Overloading** | ✅ | ⚠️ | ⚠️ |
+| **Smart Pointers** | ✅ | ⚠️ | ⚠️ |
+| **Exception Handling** | ✅ | ❌ | ❌ |
+| **Cross-Module Types** | ✅ | ❌ | ❌ |
+| **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
+| **Async/Await** | ✅ | ❌ | ✅ |
+| **std::optional** | ✅ | ✅ | ✅ |
+
+✅ Full support  ⚠️ Partial support  ❌ Not supported
+
+### Additional Features
+
+- **Precompiled headers**: 3-6x faster builds
+- **Auto-discovery**: Zero binding code required
+- **Type stubs**: `.pyi` generation for Python IDE support
 
 ## Documentation
 

@@ -50,6 +50,9 @@
 #include <string_view>
 #include <vector>
 #include <array>
+#include <optional>
+#include <future>
+#include <chrono>
 #include <type_traits>
 #include <concepts>
 #include <memory>
@@ -129,6 +132,20 @@ concept SmartPointer = requires {
     typename std::remove_cvref_t<T>::element_type;
 } && (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<typename std::remove_cvref_t<T>::element_type>> ||
       std::is_same_v<std::remove_cvref_t<T>, std::shared_ptr<typename std::remove_cvref_t<T>::element_type>>);
+
+// Helper trait to detect std::optional
+template<typename T>
+struct is_std_optional : std::false_type {};
+
+template<typename T>
+struct is_std_optional<std::optional<T>> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_std_optional_v = is_std_optional<std::remove_cvref_t<T>>::value;
+
+// Concept to identify std::optional types
+template<typename T>
+concept Optional = is_std_optional_v<T>;
 
 // Helper trait to detect std::function
 template<typename T>
@@ -335,6 +352,226 @@ inline bool from_python(PyObject* obj, T& out) {
         out = std::make_shared<ElementType>(std::move(value));
     }
     return true;
+}
+
+// ============================================================================
+// std::optional Type Conversion
+// ============================================================================
+//
+// Enables automatic conversion between C++ std::optional<T> and Python values.
+// - std::nullopt / empty optional → Python None
+// - std::optional with value → Python value of type T
+// - Python None → std::nullopt
+// - Python value → std::optional containing converted value
+//
+// Example C++ code:
+//   struct Config {
+//       std::optional<int> timeout;
+//       std::optional<std::string> name;
+//   };
+//
+// Python usage:
+//   config.timeout = 30      # Sets optional to 30
+//   config.timeout = None    # Sets optional to nullopt
+//   if config.name is not None:
+//       print(config.name)
+
+// Convert std::optional to Python (None if empty, otherwise convert value)
+template<typename T>
+inline PyObject* to_python(const std::optional<T>& opt) {
+    if (!opt.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return to_python(*opt);
+}
+
+// Convert Python to std::optional (None → nullopt, otherwise convert value)
+template<typename T>
+inline bool from_python(PyObject* obj, std::optional<T>& out) {
+    if (obj == Py_None) {
+        out = std::nullopt;
+        return true;
+    }
+
+    T value;
+    if (!from_python(obj, value)) {
+        return false;
+    }
+    out = std::move(value);
+    return true;
+}
+
+// ============================================================================
+// Async/Await Support - std::future<T> to Python Awaitable
+// ============================================================================
+//
+// Enables C++ methods returning std::future<T> to be awaited in Python async code.
+//
+// Example C++ code:
+//   std::future<int> compute_async(int x) {
+//       return std::async(std::launch::async, [x]() {
+//           std::this_thread::sleep_for(std::chrono::seconds(1));
+//           return x * 2;
+//       });
+//   }
+//
+// Python usage:
+//   async def main():
+//       result = await obj.compute_async(21)
+//       print(result)  # 42
+//
+// The awaitable wrapper polls the future and yields control back to the event
+// loop if the result is not ready yet.
+
+// Helper trait to detect std::future
+template<typename T>
+struct is_std_future : std::false_type {};
+
+template<typename T>
+struct is_std_future<std::future<T>> : std::true_type {};
+
+template<typename T>
+struct is_std_future<std::shared_future<T>> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_std_future_v = is_std_future<std::remove_cvref_t<T>>::value;
+
+// Concept for future types
+template<typename T>
+concept Future = is_std_future_v<T>;
+
+// Python awaitable wrapper for std::future<T>
+template<typename T>
+struct PyFutureAwaitable {
+    PyObject_HEAD
+    std::shared_future<T>* future;  // Use shared_future for copyability
+    bool done;
+};
+
+// Dealloc for PyFutureAwaitable
+template<typename T>
+void future_awaitable_dealloc(PyObject* self) {
+    auto* awaitable = reinterpret_cast<PyFutureAwaitable<T>*>(self);
+    delete awaitable->future;
+    Py_TYPE(self)->tp_free(self);
+}
+
+// __await__ method - returns self (awaitable is its own iterator)
+template<typename T>
+PyObject* future_awaitable_await(PyObject* self) {
+    Py_INCREF(self);
+    return self;
+}
+
+// __iter__ method - returns self
+template<typename T>
+PyObject* future_awaitable_iter(PyObject* self) {
+    Py_INCREF(self);
+    return self;
+}
+
+// __next__ method - checks if future is ready
+template<typename T>
+PyObject* future_awaitable_next(PyObject* self) {
+    auto* awaitable = reinterpret_cast<PyFutureAwaitable<T>*>(self);
+
+    if (awaitable->done) {
+        PyErr_SetString(PyExc_StopIteration, "Future already completed");
+        return nullptr;
+    }
+
+    // Check if future is ready (with zero timeout)
+    auto status = awaitable->future->wait_for(std::chrono::seconds(0));
+
+    if (status == std::future_status::ready) {
+        // Future is ready - get result and raise StopIteration with value
+        awaitable->done = true;
+
+        try {
+            if constexpr (std::is_void_v<T>) {
+                awaitable->future->get();
+                // For void futures, StopIteration value is None
+                PyErr_SetNone(PyExc_StopIteration);
+            } else {
+                T result = awaitable->future->get();
+                PyObject* py_result = to_python(result);
+                if (!py_result) {
+                    return nullptr;
+                }
+                // Set StopIteration with the result value
+                PyErr_SetObject(PyExc_StopIteration, py_result);
+                Py_DECREF(py_result);
+            }
+        } catch (const std::exception& e) {
+            PyErr_SetString(PyExc_RuntimeError, e.what());
+        }
+        return nullptr;
+    }
+
+    // Future not ready - yield None to give control back to event loop
+    Py_RETURN_NONE;
+}
+
+// Create the PyTypeObject for PyFutureAwaitable<T>
+template<typename T>
+PyTypeObject* get_future_awaitable_type() {
+    static PyAsyncMethods async_methods = {
+        .am_await = future_awaitable_await<T>,
+    };
+
+    static PyTypeObject type_object = {
+        PyVarObject_HEAD_INIT(nullptr, 0)
+        .tp_name = "FutureAwaitable",
+        .tp_basicsize = sizeof(PyFutureAwaitable<T>),
+        .tp_itemsize = 0,
+        .tp_dealloc = future_awaitable_dealloc<T>,
+        .tp_as_async = &async_methods,
+        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_doc = "Awaitable wrapper for C++ std::future",
+        .tp_iter = future_awaitable_iter<T>,
+        .tp_iternext = future_awaitable_next<T>,
+    };
+
+    static bool initialized = false;
+    if (!initialized) {
+        if (PyType_Ready(&type_object) < 0) {
+            return nullptr;
+        }
+        initialized = true;
+    }
+
+    return &type_object;
+}
+
+// Convert std::future<T> to Python awaitable
+template<typename T>
+inline PyObject* to_python(std::future<T>&& fut) {
+    PyTypeObject* type = get_future_awaitable_type<T>();
+    if (!type) return nullptr;
+
+    auto* awaitable = reinterpret_cast<PyFutureAwaitable<T>*>(type->tp_alloc(type, 0));
+    if (!awaitable) return nullptr;
+
+    // Convert to shared_future for copyability
+    awaitable->future = new std::shared_future<T>(std::move(fut));
+    awaitable->done = false;
+
+    return reinterpret_cast<PyObject*>(awaitable);
+}
+
+// Convert std::shared_future<T> to Python awaitable
+template<typename T>
+inline PyObject* to_python(const std::shared_future<T>& fut) {
+    PyTypeObject* type = get_future_awaitable_type<T>();
+    if (!type) return nullptr;
+
+    auto* awaitable = reinterpret_cast<PyFutureAwaitable<T>*>(type->tp_alloc(type, 0));
+    if (!awaitable) return nullptr;
+
+    awaitable->future = new std::shared_future<T>(fut);
+    awaitable->done = false;
+
+    return reinterpret_cast<PyObject*>(awaitable);
 }
 
 // ============================================================================
