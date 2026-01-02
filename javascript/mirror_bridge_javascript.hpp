@@ -598,6 +598,41 @@ bool from_javascript(napi_env env, napi_value value, std::optional<T>& out) {
 }
 
 // ============================================================================
+// Custom Type Converter Extension Point
+// ============================================================================
+//
+// Users can add conversion support for custom types by defining
+// to_javascript/from_javascript overloads or specializing CustomJsConverter.
+//
+// Example:
+//   namespace mirror_bridge::javascript {
+//       napi_value to_javascript(napi_env env, const MyType& v) { ... }
+//       bool from_javascript(napi_env env, napi_value val, MyType& v) { ... }
+//   }
+
+template<typename T, typename Enable = void>
+struct CustomJsConverter {
+    static constexpr bool has_custom_conversion = false;
+};
+
+template<typename T>
+concept HasCustomJsConverter = requires {
+    { CustomJsConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
+} && CustomJsConverter<T>::has_custom_conversion;
+
+template<typename T>
+    requires HasCustomJsConverter<T>
+napi_value to_javascript(napi_env env, const T& value) {
+    return CustomJsConverter<T>::to_javascript(env, value);
+}
+
+template<typename T>
+    requires HasCustomJsConverter<T>
+bool from_javascript(napi_env env, napi_value val, T& value) {
+    return CustomJsConverter<T>::from_javascript(env, val, value);
+}
+
+// ============================================================================
 // Async/Await Support - std::future<T> to JavaScript Promise
 // ============================================================================
 //

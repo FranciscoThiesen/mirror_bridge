@@ -508,6 +508,42 @@ bool from_lua(lua_State* L, int idx, std::optional<T>& out) {
     return true;
 }
 
+// ============================================================================
+// Custom Type Converter Extension Point
+// ============================================================================
+//
+// Users can add conversion support for custom types by defining to_lua/from_lua
+// overloads in the mirror_bridge::lua namespace, or by specializing
+// CustomLuaConverter.
+//
+// Example:
+//   namespace mirror_bridge::lua {
+//       void to_lua(lua_State* L, const MyType& v) { ... }
+//       bool from_lua(lua_State* L, int idx, MyType& v) { ... }
+//   }
+
+template<typename T, typename Enable = void>
+struct CustomLuaConverter {
+    static constexpr bool has_custom_conversion = false;
+};
+
+template<typename T>
+concept HasCustomLuaConverter = requires {
+    { CustomLuaConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
+} && CustomLuaConverter<T>::has_custom_conversion;
+
+template<typename T>
+    requires HasCustomLuaConverter<T>
+void to_lua(lua_State* L, const T& value) {
+    CustomLuaConverter<T>::to_lua(L, value);
+}
+
+template<typename T>
+    requires HasCustomLuaConverter<T>
+bool from_lua(lua_State* L, int idx, T& value) {
+    return CustomLuaConverter<T>::from_lua(L, idx, value);
+}
+
 // Forward declaration for LuaWrapper (needed for from_lua with wrapped objects)
 template<typename T> struct LuaWrapper;
 

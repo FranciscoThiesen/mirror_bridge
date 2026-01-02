@@ -1244,6 +1244,73 @@ bool from_python(PyObject* obj, std::variant<Ts...>& v) {
 }
 
 // ============================================================================
+// Custom Type Converter Extension Point
+// ============================================================================
+//
+// Allows users to add conversion support for custom types (e.g., Eigen matrices,
+// custom math types, domain-specific objects) by specializing the converter
+// template or providing to_python/from_python overloads.
+//
+// METHOD 1: Function overloads (simpler)
+// ----------------------------------------
+// Simply define to_python/from_python functions for your type in the
+// mirror_bridge namespace BEFORE including the binding header:
+//
+//   namespace mirror_bridge {
+//       inline PyObject* to_python(const Eigen::Vector3d& v) {
+//           PyObject* list = PyList_New(3);
+//           PyList_SET_ITEM(list, 0, PyFloat_FromDouble(v.x()));
+//           PyList_SET_ITEM(list, 1, PyFloat_FromDouble(v.y()));
+//           PyList_SET_ITEM(list, 2, PyFloat_FromDouble(v.z()));
+//           return list;
+//       }
+//
+//       inline bool from_python(PyObject* obj, Eigen::Vector3d& v) {
+//           if (!PyList_Check(obj) || PyList_Size(obj) != 3) return false;
+//           v.x() = PyFloat_AsDouble(PyList_GetItem(obj, 0));
+//           v.y() = PyFloat_AsDouble(PyList_GetItem(obj, 1));
+//           v.z() = PyFloat_AsDouble(PyList_GetItem(obj, 2));
+//           return !PyErr_Occurred();
+//       }
+//   }
+//
+// METHOD 2: Template specialization (more control)
+// -------------------------------------------------
+// Specialize the CustomTypeConverter template for complete control:
+//
+//   template<>
+//   struct mirror_bridge::CustomTypeConverter<MyType> {
+//       static PyObject* to_python(const MyType& value) { ... }
+//       static bool from_python(PyObject* obj, MyType& value) { ... }
+//   };
+
+// Base template for custom type conversion - users can specialize this
+template<typename T, typename Enable = void>
+struct CustomTypeConverter {
+    // Default: no custom conversion available
+    static constexpr bool has_custom_conversion = false;
+};
+
+// Helper to detect if a custom converter exists
+template<typename T>
+concept HasCustomConverter = requires {
+    { CustomTypeConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
+} && CustomTypeConverter<T>::has_custom_conversion;
+
+// Convert using custom converter if available
+template<typename T>
+    requires HasCustomConverter<T>
+PyObject* to_python(const T& value) {
+    return CustomTypeConverter<T>::to_python(value);
+}
+
+template<typename T>
+    requires HasCustomConverter<T>
+bool from_python(PyObject* obj, T& value) {
+    return CustomTypeConverter<T>::from_python(obj, value);
+}
+
+// ============================================================================
 // Buffer Protocol Support - Zero-Copy NumPy Integration
 // ============================================================================
 //
