@@ -1,0 +1,68 @@
+# Pre-commit hooks for Mirror Bridge
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # C++ formatting with clang-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c++, c]
+        files: \.(cpp|hpp|h|c|cc|cxx)$
+
+  # General file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(benchmarks/|blog_draft/)
+      - id: end-of-file-fixer
+        exclude: ^(benchmarks/|blog_draft/)
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Python formatting (for test files and tools)
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        language_version: python3
+        files: \.(py)$
+        exclude: ^(benchmarks/|blog_draft/)
+
+  # Python linting
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        args: ['--max-line-length=120', '--ignore=E501,W503']
+        files: \.(py)$
+        exclude: ^(benchmarks/|blog_draft/)
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning']
+        files: \.(sh|bash)$
+
+  # Markdown formatting
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.41.0
+    hooks:
+      - id: markdownlint-fix
+        args: ['--disable', 'MD013', 'MD033', 'MD041', '--']
+        files: \.(md)$
+        exclude: ^(CHANGELOG.md|benchmarks/|blog_draft/)
+
+# CI configuration
+ci:
+  autofix_commit_msg: 'style: auto-fix from pre-commit hooks'
+  autoupdate_commit_msg: 'chore: update pre-commit hooks'
