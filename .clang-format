@@ -1,0 +1,77 @@
+# Mirror Bridge Code Style
+# Based on the project's existing conventions
+
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+IndentCaseLabels: false
+NamespaceIndentation: None
+AccessModifierOffset: -4
+
+# Braces
+BreakBeforeBraces: Attach
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Line width
+ColumnLimit: 120
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignOperands: true
+AlignTrailingComments: true
+
+# Templates
+SpaceAfterTemplateKeyword: false
+AlwaysBreakTemplateDeclarations: Yes
+
+# Pointers and References
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Includes
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+IncludeCategories:
+  # Standard library headers
+  - Regex: '<[a-z_]+>'
+    Priority: 3
+  # Third-party headers (Python, Lua, Node)
+  - Regex: '<(Python|lua|node_api).*>'
+    Priority: 2
+  # Project headers
+  - Regex: '".*"'
+    Priority: 1
+
+# Spaces
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+
+# Other
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: None
+BreakStringLiterals: true
+Cpp11BracedListStyle: true
+DerivePointerAlignment: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+ReflowComments: true
+SortUsingDeclarations: true
+
+# C++20/26 features
+Standard: Latest
