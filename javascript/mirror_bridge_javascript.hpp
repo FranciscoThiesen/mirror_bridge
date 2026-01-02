@@ -11,6 +11,10 @@
 #include <cstring>
 #include <optional>
 #include <future>
+#include <map>
+#include <unordered_map>
+#include <set>
+#include <unordered_set>
 
 namespace mirror_bridge {
 namespace javascript {
@@ -241,6 +245,194 @@ bool from_javascript(napi_env env, napi_value value, T& out) {
         out = std::make_unique<ElementType>(std::move(cpp_value));
     } else {
         out = std::make_shared<ElementType>(std::move(cpp_value));
+    }
+    return true;
+}
+
+// ============================================================================
+// std::map / std::unordered_map Support - Associative Containers
+// ============================================================================
+
+// Convert std::map to JavaScript Object
+template<typename K, typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::map<K, V, Args...>& map) {
+    napi_value obj;
+    napi_create_object(env, &obj);
+
+    for (const auto& [key, value] : map) {
+        napi_value js_key = to_javascript(env, key);
+        napi_value js_value = to_javascript(env, value);
+
+        // Convert key to string for object property
+        napi_value key_str;
+        napi_coerce_to_string(env, js_key, &key_str);
+
+        napi_set_property(env, obj, key_str, js_value);
+    }
+    return obj;
+}
+
+// Convert std::unordered_map to JavaScript Object
+template<typename K, typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::unordered_map<K, V, Args...>& map) {
+    napi_value obj;
+    napi_create_object(env, &obj);
+
+    for (const auto& [key, value] : map) {
+        napi_value js_key = to_javascript(env, key);
+        napi_value js_value = to_javascript(env, value);
+
+        napi_value key_str;
+        napi_coerce_to_string(env, js_key, &key_str);
+
+        napi_set_property(env, obj, key_str, js_value);
+    }
+    return obj;
+}
+
+// Convert JavaScript Object to std::map
+template<typename K, typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::map<K, V, Args...>& map) {
+    napi_valuetype type;
+    napi_typeof(env, value, &type);
+    if (type != napi_object) return false;
+
+    map.clear();
+
+    // Get property names
+    napi_value prop_names;
+    if (napi_get_property_names(env, value, &prop_names) != napi_ok) return false;
+
+    uint32_t length;
+    napi_get_array_length(env, prop_names, &length);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        napi_value js_key;
+        napi_get_element(env, prop_names, i, &js_key);
+
+        napi_value js_value;
+        napi_get_property(env, value, js_key, &js_value);
+
+        K cpp_key;
+        V cpp_value;
+
+        if (!from_javascript(env, js_key, cpp_key)) return false;
+        if (!from_javascript(env, js_value, cpp_value)) return false;
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+    }
+    return true;
+}
+
+// Convert JavaScript Object to std::unordered_map
+template<typename K, typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::unordered_map<K, V, Args...>& map) {
+    napi_valuetype type;
+    napi_typeof(env, value, &type);
+    if (type != napi_object) return false;
+
+    map.clear();
+
+    napi_value prop_names;
+    if (napi_get_property_names(env, value, &prop_names) != napi_ok) return false;
+
+    uint32_t length;
+    napi_get_array_length(env, prop_names, &length);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        napi_value js_key;
+        napi_get_element(env, prop_names, i, &js_key);
+
+        napi_value js_value;
+        napi_get_property(env, value, js_key, &js_value);
+
+        K cpp_key;
+        V cpp_value;
+
+        if (!from_javascript(env, js_key, cpp_key)) return false;
+        if (!from_javascript(env, js_value, cpp_value)) return false;
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+    }
+    return true;
+}
+
+// ============================================================================
+// std::set / std::unordered_set Support - Set Containers
+// ============================================================================
+
+// Convert std::set to JavaScript Array
+template<typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::set<V, Args...>& set) {
+    napi_value array;
+    napi_create_array_with_length(env, set.size(), &array);
+
+    size_t index = 0;
+    for (const auto& value : set) {
+        napi_value js_value = to_javascript(env, value);
+        napi_set_element(env, array, index++, js_value);
+    }
+    return array;
+}
+
+// Convert std::unordered_set to JavaScript Array
+template<typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::unordered_set<V, Args...>& set) {
+    napi_value array;
+    napi_create_array_with_length(env, set.size(), &array);
+
+    size_t index = 0;
+    for (const auto& value : set) {
+        napi_value js_value = to_javascript(env, value);
+        napi_set_element(env, array, index++, js_value);
+    }
+    return array;
+}
+
+// Convert JavaScript Array to std::set
+template<typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::set<V, Args...>& set) {
+    bool is_array;
+    napi_is_array(env, value, &is_array);
+    if (!is_array) return false;
+
+    set.clear();
+
+    uint32_t length;
+    napi_get_array_length(env, value, &length);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        napi_value js_value;
+        napi_get_element(env, value, i, &js_value);
+
+        V cpp_value;
+        if (!from_javascript(env, js_value, cpp_value)) return false;
+
+        set.insert(std::move(cpp_value));
+    }
+    return true;
+}
+
+// Convert JavaScript Array to std::unordered_set
+template<typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::unordered_set<V, Args...>& set) {
+    bool is_array;
+    napi_is_array(env, value, &is_array);
+    if (!is_array) return false;
+
+    set.clear();
+
+    uint32_t length;
+    napi_get_array_length(env, value, &length);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        napi_value js_value;
+        napi_get_element(env, value, i, &js_value);
+
+        V cpp_value;
+        if (!from_javascript(env, js_value, cpp_value)) return false;
+
+        set.insert(std::move(cpp_value));
     }
     return true;
 }

@@ -14,6 +14,10 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <map>
+#include <unordered_map>
+#include <set>
+#include <unordered_set>
 
 namespace mirror_bridge {
 namespace lua {
@@ -191,6 +195,153 @@ bool from_lua(lua_State* L, int idx, T& out) {
         out = std::make_unique<ElementType>(std::move(value));
     } else {
         out = std::make_shared<ElementType>(std::move(value));
+    }
+    return true;
+}
+
+// ============================================================================
+// std::map / std::unordered_map Support - Associative Containers
+// ============================================================================
+
+// Convert std::map to Lua table
+template<typename K, typename V, typename... Args>
+void to_lua(lua_State* L, const std::map<K, V, Args...>& map) {
+    lua_createtable(L, 0, map.size());
+
+    for (const auto& [key, value] : map) {
+        to_lua(L, key);
+        to_lua(L, value);
+        lua_settable(L, -3);
+    }
+}
+
+// Convert std::unordered_map to Lua table
+template<typename K, typename V, typename... Args>
+void to_lua(lua_State* L, const std::unordered_map<K, V, Args...>& map) {
+    lua_createtable(L, 0, map.size());
+
+    for (const auto& [key, value] : map) {
+        to_lua(L, key);
+        to_lua(L, value);
+        lua_settable(L, -3);
+    }
+}
+
+// Convert Lua table to std::map
+template<typename K, typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::map<K, V, Args...>& map) {
+    if (!lua_istable(L, idx)) return false;
+
+    map.clear();
+
+    lua_pushnil(L);  // First key
+    while (lua_next(L, idx) != 0) {
+        K cpp_key;
+        V cpp_value;
+
+        // Value is at -1, key is at -2
+        if (!from_lua(L, -2, cpp_key) || !from_lua(L, -1, cpp_value)) {
+            lua_pop(L, 2);  // Pop key and value
+            return false;
+        }
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+        lua_pop(L, 1);  // Pop value, keep key for next iteration
+    }
+    return true;
+}
+
+// Convert Lua table to std::unordered_map
+template<typename K, typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::unordered_map<K, V, Args...>& map) {
+    if (!lua_istable(L, idx)) return false;
+
+    map.clear();
+
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        K cpp_key;
+        V cpp_value;
+
+        if (!from_lua(L, -2, cpp_key) || !from_lua(L, -1, cpp_value)) {
+            lua_pop(L, 2);
+            return false;
+        }
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+        lua_pop(L, 1);
+    }
+    return true;
+}
+
+// ============================================================================
+// std::set / std::unordered_set Support - Set Containers
+// ============================================================================
+
+// Convert std::set to Lua table (as array with sequential indices)
+template<typename V, typename... Args>
+void to_lua(lua_State* L, const std::set<V, Args...>& set) {
+    lua_createtable(L, set.size(), 0);
+
+    int index = 1;
+    for (const auto& value : set) {
+        to_lua(L, value);
+        lua_rawseti(L, -2, index++);
+    }
+}
+
+// Convert std::unordered_set to Lua table
+template<typename V, typename... Args>
+void to_lua(lua_State* L, const std::unordered_set<V, Args...>& set) {
+    lua_createtable(L, set.size(), 0);
+
+    int index = 1;
+    for (const auto& value : set) {
+        to_lua(L, value);
+        lua_rawseti(L, -2, index++);
+    }
+}
+
+// Convert Lua table (array) to std::set
+template<typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::set<V, Args...>& set) {
+    if (!lua_istable(L, idx)) return false;
+
+    set.clear();
+
+    int table_size = lua_rawlen(L, idx);
+    for (int i = 1; i <= table_size; ++i) {
+        lua_rawgeti(L, idx, i);
+
+        V cpp_value;
+        if (!from_lua(L, -1, cpp_value)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        set.insert(std::move(cpp_value));
+        lua_pop(L, 1);
+    }
+    return true;
+}
+
+// Convert Lua table to std::unordered_set
+template<typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::unordered_set<V, Args...>& set) {
+    if (!lua_istable(L, idx)) return false;
+
+    set.clear();
+
+    int table_size = lua_rawlen(L, idx);
+    for (int i = 1; i <= table_size; ++i) {
+        lua_rawgeti(L, idx, i);
+
+        V cpp_value;
+        if (!from_lua(L, -1, cpp_value)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        set.insert(std::move(cpp_value));
+        lua_pop(L, 1);
     }
     return true;
 }

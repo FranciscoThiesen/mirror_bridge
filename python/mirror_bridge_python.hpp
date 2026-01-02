@@ -50,6 +50,12 @@
 #include <string_view>
 #include <vector>
 #include <array>
+#include <map>
+#include <unordered_map>
+#include <set>
+#include <unordered_set>
+#include <tuple>
+#include <variant>
 #include <optional>
 #include <future>
 #include <chrono>
@@ -57,7 +63,6 @@
 #include <concepts>
 #include <memory>
 #include <functional>
-#include <unordered_map>
 #include <cstdint>  // For uint8_t, int32_t, etc.
 #include <cstdio>   // For snprintf in simple repr functions
 
@@ -812,6 +817,262 @@ bool from_python(PyObject* obj, std::array<T, N>& arr) {
         }
     }
     return true;
+}
+
+// ============================================================================
+// std::map / std::unordered_map Support - Associative Containers
+// ============================================================================
+//
+// Enables automatic conversion between C++ maps and Python dicts.
+//
+// Example C++ code:
+//   struct Config {
+//       std::map<std::string, int> settings;
+//       std::unordered_map<int, std::string> labels;
+//   };
+//
+// Python usage:
+//   config.settings = {"timeout": 30, "retries": 3}
+//   config.labels = {1: "error", 2: "warning", 3: "info"}
+//   print(config.settings["timeout"])  # 30
+
+// Helper traits to detect map types
+template<typename T>
+struct is_std_map : std::false_type {};
+
+template<typename K, typename V, typename... Args>
+struct is_std_map<std::map<K, V, Args...>> : std::true_type {};
+
+template<typename T>
+struct is_std_unordered_map : std::false_type {};
+
+template<typename K, typename V, typename... Args>
+struct is_std_unordered_map<std::unordered_map<K, V, Args...>> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_map_like_v =
+    is_std_map<std::remove_cvref_t<T>>::value ||
+    is_std_unordered_map<std::remove_cvref_t<T>>::value;
+
+// Concept for map-like types
+template<typename T>
+concept MapLike = is_map_like_v<T>;
+
+// Convert std::map to Python dict
+template<typename K, typename V, typename... Args>
+PyObject* to_python(const std::map<K, V, Args...>& map) {
+    PyObject* dict = PyDict_New();
+    if (!dict) return nullptr;
+
+    for (const auto& [key, value] : map) {
+        PyObject* py_key = to_python(key);
+        if (!py_key) {
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        PyObject* py_value = to_python(value);
+        if (!py_value) {
+            Py_DECREF(py_key);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        if (PyDict_SetItem(dict, py_key, py_value) < 0) {
+            Py_DECREF(py_key);
+            Py_DECREF(py_value);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        Py_DECREF(py_key);
+        Py_DECREF(py_value);
+    }
+    return dict;
+}
+
+// Convert std::unordered_map to Python dict
+template<typename K, typename V, typename... Args>
+PyObject* to_python(const std::unordered_map<K, V, Args...>& map) {
+    PyObject* dict = PyDict_New();
+    if (!dict) return nullptr;
+
+    for (const auto& [key, value] : map) {
+        PyObject* py_key = to_python(key);
+        if (!py_key) {
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        PyObject* py_value = to_python(value);
+        if (!py_value) {
+            Py_DECREF(py_key);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        if (PyDict_SetItem(dict, py_key, py_value) < 0) {
+            Py_DECREF(py_key);
+            Py_DECREF(py_value);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        Py_DECREF(py_key);
+        Py_DECREF(py_value);
+    }
+    return dict;
+}
+
+// Convert Python dict to std::map
+template<typename K, typename V, typename... Args>
+bool from_python(PyObject* obj, std::map<K, V, Args...>& map) {
+    if (!PyDict_Check(obj)) return false;
+
+    map.clear();
+
+    PyObject *py_key, *py_value;
+    Py_ssize_t pos = 0;
+
+    while (PyDict_Next(obj, &pos, &py_key, &py_value)) {
+        K cpp_key;
+        V cpp_value;
+
+        if (!from_python(py_key, cpp_key)) return false;
+        if (!from_python(py_value, cpp_value)) return false;
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+    }
+    return true;
+}
+
+// Convert Python dict to std::unordered_map
+template<typename K, typename V, typename... Args>
+bool from_python(PyObject* obj, std::unordered_map<K, V, Args...>& map) {
+    if (!PyDict_Check(obj)) return false;
+
+    map.clear();
+
+    PyObject *py_key, *py_value;
+    Py_ssize_t pos = 0;
+
+    while (PyDict_Next(obj, &pos, &py_key, &py_value)) {
+        K cpp_key;
+        V cpp_value;
+
+        if (!from_python(py_key, cpp_key)) return false;
+        if (!from_python(py_value, cpp_value)) return false;
+
+        map[std::move(cpp_key)] = std::move(cpp_value);
+    }
+    return true;
+}
+
+// ============================================================================
+// std::set / std::unordered_set Support - Set Containers
+// ============================================================================
+
+// Helper traits to detect set types
+template<typename T>
+struct is_std_set : std::false_type {};
+
+template<typename V, typename... Args>
+struct is_std_set<std::set<V, Args...>> : std::true_type {};
+
+template<typename T>
+struct is_std_unordered_set : std::false_type {};
+
+template<typename V, typename... Args>
+struct is_std_unordered_set<std::unordered_set<V, Args...>> : std::true_type {};
+
+// Convert std::set to Python set
+template<typename V, typename... Args>
+PyObject* to_python(const std::set<V, Args...>& set) {
+    PyObject* py_set = PySet_New(nullptr);
+    if (!py_set) return nullptr;
+
+    for (const auto& value : set) {
+        PyObject* py_value = to_python(value);
+        if (!py_value) {
+            Py_DECREF(py_set);
+            return nullptr;
+        }
+        if (PySet_Add(py_set, py_value) < 0) {
+            Py_DECREF(py_value);
+            Py_DECREF(py_set);
+            return nullptr;
+        }
+        Py_DECREF(py_value);
+    }
+    return py_set;
+}
+
+// Convert std::unordered_set to Python set
+template<typename V, typename... Args>
+PyObject* to_python(const std::unordered_set<V, Args...>& set) {
+    PyObject* py_set = PySet_New(nullptr);
+    if (!py_set) return nullptr;
+
+    for (const auto& value : set) {
+        PyObject* py_value = to_python(value);
+        if (!py_value) {
+            Py_DECREF(py_set);
+            return nullptr;
+        }
+        if (PySet_Add(py_set, py_value) < 0) {
+            Py_DECREF(py_value);
+            Py_DECREF(py_set);
+            return nullptr;
+        }
+        Py_DECREF(py_value);
+    }
+    return py_set;
+}
+
+// Convert Python set to std::set
+template<typename V, typename... Args>
+bool from_python(PyObject* obj, std::set<V, Args...>& set) {
+    if (!PySet_Check(obj) && !PyFrozenSet_Check(obj)) return false;
+
+    set.clear();
+
+    PyObject* iterator = PyObject_GetIter(obj);
+    if (!iterator) return false;
+
+    PyObject* item;
+    while ((item = PyIter_Next(iterator))) {
+        V cpp_value;
+        if (!from_python(item, cpp_value)) {
+            Py_DECREF(item);
+            Py_DECREF(iterator);
+            return false;
+        }
+        set.insert(std::move(cpp_value));
+        Py_DECREF(item);
+    }
+    Py_DECREF(iterator);
+
+    return !PyErr_Occurred();
+}
+
+// Convert Python set to std::unordered_set
+template<typename V, typename... Args>
+bool from_python(PyObject* obj, std::unordered_set<V, Args...>& set) {
+    if (!PySet_Check(obj) && !PyFrozenSet_Check(obj)) return false;
+
+    set.clear();
+
+    PyObject* iterator = PyObject_GetIter(obj);
+    if (!iterator) return false;
+
+    PyObject* item;
+    while ((item = PyIter_Next(iterator))) {
+        V cpp_value;
+        if (!from_python(item, cpp_value)) {
+            Py_DECREF(item);
+            Py_DECREF(iterator);
+            return false;
+        }
+        set.insert(std::move(cpp_value));
+        Py_DECREF(item);
+    }
+    Py_DECREF(iterator);
+
+    return !PyErr_Occurred();
 }
 
 // ============================================================================
