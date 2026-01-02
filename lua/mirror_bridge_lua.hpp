@@ -20,6 +20,7 @@ extern "C" {
 #include <unordered_set>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace mirror_bridge {
 namespace lua {
@@ -435,6 +436,39 @@ bool from_lua(lua_State* L, int idx, std::pair<T1, T2>& p) {
     lua_pop(L, 1);
 
     return true;
+}
+
+// ============================================================================
+// std::variant Support - Type-Safe Unions
+// ============================================================================
+
+// Convert std::variant to Lua (converts the active alternative)
+template<typename... Ts>
+void to_lua(lua_State* L, const std::variant<Ts...>& v) {
+    std::visit([L](const auto& val) {
+        to_lua(L, val);
+    }, v);
+}
+
+// Helper to try converting Lua value to each variant alternative
+template<typename Variant, typename T, typename... Rest>
+bool try_lua_variant_alternatives(lua_State* L, int idx, Variant& v) {
+    T value;
+    if (from_lua(L, idx, value)) {
+        v = std::move(value);
+        return true;
+    }
+
+    if constexpr (sizeof...(Rest) > 0) {
+        return try_lua_variant_alternatives<Variant, Rest...>(L, idx, v);
+    }
+    return false;
+}
+
+// Convert Lua to std::variant (tries each alternative in order)
+template<typename... Ts>
+bool from_lua(lua_State* L, int idx, std::variant<Ts...>& v) {
+    return try_lua_variant_alternatives<std::variant<Ts...>, Ts...>(L, idx, v);
 }
 
 // ============================================================================

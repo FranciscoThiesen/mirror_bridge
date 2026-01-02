@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace mirror_bridge {
 namespace javascript {
@@ -527,6 +528,39 @@ bool from_javascript(napi_env env, napi_value value, std::pair<T1, T2>& p) {
     napi_get_element(env, value, 1, &second);
 
     return from_javascript(env, first, p.first) && from_javascript(env, second, p.second);
+}
+
+// ============================================================================
+// std::variant Support - Type-Safe Unions
+// ============================================================================
+
+// Convert std::variant to JavaScript (converts the active alternative)
+template<typename... Ts>
+napi_value to_javascript(napi_env env, const std::variant<Ts...>& v) {
+    return std::visit([env](const auto& val) -> napi_value {
+        return to_javascript(env, val);
+    }, v);
+}
+
+// Helper to try converting JavaScript value to each variant alternative
+template<typename Variant, typename T, typename... Rest>
+bool try_js_variant_alternatives(napi_env env, napi_value value, Variant& v) {
+    T cpp_value;
+    if (from_javascript(env, value, cpp_value)) {
+        v = std::move(cpp_value);
+        return true;
+    }
+
+    if constexpr (sizeof...(Rest) > 0) {
+        return try_js_variant_alternatives<Variant, Rest...>(env, value, v);
+    }
+    return false;
+}
+
+// Convert JavaScript to std::variant (tries each alternative in order)
+template<typename... Ts>
+bool from_javascript(napi_env env, napi_value value, std::variant<Ts...>& v) {
+    return try_js_variant_alternatives<std::variant<Ts...>, Ts...>(env, value, v);
 }
 
 // ============================================================================

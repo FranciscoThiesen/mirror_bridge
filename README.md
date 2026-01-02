@@ -90,6 +90,7 @@ python3 test_greeter.py
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
+| **Variants (std::variant)** | ✅ | ✅ | ✅ |
 | **Nested Objects** | ✅ | ✅ | ✅ |
 | **Enums** | ✅ | ✅ | ✅ |
 | **Inheritance** | ✅ | ✅ | ✅ |

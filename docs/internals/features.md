@@ -159,7 +159,10 @@ Python fully supports smart pointer conversion. Lua and JavaScript have partial 
 |------------|--------|
 | Raw pointers (T*) | Not supported |
 | `std::optional` | Supported |
-| `std::variant` | Not yet implemented |
+| `std::variant` | Supported |
+| `std::tuple`/`std::pair` | Supported |
+| `std::map`/`std::unordered_map` | Supported |
+| `std::set`/`std::unordered_set` | Supported |
 | `std::function` | Python only (callbacks) |
 | Template classes | Must explicitly instantiate |
 

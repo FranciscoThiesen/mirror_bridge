@@ -1193,6 +1193,57 @@ bool from_python(PyObject* obj, std::pair<T1, T2>& p) {
 }
 
 // ============================================================================
+// std::variant Support - Type-Safe Unions
+// ============================================================================
+//
+// Enables automatic conversion between C++ std::variant and Python values.
+// The variant is converted to/from the currently active alternative.
+//
+// Example C++ code:
+//   using Value = std::variant<int, std::string, double>;
+//   Value get_value() { return "hello"; }
+//   void set_value(Value v) { ... }
+//
+// Python usage:
+//   val = obj.get_value()  # Returns "hello" (string)
+//   obj.set_value(42)      # Sets int alternative
+//   obj.set_value(3.14)    # Sets double alternative
+
+// Convert std::variant to Python (converts the active alternative)
+template<typename... Ts>
+PyObject* to_python(const std::variant<Ts...>& v) {
+    return std::visit([](const auto& val) -> PyObject* {
+        return to_python(val);
+    }, v);
+}
+
+// Helper to try converting Python value to each variant alternative
+template<typename Variant, typename T, typename... Rest>
+bool try_variant_alternatives(PyObject* obj, Variant& v) {
+    T value;
+    if (from_python(obj, value)) {
+        v = std::move(value);
+        return true;
+    }
+    PyErr_Clear();  // Clear error from failed conversion
+
+    if constexpr (sizeof...(Rest) > 0) {
+        return try_variant_alternatives<Variant, Rest...>(obj, v);
+    }
+    return false;
+}
+
+// Convert Python to std::variant (tries each alternative in order)
+template<typename... Ts>
+bool from_python(PyObject* obj, std::variant<Ts...>& v) {
+    if (try_variant_alternatives<std::variant<Ts...>, Ts...>(obj, v)) {
+        return true;
+    }
+    PyErr_SetString(PyExc_TypeError, "Value does not match any variant alternative");
+    return false;
+}
+
+// ============================================================================
 // Buffer Protocol Support - Zero-Copy NumPy Integration
 // ============================================================================
 //
