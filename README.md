@@ -1,8 +1,11 @@
 # Mirror Bridge
 
-**C++ to Multi-Language Bindings via C++26 Reflection — Zero Boilerplate**
+**Write C++ once, bind everywhere — automatically.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespaces-Open-blue?logo=github)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
+
+Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
 > **Experimental**: Requires C++26 reflection (P2996) via [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996).
 
@@ -26,6 +29,27 @@ import calc
 c = calc.Calculator()
 c.add(10)
 print(c.value)  # 10.0
+```
+
+## Try It Now
+
+No installation required — run in your browser or with Docker:
+
+**GitHub Codespaces** (browser-based, ~2 min):
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
+
+**Docker** (local, one command):
+
+```bash
+docker run -it --rm -v $(pwd):/workspace ghcr.io/franciscothiesen/mirror_bridge:latest
+```
+
+Then inside the container:
+```bash
+cd examples/01-hello-world
+../../tools/mirror_bridge generate src/ --module greeter --lang python
+python3 test_greeter.py
 ```
 
 ## Quick Start
