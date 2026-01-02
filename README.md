@@ -89,6 +89,7 @@ python3 test_greeter.py
 | **Containers (vector/array)** | ✅ | ✅ | ✅ |
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
+| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
 | **Nested Objects** | ✅ | ✅ | ✅ |
 | **Enums** | ✅ | ✅ | ✅ |
 | **Inheritance** | ✅ | ✅ | ✅ |

@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <set>
 #include <unordered_set>
+#include <tuple>
+#include <utility>
 
 namespace mirror_bridge {
 namespace javascript {
@@ -435,6 +437,96 @@ bool from_javascript(napi_env env, napi_value value, std::unordered_set<V, Args.
         set.insert(std::move(cpp_value));
     }
     return true;
+}
+
+// ============================================================================
+// std::tuple Support - Heterogeneous Fixed-Size Containers
+// ============================================================================
+
+// Helper to convert tuple elements to JavaScript array
+template<typename Tuple, std::size_t... Is>
+napi_value tuple_to_javascript_impl(napi_env env, const Tuple& t, std::index_sequence<Is...>) {
+    napi_value array;
+    napi_create_array_with_length(env, sizeof...(Is), &array);
+
+    (void)std::initializer_list<int>{(
+        napi_set_element(env, array, Is, to_javascript(env, std::get<Is>(t))),
+        0
+    )...};
+
+    return array;
+}
+
+// Convert std::tuple to JavaScript array
+template<typename... Ts>
+napi_value to_javascript(napi_env env, const std::tuple<Ts...>& t) {
+    return tuple_to_javascript_impl(env, t, std::index_sequence_for<Ts...>{});
+}
+
+// Helper to convert JavaScript array to tuple
+template<typename Tuple, std::size_t... Is>
+bool tuple_from_javascript_impl(napi_env env, napi_value value, Tuple& t, std::index_sequence<Is...>) {
+    bool is_array;
+    napi_is_array(env, value, &is_array);
+    if (!is_array) return false;
+
+    uint32_t length;
+    napi_get_array_length(env, value, &length);
+    if (length != sizeof...(Is)) return false;
+
+    bool success = true;
+    (void)std::initializer_list<int>{(
+        [&]() {
+            if (!success) return;
+            napi_value elem;
+            napi_get_element(env, value, Is, &elem);
+            if (!from_javascript(env, elem, std::get<Is>(t))) {
+                success = false;
+            }
+        }(), 0
+    )...};
+
+    return success;
+}
+
+// Convert JavaScript array to std::tuple
+template<typename... Ts>
+bool from_javascript(napi_env env, napi_value value, std::tuple<Ts...>& t) {
+    return tuple_from_javascript_impl(env, value, t, std::index_sequence_for<Ts...>{});
+}
+
+// ============================================================================
+// std::pair Support - Two-Element Tuple
+// ============================================================================
+
+// Convert std::pair to JavaScript array
+template<typename T1, typename T2>
+napi_value to_javascript(napi_env env, const std::pair<T1, T2>& p) {
+    napi_value array;
+    napi_create_array_with_length(env, 2, &array);
+
+    napi_set_element(env, array, 0, to_javascript(env, p.first));
+    napi_set_element(env, array, 1, to_javascript(env, p.second));
+
+    return array;
+}
+
+// Convert JavaScript array to std::pair
+template<typename T1, typename T2>
+bool from_javascript(napi_env env, napi_value value, std::pair<T1, T2>& p) {
+    bool is_array;
+    napi_is_array(env, value, &is_array);
+    if (!is_array) return false;
+
+    uint32_t length;
+    napi_get_array_length(env, value, &length);
+    if (length != 2) return false;
+
+    napi_value first, second;
+    napi_get_element(env, value, 0, &first);
+    napi_get_element(env, value, 1, &second);
+
+    return from_javascript(env, first, p.first) && from_javascript(env, second, p.second);
 }
 
 // ============================================================================

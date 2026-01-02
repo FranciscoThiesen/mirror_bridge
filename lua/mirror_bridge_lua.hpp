@@ -18,6 +18,8 @@ extern "C" {
 #include <unordered_map>
 #include <set>
 #include <unordered_set>
+#include <tuple>
+#include <utility>
 
 namespace mirror_bridge {
 namespace lua {
@@ -343,6 +345,95 @@ bool from_lua(lua_State* L, int idx, std::unordered_set<V, Args...>& set) {
         set.insert(std::move(cpp_value));
         lua_pop(L, 1);
     }
+    return true;
+}
+
+// ============================================================================
+// std::tuple Support - Heterogeneous Fixed-Size Containers
+// ============================================================================
+
+// Helper to convert tuple elements to Lua table
+template<typename Tuple, std::size_t... Is>
+void tuple_to_lua_impl(lua_State* L, const Tuple& t, std::index_sequence<Is...>) {
+    lua_createtable(L, sizeof...(Is), 0);
+    (void)std::initializer_list<int>{(
+        to_lua(L, std::get<Is>(t)),
+        lua_rawseti(L, -2, Is + 1),  // Lua arrays are 1-indexed
+        0
+    )...};
+}
+
+// Convert std::tuple to Lua table
+template<typename... Ts>
+void to_lua(lua_State* L, const std::tuple<Ts...>& t) {
+    tuple_to_lua_impl(L, t, std::index_sequence_for<Ts...>{});
+}
+
+// Helper to convert Lua table to tuple
+template<typename Tuple, std::size_t... Is>
+bool tuple_from_lua_impl(lua_State* L, int idx, Tuple& t, std::index_sequence<Is...>) {
+    if (!lua_istable(L, idx)) return false;
+
+    int table_size = lua_rawlen(L, idx);
+    if (static_cast<std::size_t>(table_size) != sizeof...(Is)) return false;
+
+    bool success = true;
+    (void)std::initializer_list<int>{(
+        [&]() {
+            if (!success) return;
+            lua_rawgeti(L, idx, Is + 1);  // Lua arrays are 1-indexed
+            if (!from_lua(L, -1, std::get<Is>(t))) {
+                success = false;
+            }
+            lua_pop(L, 1);
+        }(), 0
+    )...};
+
+    return success;
+}
+
+// Convert Lua table to std::tuple
+template<typename... Ts>
+bool from_lua(lua_State* L, int idx, std::tuple<Ts...>& t) {
+    return tuple_from_lua_impl(L, idx, t, std::index_sequence_for<Ts...>{});
+}
+
+// ============================================================================
+// std::pair Support - Two-Element Tuple
+// ============================================================================
+
+// Convert std::pair to Lua table
+template<typename T1, typename T2>
+void to_lua(lua_State* L, const std::pair<T1, T2>& p) {
+    lua_createtable(L, 2, 0);
+    to_lua(L, p.first);
+    lua_rawseti(L, -2, 1);
+    to_lua(L, p.second);
+    lua_rawseti(L, -2, 2);
+}
+
+// Convert Lua table to std::pair
+template<typename T1, typename T2>
+bool from_lua(lua_State* L, int idx, std::pair<T1, T2>& p) {
+    if (!lua_istable(L, idx)) return false;
+
+    int table_size = lua_rawlen(L, idx);
+    if (table_size != 2) return false;
+
+    lua_rawgeti(L, idx, 1);
+    if (!from_lua(L, -1, p.first)) {
+        lua_pop(L, 1);
+        return false;
+    }
+    lua_pop(L, 1);
+
+    lua_rawgeti(L, idx, 2);
+    if (!from_lua(L, -1, p.second)) {
+        lua_pop(L, 1);
+        return false;
+    }
+    lua_pop(L, 1);
+
     return true;
 }
 

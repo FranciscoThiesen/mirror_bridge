@@ -1076,6 +1076,123 @@ bool from_python(PyObject* obj, std::unordered_set<V, Args...>& set) {
 }
 
 // ============================================================================
+// std::tuple Support - Heterogeneous Fixed-Size Containers
+// ============================================================================
+//
+// Enables automatic conversion between C++ std::tuple and Python tuple.
+//
+// Example C++ code:
+//   std::tuple<int, std::string, double> get_info() {
+//       return {42, "hello", 3.14};
+//   }
+//
+// Python usage:
+//   num, text, val = obj.get_info()
+//   print(f"{text}: {num}, {val}")  # hello: 42, 3.14
+
+// Helper to convert tuple elements to Python
+template<typename Tuple, std::size_t... Is>
+PyObject* tuple_to_python_impl(const Tuple& t, std::index_sequence<Is...>) {
+    PyObject* py_tuple = PyTuple_New(sizeof...(Is));
+    if (!py_tuple) return nullptr;
+
+    bool success = true;
+    (void)std::initializer_list<int>{(
+        [&]() {
+            if (!success) return;
+            PyObject* elem = to_python(std::get<Is>(t));
+            if (!elem) {
+                success = false;
+                return;
+            }
+            PyTuple_SET_ITEM(py_tuple, Is, elem);
+        }(), 0
+    )...};
+
+    if (!success) {
+        Py_DECREF(py_tuple);
+        return nullptr;
+    }
+    return py_tuple;
+}
+
+// Convert std::tuple to Python tuple
+template<typename... Ts>
+PyObject* to_python(const std::tuple<Ts...>& t) {
+    return tuple_to_python_impl(t, std::index_sequence_for<Ts...>{});
+}
+
+// Helper to convert Python tuple elements to C++ tuple
+template<typename Tuple, std::size_t... Is>
+bool tuple_from_python_impl(PyObject* obj, Tuple& t, std::index_sequence<Is...>) {
+    if (!PyTuple_Check(obj) && !PyList_Check(obj)) return false;
+
+    Py_ssize_t size = PyTuple_Check(obj) ? PyTuple_Size(obj) : PyList_Size(obj);
+    if (static_cast<std::size_t>(size) != sizeof...(Is)) return false;
+
+    bool success = true;
+    (void)std::initializer_list<int>{(
+        [&]() {
+            if (!success) return;
+            PyObject* elem = PyTuple_Check(obj) ?
+                PyTuple_GetItem(obj, Is) : PyList_GetItem(obj, Is);
+            if (!from_python(elem, std::get<Is>(t))) {
+                success = false;
+            }
+        }(), 0
+    )...};
+
+    return success;
+}
+
+// Convert Python tuple/list to std::tuple
+template<typename... Ts>
+bool from_python(PyObject* obj, std::tuple<Ts...>& t) {
+    return tuple_from_python_impl(obj, t, std::index_sequence_for<Ts...>{});
+}
+
+// ============================================================================
+// std::pair Support - Two-Element Tuple
+// ============================================================================
+
+// Convert std::pair to Python tuple
+template<typename T1, typename T2>
+PyObject* to_python(const std::pair<T1, T2>& p) {
+    PyObject* py_tuple = PyTuple_New(2);
+    if (!py_tuple) return nullptr;
+
+    PyObject* first = to_python(p.first);
+    if (!first) {
+        Py_DECREF(py_tuple);
+        return nullptr;
+    }
+    PyTuple_SET_ITEM(py_tuple, 0, first);
+
+    PyObject* second = to_python(p.second);
+    if (!second) {
+        Py_DECREF(py_tuple);
+        return nullptr;
+    }
+    PyTuple_SET_ITEM(py_tuple, 1, second);
+
+    return py_tuple;
+}
+
+// Convert Python tuple/list to std::pair
+template<typename T1, typename T2>
+bool from_python(PyObject* obj, std::pair<T1, T2>& p) {
+    if (!PyTuple_Check(obj) && !PyList_Check(obj)) return false;
+
+    Py_ssize_t size = PyTuple_Check(obj) ? PyTuple_Size(obj) : PyList_Size(obj);
+    if (size != 2) return false;
+
+    PyObject* first = PyTuple_Check(obj) ? PyTuple_GetItem(obj, 0) : PyList_GetItem(obj, 0);
+    PyObject* second = PyTuple_Check(obj) ? PyTuple_GetItem(obj, 1) : PyList_GetItem(obj, 1);
+
+    return from_python(first, p.first) && from_python(second, p.second);
+}
+
+// ============================================================================
 // Buffer Protocol Support - Zero-Copy NumPy Integration
 // ============================================================================
 //
