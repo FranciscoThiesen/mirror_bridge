@@ -35,6 +35,8 @@ print(c.value)  # 10.0
 
 No installation required — run in your browser or with Docker:
 
+**[Interactive Playground](docs/playground.md)** - Godbolt examples showing C++26 reflection in action
+
 **GitHub Codespaces** (browser-based, ~2 min):
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/FranciscoThiesen/mirror_bridge)

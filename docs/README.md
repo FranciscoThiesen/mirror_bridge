@@ -4,6 +4,9 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 
 ## Quick Navigation
 
+### Try It Now
+- **[Interactive Playground](playground.md)** - Godbolt examples, Codespaces, Docker
+
 ### Getting Started
 - **[Quick Start](getting-started/quickstart.md)** - Get running in 5 minutes
 - **[Installation](getting-started/installation.md)** - Detailed setup instructions
