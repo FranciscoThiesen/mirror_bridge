@@ -121,9 +121,9 @@ Tests are automatically discovered and run by `run_all_tests.sh`.
 
 This library showcases modern C++26:
 
-**Reflection:**
+**Reflection (P2996R10 syntax):**
 ```cpp
-constexpr auto members = std::meta::members_of(^^T);
+auto members = std::meta::members_of(^^T, std::meta::access_context::current());
 constexpr auto name = std::meta::identifier_of(member);
 auto& value = obj.[:member:];  // Splicer
 ```

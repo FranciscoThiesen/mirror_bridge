@@ -68,7 +68,7 @@ Matches classes that can be reflected and bound.
 ```cpp
 template<typename T>
 concept Bindable = std::is_class_v<std::remove_cvref_t<T>> && requires {
-    { std::meta::nonstatic_data_members_of(^^T) };
+    { std::meta::nonstatic_data_members_of(^^std::remove_cvref_t<T>, std::meta::access_context::current()) };
 };
 ```
 

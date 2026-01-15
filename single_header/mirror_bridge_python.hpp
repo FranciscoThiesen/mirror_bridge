@@ -506,7 +506,7 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 // A showcase of modern C++26 techniques for zero-overhead metaprogramming:
 //
 // • C++26 Reflection (P2996): Compile-time class introspection
-//   - std::meta::members_of(^^T) - discover class structure
+//   - std::meta::members_of(^^T, access_context) - discover class structure
 //   - [:expr:] splicers - inject reflected code back into source
 //   - consteval - guaranteed compile-time evaluation
 //

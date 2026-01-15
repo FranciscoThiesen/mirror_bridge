@@ -62,8 +62,8 @@ This document describes the internal architecture of Mirror Bridge, intended for
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         C++26 Reflection (P2996)                        │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  std::meta::members_of(^^T)        - Discover class members      │   │
-│  │  std::meta::nonstatic_data_members_of(^^T) - Data members only   │   │
+│  │  std::meta::members_of(^^T, access_context) - Discover members   │   │
+│  │  std::meta::nonstatic_data_members_of(^^T, access_context)       │   │
 │  │  std::meta::identifier_of(member)  - Get member name             │   │
 │  │  std::meta::type_of(member)        - Get member type             │   │
 │  │  std::meta::parameters_of(func)    - Get function parameters     │   │
@@ -204,9 +204,9 @@ Node.js N-API implementation (~646 lines):
    clang++ -std=c++2c -freflection ... → my_mod.so
 
 5. At compile-time (inside bind_class<T>):
-   ├── std::meta::nonstatic_data_members_of(^^T)
+   ├── std::meta::nonstatic_data_members_of(^^T, access_context)
    │   → Discover data members
-   ├── std::meta::members_of(^^T)
+   ├── std::meta::members_of(^^T, access_context)
    │   → Discover methods
    ├── Generate PyGetSetDef[] for properties
    ├── Generate PyMethodDef[] for methods

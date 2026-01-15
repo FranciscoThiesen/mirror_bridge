@@ -48,9 +48,9 @@ mirror_bridge/
 The foundation of mirror_bridge uses C++26 reflection APIs:
 
 ```cpp
-// Discover class members at compile-time
-std::meta::nonstatic_data_members_of(^^T)  // Data members
-std::meta::members_of(^^T)                  // All members
+// Discover class members at compile-time (P2996R10 syntax)
+std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())  // Data members
+std::meta::members_of(^^T, std::meta::access_context::current())                  // All members
 std::meta::identifier_of(member)            // Member name
 std::meta::type_of(member)                  // Member type
 std::meta::parameters_of(func)              // Function parameters
