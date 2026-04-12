@@ -3037,6 +3037,33 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
 // Or a global policy flag:
 //   bind_class<Outer, NestedAsObject>(m, "Outer");
 //
+// ============================================================================
+// Interned Member Name Cache
+// ============================================================================
+//
+// Pre-interns Python string objects for member names at first use, avoiding
+// repeated string allocation in tight loops. PyUnicode_InternFromString
+// creates an immortal string that's reused by identity comparison in dict
+// lookups, making both PyDict_SetItem and PyDict_GetItem faster.
+
+template<typename T>
+struct InternedMemberNames {
+    static constexpr std::size_t count = get_nested_member_count<T>();
+
+    // Lazily-initialized cache of interned Python string objects
+    static std::array<PyObject*, count>& get() {
+        static std::array<PyObject*, count> names{};
+        static bool initialized = false;
+        if (!initialized) {
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ((names[Is] = PyUnicode_InternFromString(get_nested_member_name<T, Is>())), ...);
+            }(std::make_index_sequence<count>{});
+            initialized = true;
+        }
+        return names;
+    }
+};
+
 // Helper to auto-generate non-template conversion overloads using reflection
 // This ensures proper overload resolution for types used in smart pointers
 template<typename T>
@@ -3048,6 +3075,7 @@ struct ConversionOverloadGenerator {
         if (!dict) return nullptr;
 
         constexpr std::size_t member_count = get_nested_member_count<T>();
+        auto& interned_names = InternedMemberNames<T>::get();
         bool success = true;
 
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
@@ -3055,12 +3083,12 @@ struct ConversionOverloadGenerator {
                 if (!success) return;
 
                 constexpr auto member = get_nested_member<T, Is>();
-                constexpr auto name = get_nested_member_name<T, Is>();
 
                 const auto& value = obj.[:member:];
                 PyObject* py_value = to_python(value);
 
-                if (!py_value || PyDict_SetItemString(dict, name, py_value) < 0) {
+                // Use interned string key for O(1) identity-based dict lookup
+                if (!py_value || PyDict_SetItem(dict, interned_names[Is], py_value) < 0) {
                     success = false;
                     Py_XDECREF(py_value);
                 } else {
@@ -3082,6 +3110,7 @@ struct ConversionOverloadGenerator {
         if (!PyDict_Check(obj)) return false;
 
         constexpr std::size_t member_count = get_nested_member_count<T>();
+        auto& interned_names = InternedMemberNames<T>::get();
         bool success = true;
 
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
@@ -3089,10 +3118,10 @@ struct ConversionOverloadGenerator {
                 if (!success) return;
 
                 constexpr auto member = get_nested_member<T, Is>();
-                constexpr auto name = get_nested_member_name<T, Is>();
                 using MemberType = NestedMemberType<T, Is>;
 
-                PyObject* py_value = PyDict_GetItemString(obj, name);
+                // Use interned string key for faster dict lookup
+                PyObject* py_value = PyDict_GetItem(obj, interned_names[Is]);
                 if (!py_value) {
                     success = false;
                     return;
