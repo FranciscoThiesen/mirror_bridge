@@ -1020,60 +1020,58 @@ T* call_lua_constructor_impl(lua_State* L, int arg_offset, std::index_sequence<I
 
 template<typename T>
 int lua_constructor(lua_State* L) {
-    // Get number of arguments (subtract 1 for the class table itself when called via __call)
     int nargs = lua_gettop(L) - 1;
 
     T* cpp_object = nullptr;
 
-    // Default constructor case
-    if (nargs == 0) {
-        if constexpr (std::is_default_constructible_v<T>) {
-            cpp_object = new T();
-        } else {
-            luaL_error(L, "This class requires constructor arguments");
-            return 0;
-        }
-    } else {
-        // Try to find matching constructor by parameter count
-        constexpr std::size_t ctor_count = get_lua_constructor_count<T>();
-
-        if constexpr (ctor_count > 0) {
-            bool found = false;
-            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-                ([&] {
-                    if (found) return;
-
-                    constexpr std::size_t param_count = get_lua_constructor_param_count<T, Is>();
-                    if (nargs == static_cast<int>(param_count)) {
-                        T* obj = call_lua_constructor_impl<T, Is>(L, 1,
-                            std::make_index_sequence<param_count>{});
-
-                        if (obj) {
-                            cpp_object = obj;
-                            found = true;
-                        }
-                    }
-                }(), ...);
-            }(std::make_index_sequence<ctor_count>{});
-
-            if (!found && !cpp_object) {
-                // Try default constructor as fallback if available
-                if constexpr (std::is_default_constructible_v<T>) {
-                    cpp_object = new T();
-                } else {
-                    luaL_error(L, "No matching constructor found for %d arguments", nargs);
-                    return 0;
-                }
-            }
-        } else {
-            // No parameterized constructors, try default
+    try {
+        if (nargs == 0) {
             if constexpr (std::is_default_constructible_v<T>) {
                 cpp_object = new T();
             } else {
-                luaL_error(L, "This class has no constructors accepting arguments");
-                return 0;
+                return luaL_error(L, "This class requires constructor arguments");
+            }
+        } else {
+            constexpr std::size_t ctor_count = get_lua_constructor_count<T>();
+
+            if constexpr (ctor_count > 0) {
+                bool found = false;
+                [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                    ([&] {
+                        if (found) return;
+
+                        constexpr std::size_t param_count = get_lua_constructor_param_count<T, Is>();
+                        if (nargs == static_cast<int>(param_count)) {
+                            T* obj = call_lua_constructor_impl<T, Is>(L, 1,
+                                std::make_index_sequence<param_count>{});
+
+                            if (obj) {
+                                cpp_object = obj;
+                                found = true;
+                            }
+                        }
+                    }(), ...);
+                }(std::make_index_sequence<ctor_count>{});
+
+                if (!found && !cpp_object) {
+                    if constexpr (std::is_default_constructible_v<T>) {
+                        cpp_object = new T();
+                    } else {
+                        return luaL_error(L, "No matching constructor found for %d arguments", nargs);
+                    }
+                }
+            } else {
+                if constexpr (std::is_default_constructible_v<T>) {
+                    cpp_object = new T();
+                } else {
+                    return luaL_error(L, "This class has no constructors accepting arguments");
+                }
             }
         }
+    } catch (const std::exception& e) {
+        return luaL_error(L, "C++ constructor exception: %s", e.what());
+    } catch (...) {
+        return luaL_error(L, "Unknown C++ exception in constructor");
     }
 
     // Allocate userdata for wrapper

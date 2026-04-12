@@ -638,7 +638,9 @@ napi_value to_javascript(napi_env env, const std::expected<T, E>& exp) {
         }
     }
 
-    // Error case: throw a JavaScript Error
+    // Error case: throw a JavaScript Error, then return nullptr.
+    // After napi_throw_error, the env is in a pending-exception state —
+    // no further NAPI calls should be made before returning.
     if constexpr (std::is_same_v<std::remove_cvref_t<E>, std::string>) {
         napi_throw_error(env, nullptr, exp.error().c_str());
     } else if constexpr (std::is_arithmetic_v<std::remove_cvref_t<E>>) {
@@ -647,10 +649,7 @@ napi_value to_javascript(napi_env env, const std::expected<T, E>& exp) {
     } else {
         napi_throw_error(env, nullptr, "expected contained an error");
     }
-
-    napi_value result;
-    napi_get_undefined(env, &result);
-    return result;
+    return nullptr;
 }
 
 // JavaScript to std::expected (always produces success value)
@@ -911,8 +910,16 @@ napi_value js_getter(napi_env env, napi_callback_info info) {
     constexpr auto member = get_data_member<T, Index>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    auto& value = (*wrapper->cpp_object).[:member:];
-    return to_javascript(env, value);
+    try {
+        auto& value = (*wrapper->cpp_object).[:member:];
+        return to_javascript(env, value);
+    } catch (const std::exception& e) {
+        napi_throw_error(env, nullptr, e.what());
+        return nullptr;
+    } catch (...) {
+        napi_throw_error(env, nullptr, "Unknown C++ exception in property getter");
+        return nullptr;
+    }
 }
 
 // ============================================================================
@@ -943,7 +950,15 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
-    (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+    try {
+        (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+    } catch (const std::exception& e) {
+        napi_throw_error(env, nullptr, e.what());
+        return nullptr;
+    } catch (...) {
+        napi_throw_error(env, nullptr, "Unknown C++ exception in property setter");
+        return nullptr;
+    }
 
     napi_value undefined;
     napi_get_undefined(env, &undefined);
@@ -1202,31 +1217,35 @@ napi_value js_constructor(napi_env env, napi_callback_info info) {
 
     T* cpp_object = nullptr;
 
-    if (argc == 0) {
-        // Default constructor
-        cpp_object = new T();
-    } else {
-        // Try parameterized constructors
-        constexpr std::size_t ctor_count = get_js_constructor_count<T>();
-
-        if constexpr (ctor_count > 0) {
-            // Try each constructor
-            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-                ([&] {
-                    if (cpp_object != nullptr) return; // Already found a match
-                    bool matched = false;
-                    T* result = try_js_constructor<T, Is>(env, args, argc, matched);
-                    if (result != nullptr) {
-                        cpp_object = result;
-                    }
-                }(), ...);
-            }(std::make_index_sequence<ctor_count>{});
-        }
-
-        // If no constructor matched, fall back to default
-        if (cpp_object == nullptr) {
+    try {
+        if (argc == 0) {
             cpp_object = new T();
+        } else {
+            constexpr std::size_t ctor_count = get_js_constructor_count<T>();
+
+            if constexpr (ctor_count > 0) {
+                [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                    ([&] {
+                        if (cpp_object != nullptr) return;
+                        bool matched = false;
+                        T* result = try_js_constructor<T, Is>(env, args, argc, matched);
+                        if (result != nullptr) {
+                            cpp_object = result;
+                        }
+                    }(), ...);
+                }(std::make_index_sequence<ctor_count>{});
+            }
+
+            if (cpp_object == nullptr) {
+                cpp_object = new T();
+            }
         }
+    } catch (const std::exception& e) {
+        napi_throw_error(env, nullptr, e.what());
+        return nullptr;
+    } catch (...) {
+        napi_throw_error(env, nullptr, "Unknown C++ exception in constructor");
+        return nullptr;
     }
 
     JsWrapper<T>* wrapper = new JsWrapper<T>();

@@ -1774,16 +1774,21 @@ inline bool from_python(PyObject* obj, T& out) {
     return true;
 }
 
-// Convert Python lists to C++ containers
-// Supports any container with push_back (vector, list, deque) or insert (set, etc.)
+// Convert Python sequences to C++ containers.
+// Accepts list, tuple, array.array, and any type supporting the sequence protocol.
+// This ensures round-trip compatibility: to_python returns array.array for numeric
+// vectors, and from_python accepts it back.
 template<Container T>
 bool from_python(PyObject* obj, T& container) {
-    if (!PyList_Check(obj)) return false;
+    if (!PySequence_Check(obj) || PyUnicode_Check(obj) || PyBytes_Check(obj)) {
+        return false;
+    }
 
-    Py_ssize_t size = PyList_Size(obj);
+    Py_ssize_t size = PySequence_Size(obj);
+    if (size < 0) return false;
+
     using ValueType = typename std::remove_cvref_t<T>::value_type;
 
-    // Clear the container if it supports clear(), otherwise skip
     if constexpr (requires { container.clear(); }) {
         container.clear();
     }
@@ -1793,22 +1798,20 @@ bool from_python(PyObject* obj, T& container) {
 
     Py_ssize_t i = 0;
     for (; i < size && i < static_cast<Py_ssize_t>(container.size()); ++i) {
-        PyObject* py_item = PyList_GetItem(obj, i);  // Borrowed reference
+        PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
+        if (!py_item) return false;
         ValueType cpp_item;
         if (!from_python(py_item, cpp_item)) {
+            Py_DECREF(py_item);
             return false;
         }
+        Py_DECREF(py_item);
 
-        // For indexed containers (array), use operator[]
         if constexpr (requires { container[i]; }) {
             container[i] = std::move(cpp_item);
-        }
-        // For sequential containers, use push_back
-        else if constexpr (requires { container.push_back(cpp_item); }) {
+        } else if constexpr (requires { container.push_back(cpp_item); }) {
             container.push_back(std::move(cpp_item));
-        }
-        // For associative containers, use insert
-        else if constexpr (requires { container.insert(cpp_item); }) {
+        } else if constexpr (requires { container.insert(cpp_item); }) {
             container.insert(std::move(cpp_item));
         } else {
             static_assert(requires { container.push_back(cpp_item); },
@@ -1816,14 +1819,16 @@ bool from_python(PyObject* obj, T& container) {
         }
     }
 
-    // For push_back containers, add remaining elements if list is larger
     if constexpr (requires { container.push_back(ValueType{}); }) {
         for (; i < size; ++i) {
-            PyObject* py_item = PyList_GetItem(obj, i);
+            PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
+            if (!py_item) return false;
             ValueType cpp_item;
             if (!from_python(py_item, cpp_item)) {
+                Py_DECREF(py_item);
                 return false;
             }
+            Py_DECREF(py_item);
             container.push_back(std::move(cpp_item));
         }
     }
