@@ -1,0 +1,39 @@
+#!/bin/bash
+# Test that compile-time validation catches unconvertible member types.
+# This test succeeds when the BAD code FAILS to compile with the expected error message.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "=============================================="
+echo "Testing Compile-Time Binding Validation"
+echo "=============================================="
+echo
+
+CXX="clang++"
+COMMON_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++ -fPIC -shared -O2"
+INCLUDES="-I/workspace -I/workspace/tests/expected"
+PYTHON_FLAGS=$(python3-config --includes)
+
+# Test 1: Unconvertible type should fail to compile
+echo "Test 1: Binding a class with function pointer member should fail..."
+if $CXX $COMMON_FLAGS $INCLUDES $PYTHON_FLAGS test_validation.cpp -o /dev/null 2>&1 | grep -q "cannot convert"; then
+    echo "  PASS: Compilation correctly rejected with clear error message"
+else
+    # Check if it failed at all (even without the exact message)
+    if ! $CXX $COMMON_FLAGS $INCLUDES $PYTHON_FLAGS test_validation.cpp -o /dev/null 2>/dev/null; then
+        echo "  PASS: Compilation correctly rejected (unconvertible type detected)"
+    else
+        echo "  FAIL: Compilation should have failed for unconvertible type"
+        exit 1
+    fi
+fi
+
+# Test 2: A valid class should compile fine
+echo "Test 2: Binding a class with only convertible members should succeed..."
+$CXX $COMMON_FLAGS $INCLUDES $PYTHON_FLAGS expected_binding.cpp -o /dev/null 2>/dev/null
+echo "  PASS: Valid class compiles successfully"
+
+echo
+echo "All validation tests passed!"

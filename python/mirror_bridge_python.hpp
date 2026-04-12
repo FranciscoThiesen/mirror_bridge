@@ -3274,6 +3274,13 @@ from_python(PyObject* obj, T& out) {
 // Optionally accepts a file content hash for implementation change detection
 template<Bindable T>
 PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_hash = nullptr) {
+    // Compile-time validation: ensure all member types are convertible
+    static_assert(core::validate_bindable_members<T>(),
+        "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
+        "Mark unconvertible members with [[=exclude{}]] or add a custom type converter. "
+        "Supported: arithmetic, std::string, containers, smart pointers, "
+        "std::optional, std::expected, enums, and nested bindable classes.");
+
     // Generate type signature for hash-based change detection
     auto signature = generate_type_signature<T>(file_hash);
 

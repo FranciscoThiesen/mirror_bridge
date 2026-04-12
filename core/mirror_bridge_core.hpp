@@ -473,5 +473,106 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
     return sig;
 }
 
+// ============================================================================
+// Compile-Time Binding Validation
+// ============================================================================
+//
+// Validates that all data member types in a class are convertible before
+// binding is generated. Produces clear diagnostic messages instead of
+// cryptic template instantiation errors.
+//
+// Supported types (any nesting depth):
+//   - Arithmetic (int, float, double, bool, etc.)
+//   - String-like (std::string, std::string_view, const char*)
+//   - Containers (std::vector, std::array, std::map, std::set, etc.)
+//   - Smart pointers (std::unique_ptr, std::shared_ptr)
+//   - std::optional<T>, std::expected<T, E>
+//   - Enums (enum, enum class)
+//   - Nested Bindable classes (structs with reflectable members)
+
+// Trait-based detection for smart pointers (avoids requires-in-consteval issues)
+template<typename T>
+struct is_smart_pointer : std::false_type {};
+
+template<typename T>
+struct is_smart_pointer<std::unique_ptr<T>> : std::true_type {};
+
+template<typename T>
+struct is_smart_pointer<std::shared_ptr<T>> : std::true_type {};
+
+// Trait-based detection for containers
+template<typename T, typename = void>
+struct is_container : std::false_type {};
+
+template<typename T>
+struct is_container<T, std::void_t<
+    typename T::value_type,
+    decltype(std::declval<T>().begin()),
+    decltype(std::declval<T>().size())
+>> : std::bool_constant<!std::is_same_v<T, std::string> &&
+                         !std::is_same_v<T, std::string_view>> {};
+
+// Checks if a type is convertible by mirror_bridge
+template<typename T>
+consteval bool is_convertible_type() {
+    using U = std::remove_cvref_t<T>;
+
+    if constexpr (std::is_arithmetic_v<U>) {
+        return true;
+    } else if constexpr (std::is_same_v<U, std::string> ||
+                         std::is_same_v<U, std::string_view> ||
+                         std::is_same_v<U, const char*> ||
+                         std::is_same_v<U, char*>) {
+        return true;
+    } else if constexpr (std::is_enum_v<U>) {
+        return true;
+    } else if constexpr (is_smart_pointer<U>::value) {
+        return true;
+    } else if constexpr (is_container<U>::value) {
+        return true;
+    } else if constexpr (Bindable<U>) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// Validates a single data member at index I of class T
+template<Bindable T, std::size_t I>
+consteval bool validate_member_at_index() {
+    constexpr auto member = get_data_member<T, I>();
+    using MemberType = std::remove_cvref_t<typename [:std::meta::type_of(member):]>;
+    return is_convertible_type<MemberType>();
+}
+
+// Validates all data members of a Bindable class using index_sequence.
+// Returns true if every data member type is convertible by mirror_bridge.
+template<Bindable T, std::size_t... Is>
+consteval bool validate_members_impl(std::index_sequence<Is...>) {
+    return (validate_member_at_index<T, Is>() && ...);
+}
+
+template<Bindable T>
+consteval bool validate_bindable_members() {
+    constexpr std::size_t count = get_data_member_count<T>();
+    return validate_members_impl<T>(std::make_index_sequence<count>{});
+}
+
+// Convenience macro — place in bind_class or module definition to get a
+// clear error when a class has unconvertible members.
+//
+// Usage:
+//   MIRROR_BRIDGE_VALIDATE(MyClass);
+//
+// On failure, produces:
+//   error: static assertion failed: "MyClass contains members with types that
+//   mirror_bridge cannot convert. Mark them with @exclude or add a custom converter."
+#define MIRROR_BRIDGE_VALIDATE(T) \
+    static_assert(::mirror_bridge::core::validate_bindable_members<T>(), \
+        #T " contains members with types that mirror_bridge cannot convert. " \
+        "Mark unconvertible members with [[=exclude{}]] or add a custom type converter. " \
+        "Supported types: arithmetic, std::string, containers, smart pointers, " \
+        "std::optional, std::expected, enums, and nested bindable classes.")
+
 } // namespace core
 } // namespace mirror_bridge

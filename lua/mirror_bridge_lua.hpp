@@ -1164,6 +1164,10 @@ from_lua(lua_State* L, int idx, T& out) {
 
 template<Bindable T>
 void bind_class(lua_State* L, const char* name) {
+    static_assert(core::validate_bindable_members<T>(),
+        "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
+        "Mark unconvertible members with [[=exclude{}]] or add a custom type converter.");
+
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();
 
     // Store metatable name in type registry (for to_lua wrapper creation)
