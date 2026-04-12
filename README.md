@@ -98,7 +98,7 @@ python3 test_greeter.py
 | **Inheritance** | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ |
 | **Smart Pointers** | ✅ | ⚠️ | ⚠️ |
-| **Exception Handling** | ✅ | ❌ | ❌ |
+| **Exception Handling** | ✅ | ✅ | ✅ |
 | **Cross-Module Types** | ✅ | ❌ | ❌ |
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
 | **Async/Await** | ✅ | ❌ | ✅ |

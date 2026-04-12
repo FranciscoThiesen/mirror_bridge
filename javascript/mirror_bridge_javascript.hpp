@@ -975,14 +975,22 @@ napi_value call_method_impl(napi_env env, JsWrapper<T>* wrapper, napi_value* arg
         return nullptr;
     }
 
-    if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
-        napi_value undefined;
-        napi_get_undefined(env, &undefined);
-        return undefined;
-    } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
-        return to_javascript(env, result);
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+            napi_value undefined;
+            napi_get_undefined(env, &undefined);
+            return undefined;
+        } else {
+            ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+            return to_javascript(env, result);
+        }
+    } catch (const std::exception& e) {
+        napi_throw_error(env, nullptr, e.what());
+        return nullptr;
+    } catch (...) {
+        napi_throw_error(env, nullptr, "Unknown C++ exception");
+        return nullptr;
     }
 }
 
@@ -1036,14 +1044,22 @@ napi_value call_static_method_impl(napi_env env, napi_value* args, std::index_se
         return nullptr;
     }
 
-    if constexpr (std::is_void_v<ReturnType>) {
-        [:member_func:](std::move(std::get<Is>(cpp_args))...);
-        napi_value undefined;
-        napi_get_undefined(env, &undefined);
-        return undefined;
-    } else {
-        ReturnType result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
-        return to_javascript(env, result);
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            [:member_func:](std::move(std::get<Is>(cpp_args))...);
+            napi_value undefined;
+            napi_get_undefined(env, &undefined);
+            return undefined;
+        } else {
+            ReturnType result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
+            return to_javascript(env, result);
+        }
+    } catch (const std::exception& e) {
+        napi_throw_error(env, nullptr, e.what());
+        return nullptr;
+    } catch (...) {
+        napi_throw_error(env, nullptr, "Unknown C++ exception");
+        return nullptr;
     }
 }
 

@@ -1,0 +1,13 @@
+{
+  "name": "exception-test",
+  "version": "1.0.0",
+  "description": "Test C++ exception handling in JavaScript bindings",
+  "main": "test_exceptions.js",
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "test": "node test_exceptions.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  }
+}

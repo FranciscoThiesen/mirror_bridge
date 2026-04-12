@@ -815,13 +815,26 @@ int call_method_impl(lua_State* L, LuaWrapper<T>* wrapper, std::index_sequence<I
         return luaL_error(L, "Argument type conversion failed");
     }
 
-    if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
-        return 0;
-    } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
-        to_lua(L, result);
-        return 1;
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+            return 0;
+        } else {
+            // Handle std::expected return types with idiomatic Lua multi-return
+            using CleanReturn = std::remove_cvref_t<ReturnType>;
+            if constexpr (is_lua_std_expected<CleanReturn>::value) {
+                auto result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+                return to_lua_expected(L, result);
+            } else {
+                ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+                to_lua(L, result);
+                return 1;
+            }
+        }
+    } catch (const std::exception& e) {
+        return luaL_error(L, "C++ exception: %s", e.what());
+    } catch (...) {
+        return luaL_error(L, "Unknown C++ exception");
     }
 }
 
@@ -868,13 +881,25 @@ int call_static_method_impl(lua_State* L, std::index_sequence<Is...>) {
         return luaL_error(L, "Argument type conversion failed");
     }
 
-    if constexpr (std::is_void_v<ReturnType>) {
-        [:member_func:](std::move(std::get<Is>(cpp_args))...);
-        return 0;
-    } else {
-        ReturnType result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
-        to_lua(L, result);
-        return 1;
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            [:member_func:](std::move(std::get<Is>(cpp_args))...);
+            return 0;
+        } else {
+            using CleanReturn = std::remove_cvref_t<ReturnType>;
+            if constexpr (is_lua_std_expected<CleanReturn>::value) {
+                auto result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
+                return to_lua_expected(L, result);
+            } else {
+                ReturnType result = [:member_func:](std::move(std::get<Is>(cpp_args))...);
+                to_lua(L, result);
+                return 1;
+            }
+        }
+    } catch (const std::exception& e) {
+        return luaL_error(L, "C++ exception: %s", e.what());
+    } catch (...) {
+        return luaL_error(L, "Unknown C++ exception");
     }
 }
 

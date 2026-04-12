@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Exception handling for Lua (`luaL_error`) and JavaScript (`napi_throw_error`) bindings: C++ exceptions are now caught and propagated as native errors in all three languages
 - Compile-time binding validation: `bind_class<T>` now produces clear `static_assert` messages when a class contains unconvertible member types, instead of cryptic template errors
 - `MIRROR_BRIDGE_VALIDATE(T)` macro for explicit validation outside `bind_class`
 - `std::expected<T, E>` type conversion for Python (ValueError on error), Lua (idiomatic value, err multi-return), and JavaScript (throw Error on error)
