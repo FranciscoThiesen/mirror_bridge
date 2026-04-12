@@ -57,6 +57,7 @@
 #include <tuple>
 #include <variant>
 #include <optional>
+#include <expected>
 #include <future>
 #include <chrono>
 #include <type_traits>
@@ -151,6 +152,20 @@ inline constexpr bool is_std_optional_v = is_std_optional<std::remove_cvref_t<T>
 // Concept to identify std::optional types
 template<typename T>
 concept Optional = is_std_optional_v<T>;
+
+// Helper trait to detect std::expected
+template<typename T>
+struct is_std_expected : std::false_type {};
+
+template<typename T, typename E>
+struct is_std_expected<std::expected<T, E>> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_std_expected_v = is_std_expected<std::remove_cvref_t<T>>::value;
+
+// Concept to identify std::expected types
+template<typename T>
+concept Expected = is_std_expected_v<T>;
 
 // Helper trait to detect std::function
 template<typename T>
@@ -404,6 +419,82 @@ inline bool from_python(PyObject* obj, std::optional<T>& out) {
     }
     out = std::move(value);
     return true;
+}
+
+// ============================================================================
+// std::expected Type Conversion
+// ============================================================================
+//
+// Enables automatic conversion between C++ std::expected<T, E> and Python values.
+// On success (has_value): returns the converted T value to Python.
+// On error (!has_value): raises a Python ValueError with the error converted to string.
+//
+// This lets C++ APIs use std::expected for error handling while Python callers
+// get natural exception-based error propagation.
+//
+// Example C++ code:
+//   std::expected<double, std::string> safe_divide(double a, double b) {
+//       if (b == 0.0) return std::unexpected("division by zero");
+//       return a / b;
+//   }
+//
+// Python usage:
+//   result = obj.safe_divide(10.0, 2.0)   # Returns 5.0
+//   result = obj.safe_divide(10.0, 0.0)   # Raises ValueError: "division by zero"
+
+// Convert std::expected to Python (value on success, raise exception on error)
+template<typename T, typename E>
+inline PyObject* to_python(const std::expected<T, E>& exp) {
+    if (exp.has_value()) {
+        if constexpr (std::is_void_v<T>) {
+            Py_RETURN_NONE;
+        } else {
+            return to_python(*exp);
+        }
+    }
+
+    // Convert the error to a string message for the Python exception
+    if constexpr (std::is_same_v<std::remove_cvref_t<E>, std::string>) {
+        PyErr_SetString(PyExc_ValueError, exp.error().c_str());
+    } else if constexpr (std::is_arithmetic_v<std::remove_cvref_t<E>>) {
+        std::string msg = "expected failed with error code: " + std::to_string(exp.error());
+        PyErr_SetString(PyExc_ValueError, msg.c_str());
+    } else if constexpr (Bindable<std::remove_cvref_t<E>>) {
+        // For bindable error types, convert to dict repr
+        PyObject* err_obj = to_python(exp.error());
+        if (err_obj) {
+            PyObject* repr = PyObject_Repr(err_obj);
+            if (repr) {
+                PyErr_SetObject(PyExc_ValueError, repr);
+                Py_DECREF(repr);
+            } else {
+                PyErr_SetString(PyExc_ValueError, "expected contained an error");
+            }
+            Py_DECREF(err_obj);
+        } else {
+            PyErr_SetString(PyExc_ValueError, "expected contained an error");
+        }
+    } else {
+        PyErr_SetString(PyExc_ValueError, "expected contained an error");
+    }
+    return nullptr;
+}
+
+// Convert Python to std::expected (always produces a success value; errors are
+// represented as Python exceptions, not as expected error states)
+template<typename T, typename E>
+inline bool from_python(PyObject* obj, std::expected<T, E>& out) {
+    if constexpr (std::is_void_v<T>) {
+        out = std::expected<T, E>{};
+        return true;
+    } else {
+        T value;
+        if (!from_python(obj, value)) {
+            return false;
+        }
+        out = std::move(value);
+        return true;
+    }
 }
 
 // ============================================================================

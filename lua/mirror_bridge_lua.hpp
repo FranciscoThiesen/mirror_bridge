@@ -14,6 +14,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <expected>
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -506,6 +507,79 @@ bool from_lua(lua_State* L, int idx, std::optional<T>& out) {
     }
     out = std::move(value);
     return true;
+}
+
+// ============================================================================
+// std::expected Type Conversion
+// ============================================================================
+//
+// Enables conversion between C++ std::expected<T, E> and Lua values using
+// idiomatic Lua multi-return: value, err.
+//
+// On success: pushes the value and nil (two return values)
+// On error: pushes nil and the error message (two return values)
+//
+// This follows the standard Lua error convention used by io.open, pcall, etc.
+//
+// Example C++ code:
+//   std::expected<double, std::string> safe_sqrt(double x) {
+//       if (x < 0) return std::unexpected("cannot take sqrt of negative number");
+//       return std::sqrt(x);
+//   }
+//
+// Lua usage:
+//   local result, err = obj:safe_sqrt(4.0)
+//   if err then print("Error: " .. err)
+//   else print("Result: " .. result) end
+
+// Helper trait to detect std::expected
+template<typename T>
+struct is_lua_std_expected : std::false_type {};
+
+template<typename T, typename E>
+struct is_lua_std_expected<std::expected<T, E>> : std::true_type {};
+
+// std::expected to Lua — pushes two values (value, nil) or (nil, error)
+// Returns the number of values pushed (always 2)
+template<typename T, typename E>
+int to_lua_expected(lua_State* L, const std::expected<T, E>& exp) {
+    if (exp.has_value()) {
+        if constexpr (std::is_void_v<T>) {
+            lua_pushboolean(L, 1);  // true for void success
+        } else {
+            to_lua(L, *exp);
+        }
+        lua_pushnil(L);  // no error
+        return 2;
+    }
+
+    // Error case: push nil, then error
+    lua_pushnil(L);
+    if constexpr (std::is_same_v<std::remove_cvref_t<E>, std::string>) {
+        lua_pushstring(L, exp.error().c_str());
+    } else if constexpr (std::is_arithmetic_v<std::remove_cvref_t<E>>) {
+        std::string msg = "error code: " + std::to_string(exp.error());
+        lua_pushstring(L, msg.c_str());
+    } else {
+        lua_pushstring(L, "expected contained an error");
+    }
+    return 2;
+}
+
+// Lua to std::expected (always produces success value; Lua errors are separate)
+template<typename T, typename E>
+bool from_lua(lua_State* L, int idx, std::expected<T, E>& out) {
+    if constexpr (std::is_void_v<T>) {
+        out = std::expected<T, E>{};
+        return true;
+    } else {
+        T value;
+        if (!from_lua(L, idx, value)) {
+            return false;
+        }
+        out = std::move(value);
+        return true;
+    }
 }
 
 // ============================================================================

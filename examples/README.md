@@ -19,6 +19,7 @@ python3 test_greeter.py
 | [03-containers](03-containers/) | Vector/array conversion, STL containers | Intermediate |
 | [04-image-processing](04-image-processing/) | Real-world image processing library | Advanced |
 | [05-nbody-simulation](05-nbody-simulation/) | Scientific computing, physics simulation | Advanced |
+| [11-expected](11-expected/) | `std::expected` error handling | Intermediate |
 
 ## Example Details
 

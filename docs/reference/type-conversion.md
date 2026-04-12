@@ -233,6 +233,58 @@ struct Data {
 };
 ```
 
+## std::optional
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `std::optional<T>` (with value) | Converted `T` | Converted `T` | Converted `T` |
+| `std::optional<T>` (empty) | `None` | `nil` | `null` |
+
+## std::expected
+
+C++23's `std::expected<T, E>` maps naturally to each language's error handling idiom:
+
+| C++ State | Python | Lua | JavaScript |
+|-----------|--------|-----|------------|
+| Success (has value) | Returns `T` | Returns `value, nil` | Returns `T` |
+| Error (!has_value) | Raises `ValueError` | Returns `nil, error_string` | Throws `Error` |
+
+**C++:**
+```cpp
+struct Service {
+    std::expected<double, std::string> safe_divide(double a, double b) {
+        if (b == 0.0) return std::unexpected("division by zero");
+        return a / b;
+    }
+};
+```
+
+**Python:**
+```python
+svc = Service()
+result = svc.safe_divide(10.0, 2.0)  # Returns 5.0
+try:
+    svc.safe_divide(10.0, 0.0)       # Raises ValueError("division by zero")
+except ValueError as e:
+    print(e)
+```
+
+**Lua:**
+```lua
+local svc = Service()
+local result, err = svc:safe_divide(10.0, 2.0)  -- result=5.0, err=nil
+local result, err = svc:safe_divide(10.0, 0.0)  -- result=nil, err="division by zero"
+```
+
+**JavaScript:**
+```javascript
+const svc = new Service();
+const result = svc.safe_divide(10.0, 2.0);  // 5.0
+try {
+    svc.safe_divide(10.0, 0.0);  // throws Error("division by zero")
+} catch (e) { console.error(e.message); }
+```
+
 ## Limitations
 
 ### Not Currently Supported
@@ -241,11 +293,7 @@ struct Data {
 |------|--------|
 | Raw pointers (T*) | Not supported |
 | References as parameters | Partial support |
-| `std::optional<T>` | Not yet implemented |
-| `std::variant<Ts...>` | Not yet implemented |
-| `std::tuple<Ts...>` | Not yet implemented |
 | Function pointers | Not supported |
-| `std::function<>` | Not supported |
 | `weak_ptr` | Not supported |
 
 ### Template Classes

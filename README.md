@@ -103,6 +103,7 @@ python3 test_greeter.py
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
 | **Async/Await** | ✅ | ❌ | ✅ |
 | **std::optional** | ✅ | ✅ | ✅ |
+| **std::expected** | ✅ | ✅ | ✅ |
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
 

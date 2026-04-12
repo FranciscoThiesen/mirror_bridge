@@ -22,6 +22,7 @@
 #include <concepts>
 #include <memory>
 #include <unordered_map>
+#include <expected>
 #include <version>
 #include <mutex>
 #include <typeindex>

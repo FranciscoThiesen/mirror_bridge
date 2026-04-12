@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <expected>
 #include <future>
 #include <map>
 #include <unordered_map>
@@ -595,6 +596,77 @@ bool from_javascript(napi_env env, napi_value value, std::optional<T>& out) {
     }
     out = std::move(cpp_value);
     return true;
+}
+
+// ============================================================================
+// std::expected Type Conversion
+// ============================================================================
+//
+// Enables conversion between C++ std::expected<T, E> and JavaScript values.
+// On success: returns the converted T value.
+// On error: throws a JavaScript Error with the error message.
+//
+// Example C++ code:
+//   std::expected<double, std::string> safe_divide(double a, double b) {
+//       if (b == 0.0) return std::unexpected("division by zero");
+//       return a / b;
+//   }
+//
+// JavaScript usage:
+//   const result = obj.safe_divide(10.0, 2.0);  // Returns 5.0
+//   try {
+//       obj.safe_divide(10.0, 0.0);  // Throws Error("division by zero")
+//   } catch (e) { console.error(e.message); }
+
+// Helper trait to detect std::expected
+template<typename T>
+struct is_js_std_expected : std::false_type {};
+
+template<typename T, typename E>
+struct is_js_std_expected<std::expected<T, E>> : std::true_type {};
+
+// std::expected to JavaScript (value on success, throw on error)
+template<typename T, typename E>
+napi_value to_javascript(napi_env env, const std::expected<T, E>& exp) {
+    if (exp.has_value()) {
+        if constexpr (std::is_void_v<T>) {
+            napi_value result;
+            napi_get_undefined(env, &result);
+            return result;
+        } else {
+            return to_javascript(env, *exp);
+        }
+    }
+
+    // Error case: throw a JavaScript Error
+    if constexpr (std::is_same_v<std::remove_cvref_t<E>, std::string>) {
+        napi_throw_error(env, nullptr, exp.error().c_str());
+    } else if constexpr (std::is_arithmetic_v<std::remove_cvref_t<E>>) {
+        std::string msg = "error code: " + std::to_string(exp.error());
+        napi_throw_error(env, nullptr, msg.c_str());
+    } else {
+        napi_throw_error(env, nullptr, "expected contained an error");
+    }
+
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
+// JavaScript to std::expected (always produces success value)
+template<typename T, typename E>
+bool from_javascript(napi_env env, napi_value value, std::expected<T, E>& out) {
+    if constexpr (std::is_void_v<T>) {
+        out = std::expected<T, E>{};
+        return true;
+    } else {
+        T cpp_value;
+        if (!from_javascript(env, value, cpp_value)) {
+            return false;
+        }
+        out = std::move(cpp_value);
+        return true;
+    }
 }
 
 // ============================================================================
