@@ -51,6 +51,7 @@ ${YELLOW}Commands:${NC}
   pch         Build precompiled header for faster compilation
   build       Compile a manually-written binding file
   config      Generate bindings from a configuration file
+  diff        Show binding surface changes since last build
   init        Initialize a new Mirror Bridge project
   version     Show version information
 
@@ -594,6 +595,118 @@ cmd_config() {
     fi
 }
 
+# Command: diff - Show binding surface changes between builds
+# Compares current class signatures with the last recorded snapshot
+cmd_diff() {
+    local src_dir=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h) show_diff_help; exit 0 ;;
+            --output|-o) OUTPUT_DIR="$2"; shift 2 ;;
+            *) src_dir="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$src_dir" ] && { echo -e "${RED}Error: Source directory required${NC}"; exit 1; }
+
+    local snapshot_dir="$OUTPUT_DIR/.mirror_bridge"
+    local snapshot_file="$snapshot_dir/binding_snapshot.txt"
+
+    # Scan current headers and extract class signatures
+    local current_sig=$(scan_binding_signatures "$src_dir")
+
+    if [ ! -f "$snapshot_file" ]; then
+        echo -e "${YELLOW}No previous snapshot found. Creating initial snapshot.${NC}"
+        mkdir -p "$snapshot_dir"
+        echo "$current_sig" > "$snapshot_file"
+        echo -e "${GREEN}Snapshot saved to $snapshot_file${NC}"
+        return 0
+    fi
+
+    local previous_sig=$(cat "$snapshot_file")
+
+    if [ "$current_sig" = "$previous_sig" ]; then
+        echo -e "${GREEN}No binding surface changes detected.${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Binding Surface Changes:${NC}"
+    echo "========================"
+
+    # Compare line by line
+    diff --color=auto <(echo "$previous_sig") <(echo "$current_sig") || true
+
+    # Show summary
+    local added=$(diff <(echo "$previous_sig") <(echo "$current_sig") | grep "^>" | wc -l)
+    local removed=$(diff <(echo "$previous_sig") <(echo "$current_sig") | grep "^<" | wc -l)
+
+    echo ""
+    echo -e "  ${GREEN}+ $added added${NC}  ${RED}- $removed removed${NC}"
+    echo ""
+
+    # Update snapshot
+    read -p "Update snapshot? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "$current_sig" > "$snapshot_file"
+        echo -e "${GREEN}Snapshot updated.${NC}"
+    fi
+}
+
+# Scan headers to extract binding signatures (class names, members, methods)
+scan_binding_signatures() {
+    local src_dir="$1"
+
+    # Extract struct/class declarations and their public members
+    for header in "$src_dir"/*.hpp "$src_dir"/*.h; do
+        [ -f "$header" ] || continue
+        local basename=$(basename "$header")
+
+        # Skip files marked with MIRROR_BRIDGE_SKIP
+        grep -q "MIRROR_BRIDGE_SKIP" "$header" 2>/dev/null && continue
+
+        echo "=== $basename ==="
+
+        # Extract class/struct names
+        grep -E "^(struct|class)\s+\w+" "$header" 2>/dev/null | while read -r line; do
+            local class_name=$(echo "$line" | grep -oE "(struct|class)\s+\w+" | awk '{print $2}')
+            echo "  class: $class_name"
+        done
+
+        # Extract public data members (type name = default pattern)
+        grep -E "^\s+(int|double|float|bool|std::\w+|unsigned|long|short|char)\s+\w+" "$header" 2>/dev/null | \
+            sed 's/^\s*/  member: /' | head -50
+
+        # Extract method signatures
+        grep -E "^\s+\w+.*\w+\(.*\)" "$header" 2>/dev/null | \
+            grep -v "^\s*//" | grep -v "^\s*#" | grep -v "^\s*if\b" | grep -v "^\s*for\b" | grep -v "^\s*while\b" | grep -v "^\s*return\b" | \
+            sed 's/^\s*/  method: /' | head -50
+
+        echo ""
+    done
+}
+
+show_diff_help() {
+    cat << EOF
+${CYAN}mirror_bridge diff${NC} - Show binding surface changes
+
+${YELLOW}Usage:${NC}
+  mirror_bridge diff <src_dir> [--output <dir>]
+
+Compares the current class definitions in <src_dir> against a stored
+snapshot, showing added/removed members and methods. Useful for catching
+accidental ABI breaks during development.
+
+${YELLOW}Options:${NC}
+  --output, -o    Build directory for storing snapshots (default: build)
+
+${YELLOW}Example:${NC}
+  mirror_bridge diff src/
+  mirror_bridge diff src/ --output build/
+EOF
+}
+
 # Command: version
 cmd_version() {
     echo "Mirror Bridge v$VERSION"
@@ -618,6 +731,7 @@ main() {
         pch) cmd_pch "$@" ;;
         build) cmd_build "$@" ;;
         config) cmd_config "$@" ;;
+        diff) cmd_diff "$@" ;;
         init) echo "Not yet implemented"; exit 1 ;;
         version|--version|-v) cmd_version ;;
         help|--help|-h) show_help ;;
