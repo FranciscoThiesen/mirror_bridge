@@ -20,6 +20,7 @@ python3 test_greeter.py
 | [04-image-processing](04-image-processing/) | Real-world image processing library | Advanced |
 | [05-nbody-simulation](05-nbody-simulation/) | Scientific computing, physics simulation | Advanced |
 | [11-expected](11-expected/) | `std::expected` error handling | Intermediate |
+| [packaging](packaging/) | Distributable pip package | Intermediate |
 
 ## Example Details
 
