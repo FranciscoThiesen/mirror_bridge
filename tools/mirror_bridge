@@ -600,11 +600,13 @@ cmd_config() {
 # Compares current class signatures with the last recorded snapshot
 cmd_diff() {
     local src_dir=""
+    local update_snapshot=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --help|-h) show_diff_help; exit 0 ;;
             --output|-o) OUTPUT_DIR="$2"; shift 2 ;;
+            --update|-u) update_snapshot=1; shift ;;
             *) src_dir="$1"; shift ;;
         esac
     done
@@ -614,18 +616,19 @@ cmd_diff() {
     local snapshot_dir="$OUTPUT_DIR/.mirror_bridge"
     local snapshot_file="$snapshot_dir/binding_snapshot.txt"
 
-    # Scan current headers and extract class signatures
-    local current_sig=$(scan_binding_signatures "$src_dir")
+    local current_sig
+    current_sig=$(scan_binding_signatures "$src_dir")
 
     if [ ! -f "$snapshot_file" ]; then
         echo -e "${YELLOW}No previous snapshot found. Creating initial snapshot.${NC}"
         mkdir -p "$snapshot_dir"
-        echo "$current_sig" > "$snapshot_file"
+        printf '%s\n' "$current_sig" > "$snapshot_file"
         echo -e "${GREEN}Snapshot saved to $snapshot_file${NC}"
         return 0
     fi
 
-    local previous_sig=$(cat "$snapshot_file")
+    local previous_sig
+    previous_sig=$(cat "$snapshot_file")
 
     if [ "$current_sig" = "$previous_sig" ]; then
         echo -e "${GREEN}No binding surface changes detected.${NC}"
@@ -635,23 +638,29 @@ cmd_diff() {
     echo -e "${CYAN}Binding Surface Changes:${NC}"
     echo "========================"
 
-    # Compare line by line
-    diff --color=auto <(echo "$previous_sig") <(echo "$current_sig") || true
+    diff <(printf '%s\n' "$previous_sig") <(printf '%s\n' "$current_sig") || true
 
-    # Show summary
-    local added=$(diff <(echo "$previous_sig") <(echo "$current_sig") | grep "^>" | wc -l)
-    local removed=$(diff <(echo "$previous_sig") <(echo "$current_sig") | grep "^<" | wc -l)
+    local added removed
+    added=$(diff <(printf '%s\n' "$previous_sig") <(printf '%s\n' "$current_sig") | grep -c "^>" || true)
+    removed=$(diff <(printf '%s\n' "$previous_sig") <(printf '%s\n' "$current_sig") | grep -c "^<" || true)
 
     echo ""
     echo -e "  ${GREEN}+ $added added${NC}  ${RED}- $removed removed${NC}"
-    echo ""
 
-    # Update snapshot
-    read -p "Update snapshot? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "$current_sig" > "$snapshot_file"
+    # Update snapshot: via flag, or interactively if terminal is attached
+    if [ "$update_snapshot" -eq 1 ]; then
+        printf '%s\n' "$current_sig" > "$snapshot_file"
         echo -e "${GREEN}Snapshot updated.${NC}"
+    elif [ -t 0 ]; then
+        echo ""
+        read -p "Update snapshot? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            printf '%s\n' "$current_sig" > "$snapshot_file"
+            echo -e "${GREEN}Snapshot updated.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Run with --update to save new snapshot.${NC}"
     fi
 }
 
@@ -659,29 +668,32 @@ cmd_diff() {
 scan_binding_signatures() {
     local src_dir="$1"
 
-    # Extract struct/class declarations and their public members
-    for header in "$src_dir"/*.hpp "$src_dir"/*.h; do
+    # Find headers and sort for deterministic output across platforms
+    find "$src_dir" -maxdepth 1 \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null | sort | while read -r header; do
         [ -f "$header" ] || continue
-        local basename=$(basename "$header")
+        local basename
+        basename=$(basename "$header")
 
         # Skip files marked with MIRROR_BRIDGE_SKIP
         grep -q "MIRROR_BRIDGE_SKIP" "$header" 2>/dev/null && continue
 
-        echo "=== $basename ==="
+        printf '=== %s ===\n' "$basename"
 
         # Extract class/struct names
         grep -E "^(struct|class)\s+\w+" "$header" 2>/dev/null | while read -r line; do
-            local class_name=$(echo "$line" | grep -oE "(struct|class)\s+\w+" | awk '{print $2}')
-            echo "  class: $class_name"
+            local class_name
+            class_name=$(printf '%s' "$line" | grep -oE "(struct|class)\s+\w+" | awk '{print $2}')
+            printf '  class: %s\n' "$class_name"
         done
 
-        # Extract public data members (type name = default pattern)
+        # Extract public data members
         grep -E "^\s+(int|double|float|bool|std::\w+|unsigned|long|short|char)\s+\w+" "$header" 2>/dev/null | \
             sed 's/^\s*/  member: /' | head -50
 
-        # Extract method signatures
+        # Extract method signatures (skip control flow, comments, preprocessor)
         grep -E "^\s+\w+.*\w+\(.*\)" "$header" 2>/dev/null | \
-            grep -v "^\s*//" | grep -v "^\s*#" | grep -v "^\s*if\b" | grep -v "^\s*for\b" | grep -v "^\s*while\b" | grep -v "^\s*return\b" | \
+            grep -v "^\s*//" | grep -v "^\s*#" | grep -v "^\s*if\b" | \
+            grep -v "^\s*for\b" | grep -v "^\s*while\b" | grep -v "^\s*return\b" | \
             sed 's/^\s*/  method: /' | head -50
 
         echo ""
@@ -701,9 +713,11 @@ accidental ABI breaks during development.
 
 ${YELLOW}Options:${NC}
   --output, -o    Build directory for storing snapshots (default: build)
+  --update, -u    Update the snapshot without prompting (CI-friendly)
 
 ${YELLOW}Example:${NC}
   mirror_bridge diff src/
+  mirror_bridge diff src/ --update      # Non-interactive update
   mirror_bridge diff src/ --output build/
 EOF
 }
@@ -736,8 +750,12 @@ cmd_watch() {
     echo -e "Press Ctrl+C to stop."
     echo ""
 
-    # Store checksums of watched files
-    local checksum_file=$(mktemp)
+    local checksum_file
+    checksum_file=$(mktemp) || { echo -e "${RED}Error: failed to create temp file${NC}"; exit 1; }
+
+    # Clean up temp files on exit (Ctrl+C, termination, or normal exit)
+    trap 'rm -f "$checksum_file"; exit' INT TERM EXIT
+
     compute_header_checksums "$src_dir" > "$checksum_file"
 
     # Initial build
@@ -750,12 +768,13 @@ cmd_watch() {
     while true; do
         sleep "$interval"
 
-        local new_checksums=$(mktemp)
+        local new_checksums
+        new_checksums=$(mktemp) || continue
         compute_header_checksums "$src_dir" > "$new_checksums"
 
         if ! diff -q "$checksum_file" "$new_checksums" > /dev/null 2>&1; then
-            # Find which files changed
-            local changed_files=$(diff "$checksum_file" "$new_checksums" | grep ">" | awk '{print $3}')
+            local changed_files
+            changed_files=$(diff "$checksum_file" "$new_checksums" | grep ">" | awk '{print $3}')
             echo ""
             echo -e "${YELLOW}[$(date +%H:%M:%S)]${NC} Changes detected:"
             for f in $changed_files; do
@@ -767,7 +786,6 @@ cmd_watch() {
                 echo -e "${GREEN}[$(date +%H:%M:%S)] Build successful${NC}" || \
                 echo -e "${RED}[$(date +%H:%M:%S)] Build failed${NC}"
 
-            # Update checksums
             cp "$new_checksums" "$checksum_file"
         fi
 

@@ -66,6 +66,7 @@
 #include <functional>
 #include <cstdint>  // For uint8_t, int32_t, etc.
 #include <cstdio>   // For snprintf in simple repr functions
+#include <mutex>    // For std::once_flag in thread-safe initialization
 
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
@@ -1672,16 +1673,19 @@ PyObject* to_python(const T& container) {
     if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
                   std::is_arithmetic_v<ValueType> &&
                   !std::is_same_v<ValueType, unsigned char>) {
-        // Use Python's array module for typed numeric arrays
-        // This does a single memcpy instead of N Python object allocations
+        // Use Python's array module for typed numeric arrays.
+        // This does a single memcpy instead of N Python object allocations.
+        // Initialization is thread-safe via std::call_once (GIL must be held
+        // by the caller, which is guaranteed in Python C API callbacks).
         static PyObject* array_module = nullptr;
         static PyObject* array_type = nullptr;
-        if (!array_module) {
+        static std::once_flag array_init_flag;
+        std::call_once(array_init_flag, []() {
             array_module = PyImport_ImportModule("array");
             if (array_module) {
                 array_type = PyObject_GetAttrString(array_module, "array");
             }
-        }
+        });
 
         if (array_type) {
             // Map C++ type to Python array typecode
@@ -1696,14 +1700,19 @@ PyObject* to_python(const T& container) {
             else if constexpr (std::is_same_v<ValueType, uint16_t> || std::is_same_v<ValueType, unsigned short>) typecode = "H";
 
             if (typecode) {
-                // Create bytes from raw data, then construct array.array(typecode, bytes)
                 PyObject* raw_bytes = PyBytes_FromStringAndSize(
                     reinterpret_cast<const char*>(container.data()),
                     container.size() * sizeof(ValueType));
                 if (!raw_bytes) return nullptr;
 
-                PyObject* args = PyTuple_Pack(2,
-                    PyUnicode_FromString(typecode), raw_bytes);
+                PyObject* typecode_obj = PyUnicode_FromString(typecode);
+                if (!typecode_obj) {
+                    Py_DECREF(raw_bytes);
+                    return nullptr;
+                }
+
+                PyObject* args = PyTuple_Pack(2, typecode_obj, raw_bytes);
+                Py_DECREF(typecode_obj);
                 Py_DECREF(raw_bytes);
                 if (!args) return nullptr;
 
@@ -3101,16 +3110,16 @@ template<typename T>
 struct InternedMemberNames {
     static constexpr std::size_t count = get_nested_member_count<T>();
 
-    // Lazily-initialized cache of interned Python string objects
+    // Lazily-initialized cache of interned Python string objects.
+    // Thread-safe via std::call_once (GIL is held by callers).
     static std::array<PyObject*, count>& get() {
         static std::array<PyObject*, count> names{};
-        static bool initialized = false;
-        if (!initialized) {
+        static std::once_flag init_flag;
+        std::call_once(init_flag, [&]() {
             [&]<std::size_t... Is>(std::index_sequence<Is...>) {
                 ((names[Is] = PyUnicode_InternFromString(get_nested_member_name<T, Is>())), ...);
             }(std::make_index_sequence<count>{});
-            initialized = true;
-        }
+        });
         return names;
     }
 };
