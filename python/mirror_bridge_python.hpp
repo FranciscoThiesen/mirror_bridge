@@ -267,36 +267,25 @@ PyObject* to_python(const T& value) {
     }
 }
 
-// Smart pointer conversion - converts pointee, not pointer itself
+// Smart pointer conversion - dereferences and converts the pointee.
 //
-// CURRENT LIMITATION: For Bindable element types, this returns dicts (not wrapper objects).
-// This is because to_python(*ptr) resolves to the Bindable overload which returns dicts.
+// For bound types (registered via bind_class): returns a proper PyWrapper<T>
+// object with full method and property access — NOT a dict.
+//
+// For unbound types: falls back to dict conversion via the Bindable overload.
+//
+// Null pointers return Python None.
 //
 // Example:
-//   struct Foo { int x; };
-//   std::shared_ptr<Foo> ptr;
-//   to_python(ptr) → returns dict {'x': 0}, not a Foo wrapper object
-//
-// IDEAL BEHAVIOR: Should return a PyWrapper<Foo>* if Foo has been bound via bind_class.
-//
-// PROPOSED FIX:
-//   1. Add Registry::is_bound<T>() to check if type has been bound
-//   2. If bound: Create PyWrapper<ElementType>, set owns=false (shared ownership with smart ptr)
-//   3. If not bound: Fall back to dict conversion (current behavior)
-//
-// This requires coordination between smart pointer lifetime and Python ref counting:
-//   - shared_ptr: Can safely share ownership (increment ref count on smart ptr)
-//   - unique_ptr: More complex - need to transfer ownership or use raw pointer with custom deleter
-//
-// For now, dict conversion is consistent with nested Bindable semantics (see documentation above).
+//   struct Foo { int x; double length() const; };
+//   bind_class<Foo>(m, "Foo");
+//   std::shared_ptr<Foo> ptr = ...;
+//   to_python(ptr) → returns Foo wrapper object with .x and .length()
 template<SmartPointer T>
 inline PyObject* to_python(const T& ptr) {
     if (!ptr) {
         Py_RETURN_NONE;
     }
-    using ElementType = typename std::remove_cvref_t<T>::element_type;
-    // Let overload resolution choose - non-template overloads have higher priority
-    // TODO: Check if ElementType is bound and create wrapper object instead of dict
     return to_python(*ptr);
 }
 
