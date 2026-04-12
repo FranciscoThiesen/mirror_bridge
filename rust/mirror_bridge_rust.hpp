@@ -1,0 +1,308 @@
+#pragma once
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mirror Bridge Rust - Rust FFI Bindings for C++ Code via C++26 Reflection
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Generates Rust FFI bindings from C++ classes using C++26 reflection:
+//   1. extern "C" wrapper functions for each method/constructor
+//   2. Rust #[repr(C)] struct definitions matching C++ layout
+//   3. Safe Rust wrapper types with idiomatic API
+//
+// The generated output is a pair of files:
+//   - <module>_ffi.h   : C header with extern "C" function declarations
+//   - <module>_ffi.rs  : Rust source with safe wrappers
+//
+// Usage:
+//   #include "rust/mirror_bridge_rust.hpp"
+//   auto output = mirror_bridge::rust::generate_bindings<MyClass>("MyClass");
+//   // output.c_header contains the extern "C" declarations
+//   // output.rust_source contains the Rust FFI + safe wrappers
+
+#include "../core/mirror_bridge_core.hpp"
+#include <string>
+#include <sstream>
+#include <vector>
+
+namespace mirror_bridge {
+namespace rust {
+
+using namespace mirror_bridge::core;
+
+// ============================================================================
+// C++ Type to Rust Type Mapping
+// ============================================================================
+
+template<typename T>
+consteval const char* rust_type_name() {
+    using U = std::remove_cvref_t<T>;
+
+    if constexpr (std::is_same_v<U, bool>) return "bool";
+    else if constexpr (std::is_same_v<U, char>) return "i8";
+    else if constexpr (std::is_same_v<U, int8_t>) return "i8";
+    else if constexpr (std::is_same_v<U, uint8_t>) return "u8";
+    else if constexpr (std::is_same_v<U, int16_t>) return "i16";
+    else if constexpr (std::is_same_v<U, uint16_t>) return "u16";
+    else if constexpr (std::is_same_v<U, int32_t> || (std::is_same_v<U, int> && sizeof(int) == 4)) return "i32";
+    else if constexpr (std::is_same_v<U, uint32_t> || (std::is_same_v<U, unsigned int> && sizeof(unsigned int) == 4)) return "u32";
+    else if constexpr (std::is_same_v<U, int64_t> || std::is_same_v<U, long long>) return "i64";
+    else if constexpr (std::is_same_v<U, uint64_t> || std::is_same_v<U, unsigned long long>) return "u64";
+    else if constexpr (std::is_same_v<U, float>) return "f32";
+    else if constexpr (std::is_same_v<U, double>) return "f64";
+    else return nullptr;  // Complex type, needs special handling
+}
+
+// Map C++ type to C FFI type name (for the extern "C" header)
+template<typename T>
+std::string c_ffi_type_name() {
+    using U = std::remove_cvref_t<T>;
+
+    if constexpr (std::is_same_v<U, bool>) return "int";
+    else if constexpr (std::is_same_v<U, int8_t> || std::is_same_v<U, char>) return "int8_t";
+    else if constexpr (std::is_same_v<U, uint8_t>) return "uint8_t";
+    else if constexpr (std::is_same_v<U, int16_t>) return "int16_t";
+    else if constexpr (std::is_same_v<U, uint16_t>) return "uint16_t";
+    else if constexpr (std::is_same_v<U, int32_t> || (std::is_same_v<U, int> && sizeof(int) == 4)) return "int32_t";
+    else if constexpr (std::is_same_v<U, uint32_t>) return "uint32_t";
+    else if constexpr (std::is_same_v<U, int64_t> || std::is_same_v<U, long long>) return "int64_t";
+    else if constexpr (std::is_same_v<U, uint64_t>) return "uint64_t";
+    else if constexpr (std::is_same_v<U, float>) return "float";
+    else if constexpr (std::is_same_v<U, double>) return "double";
+    else if constexpr (std::is_same_v<U, std::string>) return "const char*";
+    else return "void*";
+}
+
+// Rust type for FFI declarations
+template<typename T>
+std::string rust_ffi_type() {
+    using U = std::remove_cvref_t<T>;
+
+    constexpr const char* primitive = rust_type_name<U>();
+    if constexpr (primitive != nullptr) {
+        return primitive;
+    } else if constexpr (std::is_same_v<U, std::string>) {
+        return "*const std::os::raw::c_char";
+    } else {
+        return "*mut std::ffi::c_void";
+    }
+}
+
+// ============================================================================
+// Binding Output
+// ============================================================================
+
+struct BindingOutput {
+    std::string c_header;       // extern "C" header content
+    std::string cpp_impl;       // C++ implementation of extern "C" wrappers
+    std::string rust_source;    // Rust FFI + safe wrapper source
+};
+
+// ============================================================================
+// Code Generation
+// ============================================================================
+
+// Generate the extern "C" function declarations and Rust bindings for a class
+template<Bindable T>
+BindingOutput generate_bindings(const char* class_name) {
+    BindingOutput output;
+    std::ostringstream c_header;
+    std::ostringstream cpp_impl;
+    std::ostringstream rust_src;
+
+    const std::string name(class_name);
+    const std::string prefix = name + "_";
+
+    // ---- C Header ----
+    c_header << "// Auto-generated by mirror_bridge - do not edit\n";
+    c_header << "#pragma once\n";
+    c_header << "#include <stdint.h>\n\n";
+    c_header << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n";
+    c_header << "typedef void* " << name << "_handle;\n\n";
+
+    // Constructor / destructor
+    c_header << name << "_handle " << prefix << "create(void);\n";
+    c_header << "void " << prefix << "destroy(" << name << "_handle handle);\n\n";
+
+    // ---- C++ Implementation ----
+    cpp_impl << "// Auto-generated by mirror_bridge - do not edit\n";
+    cpp_impl << "#include \"" << name << "_ffi.h\"\n";
+    cpp_impl << "#include <cstring>\n\n";
+    cpp_impl << "extern \"C\" {\n\n";
+    cpp_impl << name << "_handle " << prefix << "create(void) {\n";
+    cpp_impl << "    return static_cast<" << name << "_handle>(new " << name << "());\n";
+    cpp_impl << "}\n\n";
+    cpp_impl << "void " << prefix << "destroy(" << name << "_handle handle) {\n";
+    cpp_impl << "    delete static_cast<" << name << "*>(handle);\n";
+    cpp_impl << "}\n\n";
+
+    // ---- Rust Source ----
+    rust_src << "//! Auto-generated by mirror_bridge - do not edit\n";
+    rust_src << "//! Safe Rust bindings for C++ class `" << name << "`\n\n";
+    rust_src << "use std::ffi::CStr;\n";
+    rust_src << "use std::os::raw::c_char;\n\n";
+
+    // Extern block
+    rust_src << "extern \"C\" {\n";
+    rust_src << "    fn " << prefix << "create() -> *mut std::ffi::c_void;\n";
+    rust_src << "    fn " << prefix << "destroy(handle: *mut std::ffi::c_void);\n";
+
+    // Generate getters/setters for data members
+    constexpr std::size_t member_count = get_data_member_count<T>();
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            constexpr auto member = get_data_member<T, Is>();
+            auto member_name = std::string(std::meta::identifier_of(member));
+            using MemberType = std::remove_cvref_t<typename [:std::meta::type_of(member):]>;
+
+            std::string c_type = c_ffi_type_name<MemberType>();
+            std::string rust_type = rust_ffi_type<MemberType>();
+
+            // Getter
+            c_header << c_type << " " << prefix << "get_" << member_name
+                     << "(" << name << "_handle handle);\n";
+
+            cpp_impl << c_type << " " << prefix << "get_" << member_name
+                     << "(" << name << "_handle handle) {\n";
+            cpp_impl << "    auto* obj = static_cast<" << name << "*>(handle);\n";
+            if constexpr (std::is_same_v<MemberType, std::string>) {
+                cpp_impl << "    return obj->" << member_name << ".c_str();\n";
+            } else {
+                cpp_impl << "    return obj->" << member_name << ";\n";
+            }
+            cpp_impl << "}\n\n";
+
+            rust_src << "    fn " << prefix << "get_" << member_name
+                     << "(handle: *mut std::ffi::c_void) -> " << rust_type << ";\n";
+
+            // Setter
+            c_header << "void " << prefix << "set_" << member_name
+                     << "(" << name << "_handle handle, " << c_type << " value);\n";
+
+            cpp_impl << "void " << prefix << "set_" << member_name
+                     << "(" << name << "_handle handle, " << c_type << " value) {\n";
+            cpp_impl << "    auto* obj = static_cast<" << name << "*>(handle);\n";
+            if constexpr (std::is_same_v<MemberType, std::string>) {
+                cpp_impl << "    obj->" << member_name << " = std::string(value);\n";
+            } else {
+                cpp_impl << "    obj->" << member_name << " = value;\n";
+            }
+            cpp_impl << "}\n\n";
+
+            rust_src << "    fn " << prefix << "set_" << member_name
+                     << "(handle: *mut std::ffi::c_void, value: " << rust_type << ");\n";
+        }(), ...);
+    }(std::make_index_sequence<member_count>{});
+
+    c_header << "\n";
+    c_header << "#ifdef __cplusplus\n}\n#endif\n";
+    cpp_impl << "} // extern \"C\"\n";
+    rust_src << "}\n\n";
+
+    // ---- Safe Rust Wrapper ----
+    rust_src << "/// Safe wrapper for C++ class `" << name << "`\n";
+    rust_src << "pub struct " << name << " {\n";
+    rust_src << "    handle: *mut std::ffi::c_void,\n";
+    rust_src << "}\n\n";
+
+    rust_src << "impl " << name << " {\n";
+    rust_src << "    pub fn new() -> Self {\n";
+    rust_src << "        unsafe {\n";
+    rust_src << "            " << name << " { handle: " << prefix << "create() }\n";
+    rust_src << "        }\n";
+    rust_src << "    }\n\n";
+
+    // Generate safe getters/setters
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            constexpr auto member = get_data_member<T, Is>();
+            auto member_name = std::string(std::meta::identifier_of(member));
+            using MemberType = std::remove_cvref_t<typename [:std::meta::type_of(member):]>;
+
+            constexpr const char* prim = rust_type_name<MemberType>();
+
+            // Getter
+            if constexpr (std::is_same_v<MemberType, std::string>) {
+                rust_src << "    pub fn " << member_name << "(&self) -> String {\n";
+                rust_src << "        unsafe {\n";
+                rust_src << "            let ptr = " << prefix << "get_" << member_name << "(self.handle);\n";
+                rust_src << "            CStr::from_ptr(ptr).to_string_lossy().into_owned()\n";
+                rust_src << "        }\n";
+                rust_src << "    }\n\n";
+            } else if constexpr (prim != nullptr) {
+                rust_src << "    pub fn " << member_name << "(&self) -> " << prim << " {\n";
+                rust_src << "        unsafe { " << prefix << "get_" << member_name << "(self.handle) }\n";
+                rust_src << "    }\n\n";
+            }
+
+            // Setter
+            if constexpr (std::is_same_v<MemberType, std::string>) {
+                rust_src << "    pub fn set_" << member_name << "(&mut self, value: &str) {\n";
+                rust_src << "        let c_str = std::ffi::CString::new(value).unwrap();\n";
+                rust_src << "        unsafe { " << prefix << "set_" << member_name << "(self.handle, c_str.as_ptr()) }\n";
+                rust_src << "    }\n\n";
+            } else if constexpr (prim != nullptr) {
+                rust_src << "    pub fn set_" << member_name << "(&mut self, value: " << prim << ") {\n";
+                rust_src << "        unsafe { " << prefix << "set_" << member_name << "(self.handle, value) }\n";
+                rust_src << "    }\n\n";
+            }
+        }(), ...);
+    }(std::make_index_sequence<member_count>{});
+
+    rust_src << "}\n\n";
+
+    // Drop implementation
+    rust_src << "impl Drop for " << name << " {\n";
+    rust_src << "    fn drop(&mut self) {\n";
+    rust_src << "        unsafe { " << prefix << "destroy(self.handle) }\n";
+    rust_src << "    }\n";
+    rust_src << "}\n\n";
+
+    // Send + Sync (C++ objects accessed through opaque pointer)
+    rust_src << "unsafe impl Send for " << name << " {}\n";
+    rust_src << "unsafe impl Sync for " << name << " {}\n";
+
+    output.c_header = c_header.str();
+    output.cpp_impl = cpp_impl.str();
+    output.rust_source = rust_src.str();
+    return output;
+}
+
+// Convenience: write binding files to disk
+template<Bindable T>
+bool write_bindings(const char* class_name, const char* output_dir) {
+    auto bindings = generate_bindings<T>(class_name);
+    std::string dir(output_dir);
+    std::string name(class_name);
+
+    // Write C header
+    {
+        std::string path = dir + "/" + name + "_ffi.h";
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f) return false;
+        fputs(bindings.c_header.c_str(), f);
+        fclose(f);
+    }
+
+    // Write C++ implementation
+    {
+        std::string path = dir + "/" + name + "_ffi.cpp";
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f) return false;
+        fputs(bindings.cpp_impl.c_str(), f);
+        fclose(f);
+    }
+
+    // Write Rust source
+    {
+        std::string path = dir + "/" + name + ".rs";
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f) return false;
+        fputs(bindings.rust_source.c_str(), f);
+        fclose(f);
+    }
+
+    return true;
+}
+
+} // namespace rust
+} // namespace mirror_bridge

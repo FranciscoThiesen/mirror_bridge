@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Rust FFI binding generation: `generate_bindings<T>()` produces extern "C" wrappers, C headers, and safe Rust wrapper types with Drop, Send, Sync, and idiomatic getters/setters
 - `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
 - `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
 - Bulk array transfer for numeric vectors: `vector<float>`, `vector<double>`, `vector<int>`, etc. are now returned as `array.array` objects via single memcpy (~10-50x faster than element-by-element list construction)

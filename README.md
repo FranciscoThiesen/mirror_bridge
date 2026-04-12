@@ -80,6 +80,7 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
+| Rust | Beta | Code generation |
 
 ### Feature Matrix
 
