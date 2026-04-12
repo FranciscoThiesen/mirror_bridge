@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Improved devcontainer configuration with proper C++2c reflection flags
 
-## [0.2.0] - 2024-12-01
+## [0.2.0] - 2025-12-01
 
 ### Added
 - P3394 annotation support for field-level binding control (`[[=exclude{}]]`, `[[=readonly{}]]`)
@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - V8 SetNativeDataProperty API compatibility
 - Fold expression empty pack handling
 
-## [0.1.0] - 2024-11-01
+## [0.1.0] - 2025-11-12
 
 ### Added
 - Initial release with C++26 reflection-based binding generation
@@ -67,3 +67,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/FranciscoThiesen/mirror_bridge/releases/tag/v0.1.0
+

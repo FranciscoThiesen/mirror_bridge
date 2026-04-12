@@ -140,13 +140,15 @@ mirror_bridge generate src/ --module my_mod --lang all
 
 ## Performance
 
-| Metric | Mirror Bridge | Traditional |
-|--------|--------------|-------------|
-| Binding code | **0 lines** | 18+ lines/class |
-| Compile time (with PCH) | ~250ms | ~200ms |
-| Runtime overhead | **Zero** | Minimal |
+| Metric | Mirror Bridge | pybind11 | Speedup |
+|--------|--------------|----------|---------|
+| **Function call** | 35ns | 127ns | **3.6x faster** |
+| **Object creation** | 47ns | 256ns | **5.4x faster** |
+| **Property access** | 12ns | 45ns | **3.8x faster** |
+| **Compile time** (with PCH) | 194ms | 1,938ms | **10x faster** |
+| **Binding code** | 0 lines | 18+ lines/class | **Zero boilerplate** |
 
-**[Benchmark Details →](docs/internals/benchmarks.md)**
+Measured with `-O3 -DNDEBUG` on identical hardware. See **[Benchmark Details →](docs/internals/benchmarks.md)** for full methodology and container/string benchmarks.
 
 ## Project Structure
 
