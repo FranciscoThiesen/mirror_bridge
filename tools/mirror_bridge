@@ -52,6 +52,7 @@ ${YELLOW}Commands:${NC}
   build       Compile a manually-written binding file
   config      Generate bindings from a configuration file
   diff        Show binding surface changes since last build
+  watch       Watch headers and auto-recompile bindings on change
   init        Initialize a new Mirror Bridge project
   version     Show version information
 
@@ -707,6 +708,107 @@ ${YELLOW}Example:${NC}
 EOF
 }
 
+# Command: watch - Live reload during development
+# Watches header files for changes and recompiles bindings automatically
+cmd_watch() {
+    local src_dir=""
+    local module_name=""
+    local interval=2
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h) show_watch_help; exit 0 ;;
+            --module|-m) module_name="$2"; shift 2 ;;
+            --output|-o) OUTPUT_DIR="$2"; shift 2 ;;
+            --lang|-l) LANG="$2"; shift 2 ;;
+            --interval|-i) interval="$2"; shift 2 ;;
+            --pch) USE_PCH="--pch"; shift ;;
+            *) src_dir="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$src_dir" ] && { echo -e "${RED}Error: Source directory required${NC}"; exit 1; }
+    [ -z "$module_name" ] && { echo -e "${RED}Error: Module name required (--module)${NC}"; exit 1; }
+
+    echo -e "${CYAN}Mirror Bridge Watch Mode${NC}"
+    echo -e "Watching ${BLUE}$src_dir${NC} for changes..."
+    echo -e "Module: ${GREEN}$module_name${NC} | Language: ${GREEN}$LANG${NC} | Interval: ${interval}s"
+    echo -e "Press Ctrl+C to stop."
+    echo ""
+
+    # Store checksums of watched files
+    local checksum_file=$(mktemp)
+    compute_header_checksums "$src_dir" > "$checksum_file"
+
+    # Initial build
+    echo -e "${YELLOW}[$(date +%H:%M:%S)]${NC} Initial build..."
+    cmd_generate "$src_dir" --module "$module_name" --lang "$LANG" $USE_PCH 2>&1 && \
+        echo -e "${GREEN}[$(date +%H:%M:%S)] Build successful${NC}" || \
+        echo -e "${RED}[$(date +%H:%M:%S)] Build failed${NC}"
+
+    # Watch loop
+    while true; do
+        sleep "$interval"
+
+        local new_checksums=$(mktemp)
+        compute_header_checksums "$src_dir" > "$new_checksums"
+
+        if ! diff -q "$checksum_file" "$new_checksums" > /dev/null 2>&1; then
+            # Find which files changed
+            local changed_files=$(diff "$checksum_file" "$new_checksums" | grep ">" | awk '{print $3}')
+            echo ""
+            echo -e "${YELLOW}[$(date +%H:%M:%S)]${NC} Changes detected:"
+            for f in $changed_files; do
+                echo -e "  ${BLUE}$f${NC}"
+            done
+
+            echo -e "${YELLOW}[$(date +%H:%M:%S)]${NC} Rebuilding..."
+            cmd_generate "$src_dir" --module "$module_name" --lang "$LANG" $USE_PCH 2>&1 && \
+                echo -e "${GREEN}[$(date +%H:%M:%S)] Build successful${NC}" || \
+                echo -e "${RED}[$(date +%H:%M:%S)] Build failed${NC}"
+
+            # Update checksums
+            cp "$new_checksums" "$checksum_file"
+        fi
+
+        rm -f "$new_checksums"
+    done
+
+    rm -f "$checksum_file"
+}
+
+# Compute checksums of all header files in a directory
+compute_header_checksums() {
+    local dir="$1"
+    find "$dir" -maxdepth 3 \( -name "*.hpp" -o -name "*.h" \) -exec md5sum {} \; 2>/dev/null | sort
+}
+
+show_watch_help() {
+    cat << EOF
+${CYAN}mirror_bridge watch${NC} - Live reload during development
+
+${YELLOW}Usage:${NC}
+  mirror_bridge watch <src_dir> --module <name> [options]
+
+Watches C++ header files for changes and automatically recompiles
+bindings when modifications are detected.
+
+${YELLOW}Required:${NC}
+  <src_dir>             Directory containing C++ headers
+  --module, -m <name>   Name for the generated module
+
+${YELLOW}Options:${NC}
+  --lang, -l <lang>     Target language (python|lua|js|all) [default: python]
+  --output, -o <dir>    Output directory [default: build]
+  --interval, -i <sec>  Poll interval in seconds [default: 2]
+  --pch                 Use precompiled header for faster builds
+
+${YELLOW}Example:${NC}
+  mirror_bridge watch src/ --module my_lib --lang python
+  mirror_bridge watch src/ --module my_lib --lang all --pch --interval 1
+EOF
+}
+
 # Command: version
 cmd_version() {
     echo "Mirror Bridge v$VERSION"
@@ -732,6 +834,7 @@ main() {
         build) cmd_build "$@" ;;
         config) cmd_config "$@" ;;
         diff) cmd_diff "$@" ;;
+        watch) cmd_watch "$@" ;;
         init) echo "Not yet implemented"; exit 1 ;;
         version|--version|-v) cmd_version ;;
         help|--help|-h) show_help ;;

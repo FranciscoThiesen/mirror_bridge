@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
+- `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
 - Bulk array transfer for numeric vectors: `vector<float>`, `vector<double>`, `vector<int>`, etc. are now returned as `array.array` objects via single memcpy (~10-50x faster than element-by-element list construction)
 - String interning for member names in Python dict conversion via `PyUnicode_InternFromString`
 - Exception handling for Lua (`luaL_error`) and JavaScript (`napi_throw_error`) bindings: C++ exceptions are now caught and propagated as native errors in all three languages
