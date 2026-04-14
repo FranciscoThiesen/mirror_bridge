@@ -15,7 +15,8 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 ### Guides
 - **[Workflow Guide](guides/workflow.md)** - Recommended development workflow with PCH
 - **[PCH Optimization](guides/pch-optimization.md)** - 3-6x faster compilation with precompiled headers
-- **[Multi-Language Support](guides/multi-language.md)** - Python, Lua, and JavaScript bindings
+- **[Multi-Language Support](guides/multi-language.md)** - Python, Lua, JavaScript, and Rust bindings
+- **[Packaging](guides/packaging.md)** - Distribute bindings as pip-installable packages
 - **[Single-Header Distribution](guides/single-header.md)** - Simplified integration with amalgamated headers
 - **[Contributing](guides/contributing.md)** - Development guide and contribution workflow
 
@@ -39,6 +40,7 @@ Mirror Bridge is a **header-only C++ library** that uses C++26 reflection (P2996
 | Python   | Stable | `mirror_bridge generate --lang python` |
 | Lua      | Stable | `mirror_bridge generate --lang lua` |
 | JavaScript (Node.js) | Stable | `mirror_bridge generate --lang js` |
+| Rust     | Beta   | `generate_bindings<T>()` code generation |
 
 ### Key Features
 

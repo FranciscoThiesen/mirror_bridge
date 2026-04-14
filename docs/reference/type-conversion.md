@@ -32,10 +32,13 @@ Mirror Bridge automatically converts types between C++ and target languages. Thi
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `std::vector<T>` | `list` | `table` (array) | `Array` |
+| `std::vector<T>` (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
+| `std::vector<T>` (other T) | `list` | `table` (array) | `Array` |
 | `std::array<T, N>` | `list` | `table` (array) | `Array` |
 | `std::deque<T>` | `list` | `table` (array) | `Array` |
 | `std::list<T>` | `list` | `table` (array) | `Array` |
+
+**Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings use a single `memcpy` into an `array.array` object instead of element-by-element conversion. This is ~10-50x faster for large arrays. The `from_python` direction accepts both `list` and `array.array` inputs.
 
 **Example:**
 

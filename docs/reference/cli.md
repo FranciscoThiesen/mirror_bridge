@@ -183,6 +183,79 @@ mirror_bridge config bindings.mirror
 mirror_bridge config bindings.mirror -v
 ```
 
+### `diff` - Binding Surface Diff
+
+Compare current class definitions against a stored snapshot to detect added/removed members and methods.
+
+```bash
+mirror_bridge diff <src_dir> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<src_dir>` | Directory containing C++ headers |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output DIR` | Build directory for storing snapshots (default: `build/`) |
+| `-u, --update` | Update the snapshot without prompting (CI-friendly) |
+
+The first run creates an initial snapshot. Subsequent runs compare against it and show added/removed binding surface elements.
+
+**Examples:**
+
+```bash
+# Check for changes
+mirror_bridge diff src/
+
+# Non-interactive update (for CI pipelines)
+mirror_bridge diff src/ --update
+
+# Custom snapshot location
+mirror_bridge diff src/ --output build/
+```
+
+### `watch` - Live Reload
+
+Watch header files for changes and automatically recompile bindings.
+
+```bash
+mirror_bridge watch <src_dir> --module <name> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<src_dir>` | Directory containing C++ headers |
+| `--module NAME` | Output module name |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--lang LANG` | Target language (default: `python`) |
+| `-o, --output DIR` | Output directory (default: `build/`) |
+| `-i, --interval SEC` | Poll interval in seconds (default: `2`) |
+| `--pch` | Use precompiled header for faster builds |
+
+**Examples:**
+
+```bash
+# Watch and rebuild Python bindings on changes
+mirror_bridge watch src/ --module my_lib --lang python
+
+# All languages with faster polling
+mirror_bridge watch src/ --module my_lib --lang all --interval 1
+
+# With precompiled header for fast iteration
+mirror_bridge watch src/ --module my_lib --lang python --pch
+```
+
 ### `init` - Initialize Project
 
 Create a new Mirror Bridge project structure.

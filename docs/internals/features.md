@@ -2,7 +2,7 @@
 
 All features have been tested and verified across all supported languages.
 
-**Last Updated**: 2025-11-19
+**Last Updated**: 2026-04-12
 **Environment**: Docker (Bloomberg clang-p2996)
 
 ## Supported Languages
@@ -12,6 +12,7 @@ All features have been tested and verified across all supported languages.
 | **Python** | Stable | `mirror_bridge generate --lang python` | 100% |
 | **Lua** | Stable | `mirror_bridge generate --lang lua` | 100% |
 | **JavaScript** | Stable | `mirror_bridge generate --lang js` | 100% |
+| **Rust** | Beta | Code generation via `generate_bindings<T>()` | 100% |
 
 ## Feature Matrix
 
@@ -36,10 +37,13 @@ All features have been tested and verified across all supported languages.
 | **Smart Pointers** | Yes | Partial | Partial |
 | **Cross-Module Types** | Yes | No | No |
 | **Inheritance** | Yes | Yes | Yes |
-| **Exception Handling** | Yes | No | No |
+| **Exception Handling** | Yes | Yes | Yes |
 | **Auto-Discovery** | Yes | Yes | Yes |
 | **Async/Await (std::future)** | Yes | No | Yes |
 | **std::optional** | Yes | Yes | Yes |
+| **std::expected** | Yes | Yes | Yes |
+| **Bulk Array Transfer** | Yes (array.array) | No | No |
+| **Compile-Time Validation** | Yes | Yes | Yes |
 
 ## Test Coverage
 
@@ -172,7 +176,6 @@ Python fully supports smart pointer conversion. Lua and JavaScript have partial 
 |------------|--------|
 | Smart pointers | Partial (basic only) |
 | Cross-module types | Not supported |
-| Exception handling | Not supported |
 | Method overloading | Limited |
 
 ## Performance
