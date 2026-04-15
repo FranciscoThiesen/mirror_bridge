@@ -17,3 +17,7 @@
 
 // Default: Include Python bindings for backward compatibility
 #include "python/mirror_bridge_python.hpp"
+
+// Auto-detect Eigen and include type converters if available.
+// This enables zero-effort binding of classes using Eigen::Vector3d, Matrix4d, etc.
+#include "python/mirror_bridge_eigen.hpp"

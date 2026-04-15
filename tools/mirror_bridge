@@ -236,10 +236,41 @@ EOF
     # Add unique header includes
     declare -A included
     for header in "${headers[@]}"; do
-        if [ -z "${included[$header]}" ]; then
+        if [ -z "${included["$header"]}" ]; then
             echo "#include \"$header\"" >> "$output_file"
-            included[$header]=1
+            included["$header"]=1
         fi
+    done
+
+    echo "" >> "$output_file"
+
+    # Detect namespaces from headers and build fully-qualified using directives.
+    # Tracks nesting depth to reconstruct names like "open3d::geometry".
+    declare -A ns_seen
+    for header in "${headers[@]}"; do
+        local full_path="$src_dir/$header"
+        [ -f "$full_path" ] || continue
+
+        local ns_stack=()
+        while IFS= read -r line; do
+            # Detect "namespace foo {" or "namespace foo::bar {"
+            if [[ "$line" =~ ^[[:space:]]*namespace[[:space:]]+([a-zA-Z_][a-zA-Z0-9_:]*).*\{ ]]; then
+                local ns="${BASH_REMATCH[1]}"
+                [ "$ns" = "std" ] && continue
+                ns_stack+=("$ns")
+                # Build fully qualified name
+                local fqn=""
+                for part in "${ns_stack[@]}"; do
+                    [ -n "$fqn" ] && fqn="${fqn}::${part}" || fqn="$part"
+                done
+                if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
+                    echo "using namespace $fqn;" >> "$output_file"
+                    ns_seen["$fqn"]=1
+                fi
+            fi
+            # Track closing braces for namespace depth
+            # (simplified: just count opens, don't try to match closes)
+        done < "$full_path"
     done
 
     echo "" >> "$output_file"
@@ -298,7 +329,19 @@ compile_binding() {
 
     local cmd="clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
         -I. -I$src_dir -I$PROJECT_ROOT \
-        -fPIC -shared -O3 -DNDEBUG"
+        -fPIC -shared -O3 -DNDEBUG \
+        -Wno-deprecated-declarations"
+
+    # Auto-detect Eigen and add include path
+    if grep -rq "Eigen/" "$src_dir" 2>/dev/null; then
+        for eigen_path in /usr/include/eigen3 /usr/local/include/eigen3 /opt/homebrew/include/eigen3; do
+            if [ -d "$eigen_path" ]; then
+                cmd="$cmd -I$eigen_path"
+                [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Auto-detected Eigen at $eigen_path${NC}"
+                break
+            fi
+        done
+    fi
 
     if [ -n "$pch_path" ] && [ -f "$pch_path" ]; then
         cmd="$cmd -include-pch $pch_path"

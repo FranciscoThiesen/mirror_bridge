@@ -2,15 +2,15 @@
 //
 // This is the ENTIRE binding layer for 4 geometry classes.
 // Compare with Open3D's pybind11 bindings:
-//   - pointcloud.cpp:      510 lines
-//   - lineset.cpp:          155 lines
-//   - boundingvolume.cpp:   240 lines
-//   - trianglemesh.cpp:    1010 lines
-//   Total pybind11:        1915 lines
+//   - pointcloud.cpp:      428 lines
+//   - lineset.cpp:          135 lines
+//   - boundingvolume.cpp:   217 lines
+//   - trianglemesh.cpp:     798 lines
+//   Total pybind11:        1,578 lines
 //
-// mirror_bridge version:    8 lines (below)
+// mirror_bridge version: the 4 bind_class<> calls below.
+// Eigen types are handled automatically — no custom converter needed.
 
-#include "src/eigen_converter.hpp"
 #include "mirror_bridge.hpp"
 #include "src/geometry.hpp"
 
