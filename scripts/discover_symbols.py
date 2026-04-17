@@ -23,25 +23,42 @@ from typing import Iterator
 
 @dataclass
 class ParserState:
-    """Tracks parsing state while scanning a C++ file."""
-    namespace_stack: list[str]
+    """Tracks parsing state while scanning a C++ file.
+
+    Both namespace and class scopes record the brace depth at which they were
+    opened so we can pop them correctly when that depth drops, regardless of
+    other scopes opened between them.
+    """
+    # (name, opened_at_depth) tuples.
+    namespace_stack: list[tuple[str, int]]
+    class_stack: list[tuple[str, int]]
     brace_depth: int
     in_class_or_struct: bool
     class_brace_depth: int
     skip_next: bool
     pending_namespace: str | None
+    # Name of a class whose declaration we've seen but whose opening brace
+    # we haven't yet — e.g. `class Foo\n    : public Bar {`. When we see the
+    # opening brace we push it onto class_stack.
+    pending_class: str | None
 
     def __init__(self):
         self.namespace_stack = []
+        self.class_stack = []
         self.brace_depth = 0
         self.in_class_or_struct = False
         self.class_brace_depth = 0
         self.skip_next = False
         self.pending_namespace = None
+        self.pending_class = None
 
     @property
     def current_namespace(self) -> str:
-        return "::".join(self.namespace_stack)
+        return "::".join(n for n, _ in self.namespace_stack)
+
+    @property
+    def current_class_scope(self) -> str:
+        return "::".join(n for n, _ in self.class_stack)
 
 
 # Regex patterns
@@ -135,9 +152,16 @@ def discover_classes(file_path: str, rel_path: str) -> Iterator[tuple[str, str, 
     """
     Discover class/struct definitions in a header file.
 
-    Yields tuples of (qualified_name, simple_name, header_path)
+    Yields tuples of (qualified_name, simple_name, header_path).
+
+    The qualified_name includes BOTH namespace and enclosing-class scope, so a
+    nested class is reported as `ns::Outer::Inner` and can be used as a template
+    argument in generated binding code without needing `using` declarations
+    inside the outer class.
     """
     state = ParserState()
+    # Stash pending namespace name awaiting its opening brace.
+    pending_ns_name: str | None = None
 
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
@@ -146,19 +170,12 @@ def discover_classes(file_path: str, rel_path: str) -> Iterator[tuple[str, str, 
                 state.skip_next = True
                 continue
 
-            # Handle namespace declarations
+            # Handle namespace declarations. If `{` is on the same line, the
+            # push happens below when we process the brace. Either way we
+            # remember the name in pending_ns_name.
             ns_match = NAMESPACE_PATTERN.match(line)
             if ns_match:
-                ns_name = ns_match.group(1)
-                if '{' in line:
-                    state.namespace_stack.append(ns_name)
-                else:
-                    state.pending_namespace = ns_name
-
-            # Handle pending namespace (brace on next line)
-            if state.pending_namespace and '{' in line:
-                state.namespace_stack.append(state.pending_namespace)
-                state.pending_namespace = None
+                pending_ns_name = ns_match.group(1)
 
             # Check for class/struct definition
             class_match = CLASS_STRUCT_PATTERN.match(line)
@@ -166,20 +183,34 @@ def discover_classes(file_path: str, rel_path: str) -> Iterator[tuple[str, str, 
                 if not is_forward_declaration(line) and is_class_definition_start(line):
                     class_name = class_match.group(2)
                     ns = state.current_namespace
-                    qualified = f"{ns}::{class_name}" if ns else class_name
+                    scope_prefix = state.current_class_scope
+                    parts = [p for p in (ns, scope_prefix, class_name) if p]
+                    qualified = "::".join(parts)
                     yield (qualified, class_name, rel_path)
+                    state.pending_class = class_name
 
             # Reset skip flag
             if SKIP_MARKER not in line:
                 state.skip_next = False
 
-            # Update brace depth (do this last to track namespace closes)
+            # Process each brace in order, updating depth and scope stacks.
+            # A '{' that follows a class/namespace declaration opens that scope;
+            # any other '{' is an ordinary compound statement / initializer.
             opens, closes = count_braces(line)
-            state.brace_depth += opens - closes
-
-            # Pop namespaces when their braces close
-            while state.namespace_stack and state.brace_depth < len(state.namespace_stack):
-                state.namespace_stack.pop()
+            for _ in range(opens):
+                state.brace_depth += 1
+                if state.pending_class is not None:
+                    state.class_stack.append((state.pending_class, state.brace_depth))
+                    state.pending_class = None
+                elif pending_ns_name is not None:
+                    state.namespace_stack.append((pending_ns_name, state.brace_depth))
+                    pending_ns_name = None
+            for _ in range(closes):
+                state.brace_depth -= 1
+                while state.class_stack and state.class_stack[-1][1] > state.brace_depth:
+                    state.class_stack.pop()
+                while state.namespace_stack and state.namespace_stack[-1][1] > state.brace_depth:
+                    state.namespace_stack.pop()
 
 
 def discover_functions(
@@ -200,6 +231,7 @@ def discover_functions(
     Yields tuples of (qualified_name, simple_name, header_path)
     """
     state = ParserState()
+    pending_ns_name: str | None = None
 
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
@@ -208,19 +240,10 @@ def discover_functions(
                 state.skip_next = True
                 # Don't 'continue' - we need to count braces
 
-            # Handle namespace declarations
+            # Handle namespace declarations (push happens when brace opens).
             ns_match = NAMESPACE_PATTERN.match(line)
             if ns_match:
-                ns_name = ns_match.group(1)
-                if '{' in line:
-                    state.namespace_stack.append(ns_name)
-                else:
-                    state.pending_namespace = ns_name
-
-            # Handle pending namespace
-            if state.pending_namespace and '{' in line:
-                state.namespace_stack.append(state.pending_namespace)
-                state.pending_namespace = None
+                pending_ns_name = ns_match.group(1)
 
             # Track class/struct entry (to skip member functions)
             class_match = CLASS_STRUCT_PATTERN.match(line)
@@ -256,17 +279,22 @@ def discover_functions(
             if SKIP_MARKER not in line:
                 state.skip_next = False
 
-            # Update brace depth (always do this)
+            # Process braces one at a time so namespace pushes bind to the
+            # correct opening brace.
             opens, closes = count_braces(line)
-            state.brace_depth += opens - closes
+            for _ in range(opens):
+                state.brace_depth += 1
+                if pending_ns_name is not None:
+                    state.namespace_stack.append((pending_ns_name, state.brace_depth))
+                    pending_ns_name = None
+            for _ in range(closes):
+                state.brace_depth -= 1
+                while state.namespace_stack and state.namespace_stack[-1][1] > state.brace_depth:
+                    state.namespace_stack.pop()
 
-            # Exit class/struct when braces close
+            # Exit class/struct when braces close below where it opened.
             if state.in_class_or_struct and state.brace_depth <= state.class_brace_depth:
                 state.in_class_or_struct = False
-
-            # Pop namespaces when their braces close
-            while state.namespace_stack and state.brace_depth < len(state.namespace_stack):
-                state.namespace_stack.pop()
 
 
 def main():

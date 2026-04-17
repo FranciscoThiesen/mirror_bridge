@@ -32,18 +32,38 @@ sys.path.insert(0, 'build')
 
 import geometry_auto
 
-# Test Point class
+# Top-level classes
 p = geometry_auto.Point(3.0, 4.0)
 assert p.x == 3.0
 assert p.y == 4.0
 assert abs(p.distance_from_origin() - 5.0) < 0.001
 
-# Test Circle class
 c = geometry_auto.Circle(0, 0, 10)
 assert c.radius == 10.0
 assert abs(c.area() - 314.159) < 0.01
 
-print("✓ Auto-discovery test passed!")
+# Nested classes — the Engine/Turbo types must be importable by their simple
+# names even though they're declared inside Vehicle/Engine in C++.
+v = geometry_auto.Vehicle()
+assert v.wheels == 4
+assert v.brand == "unknown"
+
+e = geometry_auto.Engine()
+e.horsepower = 300.0
+e.cylinders = 6
+assert e.horsepower == 300.0
+
+t = geometry_auto.Turbo()
+t.enabled = True
+t.boost_psi = 15.5
+assert t.enabled  # C++ bool round-trips as truthy in Python
+assert abs(t.boost_psi - 15.5) < 1e-6
+
+b = geometry_auto.Bicycle()
+assert b.wheels == 2
+assert b.frame == "steel"
+
+print("✓ Auto-discovery test passed (including 3-deep nested classes)!")
 EOF
 
 echo ""

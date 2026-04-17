@@ -142,7 +142,13 @@ ${YELLOW}Performance:${NC}
 EOF
 }
 
-# Discover classes in source directory
+# Discover classes in source directory.
+#
+# Handles nested classes correctly by tracking C++ brace depth and class scope:
+# a class declared inside another class is reported as `Outer::Inner` (scopes
+# joined with ::), so it can be referenced from binding code without needing
+# the original class body. Namespaces are NOT joined — they're handled by the
+# `using namespace` directives emitted elsewhere.
 discover_classes() {
     local src_dir="$1"
     local -n classes_ref=$2
@@ -155,6 +161,117 @@ discover_classes() {
         echo -e "${RED}Error: No header files found in $src_dir${NC}"
         exit 1
     fi
+
+    # Python parser that understands nested classes. Emits one line per class:
+    #   QUALIFIED_NAME\tLINE_NUMBER_OF_DECLARATION
+    # Line numbers let the caller check the preceding line for MIRROR_BRIDGE_SKIP.
+    #
+    # Classes declared inside other classes are reported as Outer::Inner;
+    # namespace scope is NOT joined (the `using namespace ...` emission elsewhere
+    # handles that).
+    local parser_script
+    parser_script=$(cat <<'PYSCRIPT'
+import re, sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        raw = f.read()
+except Exception:
+    sys.exit(0)
+
+# Strip comments and string/char literals while preserving line numbers so
+# error messages and MIRROR_BRIDGE_SKIP lookups remain accurate.
+def keep_newlines(m):
+    return '\n' * m.group(0).count('\n')
+
+content = re.sub(r'/\*.*?\*/', keep_newlines, raw, flags=re.DOTALL)
+content = re.sub(r'//[^\n]*', '', content)
+content = re.sub(r'"(?:[^"\\]|\\.)*"', '""', content)
+content = re.sub(r"'(?:[^'\\]|\\.)*'", "''", content)
+
+# Tokenize to {, }, ;, class NAME, struct NAME, and 'template' (for
+# template-parameter skipping). This is much simpler than hand-walking chars.
+token_re = re.compile(
+    r'\b(class|struct)\b\s+([A-Za-z_]\w*)'  # 1,2: class/struct keyword + name
+    r'|\btemplate\b'                        # 3: template keyword
+    r'|([{};])'                             # 4: punctuation we care about
+)
+
+tokens = []
+for m in token_re.finditer(content):
+    line_no = content.count('\n', 0, m.start()) + 1
+    if m.group(1):   # class/struct declaration
+        tokens.append(('decl', m.group(2), line_no, m.end()))
+    elif m.group(0) == 'template':
+        tokens.append(('template', None, line_no, m.end()))
+    else:            # {, }, ;
+        tokens.append((m.group(3), None, line_no, m.end()))
+
+# Walk tokens. A 'decl' followed (eventually) by '{' at depth D pushes the name
+# onto the class stack at depth D. A 'decl' followed by ';' is a forward
+# declaration and is dropped. 'template' makes the *next* token sequence skip
+# a matching <...> block — we handle that by scanning the raw text between the
+# template token and its balanced '>'.
+depth = 0
+class_stack = []     # list of (name, opened_at_depth)
+pending = None       # (name, line_no) awaiting a '{'
+skip_until_pos = 0   # positions up to here were eaten by a template<...>
+skip_next_decl = False  # True after a template<...> block — next decl is a template
+results = []
+
+def skip_template_params(start):
+    # Find the matching '>' for a '<' that follows 'template'.
+    lt = content.find('<', start)
+    if lt < 0:
+        return start
+    d = 1
+    i = lt + 1
+    while i < len(content) and d > 0:
+        if content[i] == '<':
+            d += 1
+        elif content[i] == '>':
+            d -= 1
+        i += 1
+    return i
+
+for kind, name, line_no, end_pos in tokens:
+    if end_pos <= skip_until_pos:
+        continue
+    if kind == 'template':
+        skip_until_pos = skip_template_params(end_pos)
+        skip_next_decl = True
+        continue
+    if kind == 'decl':
+        if skip_next_decl:
+            # Template class — can't be bound directly (needs instantiation).
+            # Still push a placeholder so the brace matching stays consistent;
+            # we just never emit it.
+            pending = ('__mb_template__', line_no)
+            skip_next_decl = False
+        else:
+            pending = (name, line_no)
+    elif kind == '{':
+        if pending is not None:
+            class_stack.append((pending[0], depth))
+            if pending[0] != '__mb_template__' and \
+               not any(n == '__mb_template__' for n, _ in class_stack[:-1]):
+                qual = '::'.join(n for n, _ in class_stack)
+                results.append((qual, pending[1]))
+            pending = None
+        depth += 1
+    elif kind == '}':
+        depth -= 1
+        while class_stack and class_stack[-1][1] >= depth:
+            class_stack.pop()
+    elif kind == ';':
+        pending = None  # forward declaration — discard
+        skip_next_decl = False
+
+for name, lineno in results:
+    print(f"{name}\t{lineno}")
+PYSCRIPT
+    )
 
     while IFS= read -r header_file; do
         local rel_path
@@ -188,30 +305,23 @@ discover_classes() {
             continue
         fi
 
-        # Find class/struct definitions
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*(struct|class)[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
-                local class_name="${BASH_REMATCH[2]}"
+        # Run the Python parser on this header.
+        while IFS=$'\t' read -r class_name line_num; do
+            [ -z "$class_name" ] && continue
 
-                # Skip forward declarations
-                [[ "$line" =~ \;[[:space:]]*$ ]] && continue
-
-                # Check for MIRROR_BRIDGE_SKIP
-                local line_num
-                line_num=$(grep -n "^[[:space:]]*\(struct\|class\)[[:space:]]\+$class_name" "$header_file" | head -1 | cut -d: -f1)
-                if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
-                    local prev_line=$((line_num - 1))
-                    if sed -n "${prev_line}p" "$header_file" | grep -q "MIRROR_BRIDGE_SKIP"; then
-                        [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Skipping: $class_name (marked SKIP)${NC}"
-                        continue
-                    fi
+            # Honor MIRROR_BRIDGE_SKIP annotation on the line before the declaration.
+            if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
+                local prev_line=$((line_num - 1))
+                if sed -n "${prev_line}p" "$header_file" | grep -q "MIRROR_BRIDGE_SKIP"; then
+                    [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Skipping: $class_name (marked SKIP)${NC}"
+                    continue
                 fi
-
-                classes_ref+=("$class_name")
-                headers_ref+=("$rel_path")
-                echo -e "  ${GREEN}✓${NC} Found: $class_name in $rel_path"
             fi
-        done < "$header_file"
+
+            classes_ref+=("$class_name")
+            headers_ref+=("$rel_path")
+            echo -e "  ${GREEN}✓${NC} Found: $class_name in $rel_path"
+        done < <(python3 -c "$parser_script" "$header_file" 2>/dev/null)
     done <<< "$header_files"
 }
 
@@ -340,22 +450,21 @@ PYSCRIPT
 
     echo "" >> "$output_file"
 
-    # Generate module
-    if [ "$lang" = "js" ] || [ "$lang" = "javascript" ]; then
-        echo "$module_macro($module_name," >> "$output_file"
-        for class_name in "${classes[@]}"; do
-            echo "    $bind_func<$class_name>(env, m, \"$class_name\");" >> "$output_file"
-        done
-    else
-        echo "$module_macro($module_name," >> "$output_file"
-        for class_name in "${classes[@]}"; do
-            if [ "$lang" = "lua" ]; then
-                echo "    $bind_func<$class_name>(L, \"$class_name\");" >> "$output_file"
-            else
-                echo "    $bind_func<$class_name>(m, \"$class_name\");" >> "$output_file"
-            fi
-        done
-    fi
+    # Generate module.
+    # Python/Lua/JS class names are the simple name (last segment after ::),
+    # since they're flat identifiers in the target language. The C++ template
+    # argument keeps the fully-qualified scope.
+    echo "$module_macro($module_name," >> "$output_file"
+    for class_name in "${classes[@]}"; do
+        local simple_name="${class_name##*::}"
+        if [ "$lang" = "js" ] || [ "$lang" = "javascript" ]; then
+            echo "    $bind_func<$class_name>(env, m, \"$simple_name\");" >> "$output_file"
+        elif [ "$lang" = "lua" ]; then
+            echo "    $bind_func<$class_name>(L, \"$simple_name\");" >> "$output_file"
+        else
+            echo "    $bind_func<$class_name>(m, \"$simple_name\");" >> "$output_file"
+        fi
+    done
 
     echo ")" >> "$output_file"
 }
