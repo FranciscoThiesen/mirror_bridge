@@ -160,6 +160,28 @@ discover_classes() {
         local rel_path
         rel_path=$(realpath --relative-to="$src_dir" "$header_file")
 
+        # If user passed -I directories, prefer a path relative to the
+        # broadest include root (so #include matches what internal headers
+        # use, e.g. "open3d/geometry/Foo.h" rather than just "Foo.h").
+        local abs_header
+        abs_header=$(realpath "$header_file" 2>/dev/null || echo "$header_file")
+        for inc in "${_INCLUDE_DIRS[@]:-}"; do
+            [ -z "$inc" ] && continue
+            local abs_inc
+            abs_inc=$(realpath "$inc" 2>/dev/null || echo "$inc")
+            if [[ "$abs_header" == "$abs_inc"/* ]]; then
+                local candidate="${abs_header#$abs_inc/}"
+                # Prefer the path with more directory components (broader root)
+                if [ -z "$rel_path_from_inc" ] || [ "${#candidate}" -gt "${#rel_path_from_inc}" ]; then
+                    rel_path_from_inc="$candidate"
+                fi
+            fi
+        done
+        if [ -n "${rel_path_from_inc:-}" ]; then
+            rel_path="$rel_path_from_inc"
+            unset rel_path_from_inc
+        fi
+
         # Skip files marked with MIRROR_BRIDGE_SKIP_FILE
         if grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null; then
             [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Skipping file: $rel_path${NC}"
@@ -244,34 +266,77 @@ EOF
 
     echo "" >> "$output_file"
 
-    # Detect namespaces from headers and build fully-qualified using directives.
-    # Tracks nesting depth to reconstruct names like "open3d::geometry".
+    # Detect namespaces and emit using directives, using a Python helper that
+    # tracks brace depth properly. Collect all files in one invocation.
     declare -A ns_seen
-    for header in "${headers[@]}"; do
-        local full_path="$src_dir/$header"
-        [ -f "$full_path" ] || continue
+    local ns_script
+    ns_script=$(cat <<'PYSCRIPT'
+import re, sys
+seen = set()
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    except Exception:
+        continue
+    text = re.sub(r'//[^\n]*', '', text)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    depth = 0
+    ns_stack = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            while ns_stack and ns_stack[-1][1] >= depth:
+                ns_stack.pop()
+        elif ch == 'n':
+            m = re.match(r'namespace\s+([a-zA-Z_][a-zA-Z0-9_:]*)\s*\{', text[i:])
+            if m:
+                ns_name = m.group(1)
+                if ns_name != 'std':
+                    ns_stack.append((ns_name, depth))
+                    fqn = '::'.join(n for n, _ in ns_stack)
+                    if fqn and fqn not in seen:
+                        seen.add(fqn)
+                        print(fqn)
+                depth += 1
+                i += m.end()
+                continue
+        i += 1
+PYSCRIPT
+    )
 
-        local ns_stack=()
-        while IFS= read -r line; do
-            # Detect "namespace foo {" or "namespace foo::bar {"
-            if [[ "$line" =~ ^[[:space:]]*namespace[[:space:]]+([a-zA-Z_][a-zA-Z0-9_:]*).*\{ ]]; then
-                local ns="${BASH_REMATCH[1]}"
-                [ "$ns" = "std" ] && continue
-                ns_stack+=("$ns")
-                # Build fully qualified name
-                local fqn=""
-                for part in "${ns_stack[@]}"; do
-                    [ -n "$fqn" ] && fqn="${fqn}::${part}" || fqn="$part"
-                done
-                if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
-                    echo "using namespace $fqn;" >> "$output_file"
-                    ns_seen["$fqn"]=1
+    local -a ns_paths=()
+    for header in "${headers[@]}"; do
+        # Header may be relative to src_dir OR to an include root.
+        # Try each form.
+        local full_path=""
+        if [ -f "$src_dir/$header" ]; then
+            full_path="$src_dir/$header"
+        elif [ -f "$header" ]; then
+            full_path="$header"
+        else
+            # Try each -I include dir
+            for inc in "${_INCLUDE_DIRS[@]:-}"; do
+                if [ -n "$inc" ] && [ -f "$inc/$header" ]; then
+                    full_path="$inc/$header"; break
                 fi
-            fi
-            # Track closing braces for namespace depth
-            # (simplified: just count opens, don't try to match closes)
-        done < "$full_path"
+            done
+        fi
+        [ -n "$full_path" ] && ns_paths+=("$full_path")
     done
+
+    if [ ${#ns_paths[@]} -gt 0 ]; then
+        while IFS= read -r fqn; do
+            if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
+                echo "using namespace $fqn;" >> "$output_file"
+                ns_seen["$fqn"]=1
+            fi
+        done < <(python3 -c "$ns_script" "${ns_paths[@]}" 2>/dev/null)
+    fi
 
     echo "" >> "$output_file"
 
@@ -303,6 +368,8 @@ compile_binding() {
     local output_dir="$4"
     local src_dir="$5"
     local pch_path="$6"
+    shift 6
+    local extra_includes=("$@")
 
     local output_ext
     local compile_flags
@@ -331,6 +398,11 @@ compile_binding() {
         -I. -I$src_dir -I$PROJECT_ROOT \
         -fPIC -shared -O3 -DNDEBUG \
         -Wno-deprecated-declarations"
+
+    # Add user-supplied -I directories
+    for inc in "${extra_includes[@]}"; do
+        [ -n "$inc" ] && cmd="$cmd -I$inc"
+    done
 
     # Auto-detect Eigen and add include path
     if grep -rq "Eigen/" "$src_dir" 2>/dev/null; then
@@ -421,10 +493,12 @@ cmd_generate() {
     echo -e "Lang:    ${YELLOW}$LANG${NC}"
     echo ""
 
-    # Discover classes
+    # Discover classes (pass include dirs so headers get proper paths)
     echo -e "${YELLOW}Scanning for classes...${NC}"
     declare -a CLASSES
     declare -a HEADERS
+    # Make include dirs visible to discover_classes (bash arrays are process-local)
+    _INCLUDE_DIRS=("${include_dirs[@]}")
     discover_classes "$src_dir" CLASSES HEADERS
 
     if [ ${#CLASSES[@]} -eq 0 ]; then
@@ -472,7 +546,7 @@ cmd_generate() {
         generate_binding_file "$lang" "$module_name" "$binding_file" CLASSES HEADERS "$src_dir"
 
         echo -e "${YELLOW}Compiling $lang module...${NC}"
-        compile_binding "$lang" "$module_name" "$binding_file" "$OUTPUT_DIR" "$src_dir" "$PCH_PATH"
+        compile_binding "$lang" "$module_name" "$binding_file" "$OUTPUT_DIR" "$src_dir" "$PCH_PATH" "${include_dirs[@]:-}"
 
         if [ $KEEP_GENERATED -eq 0 ]; then
             rm -f "$binding_file"
