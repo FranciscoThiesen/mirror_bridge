@@ -52,6 +52,24 @@ RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/libc++.conf && ldconfig
 # Set LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
+# Install common deps used by Open3D-style binding targets (Eigen, fmt, jsoncpp,
+# nanoflann). These are optional for mirror_bridge itself but let downstream
+# projects build bindings without additional setup.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libeigen3-dev libfmt-dev libjsoncpp-dev libnanoflann-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Work around a clang-p2996 + fmt 8.1 incompatibility. FMT_STRING calls in
+# fmt/format-inl.h bigint printing fail consteval under the reflection
+# compiler. These calls are only reachable from debug-print paths; replacing
+# them with runtime-parsed string_view has no functional impact but lets
+# header-only fmt compile cleanly under clang-p2996.
+RUN sed -i \
+    -e 's|format_to(out, FMT_STRING("{:x}"), value)|format_to(out, fmt::string_view("{:x}"), value)|' \
+    -e 's|format_to(out, FMT_STRING("{:08x}"), value)|format_to(out, fmt::string_view("{:08x}"), value)|' \
+    -e 's|format_to(out, FMT_STRING("p{}"),|format_to(out, fmt::string_view("p{}"),|' \
+    /usr/include/fmt/format-inl.h
+
 # Verify the <meta> header is installed
 RUN echo '#include <meta>' > /tmp/test.cpp && \
     echo 'int main() { return 0; }' >> /tmp/test.cpp && \

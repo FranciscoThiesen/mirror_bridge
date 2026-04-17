@@ -2005,20 +2005,57 @@ struct TypeRegistry {
 // Solution: Cache both data members and member functions once per type in
 // constexpr structures. This reduces compile-time complexity from O(N³) to O(N²).
 
-// Cache for data member information - instantiated once per type T
+// Cache for data member information — includes fields inherited from base
+// classes. Walks T and its bases breadth-first; deeper classes contribute only
+// fields with names not already seen (C++-style name hiding). Splicing an
+// inherited field onto a derived object — `(derived).[:base_field:]` — compiles
+// and reads/writes the field through the implicit base subobject.
+//
+// Same static-span caching as MemberFunctionCache: the BFS runs once, then
+// per-index lookups are O(1).
 template<typename T>
 struct DataMemberCache {
-    // Count data members - computed once at compile time
-    static consteval std::size_t compute_count() {
-        return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+    static consteval std::vector<std::meta::info> collect_fields() {
+        constexpr auto ctx = std::meta::access_context::current();
+        std::vector<std::meta::info> result;
+        std::vector<std::string_view> seen_names;
+
+        std::vector<std::meta::info> layer = { ^^T };
+        while (!layer.empty()) {
+            std::vector<std::meta::info> next_layer;
+            std::vector<std::string_view> layer_names;
+
+            for (auto cls : layer) {
+                for (auto f : std::meta::nonstatic_data_members_of(cls, ctx)) {
+                    auto name = std::meta::identifier_of(f);
+
+                    bool hidden = false;
+                    for (auto seen : seen_names) {
+                        if (seen == name) { hidden = true; break; }
+                    }
+                    if (hidden) continue;
+
+                    result.push_back(f);
+                    layer_names.push_back(name);
+                }
+                for (auto b : std::meta::bases_of(cls, ctx)) {
+                    next_layer.push_back(std::meta::type_of(b));
+                }
+            }
+
+            for (auto n : layer_names) seen_names.push_back(n);
+            layer = std::move(next_layer);
+        }
+
+        return result;
     }
 
-    // Get the Nth data member - computed once per Index
+    static constexpr auto fields = std::define_static_array(collect_fields());
+    static constexpr std::size_t count = fields.size();
+
     static consteval auto get_at_index(std::size_t Index) {
-        return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())[Index];
+        return fields[Index];
     }
-
-    static constexpr std::size_t count = compute_count();
 };
 
 // Helper templates for data member reflection - use the cache
@@ -2064,10 +2101,19 @@ consteval const char* get_nested_member_name() {
 template<typename T, std::size_t Index>
 using NestedMemberType = typename [:std::meta::type_of(get_data_member<T, Index>()):];
 
-// Cache for member function information - instantiated once per type T
+// Cache for member function information — instantiated once per type T.
+// Includes methods inherited from base classes via BFS over bases_of, with
+// C++-style name hiding (derived's method hides base's method of same name).
+// This matches pybind11's behavior and makes inherited virtuals / plain
+// getters transparently usable from the target language.
+//
+// The BFS result is promoted to a constexpr static span via
+// std::define_static_array, so per-index lookups are O(1) span access rather
+// than re-running the full BFS. Without this cache, a class with N methods
+// would trigger O(N³) constexpr work across MethodNameCache construction
+// (44-method classes like PointCloud would hit the compiler step limit).
 template<typename T>
 struct MemberFunctionCache {
-    // Helper to check if a member is a bindable method
     static consteval bool is_bindable_method(std::meta::info member) {
         return std::meta::is_function(member) &&
                !std::meta::is_static_member(member) &&
@@ -2076,35 +2122,53 @@ struct MemberFunctionCache {
                !std::meta::is_operator_function(member);
     }
 
-    // Count methods - computed once at compile time
-    static consteval std::size_t compute_count() {
-        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-        std::size_t count = 0;
-        for (auto member : all_members) {
-            if (is_bindable_method(member)) {
-                count++;
-            }
-        }
-        return count;
-    }
+    // Walk T and its bases breadth-first, returning every non-hidden bindable
+    // method. Overloads at the same inheritance level all stay. A name that
+    // appears at one level hides the same name from deeper bases.
+    static consteval std::vector<std::meta::info> collect_methods() {
+        constexpr auto ctx = std::meta::access_context::current();
+        std::vector<std::meta::info> result;
+        std::vector<std::string_view> seen_names;
 
-    // Get the Nth method - computed once per Index
-    static consteval auto get_at_index(std::size_t Index) {
-        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-        std::size_t func_index = 0;
-        for (auto member : all_members) {
-            if (is_bindable_method(member)) {
-                if (func_index == Index) {
-                    return member;
+        std::vector<std::meta::info> layer = { ^^T };
+        while (!layer.empty()) {
+            std::vector<std::meta::info> next_layer;
+            std::vector<std::string_view> layer_names;
+
+            for (auto cls : layer) {
+                for (auto m : std::meta::members_of(cls, ctx)) {
+                    if (!is_bindable_method(m)) continue;
+                    auto name = std::meta::identifier_of(m);
+
+                    bool hidden = false;
+                    for (auto seen : seen_names) {
+                        if (seen == name) { hidden = true; break; }
+                    }
+                    if (hidden) continue;
+
+                    result.push_back(m);
+                    layer_names.push_back(name);
                 }
-                func_index++;
+                for (auto b : std::meta::bases_of(cls, ctx)) {
+                    next_layer.push_back(std::meta::type_of(b));
+                }
             }
+
+            for (auto n : layer_names) seen_names.push_back(n);
+            layer = std::move(next_layer);
         }
-        // Should never reach here if Index is valid
-        return all_members[0];
+
+        return result;
     }
 
-    static constexpr std::size_t count = compute_count();
+    // Materialize the BFS result into a constexpr static span. Subsequent
+    // per-index lookups hit this cached span instead of rerunning collect.
+    static constexpr auto methods = std::define_static_array(collect_methods());
+    static constexpr std::size_t count = methods.size();
+
+    static consteval auto get_at_index(std::size_t Index) {
+        return methods[Index];
+    }
 };
 
 // Cache for static member functions - instantiated once per type T

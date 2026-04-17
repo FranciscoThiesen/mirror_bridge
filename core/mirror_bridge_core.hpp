@@ -234,7 +234,18 @@ consteval std::size_t get_data_member_count() {
     return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
 }
 
-// Member Function Cache - using members_of and filtering (instance methods only)
+// Member Function Cache — includes methods inherited from base classes.
+//
+// P2996R13's members_of only returns methods DIRECTLY declared in T. To match
+// pybind11's behavior of exposing inherited methods, we walk the inheritance
+// chain breadth-first via bases_of, collecting every non-hidden method.
+//
+// Name hiding follows C++ rules: if T directly declares a name, all overloads
+// at THAT level hide base overloads of the same name. Overloads at the same
+// inheritance level are all kept. Virtual dispatch is handled by the compiler
+// when we splice the base method onto a derived object (P2996 allows
+// `derived.[:base_method_info:](args)` — we verified this compiles and
+// respects overriding).
 template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
@@ -245,32 +256,59 @@ struct MemberFunctionCache {
                !std::meta::is_operator_function(member);
     }
 
-    static consteval std::size_t compute_count() {
-        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-        std::size_t count = 0;
-        for (auto member : all_members) {
-            if (is_bindable_method(member)) {
-                count++;
+    // Walk T and its bases breadth-first, accumulating bindable methods with
+    // C++-style name hiding. Returns methods in order: T's direct methods
+    // first, then each base's non-hidden methods, level by level.
+    static consteval std::vector<std::meta::info> collect_methods() {
+        constexpr auto ctx = std::meta::access_context::current();
+        std::vector<std::meta::info> result;
+        std::vector<std::string_view> seen_names;
+
+        std::vector<std::meta::info> layer = { ^^T };
+        while (!layer.empty()) {
+            std::vector<std::meta::info> next_layer;
+            std::vector<std::string_view> layer_new_names;
+
+            for (auto cls : layer) {
+                for (auto m : std::meta::members_of(cls, ctx)) {
+                    if (!is_bindable_method(m)) continue;
+                    auto name = std::meta::identifier_of(m);
+
+                    // Name hiding: skip if a closer scope already had this name.
+                    bool hidden = false;
+                    for (auto seen : seen_names) {
+                        if (seen == name) { hidden = true; break; }
+                    }
+                    if (hidden) continue;
+
+                    result.push_back(m);
+                    // Record for hiding deeper bases, but don't add to seen_names
+                    // yet — sibling overloads at the same level shouldn't hide
+                    // each other.
+                    layer_new_names.push_back(name);
+                }
+                for (auto b : std::meta::bases_of(cls, ctx)) {
+                    next_layer.push_back(std::meta::type_of(b));
+                }
             }
+
+            for (auto n : layer_new_names) seen_names.push_back(n);
+            layer = std::move(next_layer);
         }
-        return count;
+
+        return result;
     }
+
+    // Materialize BFS result into a constexpr static span (define_static_array).
+    // Subsequent per-index lookups are O(1) span access rather than re-running
+    // the full BFS — critical for keeping compile-time under the step limit on
+    // large classes like Open3D's PointCloud (44 methods).
+    static constexpr auto methods = std::define_static_array(collect_methods());
+    static constexpr std::size_t count = methods.size();
 
     static consteval auto get_at_index(std::size_t Index) {
-        auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-        std::size_t func_index = 0;
-        for (auto member : all_members) {
-            if (is_bindable_method(member)) {
-                if (func_index == Index) {
-                    return member;
-                }
-                func_index++;
-            }
-        }
-        return all_members[0];
+        return methods[Index];
     }
-
-    static constexpr std::size_t count = compute_count();
 };
 
 // Static Member Function Cache - for class-level static methods
