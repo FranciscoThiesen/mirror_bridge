@@ -392,21 +392,24 @@ consteval auto get_method_return_type() {
 // methods that CAN be bound; methods that can't are emitted as an error if
 // called from the target language (not silently missing).
 
+// A type is "value-bindable" (can be held by value in std::tuple<T>) if:
+//   - It's default-constructible (tuple needs this for its own default ctor)
+//   - It's not abstract (no pure virtuals)
+//   - It's complete
+//   - It's copy-assignable (for tuple element assignment)
+// Primitives, pointers, enums, and void are always considered value-bindable.
 template<typename T>
 consteval bool is_value_bindable() {
     using U = std::remove_cvref_t<T>;
-    // Abstract classes and non-value-types can't be held by value in tuple.
-    // void is fine (used for return types).
     if constexpr (std::is_void_v<U>) return true;
     if constexpr (std::is_arithmetic_v<U>) return true;
     if constexpr (std::is_pointer_v<U>) return true;
     if constexpr (std::is_enum_v<U>) return true;
-    // For class types: must be complete and non-abstract.
-    // Note: we can't easily check is_abstract_v on forward-declared types
-    // (it would trigger instantiation); we conservatively require the type
-    // to be complete first.
     if constexpr (requires { sizeof(U); }) {
-        return !std::is_abstract_v<U>;
+        // Type is complete. Now check all the properties tuple needs.
+        return !std::is_abstract_v<U> &&
+               std::is_default_constructible_v<U> &&
+               std::is_copy_assignable_v<U>;
     }
     return false;  // incomplete type — can't bind by value
 }
@@ -428,6 +431,32 @@ consteval bool static_method_params_are_value_bindable() {
         return (is_value_bindable<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
+
+// ============================================================================
+// Parameter Storage Strategy — Pointer Holders for Non-Value Types
+// ============================================================================
+//
+// mirror_bridge's method dispatch uses std::tuple<ParamStorage...> for local
+// argument storage. For concrete value-semantic types, we store by value.
+// For abstract types, non-copyable types, or anything that can't live in a
+// tuple by value, we store a raw pointer to the underlying C++ object
+// (which lives in a Python wrapper).
+//
+// This is analogous to pybind11's shared_ptr holder approach, but lighter:
+// we only redirect to pointer storage when strictly necessary.
+
+template<typename ParamType>
+struct param_storage {
+    using Clean = std::remove_cvref_t<ParamType>;
+    using type = std::conditional_t<
+        !is_value_bindable<Clean>() && requires { sizeof(Clean); },
+        Clean*,
+        Clean
+    >;
+};
+
+template<typename ParamType>
+using param_storage_t = typename param_storage<ParamType>::type;
 
 // Nested member utilities (for dict/object conversion)
 template<typename T>

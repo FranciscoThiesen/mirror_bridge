@@ -158,3 +158,112 @@ The remaining failures require architectural changes to mirror_bridge:
 None of these are solvable in a single session. The correct path
 forward is to land the Category B commit, document what works now,
 and stage the remaining work as prioritized mirror_bridge improvements.
+
+---
+
+## Day 2 — Pointer-Holder Parameter Storage
+
+User pushback: "If pybind can make this work we should be able to as
+well. Stay true to the mirror_bridge approach: efficient and automated."
+
+Correct — pybind11 solves this via **shared_ptr holders**. When a method
+takes `const AbstractBase&`, pybind11 doesn't try to store `AbstractBase`
+by value anywhere. It extracts a pointer from the Python wrapper and
+passes it as a reference.
+
+### Design
+
+Introduced `param_storage_t<ParamType>` in core:
+
+```cpp
+template<typename ParamType>
+struct param_storage {
+    using Clean = std::remove_cvref_t<ParamType>;
+    using type = std::conditional_t<
+        !is_value_bindable<Clean>() && requires { sizeof(Clean); },
+        Clean*,    // pointer storage for abstract / non-copyable types
+        Clean      // value storage for everything else
+    >;
+};
+```
+
+Method dispatch now uses:
+```cpp
+std::tuple<param_storage_t<Param1>, param_storage_t<Param2>, ...> cpp_args;
+```
+
+For each parameter:
+- `is_value_bindable<T>` checks: not abstract, default-constructible,
+  copy-assignable, complete. If true, store by value.
+- Otherwise store as pointer into the Python wrapper's `cpp_object`.
+
+Extraction:
+- Value storage: use the existing `from_python` overload.
+- Pointer storage: `from_python_pointer` casts the wrapper's
+  `cpp_object` (generic `void*` in the shared PyWrapper layout) to `T*`.
+  This works because all `PyWrapper<X>` instances share the same
+  memory layout.
+
+Forward to method call: `forward_arg<OriginalParam>` dereferences if
+storage is `T*`, otherwise lvalue/rvalue forwards as before.
+
+### Generalizes `is_value_bindable`
+
+The previous definition only checked `std::is_abstract_v`. But classes
+with protected constructors (like Open3D's `KDTreeSearchParam` base)
+aren't abstract — they just can't be default-constructed. Updated:
+
+```cpp
+return !std::is_abstract_v<U> &&
+       std::is_default_constructible_v<U> &&
+       std::is_copy_assignable_v<U>;
+```
+
+All three properties are needed for `std::tuple<U>` to work.
+
+### Result
+
+```
+Before:  5/18 classes bind
+After Category B:  7/18
+After pointer-holder storage:  8/18
+
+Newly binding today: HalfEdgeTriangleMesh (was regressing earlier)
+```
+
+Open3D's `AxisAlignedBoundingBox`, `OrientedBoundingBox`, `RGBDImage`,
+`KDTreeSearchParamKNN`, `KDTreeSearchParamRadius`, `Geometry`,
+`Geometry3D`, `HalfEdgeTriangleMesh` all bind cleanly out of the box.
+
+### Remaining failures (10/18)
+
+1. `unique_count must be constexpr` — PointCloud, TriangleMesh,
+   Image, VoxelGrid. Root cause not yet isolated. The failure is not
+   triggered by a simple test case; needs minimal repro.
+
+2. `to_python` not visible — LineSet, MeshBase, Line3D, Segment3D,
+   TetraMesh. These have RETURN types that mirror_bridge can't convert.
+   The solution is the return-type analog of the param pointer-holder:
+   for abstract/non-copyable return types, construct a Python wrapper
+   around a heap-allocated instance (move-constructed if possible) and
+   return that wrapper. This requires the same pattern but in the
+   return direction.
+
+3. `ElementType is abstract` — Octree has `std::shared_ptr<OctreeNode>`
+   members. Our `ConversionOverloadGenerator::from_python_impl` reads
+   from dicts and needs `ElementType` to be constructible. Needs
+   similar pointer-holder treatment for data members of abstract types.
+
+### Next steps (not in scope for this session)
+
+- Implement return-type pointer-holder (unlocks ~4 more classes).
+- Isolate the `unique_count` issue for PointCloud et al.
+- Handle abstract data member types (VoxelGrid, Octree).
+
+With these, estimated bind rate goes to 15-17/18. True 18/18 needs
+the full pybind11-equivalent holder architecture (another rewrite).
+
+### Commits
+
+1. `5d04efa` — Category B: abstract-class handling via if-constexpr guards
+2. (pending) — Pointer-holder parameter storage (this section)
