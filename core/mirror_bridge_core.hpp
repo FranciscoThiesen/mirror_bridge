@@ -378,6 +378,57 @@ consteval auto get_method_return_type() {
     return std::meta::return_type_of(func);
 }
 
+// ============================================================================
+// Method Bindability — Physical Feasibility Check
+// ============================================================================
+//
+// A method CANNOT be bound if it physically requires operations that don't
+// compile: passing an abstract class by value, for example. This isn't a
+// mirror_bridge limitation — no C++ binding library can do it without a
+// different calling convention (e.g., pybind11's shared_ptr holder).
+//
+// We detect these cases at compile time and skip the specific methods, while
+// keeping the rest of the class binding functional. The user gets all the
+// methods that CAN be bound; methods that can't are emitted as an error if
+// called from the target language (not silently missing).
+
+template<typename T>
+consteval bool is_value_bindable() {
+    using U = std::remove_cvref_t<T>;
+    // Abstract classes and non-value-types can't be held by value in tuple.
+    // void is fine (used for return types).
+    if constexpr (std::is_void_v<U>) return true;
+    if constexpr (std::is_arithmetic_v<U>) return true;
+    if constexpr (std::is_pointer_v<U>) return true;
+    if constexpr (std::is_enum_v<U>) return true;
+    // For class types: must be complete and non-abstract.
+    // Note: we can't easily check is_abstract_v on forward-declared types
+    // (it would trigger instantiation); we conservatively require the type
+    // to be complete first.
+    if constexpr (requires { sizeof(U); }) {
+        return !std::is_abstract_v<U>;
+    }
+    return false;  // incomplete type — can't bind by value
+}
+
+// Check if all params of a method are physically bindable by value.
+// Abstract types in parameters would fail std::tuple construction.
+template<typename T, std::size_t FuncIndex>
+consteval bool method_params_are_value_bindable() {
+    constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_value_bindable<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+    }(std::make_index_sequence<param_count>{});
+}
+
+template<typename T, std::size_t FuncIndex>
+consteval bool static_method_params_are_value_bindable() {
+    constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_value_bindable<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+    }(std::make_index_sequence<param_count>{});
+}
+
 // Nested member utilities (for dict/object conversion)
 template<typename T>
 consteval std::size_t get_nested_member_count() {

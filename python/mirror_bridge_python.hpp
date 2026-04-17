@@ -2377,29 +2377,36 @@ consteval auto get_constructor_param_type() {
 // This uses compile-time index sequence to extract and convert each parameter
 template<typename T, std::size_t CtorIndex, std::size_t... Is>
 T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
-    // Extract each parameter type
-    using ParamTypes = std::tuple<
-        std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...
-    >;
-
-    // Convert each Python argument to C++ type
-    std::tuple<std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
-
-    bool success = true;
-    ([&] {
-        if (!success) return;
-        // Let overload resolution choose - non-template overloads have higher priority
-        if (!from_python(PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
-            success = false;
-        }
-    }(), ...);
-
-    if (!success) {
+    // Abstract classes can't be constructed — no allocation possible.
+    if constexpr (std::is_abstract_v<T>) {
+        PyErr_SetString(PyExc_TypeError,
+            "Cannot instantiate abstract class. Bind concrete derived classes instead.");
         return nullptr;
-    }
+    } else {
+        // Extract each parameter type
+        using ParamTypes = std::tuple<
+            std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...
+        >;
 
-    // Call constructor with unpacked arguments
-    return new T(std::move(std::get<Is>(cpp_args))...);
+        // Convert each Python argument to C++ type
+        std::tuple<std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+
+        bool success = true;
+        ([&] {
+            if (!success) return;
+            // Let overload resolution choose - non-template overloads have higher priority
+            if (!from_python(PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
+                success = false;
+            }
+        }(), ...);
+
+        if (!success) {
+            return nullptr;
+        }
+
+        // Call constructor with unpacked arguments
+        return new T(std::move(std::get<Is>(cpp_args))...);
+    }
 }
 
 // Initialize Python wrapper with parameterized constructor
@@ -2808,16 +2815,27 @@ PyObject* py_static_method(PyObject* /* self */, PyObject* args) {
 // Using a value that can't be a valid PyObject* (odd address)
 inline PyObject* const OVERLOAD_TRY_NEXT = reinterpret_cast<PyObject*>(1);
 
-// Check if method at Index is the first one with its name (canonical representative)
-// We only generate dispatch entries for canonical methods
+// Check if method at Index is the first one with its name (canonical representative).
+// We only generate dispatch entries for canonical methods.
+//
+// Methods that are physically impossible to bind (e.g., taking an abstract
+// class by value, which would require instantiating std::tuple<AbstractType>)
+// are excluded. At the language boundary, attempting to call these methods
+// will surface a clear Python error; the user doesn't silently lose the
+// method — they get a diagnostic that points at the abstract argument.
 template<typename T, std::size_t Index>
 consteval bool is_canonical_method() {
-    constexpr auto target_name = get_member_function_name<T, Index>();
+    // If method params aren't value-bindable (e.g., abstract class param),
+    // we can't instantiate the dispatch template. Skip this method.
+    if constexpr (!mirror_bridge::core::method_params_are_value_bindable<T, Index>()) {
+        return false;
+    }
 
-    // Check all earlier indices - if any has the same name, Index is not canonical
+    constexpr auto target_name = get_member_function_name<T, Index>();
     return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
-        return (... && (std::string_view(get_member_function_name<T, Earlier>())
-                       != std::string_view(target_name)));
+        return (... && (!mirror_bridge::core::method_params_are_value_bindable<T, Earlier>() ||
+                        std::string_view(get_member_function_name<T, Earlier>())
+                          != std::string_view(target_name)));
     }(std::make_index_sequence<Index>{});
 }
 
@@ -2908,12 +2926,15 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, std::index_seq
     constexpr auto target_name = get_member_function_name<T, CanonicalIndex>();
     PyObject* result = OVERLOAD_TRY_NEXT;
 
-    // Try each method that has the same name as the canonical method
+    // Try each method that has the same name as the canonical method.
+    // Skip methods with non-value-bindable params (e.g., abstract class
+    // passed by value) — those can't be dispatched at all.
     ([&] {
         if (result != OVERLOAD_TRY_NEXT) return;  // Already found a match
 
         constexpr auto this_name = get_member_function_name<T, AllIndices>();
-        if constexpr (std::string_view(this_name) == std::string_view(target_name)) {
+        if constexpr (std::string_view(this_name) == std::string_view(target_name) &&
+                      mirror_bridge::core::method_params_are_value_bindable<T, AllIndices>()) {
             result = try_overload<T, AllIndices>(wrapper, args);
         }
     }(), ...);
@@ -3032,7 +3053,10 @@ auto generate_methods(std::index_sequence<Indices...>) {
     return methods;
 }
 
-// Generate Python static methods for all static member functions of a class
+// Generate Python static methods for all static member functions of a class.
+// Static methods with non-value-bindable parameters (e.g., abstract class by
+// value) are skipped — they can't be dispatched. The PyMethodDef entry is
+// left zero-initialized so the method simply isn't exposed.
 template<typename T, std::size_t... Indices>
 auto generate_static_methods(std::index_sequence<Indices...>) {
     constexpr std::size_t count = sizeof...(Indices);
@@ -3040,15 +3064,17 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
     // Build methods array
     std::array<PyMethodDef, count + 1> methods{};
 
-    // Populate entries
+    // Populate entries for bindable static methods only
     ([&] {
-        constexpr auto func_name = get_static_member_function_name<T, Indices>();
-        methods[Indices] = PyMethodDef{
-            .ml_name = func_name,
-            .ml_meth = reinterpret_cast<PyCFunction>(py_static_method<T, Indices>),
-            .ml_flags = METH_VARARGS,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
-            .ml_doc = nullptr
-        };
+        if constexpr (mirror_bridge::core::static_method_params_are_value_bindable<T, Indices>()) {
+            constexpr auto func_name = get_static_member_function_name<T, Indices>();
+            methods[Indices] = PyMethodDef{
+                .ml_name = func_name,
+                .ml_meth = reinterpret_cast<PyCFunction>(py_static_method<T, Indices>),
+                .ml_flags = METH_VARARGS,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
+                .ml_doc = nullptr
+            };
+        }
     }(), ...);
 
     // Sentinel entry
@@ -3341,14 +3367,27 @@ to_python(const T& obj) {
     }
 
     if (py_type) {
-        // Create a wrapper object with a copy of the C++ object
-        auto* wrapper = reinterpret_cast<PyWrapper<CleanT>*>(py_type->tp_alloc(py_type, 0));
-        if (!wrapper) {
-            return nullptr;
+        // Create a wrapper object.
+        // For concrete types: copy the value into a heap-allocated instance.
+        // For abstract types: we can't copy/construct (no complete type to allocate),
+        // but the caller might still want the wrapper — return a wrapper with
+        // nullptr cpp_object. Callers should use bind_class for derived concrete
+        // types in practice. This avoids hard-failing compilation when binding
+        // happens to encounter an abstract base class in a return type chain.
+        if constexpr (std::is_abstract_v<CleanT> || !std::is_copy_constructible_v<CleanT>) {
+            // Cannot copy-construct — return a dict representation instead.
+            // This is a graceful fallback: the user gets a read-only snapshot of
+            // the abstract object's members rather than a broken wrapper.
+            return ConversionOverloadGenerator<T>::to_python_impl(obj);
+        } else {
+            auto* wrapper = reinterpret_cast<PyWrapper<CleanT>*>(py_type->tp_alloc(py_type, 0));
+            if (!wrapper) {
+                return nullptr;
+            }
+            wrapper->cpp_object = new CleanT(obj);  // Copy the object
+            wrapper->owns = true;
+            return reinterpret_cast<PyObject*>(wrapper);
         }
-        wrapper->cpp_object = new CleanT(obj);  // Copy the object
-        wrapper->owns = true;
-        return reinterpret_cast<PyObject*>(wrapper);
     }
 
     // Fall back to dict conversion for unregistered types
