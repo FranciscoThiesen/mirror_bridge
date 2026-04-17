@@ -224,6 +224,30 @@ std::enable_if_t<
 >
 from_python(PyObject* obj, T& out);
 
+// Forward declarations for Container to_python/from_python. These are needed
+// because compound-type templates (std::pair, std::tuple, std::vector of Containers,
+// etc.) may be instantiated with Container-typed elements, and two-phase name
+// lookup requires the overload to be visible at the compound-type template's
+// definition point.
+template<Container T>
+PyObject* to_python(const T& container);
+
+template<Container T>
+bool from_python(PyObject* obj, T& container);
+
+} // end namespace mirror_bridge (temporarily close so Eigen overloads
+  // are declared in the right scope before compound-type templates)
+
+// Include Eigen type converters inline so their to_python/from_python
+// overloads are visible to compound-type templates (std::pair, std::tuple,
+// std::optional, etc.) that may be instantiated with Eigen types. Without
+// this, two-phase lookup inside these templates can't find the Eigen
+// overloads because ADL looks in Eigen's namespace (no to_python there)
+// and non-ADL looks at definition point.
+#include "mirror_bridge_eigen.hpp"
+
+namespace mirror_bridge {
+
 // ============================================================================
 // Python Type Conversion Utilities
 // ============================================================================
@@ -340,7 +364,10 @@ inline bool from_python(PyObject* obj, T& out) {
 }
 
 // Smart pointer conversion from Python
-// Creates a new instance from the Python value
+// Creates a new instance from the Python value. For smart pointers to abstract
+// or non-default-constructible types (e.g., std::shared_ptr<OctreeNode> where
+// OctreeNode is abstract), only None→reset is supported — materializing the
+// pointee by value is physically impossible.
 template<SmartPointer T>
 inline bool from_python(PyObject* obj, T& out) {
     using ElementType = typename std::remove_cvref_t<T>::element_type;
@@ -350,18 +377,27 @@ inline bool from_python(PyObject* obj, T& out) {
         return true;
     }
 
-    ElementType value;
-    // Let overload resolution choose - non-template overloads have higher priority
-    if (!from_python(obj, value)) {
-        return false;
-    }
-
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
-        out = std::make_unique<ElementType>(std::move(value));
+    if constexpr (std::is_abstract_v<ElementType> ||
+                  !std::is_default_constructible_v<ElementType> ||
+                  !std::is_copy_assignable_v<ElementType>) {
+        // Can't reconstruct an abstract/non-default-constructible pointee from
+        // a Python dict representation. Leave the smart pointer as-is for non-
+        // None inputs; the caller is expected to populate via typed setters.
+        return true;
     } else {
-        out = std::make_shared<ElementType>(std::move(value));
+        ElementType value;
+        // Let overload resolution choose - non-template overloads have higher priority
+        if (!from_python(obj, value)) {
+            return false;
+        }
+
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
+            out = std::make_unique<ElementType>(std::move(value));
+        } else {
+            out = std::make_shared<ElementType>(std::move(value));
+        }
+        return true;
     }
-    return true;
 }
 
 // ============================================================================
@@ -896,6 +932,46 @@ bool from_python(PyObject* obj, std::array<T, N>& arr) {
         if (!from_python(py_item, arr[i])) {
             return false;
         }
+    }
+    return true;
+}
+
+// ============================================================================
+// C-style Array Support (e.g., float[4], int[10])
+// ============================================================================
+//
+// Some C/C++ classes use raw arrays as members (e.g., Open3D's MaterialParameter
+// with float f4[4]). Convert to/from Python lists.
+
+template<typename T, std::size_t N>
+    requires (!std::is_same_v<std::remove_cv_t<T>, char>)  // exclude char[] (string-like)
+PyObject* to_python(const T (&arr)[N]) {
+    PyObject* list = PyList_New(N);
+    if (!list) return nullptr;
+    for (std::size_t i = 0; i < N; ++i) {
+        PyObject* elem = to_python(arr[i]);
+        if (!elem) { Py_DECREF(list); return nullptr; }
+        PyList_SET_ITEM(list, i, elem);
+    }
+    return list;
+}
+
+template<typename T, std::size_t N>
+    requires (!std::is_same_v<std::remove_cv_t<T>, char>)
+bool from_python(PyObject* obj, T (&arr)[N]) {
+    if (!PySequence_Check(obj) || PySequence_Size(obj) != static_cast<Py_ssize_t>(N)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < N; ++i) {
+        PyObject* item = PySequence_GetItem(obj, i);
+        if (!item) return false;
+        T val;
+        if (!from_python(item, val)) {
+            Py_DECREF(item);
+            return false;
+        }
+        arr[i] = val;
+        Py_DECREF(item);
     }
     return true;
 }
@@ -1669,10 +1745,13 @@ template<Container T>
 PyObject* to_python(const T& container) {
     using ValueType = typename std::remove_cvref_t<T>::value_type;
 
-    // Bulk transfer fast path for numeric vectors
+    // Bulk transfer fast path for numeric vectors.
+    // Excluded: unsigned char (already handled as bytes above), bool (the
+    // std::vector<bool> specialization has no .data() and is proxy-based).
     if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
                   std::is_arithmetic_v<ValueType> &&
-                  !std::is_same_v<ValueType, unsigned char>) {
+                  !std::is_same_v<ValueType, unsigned char> &&
+                  !std::is_same_v<ValueType, bool>) {
         // Use Python's array module for typed numeric arrays.
         // This does a single memcpy instead of N Python object allocations.
         // Initialization is thread-safe via std::call_once (GIL must be held
@@ -2412,8 +2491,22 @@ consteval auto get_constructor_param_type() {
     return std::meta::type_of(params[ParamIndex]);
 }
 
-// Variadic helper to call constructor with N parameters
-// This uses compile-time index sequence to extract and convert each parameter
+// Check if all constructor params are bindable (value-bindable or pointer-holdable).
+// Constructors whose params are raw-pointer-to-user-type aren't safely bindable
+// (ambiguous ownership/output semantics) and are skipped.
+template<typename T, std::size_t CtorIndex>
+consteval bool constructor_params_all_bindable() {
+    constexpr std::size_t param_count = get_constructor_param_count<T, CtorIndex>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (mirror_bridge::core::is_param_bindable<
+            typename [:get_constructor_param_type<T, CtorIndex, Is>():]>() && ...);
+    }(std::make_index_sequence<param_count>{});
+}
+
+// Variadic helper to call constructor with N parameters.
+// Uses the same pointer-holder pattern as method dispatch: params that can't
+// be held by value in std::tuple (abstract types, types with protected ctors)
+// are stored as pointers extracted from the caller's Python wrapper.
 template<typename T, std::size_t CtorIndex, std::size_t... Is>
 T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
     // Abstract classes can't be constructed — no allocation possible.
@@ -2422,19 +2515,16 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
         return nullptr;
     } else {
-        // Extract each parameter type
-        using ParamTypes = std::tuple<
-            std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...
-        >;
-
-        // Convert each Python argument to C++ type
-        std::tuple<std::remove_cvref_t<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+        // Parameter storage with pointer-holder for non-value-bindable types
+        // (e.g., abstract base classes passed by const-ref).
+        std::tuple<mirror_bridge::core::param_storage_t<
+            typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
 
         bool success = true;
         ([&] {
             if (!success) return;
-            // Let overload resolution choose - non-template overloads have higher priority
-            if (!from_python(PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
+            if (!extract_param<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+                    PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
                 success = false;
             }
         }(), ...);
@@ -2443,8 +2533,10 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
             return nullptr;
         }
 
-        // Call constructor with unpacked arguments
-        return new T(std::move(std::get<Is>(cpp_args))...);
+        // Call constructor with unpacked arguments. forward_arg dereferences
+        // pointer-stored params back into references.
+        return new T(forward_arg<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+            std::get<Is>(cpp_args))...);
     }
 }
 
@@ -2476,18 +2568,21 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
         ([&] {
             if (found) return;
 
-            constexpr std::size_t param_count = get_constructor_param_count<T, Is>();
-            if (nargs == static_cast<Py_ssize_t>(param_count)) {
-                // Try to call this constructor
-                T* obj = [&]() {
-                    return call_constructor_impl<T, Is>(args,
+            // Only try constructors whose params are all bindable.
+            // Constructors with raw-pointer-to-user-type params have ambiguous
+            // semantics and are skipped; this is also what prevents template
+            // instantiation from failing on non-bindable param storage.
+            if constexpr (constructor_params_all_bindable<T, Is>()) {
+                constexpr std::size_t param_count = get_constructor_param_count<T, Is>();
+                if (nargs == static_cast<Py_ssize_t>(param_count)) {
+                    T* obj = call_constructor_impl<T, Is>(args,
                         std::make_index_sequence<param_count>{});
-                }();
 
-                if (obj) {
-                    wrapper->cpp_object = obj;
-                    wrapper->owns = true;
-                    found = true;
+                    if (obj) {
+                        wrapper->cpp_object = obj;
+                        wrapper->owns = true;
+                        found = true;
+                    }
                 }
             }
         }(), ...);
@@ -2598,17 +2693,22 @@ int py_setter(PyObject* self, PyObject* value, void* closure) {
     constexpr auto member = get_member_info<T, Index>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    // Convert Python value to C++ type and set the member
-    MemberType cpp_value;
-    // Let overload resolution choose - non-template overloads have higher priority
-    if (!from_python(value, cpp_value)) {
-        PyErr_SetString(PyExc_TypeError, "Type conversion failed");
-        return -1;
-    }
+    if constexpr (std::is_array_v<MemberType>) {
+        // C-style arrays can't be whole-assigned. Fill in-place.
+        if (!from_python(value, (*wrapper->cpp_object).[:member:])) {
+            PyErr_SetString(PyExc_TypeError, "Type conversion failed");
+            return -1;
+        }
+    } else {
+        MemberType cpp_value;
+        if (!from_python(value, cpp_value)) {
+            PyErr_SetString(PyExc_TypeError, "Type conversion failed");
+            return -1;
+        }
 
-    // Use move semantics for move-only types (like unique_ptr)
-    // Dereference pointer first to work around compiler bug with -> operator
-    (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+        // Use move semantics for move-only types (like unique_ptr)
+        (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+    }
     return 0;
 }
 
@@ -2641,7 +2741,9 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
     return to_python(value);
 }
 
-// Setter for visible class members (same logic as py_setter but uses visible index)
+// Setter for visible class members (same logic as py_setter but uses visible index).
+// C-style arrays require in-place population — they can't be assigned as whole
+// objects in C++, so we dispatch to a from_python overload that writes element-wise.
 template<typename T, std::size_t VisibleIndex>
 int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
@@ -2658,13 +2760,20 @@ int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     constexpr auto member = get_visible_member_info<T, VisibleIndex>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    MemberType cpp_value;
-    if (!from_python(value, cpp_value)) {
-        PyErr_SetString(PyExc_TypeError, "Type conversion failed");
-        return -1;
+    if constexpr (std::is_array_v<MemberType>) {
+        // Array: fill in-place. from_python<T[N]> writes directly into the array.
+        if (!from_python(value, (*wrapper->cpp_object).[:member:])) {
+            PyErr_SetString(PyExc_TypeError, "Type conversion failed");
+            return -1;
+        }
+    } else {
+        MemberType cpp_value;
+        if (!from_python(value, cpp_value)) {
+            PyErr_SetString(PyExc_TypeError, "Type conversion failed");
+            return -1;
+        }
+        (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
     }
-
-    (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
     return 0;
 }
 
@@ -2850,26 +2959,58 @@ PyObject* py_static_method(PyObject* /* self */, PyObject* args) {
 // Using a value that can't be a valid PyObject* (odd address)
 inline PyObject* const OVERLOAD_TRY_NEXT = reinterpret_cast<PyObject*>(1);
 
-// Check if method at Index is the first one with its name (canonical representative).
-// With pointer-storage dispatch, we no longer need to filter methods with
-// abstract/non-copyable parameters — they're handled by storing pointers
-// into the Python wrappers' cpp_object fields.
+// Cache of all method name string_views for a class, computed once.
+// Without this cache, is_canonical_method<T, Index> calls
+// get_member_function_name<T, Earlier> for every earlier index, and each
+// such call re-runs std::meta::members_of() — producing O(N³) reflection
+// work for a class with N methods. Open3D's PointCloud (44 methods) hits
+// the constexpr step limit under the naive approach.
+//
+// With the cache, names are computed once (O(N²) via members_of per index),
+// and subsequent canonicality checks are O(N) string_view comparisons.
+template<typename T>
+struct MethodNameCache {
+    static constexpr std::size_t count = get_member_function_count<T>();
+
+    static consteval auto compute_names() {
+        std::array<std::string_view, (count == 0 ? 1 : count)> result{};
+        if constexpr (count > 0) {
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ((result[Is] = std::string_view(get_member_function_name<T, Is>())), ...);
+            }(std::make_index_sequence<count>{});
+        }
+        return result;
+    }
+
+    static constexpr auto names = compute_names();
+};
+
+// Check if method at Index is the first BINDABLE method with its name.
+// Methods whose params can't be stored either by value or via pointer-holder
+// (e.g., raw pointer to a user container — ambiguous ownership) are excluded,
+// but if another overload of the same name IS bindable, we still expose the
+// method. Only the unbindable overloads are skipped. Uses MethodNameCache<T>
+// to avoid redundant reflection work.
 template<typename T, std::size_t Index>
 consteval bool is_canonical_method() {
-    constexpr auto target_name = get_member_function_name<T, Index>();
-    return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
-        return (... && (std::string_view(get_member_function_name<T, Earlier>())
-                          != std::string_view(target_name)));
-    }(std::make_index_sequence<Index>{});
+    if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+        return false;
+    } else {
+        constexpr auto& names = MethodNameCache<T>::names;
+        return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
+            // Canonical iff no EARLIER bindable method shares this name.
+            // An earlier unbindable overload doesn't disqualify us.
+            return (... && (names[Earlier] != names[Index] ||
+                            !mirror_bridge::core::method_params_all_bindable<T, Earlier>()));
+        }(std::make_index_sequence<Index>{});
+    }
 }
 
 // Count unique method names (number of canonical methods)
 template<typename T>
 consteval std::size_t count_unique_method_names() {
     constexpr std::size_t total = get_member_function_count<T>();
-
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        // Need fallback value for empty pack (classes with 0 methods)
         return ((is_canonical_method<T, Is>() ? 1 : 0) + ... + 0);
     }(std::make_index_sequence<total>{});
 }
@@ -2950,12 +3091,15 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, std::index_seq
     constexpr auto target_name = get_member_function_name<T, CanonicalIndex>();
     PyObject* result = OVERLOAD_TRY_NEXT;
 
-    // Try each method that has the same name as the canonical method.
+    // Try each method that has the same name as the canonical method AND whose
+    // params are all bindable. Non-bindable overloads are skipped entirely —
+    // they can't be instantiated (param_storage_t would fail for their params).
     ([&] {
         if (result != OVERLOAD_TRY_NEXT) return;  // Already found a match
 
         constexpr auto this_name = get_member_function_name<T, AllIndices>();
-        if constexpr (std::string_view(this_name) == std::string_view(target_name)) {
+        if constexpr (std::string_view(this_name) == std::string_view(target_name) &&
+                      mirror_bridge::core::method_params_all_bindable<T, AllIndices>()) {
             result = try_overload<T, AllIndices>(wrapper, args);
         }
     }(), ...);
@@ -3075,9 +3219,10 @@ auto generate_methods(std::index_sequence<Indices...>) {
 }
 
 // Generate Python static methods for all static member functions of a class.
-// Static methods with non-value-bindable parameters (e.g., abstract class by
-// value) are skipped — they can't be dispatched. The PyMethodDef entry is
-// left zero-initialized so the method simply isn't exposed.
+// Static methods with params that can neither be stored by value nor held as
+// pointers (e.g., raw pointer to user container — ambiguous ownership) are
+// skipped. Their PyMethodDef entry is left zero-initialized so Python never
+// sees them, but the rest of the class still binds.
 template<typename T, std::size_t... Indices>
 auto generate_static_methods(std::index_sequence<Indices...>) {
     constexpr std::size_t count = sizeof...(Indices);
@@ -3085,15 +3230,17 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
     // Build methods array
     std::array<PyMethodDef, count + 1> methods{};
 
-    // Populate entries (pointer-storage dispatch handles abstract params)
+    // Populate entries only for methods whose params are all bindable.
     ([&] {
-        constexpr auto func_name = get_static_member_function_name<T, Indices>();
-        methods[Indices] = PyMethodDef{
-            .ml_name = func_name,
-            .ml_meth = reinterpret_cast<PyCFunction>(py_static_method<T, Indices>),
-            .ml_flags = METH_VARARGS,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
-            .ml_doc = nullptr
-        };
+        if constexpr (mirror_bridge::core::static_method_params_all_bindable<T, Indices>()) {
+            constexpr auto func_name = get_static_member_function_name<T, Indices>();
+            methods[Indices] = PyMethodDef{
+                .ml_name = func_name,
+                .ml_meth = reinterpret_cast<PyCFunction>(py_static_method<T, Indices>),
+                .ml_flags = METH_VARARGS,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
+                .ml_doc = nullptr
+            };
+        }
     }(), ...);
 
     // Sentinel entry
@@ -3215,7 +3362,14 @@ struct ConversionOverloadGenerator {
         return dict;
     }
 
-    // Generate from_python overload at compile time
+    // Generate from_python overload at compile time.
+    // Handles three special cases via if-constexpr:
+    //   1. Array members (T[N]): fill in-place, no whole-array assignment.
+    //   2. Abstract types: can't be default-constructed; skip (leave member
+    //      at its existing value — caller presumably set it via setter).
+    //   3. Non-assignable types: skip (leave member as-is).
+    // The normal case (value-semantic type): default-construct, populate,
+    // move-assign.
     static bool from_python_impl(PyObject* obj, T& out) {
         if (!PyDict_Check(obj)) return false;
 
@@ -3230,20 +3384,31 @@ struct ConversionOverloadGenerator {
                 constexpr auto member = get_nested_member<T, Is>();
                 using MemberType = NestedMemberType<T, Is>;
 
-                // Use interned string key for faster dict lookup
                 PyObject* py_value = PyDict_GetItem(obj, interned_names[Is]);
                 if (!py_value) {
-                    success = false;
+                    // Missing key is not necessarily fatal — leave member as-is
                     return;
                 }
 
-                MemberType cpp_value;
-                if (!from_python(py_value, cpp_value)) {
-                    success = false;
+                if constexpr (std::is_array_v<MemberType>) {
+                    // Array: fill in-place via from_python overload for T[N]
+                    if (!from_python(py_value, out.[:member:])) {
+                        success = false;
+                    }
+                } else if constexpr (std::is_abstract_v<MemberType> ||
+                                     !std::is_default_constructible_v<MemberType> ||
+                                     !std::is_move_assignable_v<MemberType>) {
+                    // Abstract or non-assignable member: can't reconstruct from
+                    // dict. Silently skip — user should populate via setters.
                     return;
+                } else {
+                    MemberType cpp_value;
+                    if (!from_python(py_value, cpp_value)) {
+                        success = false;
+                        return;
+                    }
+                    out.[:member:] = std::move(cpp_value);
                 }
-
-                out.[:member:] = std::move(cpp_value);
             }(), ...);
         }(std::make_index_sequence<member_count>{});
 

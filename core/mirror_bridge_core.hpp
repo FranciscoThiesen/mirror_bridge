@@ -397,14 +397,24 @@ consteval auto get_method_return_type() {
 //   - It's not abstract (no pure virtuals)
 //   - It's complete
 //   - It's copy-assignable (for tuple element assignment)
-// Primitives, pointers, enums, and void are always considered value-bindable.
+// Primitives, enums, and void are always considered value-bindable.
+// Raw pointers: allowed only if pointee is primitive — pointers to user types
+// are ambiguous (ownership? nullable output? iterator?) and not safely bindable.
 template<typename T>
 consteval bool is_value_bindable() {
     using U = std::remove_cvref_t<T>;
     if constexpr (std::is_void_v<U>) return true;
     if constexpr (std::is_arithmetic_v<U>) return true;
-    if constexpr (std::is_pointer_v<U>) return true;
     if constexpr (std::is_enum_v<U>) return true;
+    // Raw pointers only if pointing at simple types (char* for C-strings,
+    // void* opaque handle). Pointers to containers/classes in parameter
+    // positions are typically output parameters and not safely auto-bindable.
+    if constexpr (std::is_pointer_v<U>) {
+        using Pointee = std::remove_cv_t<std::remove_pointer_t<U>>;
+        return std::is_same_v<Pointee, char> ||
+               std::is_same_v<Pointee, void> ||
+               std::is_arithmetic_v<Pointee>;
+    }
     if constexpr (requires { sizeof(U); }) {
         // Type is complete. Now check all the properties tuple needs.
         return !std::is_abstract_v<U> &&
@@ -436,27 +446,60 @@ consteval bool static_method_params_are_value_bindable() {
 // Parameter Storage Strategy — Pointer Holders for Non-Value Types
 // ============================================================================
 //
-// mirror_bridge's method dispatch uses std::tuple<ParamStorage...> for local
-// argument storage. For concrete value-semantic types, we store by value.
-// For abstract types, non-copyable types, or anything that can't live in a
-// tuple by value, we store a raw pointer to the underlying C++ object
-// (which lives in a Python wrapper).
+// Strategy per parameter type:
+//   - value-bindable type (primitive, concrete class, vector, etc.)
+//       → store by value in std::tuple
+//   - complete class type that isn't value-bindable (abstract, non-copyable,
+//     has protected ctor, etc.)
+//       → store as pointer (extracted from the Python wrapper's cpp_object)
+//   - raw pointer to user type
+//       → method is NOT bindable (ambiguous semantics); skip it
 //
-// This is analogous to pybind11's shared_ptr holder approach, but lighter:
-// we only redirect to pointer storage when strictly necessary.
+// This is analogous to pybind11's shared_ptr holder approach, but lighter.
+
+// Can this parameter type participate in a bound method signature at all?
+// True iff we can either store it by value OR via pointer-holder.
+template<typename T>
+consteval bool is_param_bindable() {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (is_value_bindable<U>()) return true;
+    // Complete, non-pointer class type → use pointer-holder
+    if constexpr (requires { sizeof(U); } && std::is_class_v<U> && !std::is_pointer_v<U>) {
+        return true;
+    }
+    return false;
+}
 
 template<typename ParamType>
 struct param_storage {
     using Clean = std::remove_cvref_t<ParamType>;
     using type = std::conditional_t<
-        !is_value_bindable<Clean>() && requires { sizeof(Clean); },
-        Clean*,
-        Clean
+        is_value_bindable<Clean>(),
+        Clean,     // value storage
+        Clean*     // pointer storage (class types extracted from Python wrapper)
     >;
 };
 
 template<typename ParamType>
 using param_storage_t = typename param_storage<ParamType>::type;
+
+// Check if every param of a method is bindable (either value or pointer-holder).
+// Methods with raw-pointer-to-user-type params are NOT bindable.
+template<typename T, std::size_t FuncIndex>
+consteval bool method_params_all_bindable() {
+    constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_param_bindable<typename [:get_method_param_type<T, FuncIndex, Is>():]>() && ...);
+    }(std::make_index_sequence<param_count>{});
+}
+
+template<typename T, std::size_t FuncIndex>
+consteval bool static_method_params_all_bindable() {
+    constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_param_bindable<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>() && ...);
+    }(std::make_index_sequence<param_count>{});
+}
 
 // Nested member utilities (for dict/object conversion)
 template<typename T>
@@ -606,6 +649,11 @@ consteval bool is_convertible_type() {
         return true;
     } else if constexpr (std::is_enum_v<U>) {
         return true;
+    } else if constexpr (std::is_array_v<U>) {
+        // C-style arrays (e.g., float[4], int[16]) — we emit a to_python/
+        // from_python overload that produces a Python list. The element type
+        // still has to be convertible.
+        return is_convertible_type<std::remove_extent_t<U>>();
     } else if constexpr (is_smart_pointer<U>::value) {
         return true;
     } else if constexpr (is_container<U>::value) {
