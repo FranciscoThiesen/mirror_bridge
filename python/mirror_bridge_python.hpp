@@ -3262,22 +3262,171 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
     }
 }
 
-template<typename T, std::size_t FuncIndex>
-PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* args) {
-    constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
-
-    // Check argument count first
-    if (PyTuple_Size(args) != static_cast<Py_ssize_t>(param_count)) {
-        return OVERLOAD_TRY_NEXT;
-    }
-
-    return try_overload_impl<T, FuncIndex>(wrapper, args, std::make_index_sequence<param_count>{});
+// Reflection-driven parameter metadata helpers. These let the dispatcher
+// support keyword arguments and default values without hand-written binding
+// code.
+//
+// - param_name: identifier of the Ith parameter (empty string_view if the
+//   parameter was declared unnamed in the header).
+// - param_has_default: true if the Ith parameter has a C++ default-argument.
+// - min_required_args: index of the first defaulted parameter — i.e. the
+//   smallest positional-arg count that can legally be passed from Python.
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+consteval std::string_view param_name() {
+    constexpr auto func = get_member_function<T, FuncIndex>();
+    auto p = std::meta::parameters_of(func)[ParamIndex];
+    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
+    return {};
 }
 
-// Dispatch function that tries all overloads with a given name
-// CanonicalIndex is the first method with this name; we try ALL methods with matching name
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+consteval bool param_has_default() {
+    constexpr auto func = get_member_function<T, FuncIndex>();
+    return std::meta::has_default_argument(std::meta::parameters_of(func)[ParamIndex]);
+}
+
+template<typename T, std::size_t FuncIndex>
+consteval std::size_t min_required_args() {
+    constexpr std::size_t P = get_method_param_count<T, FuncIndex>();
+    // Smallest i such that param i has a default. All params AFTER the first
+    // defaulted one also have defaults in well-formed C++.
+    return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> std::size_t {
+        std::size_t result = P;
+        (((result == P && param_has_default<T, FuncIndex, Is>())
+            ? (result = Is) : 0), ...);
+        return result;
+    }(std::make_index_sequence<P>{});
+}
+
+// Invoke the method with the first N of the resolved args; params [N, P) use
+// their C++ default arguments (filled in by the compiler at the splice call).
+//
+// Implementation note: we inline all reflection splicers inside the lambda
+// body rather than using `constexpr auto member_func = …` at this scope,
+// because std::meta::info is a consteval-only type that can't be captured
+// through a runtime-callable lambda. Expanding [:get_member_function...:]
+// inside the lambda keeps every reflection operation in a constant-evaluated
+// context.
+template<typename T, std::size_t FuncIndex, std::size_t N>
+PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
+    using ReturnType = typename [:get_method_return_type<T, FuncIndex>():];
+
+    return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> PyObject* {
+        std::tuple<mirror_bridge::core::param_storage_t<
+            typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+
+        bool conversion_ok = true;
+        ([&] {
+            if (!conversion_ok) return;
+            if (!extract_param<typename [:get_method_param_type<T, FuncIndex, Is>():]>(
+                    resolved[Is], std::get<Is>(cpp_args))) {
+                conversion_ok = false;
+            }
+        }(), ...);
+
+        if (!conversion_ok) {
+            PyErr_Clear();
+            return OVERLOAD_TRY_NEXT;
+        }
+
+        try {
+            if constexpr (std::is_void_v<ReturnType>) {
+                ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                    forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                );
+                Py_RETURN_NONE;
+            } else {
+                ReturnType result = ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                    forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                );
+                return to_python(result);
+            }
+        } catch (const std::exception& e) {
+            PyErr_SetString(PyExc_RuntimeError, e.what());
+            return nullptr;
+        } catch (...) {
+            PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+            return nullptr;
+        }
+    }(std::make_index_sequence<N>{});
+}
+
+// Keyword-aware overload attempt. Accepts positional args + kwds, resolves
+// each into the correct param slot using reflection-provided names, and
+// invokes the method with the resolved leading prefix (remaining params
+// fill in from C++ defaults).
+template<typename T, std::size_t FuncIndex>
+PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* args, PyObject* kwds) {
+    constexpr std::size_t P = get_method_param_count<T, FuncIndex>();
+    constexpr std::size_t MIN = min_required_args<T, FuncIndex>();
+
+    const Py_ssize_t n_pos = args ? PyTuple_Size(args) : 0;
+    const Py_ssize_t n_kw = kwds ? PyDict_Size(kwds) : 0;
+
+    if (n_pos > static_cast<Py_ssize_t>(P)) return OVERLOAD_TRY_NEXT;
+    if (n_pos + n_kw > static_cast<Py_ssize_t>(P)) return OVERLOAD_TRY_NEXT;
+    if (n_pos + n_kw < static_cast<Py_ssize_t>(MIN)) return OVERLOAD_TRY_NEXT;
+
+    // Resolve positional + keyword args into a contiguous array of PyObject*.
+    // resolved[i] holds the arg for the i-th parameter slot.
+    PyObject* resolved[P > 0 ? P : 1] = {};
+    for (Py_ssize_t i = 0; i < n_pos; ++i) {
+        resolved[i] = PyTuple_GET_ITEM(args, i);
+    }
+
+    // Match each kwarg by name to a parameter index. We check every kwarg
+    // against every param name; parameter names come from reflection via
+    // identifier_of, so this is O(kw * P) per call (small for typical APIs).
+    if (kwds && n_kw > 0) {
+        PyObject* key;
+        PyObject* value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(kwds, &pos, &key, &value)) {
+            Py_ssize_t key_len;
+            const char* key_str = PyUnicode_AsUTF8AndSize(key, &key_len);
+            if (!key_str) return OVERLOAD_TRY_NEXT;
+            std::string_view key_view(key_str, key_len);
+
+            bool matched = false;
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ((!matched && param_name<T, FuncIndex, Is>() == key_view
+                    ? (resolved[Is] && true  // already filled by positional — conflict
+                        ? (matched = true, void())  // mark matched to avoid error loop
+                        : (resolved[Is] = value, matched = true, void()))
+                    : void()), ...);
+            }(std::make_index_sequence<P>{});
+            if (!matched) return OVERLOAD_TRY_NEXT;  // unknown keyword
+        }
+    }
+
+    // Find N: the number of leading resolved slots that are populated. All
+    // remaining slots must be defaulted params (we already verified counts).
+    std::size_t n_used = static_cast<std::size_t>(n_pos + n_kw);
+    // If a kwarg filled a slot past the first gap, the caller provided a
+    // non-contiguous prefix — reject (can't skip a required param).
+    for (std::size_t i = 0; i < n_used; ++i) {
+        if (!resolved[i]) return OVERLOAD_TRY_NEXT;
+    }
+
+    // Dispatch to the compile-time variant matching n_used. The index
+    // sequence covers {MIN, MIN+1, ..., P}.
+    PyObject* result = OVERLOAD_TRY_NEXT;
+    [&]<std::size_t... Ns>(std::index_sequence<Ns...>) {
+        ((n_used == Ns + MIN
+            ? (result = invoke_with_n_args<T, FuncIndex, Ns + MIN>(wrapper, resolved), void())
+            : void()), ...);
+    }(std::make_index_sequence<P - MIN + 1>{});
+
+    return result;
+}
+
+// Dispatch function that tries all overloads with a given name.
+// CanonicalIndex is the first method with this name; we try ALL methods with
+// matching name. Keyword arguments are supported via each overload's
+// try_overload<...>, which uses reflection to map kwarg names -> param slots.
 template<typename T, std::size_t CanonicalIndex, std::size_t... AllIndices>
-PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, std::index_sequence<AllIndices...>) {
+PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, PyObject* kwds,
+                                   std::index_sequence<AllIndices...>) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
         PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
@@ -3287,36 +3436,34 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, std::index_seq
     constexpr auto target_name = get_member_function_name<T, CanonicalIndex>();
     PyObject* result = OVERLOAD_TRY_NEXT;
 
-    // Try each method that has the same name as the canonical method AND whose
-    // params are all bindable. Non-bindable overloads are skipped entirely —
-    // they can't be instantiated (param_storage_t would fail for their params).
     ([&] {
-        if (result != OVERLOAD_TRY_NEXT) return;  // Already found a match
+        if (result != OVERLOAD_TRY_NEXT) return;
 
         constexpr auto this_name = get_member_function_name<T, AllIndices>();
         if constexpr (std::string_view(this_name) == std::string_view(target_name) &&
                       mirror_bridge::core::method_params_all_bindable<T, AllIndices>()) {
-            result = try_overload<T, AllIndices>(wrapper, args);
+            result = try_overload<T, AllIndices>(wrapper, args, kwds);
         }
     }(), ...);
 
     if (result == OVERLOAD_TRY_NEXT) {
-        // No matching overload - generate helpful error message
         PyErr_Format(PyExc_TypeError,
-            "No matching overload for '%s' with %zd argument(s)",
-            target_name, PyTuple_Size(args));
+            "No matching overload for '%s' with %zd positional argument(s)%s",
+            target_name,
+            args ? PyTuple_Size(args) : 0,
+            (kwds && PyDict_Size(kwds) > 0) ? " and keyword argument(s)" : "");
         return nullptr;
     }
 
     return result;
 }
 
-// Wrapper that creates the index sequence for dispatch
+// Entry point registered in the PyMethodDef table. METH_VARARGS | METH_KEYWORDS.
 template<typename T, std::size_t CanonicalIndex>
-PyObject* py_method_dispatch(PyObject* self, PyObject* args) {
+PyObject* py_method_dispatch(PyObject* self, PyObject* args, PyObject* kwds) {
     constexpr std::size_t total_methods = get_member_function_count<T>();
     return py_method_dispatch_impl<T, CanonicalIndex>(
-        self, args, std::make_index_sequence<total_methods>{});
+        self, args, kwds, std::make_index_sequence<total_methods>{});
 }
 
 // ============================================================================
@@ -3399,7 +3546,9 @@ auto generate_methods(std::index_sequence<Indices...>) {
                 methods[method_idx] = PyMethodDef{
                     .ml_name = method_name,
                     .ml_meth = reinterpret_cast<PyCFunction>(py_method_dispatch<T, Indices>),
-                    .ml_flags = METH_VARARGS,
+                    // METH_KEYWORDS lets the dispatcher see the kwds dict so it
+                    // can resolve keyword arguments by reflection-provided name.
+                    .ml_flags = METH_VARARGS | METH_KEYWORDS,
                     .ml_doc = nullptr
                 };
                 method_idx++;
