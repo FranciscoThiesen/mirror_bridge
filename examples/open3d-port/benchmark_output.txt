@@ -1,0 +1,25 @@
+Selecting previously unselected package libeigen3-dev.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 46164 files and directories currently installed.)
+Preparing to unpack .../libeigen3-dev_3.4.0-2ubuntu2_all.deb ...
+Unpacking libeigen3-dev (3.4.0-2ubuntu2) ...
+Setting up libeigen3-dev (3.4.0-2ubuntu2) ...
+======================================================================
+Binding overhead benchmark: mirror_bridge vs pybind11
+======================================================================
+
+Operation                                    pybind11  mirror_br  speedup
+------------------------------------------------------------------------
+PointCloud()  (empty construction)             238 ns      68 ns   3.50x
+.has_points()  (bool method)                   109 ns      42 ns   2.60x
+.get_center()  (100 pts, Vector3d out)         424 ns     152 ns   2.78x
+.min_bound     (attribute get, Vector3d)       301 ns      56 ns   5.35x
+.min_bound =   (attribute set, Vector3d)       598 ns      51 ns  11.66x
+.translate(v)  (Vector3d arg, mutate)          613 ns      88 ns   6.98x
+.scale(s, c)   (double + Vector3d args)        663 ns     138 ns   4.82x
+.points = [1000 Vector3d]  (bulk assign)    499137 ns   43321 ns  11.52x
+
+Lower is better. Times are ns/call (median of 5 runs, 100k iters each).
+
+=== Binary size comparison ===
+build/open3d_geometry.so                                     175792 bytes
+pybind11_equivalent/build/open3d_geometry_pybind.so          452456 bytes
