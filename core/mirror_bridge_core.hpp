@@ -438,6 +438,26 @@ consteval auto get_method_return_type() {
 // Primitives, enums, and void are always considered value-bindable.
 // Raw pointers: allowed only if pointee is primitive — pointers to user types
 // are ambiguous (ownership? nullable output? iterator?) and not safely bindable.
+// Check if T has any user-declared virtual (ignoring the virtual destructor).
+// Value-copy of such a T slices derived state — including a vtable that was
+// swapped in by bind_class_auto — so we must pass by pointer to preserve
+// polymorphic dispatch through the original instance.
+template<typename T>
+consteval bool has_user_virtual() {
+    if constexpr (!std::is_class_v<T>) return false;
+    else if constexpr (!requires { sizeof(T); }) return false;
+    else {
+        auto ctx = std::meta::access_context::unchecked();
+        for (auto m : std::meta::members_of(^^T, ctx)) {
+            if (!std::meta::is_function(m)) continue;
+            if (!std::meta::is_virtual(m)) continue;
+            if (std::meta::is_special_member_function(m)) continue;
+            return true;
+        }
+        return false;
+    }
+}
+
 template<typename T>
 consteval bool is_value_bindable() {
     using U = std::remove_cvref_t<T>;
@@ -454,6 +474,12 @@ consteval bool is_value_bindable() {
                std::is_arithmetic_v<Pointee>;
     }
     if constexpr (requires { sizeof(U); }) {
+        // Classes with user-declared virtuals must NOT be value-bindable:
+        // copying slices derived overrides and any custom vtable (which is
+        // how bind_class_auto implements Python subclass dispatch). Force
+        // pointer-holder storage instead so method calls dispatch through
+        // the caller's actual instance.
+        if constexpr (std::is_class_v<U> && has_user_virtual<U>()) return false;
         // Type is complete. Now check all the properties tuple needs.
         return !std::is_abstract_v<U> &&
                std::is_default_constructible_v<U> &&
