@@ -3595,6 +3595,330 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
 }
 
 // ============================================================================
+// Operator Overloading — Reflection-Driven Python Slot Binding
+// ============================================================================
+//
+// P2996 exposes operators via `is_operator_function(info)` + `operator_of(info)`,
+// which together let us detect every overloaded operator and dispatch each to
+// the right Python slot. No per-class glue required — if the user declares
+// `operator+`, `operator==`, `operator[]` etc. on their C++ type, the Python
+// binding automatically gains `__add__`, comparison, subscript, etc.
+//
+// Python slots come in two flavours: number/mapping/sequence sub-tables
+// (tp_as_number, tp_as_mapping, tp_as_sequence) and direct PyTypeObject
+// fields (tp_richcompare, tp_call). We populate the right one per operator.
+
+namespace ops {
+
+// Classification of a reflected operator into the Python slot it maps to.
+enum class Slot {
+    Unknown,
+    Add, Sub, Mul, Div, Mod,                     // nb_*
+    IAdd, ISub, IMul, IDiv, IMod,                 // nb_inplace_*
+    Eq, Ne, Lt, Gt, Le, Ge,                      // tp_richcompare
+    Subscript,                                   // mp_subscript
+    Call,                                        // tp_call
+    Negative, Positive,                          // unary +, -
+};
+
+consteval Slot classify(std::meta::operators op, bool is_unary) {
+    using O = std::meta::operators;
+    switch (op) {
+        case O::op_plus:           return is_unary ? Slot::Positive : Slot::Add;
+        case O::op_minus:          return is_unary ? Slot::Negative : Slot::Sub;
+        case O::op_star:           return Slot::Mul;
+        case O::op_slash:          return Slot::Div;
+        case O::op_percent:        return Slot::Mod;
+        case O::op_plus_equals:    return Slot::IAdd;
+        case O::op_minus_equals:   return Slot::ISub;
+        case O::op_star_equals:    return Slot::IMul;
+        case O::op_slash_equals:   return Slot::IDiv;
+        case O::op_percent_equals: return Slot::IMod;
+        case O::op_equals_equals:  return Slot::Eq;
+        case O::op_exclamation_equals: return Slot::Ne;
+        case O::op_less:           return Slot::Lt;
+        case O::op_greater:        return Slot::Gt;
+        case O::op_less_equals:    return Slot::Le;
+        case O::op_greater_equals: return Slot::Ge;
+        case O::op_square_brackets: return Slot::Subscript;
+        case O::op_parentheses:    return Slot::Call;
+        default:                   return Slot::Unknown;
+    }
+}
+
+// Enumerate operator methods declared on T (not its bases — operators are
+// rarely inherited meaningfully in user code; keeping it local avoids
+// surprising polymorphic-operator resolution). Returns infos for non-static
+// member operators only.
+template<typename T>
+consteval std::vector<std::meta::info> collect_operators() {
+    auto ctx = std::meta::access_context::current();
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::members_of(^^T, ctx)) {
+        if (!std::meta::is_function(m)) continue;
+        if (std::meta::is_static_member(m)) continue;
+        if (!std::meta::is_operator_function(m)) continue;
+        // Skip ones we don't map
+        auto params = std::meta::parameters_of(m);
+        bool is_unary = params.empty();
+        if (classify(std::meta::operator_of(m), is_unary) == Slot::Unknown) continue;
+        out.push_back(m);
+    }
+    return out;
+}
+
+template<typename T>
+struct OperatorCache {
+    static constexpr auto operators = std::define_static_array(collect_operators<T>());
+    static constexpr std::size_t count = operators.size();
+
+    static consteval std::meta::info at(std::size_t i) { return operators[i]; }
+
+    static consteval Slot slot_at(std::size_t i) {
+        auto m = operators[i];
+        auto params = std::meta::parameters_of(m);
+        return classify(std::meta::operator_of(m), params.empty());
+    }
+};
+
+// Find the first operator in T's cache matching a given Slot, or size() if none.
+template<typename T>
+consteval std::size_t find_op(Slot target) {
+    for (std::size_t i = 0; i < OperatorCache<T>::count; ++i) {
+        if (OperatorCache<T>::slot_at(i) == target) return i;
+    }
+    return OperatorCache<T>::count;
+}
+
+// Helpers: the parameter count / type of T's OpIndex-th operator. We can't
+// hold an std::meta::info-typed constexpr variable (it's consteval-only), so
+// wrap each lookup in a fresh consteval function that the splicer consumes.
+template<typename T, std::size_t OpIndex>
+consteval std::size_t op_param_count() {
+    return std::meta::parameters_of(OperatorCache<T>::at(OpIndex)).size();
+}
+
+// Wrapper for a binary operator: `(a OP b) -> result`. When `InPlace` is true,
+// the semantics are compound-assignment: the wrapper returns `self` with the
+// wrapper object incref'd to match Python's in-place protocol.
+template<typename T, std::size_t OpIndex, bool InPlace>
+PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    if constexpr (op_param_count<T, OpIndex>() != 1) {
+        Py_RETURN_NOTIMPLEMENTED;
+    } else {
+        using OtherParam = typename [:std::meta::type_of(
+            std::meta::parameters_of(OperatorCache<T>::at(OpIndex))[0]):];
+
+        // Convert `other` Python arg. If conversion fails (e.g., Vec3 + int),
+        // return NotImplemented so Python tries the reverse operand's
+        // __radd__ and eventually raises TypeError if no handler accepts.
+        mirror_bridge::core::param_storage_t<OtherParam> storage;
+        if (!extract_param<OtherParam>(other, storage)) {
+            PyErr_Clear();
+            Py_RETURN_NOTIMPLEMENTED;
+        }
+
+        try {
+            if constexpr (InPlace) {
+                ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                    forward_arg<OtherParam>(storage));
+                Py_INCREF(self);
+                return self;
+            } else {
+                using Ret = typename [:std::meta::return_type_of(
+                    OperatorCache<T>::at(OpIndex)):];
+                if constexpr (std::is_void_v<Ret>) {
+                    Py_RETURN_NONE;
+                } else {
+                    Ret result = ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                        forward_arg<OtherParam>(storage));
+                    return to_python(result);
+                }
+            }
+        } catch (const std::exception& e) {
+            PyErr_SetString(PyExc_RuntimeError, e.what());
+            return nullptr;
+        }
+    }
+}
+
+// Unary operator wrapper for `-a`, `+a` (no arguments).
+template<typename T, std::size_t OpIndex>
+PyObject* unary_op_wrapper(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+    using Ret = typename [:std::meta::return_type_of(OperatorCache<T>::at(OpIndex)):];
+    try {
+        if constexpr (std::is_void_v<Ret>) {
+            ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])();
+            Py_RETURN_NONE;
+        } else {
+            Ret result = ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])();
+            return to_python(result);
+        }
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+}
+
+// Subscript: a[i] → a.operator[](i). Returns the result converted to Python.
+template<typename T, std::size_t OpIndex>
+PyObject* subscript_wrapper(PyObject* self, PyObject* key) {
+    return binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(self, key);
+}
+
+// Call: a(args...) → a.operator()(args...). For simplicity we support only
+// single-arg operator() (common shape); extending to multi-arg follows the
+// dispatch we built for regular methods.
+template<typename T, std::size_t OpIndex>
+PyObject* call_wrapper(PyObject* self, PyObject* args, PyObject* /*kwds*/) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    if constexpr (op_param_count<T, OpIndex>() != 1) {
+        PyErr_SetString(PyExc_TypeError, "operator() arity unsupported");
+        return nullptr;
+    } else {
+        if (PyTuple_Size(args) != 1) {
+            PyErr_SetString(PyExc_TypeError, "operator() expects 1 argument");
+            return nullptr;
+        }
+        return binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(
+            self, PyTuple_GET_ITEM(args, 0));
+    }
+}
+
+// Single tp_richcompare that dispatches to whichever comparison the class has.
+// C++ comparison operators return bool. We convert to PyBool (Py_True /
+// Py_False) rather than PyLong so Python's `x == y` reads as a proper
+// boolean, not as 0/1.
+template<typename T>
+PyObject* richcompare_wrapper(PyObject* self, PyObject* other, int op) {
+    auto normalize_bool = [](PyObject* r) -> PyObject* {
+        if (!r || r == OVERLOAD_TRY_NEXT) return r;
+        if (PyBool_Check(r)) return r;
+        if (PyLong_Check(r)) {
+            long v = PyLong_AsLong(r);
+            Py_DECREF(r);
+            return PyBool_FromLong(v);
+        }
+        return r;
+    };
+
+    auto try_slot = [&]<Slot S, int PyOpCode>() -> PyObject* {
+        if (op != PyOpCode) return OVERLOAD_TRY_NEXT;
+        constexpr std::size_t idx = find_op<T>(S);
+        if constexpr (idx == OperatorCache<T>::count) {
+            return OVERLOAD_TRY_NEXT;
+        } else {
+            return normalize_bool(
+                binary_op_wrapper<T, idx, /*InPlace=*/false>(self, other));
+        }
+    };
+
+    PyObject* r = OVERLOAD_TRY_NEXT;
+    (void)((r = try_slot.template operator()<Slot::Eq, Py_EQ>(), r != OVERLOAD_TRY_NEXT) ||
+           (r = try_slot.template operator()<Slot::Ne, Py_NE>(), r != OVERLOAD_TRY_NEXT) ||
+           (r = try_slot.template operator()<Slot::Lt, Py_LT>(), r != OVERLOAD_TRY_NEXT) ||
+           (r = try_slot.template operator()<Slot::Gt, Py_GT>(), r != OVERLOAD_TRY_NEXT) ||
+           (r = try_slot.template operator()<Slot::Le, Py_LE>(), r != OVERLOAD_TRY_NEXT) ||
+           (r = try_slot.template operator()<Slot::Ge, Py_GE>(), r != OVERLOAD_TRY_NEXT));
+    if (r == OVERLOAD_TRY_NEXT) Py_RETURN_NOTIMPLEMENTED;
+    return r;
+}
+
+// Build PyNumberMethods with slots filled according to T's operators.
+template<typename T>
+PyNumberMethods* build_number_methods() {
+    static PyNumberMethods nm{};
+    constexpr std::size_t add_idx = find_op<T>(Slot::Add);
+    constexpr std::size_t sub_idx = find_op<T>(Slot::Sub);
+    constexpr std::size_t mul_idx = find_op<T>(Slot::Mul);
+    constexpr std::size_t div_idx = find_op<T>(Slot::Div);
+    constexpr std::size_t mod_idx = find_op<T>(Slot::Mod);
+    constexpr std::size_t iadd_idx = find_op<T>(Slot::IAdd);
+    constexpr std::size_t isub_idx = find_op<T>(Slot::ISub);
+    constexpr std::size_t imul_idx = find_op<T>(Slot::IMul);
+    constexpr std::size_t idiv_idx = find_op<T>(Slot::IDiv);
+    constexpr std::size_t imod_idx = find_op<T>(Slot::IMod);
+    constexpr std::size_t neg_idx = find_op<T>(Slot::Negative);
+    constexpr std::size_t pos_idx = find_op<T>(Slot::Positive);
+    constexpr std::size_t N = OperatorCache<T>::count;
+
+    if constexpr (add_idx < N)  nm.nb_add = binary_op_wrapper<T, add_idx, false>;
+    if constexpr (sub_idx < N)  nm.nb_subtract = binary_op_wrapper<T, sub_idx, false>;
+    if constexpr (mul_idx < N)  nm.nb_multiply = binary_op_wrapper<T, mul_idx, false>;
+    if constexpr (div_idx < N)  nm.nb_true_divide = binary_op_wrapper<T, div_idx, false>;
+    if constexpr (mod_idx < N)  nm.nb_remainder = binary_op_wrapper<T, mod_idx, false>;
+    if constexpr (iadd_idx < N) nm.nb_inplace_add = binary_op_wrapper<T, iadd_idx, true>;
+    if constexpr (isub_idx < N) nm.nb_inplace_subtract = binary_op_wrapper<T, isub_idx, true>;
+    if constexpr (imul_idx < N) nm.nb_inplace_multiply = binary_op_wrapper<T, imul_idx, true>;
+    if constexpr (idiv_idx < N) nm.nb_inplace_true_divide = binary_op_wrapper<T, idiv_idx, true>;
+    if constexpr (imod_idx < N) nm.nb_inplace_remainder = binary_op_wrapper<T, imod_idx, true>;
+    if constexpr (neg_idx < N)  nm.nb_negative = unary_op_wrapper<T, neg_idx>;
+    if constexpr (pos_idx < N)  nm.nb_positive = unary_op_wrapper<T, pos_idx>;
+
+    // Return null if nothing was populated, so tp_as_number stays null.
+    if constexpr (add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
+                  mod_idx >= N && iadd_idx >= N && isub_idx >= N && imul_idx >= N &&
+                  idiv_idx >= N && imod_idx >= N && neg_idx >= N && pos_idx >= N) {
+        return nullptr;
+    }
+    return &nm;
+}
+
+// Build PyMappingMethods with mp_subscript set if operator[] exists.
+template<typename T>
+PyMappingMethods* build_mapping_methods() {
+    static PyMappingMethods mm{};
+    constexpr std::size_t sub_idx = find_op<T>(Slot::Subscript);
+    if constexpr (sub_idx < OperatorCache<T>::count) {
+        mm.mp_subscript = subscript_wrapper<T, sub_idx>;
+        return &mm;
+    }
+    return nullptr;
+}
+
+template<typename T>
+ternaryfunc build_call() {
+    constexpr std::size_t idx = find_op<T>(Slot::Call);
+    if constexpr (idx < OperatorCache<T>::count) {
+        return call_wrapper<T, idx>;
+    }
+    return nullptr;
+}
+
+template<typename T>
+richcmpfunc build_richcompare() {
+    constexpr std::size_t eq = find_op<T>(Slot::Eq);
+    constexpr std::size_t ne = find_op<T>(Slot::Ne);
+    constexpr std::size_t lt = find_op<T>(Slot::Lt);
+    constexpr std::size_t gt = find_op<T>(Slot::Gt);
+    constexpr std::size_t le = find_op<T>(Slot::Le);
+    constexpr std::size_t ge = find_op<T>(Slot::Ge);
+    constexpr std::size_t N  = OperatorCache<T>::count;
+    if constexpr (eq < N || ne < N || lt < N || gt < N || le < N || ge < N) {
+        return richcompare_wrapper<T>;
+    }
+    return nullptr;
+}
+
+}  // namespace ops
+
+// ============================================================================
 // Nested Bindable Conversion: dict vs. Wrapper Object Semantics
 // ============================================================================
 //
@@ -3977,13 +4301,64 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     // Store class name statically for repr
     static const char* class_name = name;
 
-    // Generic repr function for all types (optimized: avoid ostringstream overhead)
+    // Generate a repr that shows class name + each member value. Falls back
+    // to the original `<ClassName at 0xaddr>` form only if every member fails
+    // to convert to Python (which shouldn't happen once bind_class passed
+    // validate_bindable_members).
+    //
+    // Example output: PointCloud(points=[[0,0,0],[1,0,0]], colors=[])
     static auto py_repr_func = +[](PyObject* self) -> PyObject* {
         auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer), "<%s object at %p>", class_name, static_cast<void*>(wrapper->cpp_object));
-        return PyUnicode_FromString(buffer);
+        if (!wrapper->cpp_object) {
+            return PyUnicode_FromFormat("<%s object (invalid)>", class_name);
+        }
+
+        constexpr std::size_t member_count = annotations::count_visible_members<T>();
+        if constexpr (member_count == 0) {
+            return PyUnicode_FromFormat("%s()", class_name);
+        } else {
+            PyObject* parts = PyList_New(0);
+            if (!parts) return nullptr;
+
+            [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+                ([&] {
+                    constexpr auto member = annotations::get_visible_member<T>(Is);
+                    constexpr const char* name = std::meta::identifier_of(member).data();
+                    const auto& value = (*wrapper->cpp_object).[:member:];
+                    PyObject* py_val = to_python(value);
+                    if (py_val) {
+                        PyObject* py_val_repr = PyObject_Repr(py_val);
+                        Py_DECREF(py_val);
+                        if (py_val_repr) {
+                            PyObject* part = PyUnicode_FromFormat("%s=%U", name, py_val_repr);
+                            Py_DECREF(py_val_repr);
+                            if (part) {
+                                PyList_Append(parts, part);
+                                Py_DECREF(part);
+                            }
+                        }
+                    }
+                }(), ...);
+            }(std::make_index_sequence<member_count>{});
+
+            PyObject* sep = PyUnicode_FromString(", ");
+            PyObject* joined = PyUnicode_Join(sep, parts);
+            Py_DECREF(sep);
+            Py_DECREF(parts);
+
+            PyObject* result = PyUnicode_FromFormat("%s(%U)", class_name, joined);
+            Py_DECREF(joined);
+            return result;
+        }
     };
+
+    // Operator slots derived from reflection. Each build_* returns a valid
+    // pointer only if T declares at least one operator of that category,
+    // so types with no operators pay nothing.
+    static PyNumberMethods* num_slots = ops::build_number_methods<T>();
+    static PyMappingMethods* map_slots = ops::build_mapping_methods<T>();
+    static ternaryfunc call_slot = ops::build_call<T>();
+    static richcmpfunc rich_slot = ops::build_richcompare<T>();
 
     // Define the Python type structure
     // Note: Inheritance is implicitly supported - reflection sees all members including inherited ones
@@ -3994,8 +4369,12 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
         .tp_itemsize = 0,
         .tp_dealloc = py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,
+        .tp_as_number = num_slots,
+        .tp_as_mapping = map_slots,
+        .tp_call = call_slot,
         .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  // Allow subclassing
         .tp_doc = "Auto-generated binding via mirror_bridge reflection",
+        .tp_richcompare = rich_slot,
         .tp_methods = methods.data(),
         .tp_getset = getsetters.data(),
         .tp_init = (ctor_count > 0) ? (initproc)py_init<T, Trampoline> : nullptr,
