@@ -5,8 +5,10 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace open3d {
@@ -130,22 +132,33 @@ public:
     }
 
     // Real voxel downsampling: grid the points and keep at most one per cell.
+    // Hash-map-backed so it's O(N) in the point count rather than O(N^2).
     PointCloud voxel_down_sample(double voxel_size = 0.05) const {
         PointCloud out;
         if (voxel_size <= 0 || points.empty()) return out;
-        std::vector<std::tuple<int, int, int>> seen;
-        auto make_key = [&](const Eigen::Vector3d& p) {
-            return std::make_tuple(
-                int(std::floor(p.x() / voxel_size)),
-                int(std::floor(p.y() / voxel_size)),
-                int(std::floor(p.z() / voxel_size)));
+
+        struct Key { int x, y, z; bool operator==(const Key& o) const {
+            return x == o.x && y == o.y && z == o.z;
+        } };
+        struct KeyHash {
+            size_t operator()(const Key& k) const noexcept {
+                // Three-coordinate hash from the standard "big prime" trick.
+                return std::hash<long long>()(
+                    (long long)k.x * 73856093LL ^
+                    (long long)k.y * 19349663LL ^
+                    (long long)k.z * 83492791LL);
+            }
         };
+        std::unordered_map<Key, std::size_t, KeyHash> seen;
+        seen.reserve(points.size() / 2);
+
         for (size_t i = 0; i < points.size(); ++i) {
-            auto k = make_key(points[i]);
-            bool found = false;
-            for (const auto& s : seen) { if (s == k) { found = true; break; } }
-            if (!found) {
-                seen.push_back(k);
+            Key k {
+                int(std::floor(points[i].x() / voxel_size)),
+                int(std::floor(points[i].y() / voxel_size)),
+                int(std::floor(points[i].z() / voxel_size))
+            };
+            if (seen.emplace(k, out.points.size()).second) {
                 out.points.push_back(points[i]);
                 if (i < normals.size()) out.normals.push_back(normals[i]);
                 if (i < colors.size()) out.colors.push_back(colors[i]);

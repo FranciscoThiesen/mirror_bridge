@@ -165,7 +165,15 @@ ax6.set_title("get_axis_aligned_bounding_box()\n(polymorphic return)",
 ax6.set_box_aspect([1, 1, 1])
 
 plt.tight_layout()
+
+# Web-sized PNG for the blog — 80 DPI gives crisp text on retina screens
+# while staying cheap to download. Pillow post-pass trims the file further
+# (matplotlib's PNG writer leaves some metadata room).
 out_png = "mirror_bridge_open3d_demo.png"
-plt.savefig(out_png, dpi=120, bbox_inches="tight", facecolor="white")
+plt.savefig(out_png, dpi=80, bbox_inches="tight", facecolor="white")
+
+from PIL import Image
+img = Image.open(out_png)
+img.save(out_png, "PNG", optimize=True)
 print(f"\nRendered to {out_png}")
-print(f"  Image: {os.path.getsize(out_png)} bytes")
+print(f"  Image: {os.path.getsize(out_png) // 1024} KB")

@@ -1,6 +1,7 @@
-# mirror_bridge and Open3D: 25,262 lines to 71
+# mirror_bridge and Open3D: 25,262 hand-written lines → 71 auto-generated ones
 
-*Binding a 38-class C++ geometry library to Python with zero per-class glue.*
+*Binding a 38-class C++ geometry library to Python with zero per-class
+glue, and 2–7× faster than the numpy equivalent for basic operations.*
 
 ## The baseline
 
@@ -233,6 +234,56 @@ tp.points = [[1,1,1]]
 ```
 
 Every line of this works without touching a single `.def` call.
+
+## How fast is "a binding call" actually?
+
+Fair question: if Python users can already do geometry operations with
+numpy — itself a high-performance C++ library — what does calling into
+Open3D via mirror_bridge actually buy you?
+
+`examples/open3d-comprehensive/bench_python_vs_cpp.py` measures it.
+Fixture: 1,000,000 random 3-D points, median of 5 runs, Linux ARM64,
+clang-p2996 `-O2`:
+
+| Operation                          | numpy              | mirror_bridge      | Speedup  |
+|------------------------------------|--------------------|--------------------|----------|
+| Centroid (`get_center`)            | 5.8 ms             | **0.9 ms**         | **6.3×** |
+| AABB (`min + max`)                 | 17.4 ms            | **2.5 ms**         | **7.1×** |
+| Voxel downsample                   | 81.6 ms            | **33.8 ms**        | **2.4×** |
+
+No SIMD, no threading, no custom allocator — just a straight C++ loop
+compiled once at `-O2`. The numpy versions already sit on BLAS/OpenMP
+under the hood; we still come out ahead because the C++ code has one
+fewer layer of per-element dispatch (numpy ufuncs check types and
+broadcast) and better cache behavior (the data stays in a packed
+`std::vector<Eigen::Vector3d>`).
+
+A "pure Python" (no numpy) version would run roughly 100× slower than
+numpy for these operations — we're not benchmarking against that
+straw-man, but if you're coming from `for p in points: total += p` in
+a Python loop the improvement is more like 600–700×.
+
+### Where the overhead actually shows up
+
+The binding isn't free. It costs:
+
+| FFI crossing (per call)                | Cost       |
+|----------------------------------------|------------|
+| `PointCloud(python_list_of_1M_points)` | ~18 ms     |
+| `len(pcd.points)`                      | ~270 ms    |
+
+The first is a genuine 1M-vector copy from Python-list storage into
+C++-owned `std::vector<Eigen::Vector3d>`. The second is brutal: reading
+`.points` back out on every call re-materializes the vector into Python
+objects. The rule of thumb: **keep the data in C++ as long as possible
+and only extract what you display**. All the speedups in the table above
+stay wins because the 1M points were already in the `PointCloud` object;
+each operation was just a method call and a small scalar result.
+
+A follow-up optimization — already in the roadmap — is to expose
+`PointCloud.points` as a numpy-compatible buffer via the Python buffer
+protocol, making the read-out free for consumers that keep it as a
+numpy array. That would flip the FFI read to O(1).
 
 ## What does this actually look like?
 
