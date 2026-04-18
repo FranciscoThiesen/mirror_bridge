@@ -249,6 +249,34 @@ bool from_python(PyObject* obj, T& container);
 namespace mirror_bridge {
 
 // ============================================================================
+// Exception Translation: C++ std:: exceptions → Python exception types
+// ============================================================================
+//
+// Without this, every C++ exception thrown through a bound method surfaces
+// as `RuntimeError` in Python. Open3D and most real-world C++ libraries
+// throw std::invalid_argument / std::out_of_range / std::runtime_error with
+// meaningful intent that Python users expect as ValueError / IndexError /
+// RuntimeError respectively. This helper picks the most specific Python
+// exception class via dynamic_cast.
+inline void set_py_error_from_cpp_exception(const std::exception& e) {
+    if (dynamic_cast<const std::out_of_range*>(&e)) {
+        PyErr_SetString(PyExc_IndexError, e.what());
+    } else if (dynamic_cast<const std::invalid_argument*>(&e)) {
+        PyErr_SetString(PyExc_ValueError, e.what());
+    } else if (dynamic_cast<const std::domain_error*>(&e)) {
+        PyErr_SetString(PyExc_ValueError, e.what());
+    } else if (dynamic_cast<const std::logic_error*>(&e)) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+    } else if (dynamic_cast<const std::runtime_error*>(&e)) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+    } else if (dynamic_cast<const std::bad_alloc*>(&e)) {
+        PyErr_SetString(PyExc_MemoryError, e.what());
+    } else {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+    }
+}
+
+// ============================================================================
 // Python Type Conversion Utilities
 // ============================================================================
 
@@ -625,7 +653,7 @@ PyObject* future_awaitable_next(PyObject* self) {
                 Py_DECREF(py_result);
             }
         } catch (const std::exception& e) {
-            PyErr_SetString(PyExc_RuntimeError, e.what());
+            set_py_error_from_cpp_exception(e);
         }
         return nullptr;
     }
@@ -3057,7 +3085,7 @@ PyObject* py_method(PyObject* self, PyObject* args) {
         // Dispatch to variadic helper with compile-time index sequence
         return call_method_impl<T, Index>(wrapper, args, std::make_index_sequence<param_count>{});
     } catch (const std::exception& e) {
-        PyErr_SetString(PyExc_RuntimeError, e.what());
+        set_py_error_from_cpp_exception(e);
         return nullptr;
     } catch (...) {
         PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
@@ -3132,7 +3160,7 @@ PyObject* py_static_method(PyObject* /* self */, PyObject* args) {
     try {
         return call_static_method_impl<T, Index>(args, std::make_index_sequence<param_count>{});
     } catch (const std::exception& e) {
-        PyErr_SetString(PyExc_RuntimeError, e.what());
+        set_py_error_from_cpp_exception(e);
         return nullptr;
     } catch (...) {
         PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
@@ -3254,7 +3282,7 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
             return to_python(result);
         }
     } catch (const std::exception& e) {
-        PyErr_SetString(PyExc_RuntimeError, e.what());
+        set_py_error_from_cpp_exception(e);
         return nullptr;
     } catch (...) {
         PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
@@ -3342,7 +3370,7 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
                 return to_python(result);
             }
         } catch (const std::exception& e) {
-            PyErr_SetString(PyExc_RuntimeError, e.what());
+            set_py_error_from_cpp_exception(e);
             return nullptr;
         } catch (...) {
             PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
@@ -3742,7 +3770,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
                 }
             }
         } catch (const std::exception& e) {
-            PyErr_SetString(PyExc_RuntimeError, e.what());
+            set_py_error_from_cpp_exception(e);
             return nullptr;
         }
     }
@@ -3766,7 +3794,7 @@ PyObject* unary_op_wrapper(PyObject* self) {
             return to_python(result);
         }
     } catch (const std::exception& e) {
-        PyErr_SetString(PyExc_RuntimeError, e.what());
+        set_py_error_from_cpp_exception(e);
         return nullptr;
     }
 }
@@ -4211,13 +4239,23 @@ std::enable_if_t<
 to_python(const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // First check Python-based global registry (works across shared libraries)
-    PyTypeObject* py_type = lookup_type_in_python<CleanT>();
-
-    // Fall back to local TypeRegistry for single-module scenarios
-    if (!py_type) {
-        py_type = TypeRegistry<CleanT>::py_type;
+    // Polymorphic return: if CleanT has a vtable, check typeid(obj) for the
+    // dynamic type and prefer a wrapper of that derived type. Without this,
+    // `shared_ptr<Geometry>` returning a PointCloud would give Python a
+    // Geometry wrapper, missing the derived class's methods.
+    PyTypeObject* py_type = nullptr;
+    if constexpr (std::is_polymorphic_v<CleanT>) {
+        PyObject* registry = get_python_type_registry();
+        if (registry) {
+            const char* dyn_name = typeid(obj).name();
+            PyObject* derived = PyDict_GetItemString(registry, dyn_name);
+            if (derived) py_type = reinterpret_cast<PyTypeObject*>(derived);
+        }
     }
+
+    // Fall back to static-type lookup
+    if (!py_type) py_type = lookup_type_in_python<CleanT>();
+    if (!py_type) py_type = TypeRegistry<CleanT>::py_type;
 
     if (py_type) {
         // Create a wrapper object.
