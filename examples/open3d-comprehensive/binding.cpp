@@ -1,5 +1,5 @@
 // Comprehensive end-to-end demo: zero binding glue for an Open3D-shape library.
-// Single bind_class_auto call per class enables: inheritance, trampolines for
+// Single bind_class call per class enables: inheritance, trampolines for
 // Python subclass overrides, operators, keyword-args-with-defaults, Eigen type
 // conversion, and polymorphic method dispatch.
 #include "mirror_bridge.hpp"
@@ -14,4 +14,7 @@ MIRROR_BRIDGE_MODULE(open3d_comprehensive,
     // bind_class_auto: Python subclasses can override any virtual via
     // reflection-driven vtable swap. No hand-written trampoline class.
     mirror_bridge::bind_class_auto<PointCloud>(m, "PointCloud");
+    // Free functions — bound by function pointer, kwargs/defaults still work.
+    mirror_bridge::bind_function<&create_sphere>(m, "create_sphere");
+    mirror_bridge::bind_function<&create_torus>(m, "create_torus");
 )

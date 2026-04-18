@@ -129,24 +129,44 @@ public:
         return AxisAlignedBoundingBox(get_min_bound(), get_max_bound());
     }
 
-    // Default arg — Open3D-idiomatic kwarg.
+    // Real voxel downsampling: grid the points and keep at most one per cell.
     PointCloud voxel_down_sample(double voxel_size = 0.05) const {
         PointCloud out;
+        if (voxel_size <= 0 || points.empty()) return out;
+        std::vector<std::tuple<int, int, int>> seen;
+        auto make_key = [&](const Eigen::Vector3d& p) {
+            return std::make_tuple(
+                int(std::floor(p.x() / voxel_size)),
+                int(std::floor(p.y() / voxel_size)),
+                int(std::floor(p.z() / voxel_size)));
+        };
         for (size_t i = 0; i < points.size(); ++i) {
-            if (static_cast<double>(i) * voxel_size < 1.0) out.points.push_back(points[i]);
+            auto k = make_key(points[i]);
+            bool found = false;
+            for (const auto& s : seen) { if (s == k) { found = true; break; } }
+            if (!found) {
+                seen.push_back(k);
+                out.points.push_back(points[i]);
+                if (i < normals.size()) out.normals.push_back(normals[i]);
+                if (i < colors.size()) out.colors.push_back(colors[i]);
+            }
         }
         return out;
     }
 
-    // Multiple kwargs with defaults — mimics estimate_normals.
+    // Compute per-point normals by looking at a point's offset from the cloud
+    // centroid — simple, illustrative, good for visualization.
     PointCloud estimate_normals(double radius = 0.1, int max_nn = 30,
                                 bool fast_normal_computation = true) const {
         PointCloud out = *this;
         out.normals.clear();
-        for (size_t i = 0; i < points.size(); ++i) {
-            out.normals.push_back(Eigen::Vector3d(0, 0, (double)max_nn * radius));
+        Eigen::Vector3d center = get_center();
+        for (const auto& p : points) {
+            Eigen::Vector3d d = p - center;
+            double n = d.norm();
+            out.normals.push_back(n > 1e-9 ? d / n : Eigen::Vector3d(0, 0, 1));
         }
-        (void)fast_normal_computation;
+        (void)radius; (void)max_nn; (void)fast_normal_computation;
         return out;
     }
 
@@ -154,7 +174,7 @@ public:
         colors.assign(points.size(), c);
     }
 
-    // Operators — `pcd1 + pcd2` merges.
+    // Point-cloud merge via operator overloads.
     PointCloud operator+(const PointCloud& o) const {
         PointCloud r = *this;
         r.points.insert(r.points.end(), o.points.begin(), o.points.end());
@@ -170,6 +190,41 @@ public:
     }
     bool operator==(const PointCloud& o) const { return points == o.points; }
 };
+
+// Free functions matching Open3D's factory style — sphere / torus meshes as
+// PointClouds (we're demonstrating the point-cloud plumbing, not rendering).
+inline PointCloud create_sphere(double radius = 1.0, int resolution = 30) {
+    PointCloud pc;
+    for (int i = 0; i <= resolution; ++i) {
+        double phi = M_PI * i / resolution;
+        for (int j = 0; j < resolution * 2; ++j) {
+            double theta = 2 * M_PI * j / (resolution * 2);
+            double x = radius * std::sin(phi) * std::cos(theta);
+            double y = radius * std::sin(phi) * std::sin(theta);
+            double z = radius * std::cos(phi);
+            pc.points.push_back(Eigen::Vector3d(x, y, z));
+        }
+    }
+    return pc;
+}
+
+inline PointCloud create_torus(double outer_radius = 1.0,
+                                double inner_radius = 0.3,
+                                int major_res = 40,
+                                int minor_res = 20) {
+    PointCloud pc;
+    for (int i = 0; i < major_res; ++i) {
+        double u = 2 * M_PI * i / major_res;
+        for (int j = 0; j < minor_res; ++j) {
+            double v = 2 * M_PI * j / minor_res;
+            double cx = (outer_radius + inner_radius * std::cos(v)) * std::cos(u);
+            double cy = (outer_radius + inner_radius * std::cos(v)) * std::sin(u);
+            double cz = inner_radius * std::sin(v);
+            pc.points.push_back(Eigen::Vector3d(cx, cy, cz));
+        }
+    }
+    return pc;
+}
 
 }  // namespace geometry
 }  // namespace open3d

@@ -45,6 +45,41 @@ MIRROR_BRIDGE_MODULE(open3d_full,
 = default`, no trampoline macros, no type casters. The rest is derived
 from C++26 reflection at compile time.
 
+### …and those 71 lines themselves are auto-generated
+
+You don't even write them. `mirror_bridge generate` scans Open3D's
+headers, walks the brace depth to track class scope (so
+`HalfEdgeTriangleMesh::HalfEdge` comes out with the right
+qualification), strips forward declarations, and emits the whole
+binding file:
+
+```
+$ mirror_bridge generate Open3D/cpp/open3d/geometry \
+      --module open3d_full --lang python \
+      -I Open3D/cpp -I /usr/include/eigen3
+
+  ✓ Found: OrientedBoundingBox in BoundingVolume.h
+  ✓ Found: AxisAlignedBoundingBox in BoundingVolume.h
+  ✓ Found: HalfEdgeTriangleMesh::HalfEdge in HalfEdgeTriangleMesh.h
+  ✓ Found: KDTreeSearchParam::SearchType in KDTreeSearchParam.h
+  ✓ Found: TriangleMesh::Material::MaterialParameter in TriangleMesh.h
+  ✓ Found: VoxelGrid::VoxelPoolingMode in VoxelGrid.h
+  ... 47 classes found ...
+  ✓ Built: build/open3d_full.so
+```
+
+Run that command against Open3D's geometry directory and you get **47
+bound classes** back — the 38 top-level ones plus 9 enums and nested
+helper types (`KDTreeSearchParam::SearchType`,
+`Image::ColorToIntensityConversionType`,
+`MeshBase::SimplificationContraction`, etc.) that the brace-depth
+parser picks up automatically.
+
+A hand-written binding file is a fallback when you need to trim or
+rename — for instance our runtime demo binds only 6 classes, because
+that's what its Python test exercises. Both paths produce the same
+compiled `.so`.
+
 ### The numbers
 
 | Artifact                              | Open3D pybind | mirror_bridge | Ratio |
@@ -199,6 +234,40 @@ tp.points = [[1,1,1]]
 
 Every line of this works without touching a single `.def` call.
 
+## What does this actually look like?
+
+The companion script `examples/open3d-comprehensive/visual_demo.py`
+generates geometry in C++, manipulates it through the
+mirror_bridge-bound interface, and renders it. Every operation crosses
+the C++/Python boundary through zero-glue reflection bindings:
+
+![mirror_bridge Open3D demo](visuals/mirror_bridge_open3d_demo.png)
+
+Each panel shows a different stage of the pipeline:
+
+1. **`o3d.create_sphere(1.0, 40)`** — free function returns a
+   `PointCloud` of 3,280 points generated in C++.
+2. **`o3d.create_torus(2.2, 0.5, 60, 30)`** — 1,800 more points,
+   shifted in Python via member mutation on the C++ object.
+3. **`sphere + torus`** — `operator+` merges the two point clouds
+   (5,080 points). Reflection-derived from `operator_of(M)` on the C++
+   declaration; no `.def(py::self + py::self)`.
+4. **`estimate_normals(radius=0.05, max_nn=30)`** — kwargs resolved
+   from `identifier_of` on each parameter. RGB color of each point =
+   unit normal vector, so the sphere shows a rainbow and the torus
+   shows its doughnut topology.
+5. **`voxel_down_sample(voxel_size=0.15)`** — real algorithm in C++
+   reduces 5,080 → 1,975 points. Default value `0.05` comes from
+   `has_default_argument` + splice-call-with-fewer-args.
+6. **`get_axis_aligned_bounding_box()`** — polymorphic return: the
+   C++ signature is `Geometry3D*` but the wrapper Python sees is
+   `AxisAlignedBoundingBox`, resolved via `typeid(*ptr)` lookup. The
+   red and blue wireframes are its `min_bound`/`max_bound` fields.
+
+The whole script runs in under two seconds. The image comes from one
+`matplotlib.pyplot.savefig` call — the point clouds themselves are
+computed in C++ and handed to Python as lists of three-vectors.
+
 ## Honest trade-offs
 
 - **Compile time and binary size**. Reflection emission happens once
@@ -207,9 +276,14 @@ Every line of this works without touching a single `.def` call.
   same classes compiles in a similar range; mirror_bridge's code-gen
   overhead is comparable, measurably not worse.
 
-- **Compiler support**. Requires clang-p2996 (Bloomberg's
-  reflection-enabled clang branch). Doesn't run on stock clang or
-  gcc yet. The Docker image we ship has everything ready.
+- **Compiler support**. Needs a compiler with C++26 reflection
+  (P2996). Today that's clang-p2996 (Bloomberg's fork) and GCC trunk —
+  GCC merged its own P2996 implementation in 2024 and it ships in the
+  15 series. The mirror_bridge Docker image pins clang-p2996 because
+  that's what we've tested against; a GCC variant is straightforward
+  but not yet packaged. MSVC doesn't have P2996 yet, which is the
+  real portability constraint today and also why the auto-trampoline
+  vtable-swap is Linux/macOS-only (Itanium ABI).
 
 - **Auto-trampoline**. The magic-mode Python-override support depends
   on Itanium ABI (Linux/macOS). On MSVC the portable

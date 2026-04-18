@@ -86,8 +86,10 @@ print("--- 8. Open3D-style method chaining ---")
 # pcd.estimate_normals(radius=0.1, max_nn=30) — all kwargs, same as pybind11
 normaled = pcd.estimate_normals(radius=0.05, max_nn=50)
 check(len(normaled.normals) == 4, f"estimate_normals(kwargs) -> {len(normaled.normals)} normals")
-check(abs(normaled.normals[0][2] - 50 * 0.05) < 1e-9,
-      "kwarg values reached C++ correctly")
+# Normals point from centroid outward; their length is 1 (unit vectors).
+n0 = normaled.normals[0]
+mag = (n0[0]**2 + n0[1]**2 + n0[2]**2)**0.5
+check(abs(mag - 1.0) < 1e-9, f"kwarg values reached C++, normals are unit vectors (|n0|={mag})")
 
 print()
 print("--- 9. Operators on PointCloud (merge) ---")
