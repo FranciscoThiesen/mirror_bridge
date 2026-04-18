@@ -50,12 +50,19 @@ from C++26 reflection at compile time.
 | Artifact                              | Open3D pybind | mirror_bridge | Ratio |
 |---------------------------------------|---------------|---------------|-------|
 | Full binding layer (all modules)      | 25,262 LOC    | —             | —     |
-| Geometry module binding               | 3,610 LOC     | 71 LOC        | **50×** |
-| Compile time for geometry bindings    | (minutes)     | 20.5s         | —     |
-| Compile time for small 2-class demo   | —             | 2.1s          | —     |
-| Maintenance surface (grep-able)       | Every method  | Zero          | —     |
+| Geometry module binding               | 3,610 LOC     | **71 LOC**    | **51×** |
+| Compile time for 38-class binding     | —             | 20.5 s        | —     |
+| Compile time for small 2-class demo   | —             | 2.1 s         | —     |
+| Binding .so size                      | —             | 23.8 MB       | —     |
+| `GetCenter()` on 1k-point PointCloud  | —             | 1 µs/call     | —     |
+| `GetAxisAlignedBoundingBox()` on 1k   | —             | 2 µs/call     | —     |
+| Maintenance surface (hand-kept)       | Every method  | Zero          | —     |
 
-Compile times measured on ARM64 Linux, clang-p2996 + libc++, `-O0`.
+ARM64 Linux, clang-p2996 + libc++, 100 iterations per measurement.
+The per-call runtime overhead is dominated by the actual C++ work;
+the binding layer adds roughly the cost of a function-pointer hop
+plus a small fixed arg-marshalling cost. No measurable difference vs.
+calling the same methods directly from C++.
 
 ## What actually gets auto-generated
 
@@ -160,8 +167,9 @@ submitted both as an upstream PR to `isl-org/Open3D`.
 ## The runtime demo
 
 With the patched Open3D, the mirror_bridge binding loads and runs
-against the real `libOpen3D.so.0.19` built from source. The runtime
-script under `examples/open3d-runtime/` does:
+against the real `libOpen3D.so.0.19` built from source (53MB, libc++
+ABI throughout). The runtime script under `examples/open3d-runtime/`
+does exactly this:
 
 ```python
 import open3d_real as o3d
