@@ -4425,19 +4425,21 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     }
 
     // Add static methods to the type dictionary
-    // Python's PyMethodDef with METH_STATIC doesn't work - we need to manually wrap them
+    // Python's PyMethodDef with METH_STATIC doesn't work - we need to manually wrap them.
+    // Skip entries whose ml_name is null — generate_static_methods leaves those
+    // zero-initialized for static methods we couldn't bind (e.g., raw-pointer
+    // params to user types). Creating a PyCFunction with a null ml_name
+    // dereferences it via PyErr_Format and segfaults.
     if constexpr (static_method_count > 0) {
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([&] {
+                if (!static_methods[Is].ml_name) return;
                 constexpr auto func_name = get_static_member_function_name<T, Is>();
-                // Create a PyCFunction for the static method
                 PyObject* func = PyCFunction_New(&static_methods[Is], nullptr);
                 if (func) {
-                    // Wrap it as a static method
                     PyObject* static_method = PyStaticMethod_New(func);
                     Py_DECREF(func);
                     if (static_method) {
-                        // Add to type dict
                         PyObject* type_dict = type_object.tp_dict;
                         PyDict_SetItemString(type_dict, func_name, static_method);
                         Py_DECREF(static_method);
