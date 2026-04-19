@@ -146,6 +146,100 @@ contribution is that the binding *doesn't stand in the way*:
 - No intermediate `py::object` wrappers, no shared_ptr ref-count
   increments for return values, no type-erased converter dispatch.
 
+### The assembly receipt
+
+Don't take the prose on faith — the generated code tells the story.
+Both snippets below are clang-p2996 at `-O3`, linux-aarch64, libc++,
+same `PointCloud::get_center()` in `geometry_min.hpp`. Only the
+binding layer changes.
+
+**pybind11's dispatcher has to cross four function boundaries before
+your loop runs.** The C function Python calls is an `__invoke` stub
+that tail-calls the actual `cl` lambda body — and the body does this
+([full source][asm-bench]):
+
+```asm
+; pybind11 cpp_function::initialize<…>::__invoke body (simplified)
+bl    pybind11::detail::type_caster_generic::type_caster_generic(…)  ; 1
+bl    pybind11::detail::type_caster_generic::load_impl<…>(…)          ; 2
+ldr   x9, [x8, x9]                  ; member-function-ptr resolution
+blr   x9                            ; 3: indirect call → get_center()
+bl    type_caster<Eigen::Matrix<…>>::cast_impl<…>(…)                  ; 4
+```
+
+And `get_center` stays a separate symbol in the `.s` — not inlined:
+
+```asm
+demo::PointCloud::get_center() const:     ; reachable function (separate frame)
+.LBB231_2:
+    ldr   q2, [x11]
+    ldr   d3, [x11, #16]
+    fadd  v1.2d, v1.2d, v2.2d             ; same SIMD reduction,
+    fadd  d0, d0, d3                      ; but behind a call boundary
+    b.ne  .LBB231_2
+    ret
+```
+
+**mirror_bridge's dispatcher IS the method.** The reflection splice
+`((*wrapper->cpp_object).[:member_func:])(...)` lets the compiler see
+the full body of `get_center` at the call site, inline it, and fuse
+the result straight into the three `PyFloat_FromDouble` calls:
+
+```asm
+; mirror_bridge invoke_with_n_args<PointCloud, 0> body, -O3
+ldr   x8, [x0, #8]                  ; wrapper → cpp_object
+ldr   x8, [x8]
+ldr   x9, [x8, #16]                 ; &points
+ldp   x8, x9, [x9]                  ; points.begin, points.end
+.LBB35_2:                           ; ── INLINED get_center loop ──
+    ldr   q2, [x10]
+    ldr   d3, [x10, #16]
+    fadd  v1.2d, v1.2d, v2.2d       ; no function call
+    fadd  d0, d0, d3                ; between Python and math
+    b.ne  .LBB35_2
+; …fdiv by size…
+bl    PyList_New                    ; return marshalling is
+bl    PyFloat_FromDouble            ; exactly four CPython calls,
+bl    PyFloat_FromDouble            ; and nothing else
+bl    PyFloat_FromDouble
+ret
+```
+
+`demo::PointCloud::get_center()` does **not** exist as a symbol in
+the mirror_bridge object file. We checked:
+
+```bash
+$ grep -c 'PointCloud.*get_centerEv' bind_mb.s
+0
+$ grep -c 'PointCloud.*get_centerEv' bind_pybind.s
+8                                   # defined once + reached indirectly
+```
+
+The compiler *couldn't* inline it for pybind11 because the dispatcher
+template in pybind11's header holds a `Ret (Class::*)(...)` pointer —
+opaque at instantiation time. Reflection gives the compiler a
+concrete splice at instantiation time, so inlining falls out for free.
+
+### Scope check: the whole object file
+
+Same one-class binding, same `-O3`, same flags:
+
+| File          | `.s` size | `bl`/`blr` instructions (whole module) |
+|---------------|----------:|---------------------------------------:|
+| `bind_mb.s`   | 240 KB    | 271                                    |
+| `bind_pybind.s`| 2,762 KB | 4,420                                  |
+
+11.5× more assembly, 16× more call instructions — most of it the
+`type_caster<...>` specializations for every primitive pybind11
+might convert. Reflection-based dispatch doesn't emit any of that
+because it knows at compile time which types show up and which ones
+don't.
+
+pybind11 isn't badly written — it's carefully written. But it's a
+deployed library, and at the point its dispatcher templates are
+instantiated it *can't see* the user's class. mirror_bridge turns
+that "can't see" into "can," and the optimizer takes it from there.
+
 The flags matter too:
 
 | Build flags                          | Centroid | AABB     | Voxel    |
@@ -358,3 +452,4 @@ community — none of this is possible without their reflection work.*
 [fork]:    https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-full-port/Open3D
 [o3d-pybind]: https://github.com/isl-org/Open3D/blob/main/cpp/pybind/geometry/pointcloud.cpp
 [repro]:   https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/open3d-comprehensive/bench_three_way.py
+[asm-bench]: https://github.com/FranciscoThiesen/mirror_bridge/tree/main/asm_study
