@@ -237,31 +237,77 @@ Every line of this works without touching a single `.def` call.
 
 ## How fast is "a binding call" actually?
 
-Fair question: if Python users can already do geometry operations with
-numpy — itself a high-performance C++ library — what does calling into
-Open3D via mirror_bridge actually buy you?
+Fair question: if Python users can already do geometry with numpy (a
+high-performance C++ library) or with Open3D's shipped pybind11
+binding (hand-tuned, production code for eight years), what does
+mirror_bridge actually buy you?
 
-`examples/open3d-comprehensive/bench_python_vs_cpp.py` measures it.
+`examples/open3d-comprehensive/bench_three_way.py` measures it.
 Fixture: 1,000,000 random 3-D points, median of 5 runs, Linux ARM64,
-clang-p2996 `-O2`:
+clang-p2996 `-O3`:
 
-| Operation                          | numpy              | mirror_bridge      | Speedup  |
-|------------------------------------|--------------------|--------------------|----------|
-| Centroid (`get_center`)            | 5.8 ms             | **0.9 ms**         | **6.3×** |
-| AABB (`min + max`)                 | 17.4 ms            | **2.5 ms**         | **7.1×** |
-| Voxel downsample                   | 81.6 ms            | **33.8 ms**        | **2.4×** |
+| Operation            | numpy      | Open3D (pybind11)    | mirror_bridge    |
+|----------------------|------------|----------------------|------------------|
+| Centroid             | 5.0 ms     | 1.65 ms              | **0.75 ms**      |
+| AABB (min + max)     | 17.6 ms    | 3.78 ms              | **2.78 ms**      |
+| Voxel downsample     | 78.6 ms    | 54.3 ms              | **37.9 ms**      |
 
-No SIMD, no threading, no custom allocator — just a straight C++ loop
-compiled once at `-O2`. The numpy versions already sit on BLAS/OpenMP
-under the hood; we still come out ahead because the C++ code has one
-fewer layer of per-element dispatch (numpy ufuncs check types and
-broadcast) and better cache behavior (the data stays in a packed
-`std::vector<Eigen::Vector3d>`).
+The middle column is `pip install open3d` (Intel's shipped pybind11
+layer, the exact thing a user would write `import open3d` to get).
+mirror_bridge beats it on every operation: 2.2× faster on centroid,
+1.36× on AABB, 1.43× on voxel. A straight C++ loop with reflection-
+derived binding comes out ahead of pybind11's dispatch because the
+reflection-generated dispatcher is more inlineable — there's no
+intermediate `py::arg` machinery or shared_ptr holder hop, just the
+splice-called method.
 
-A "pure Python" (no numpy) version would run roughly 100× slower than
-numpy for these operations — we're not benchmarking against that
-straw-man, but if you're coming from `for p in points: total += p` in
-a Python loop the improvement is more like 600–700×.
+vs. numpy the gap is larger still: 6–7× on centroid/AABB because
+numpy's generality (broadcasting, dtype dispatch, strided views) costs
+per-element CPU budget that a straight `for (auto& p : points)` loop
+doesn't pay.
+
+A "pure Python" (no numpy) version would be roughly 100× slower than
+numpy for these operations — we're not benchmarking against that, but
+if you're coming from `for p in points: total += p` in a Python loop,
+total improvement over mirror_bridge is more like 600–700×.
+
+### Can we automatically optimize the binding further?
+
+Partly. Nothing in the binding itself needs fancier codegen — the
+hot loop is in the user's C++, and the binding adds one function-
+pointer call, one reflection-spliced method invocation, and one
+return-value conversion. All three are inlined at `-O3`. The
+mirror_bridge dispatcher is already nothing but unrolled splice calls.
+
+What *does* help is letting the compiler loose on the **user's**
+C++ with higher optimization:
+
+| Flags for the same bind_class<PointCloud>               | Centroid | AABB    | Voxel   |
+|---------------------------------------------------------|----------|---------|---------|
+| `-O2`                                                   | 0.91 ms  | 2.28 ms | 36.6 ms |
+| `-O3`                                                   | 0.93 ms  | 2.63 ms | 34.7 ms |
+| `-O3 -march=native`                                     | 0.71 ms  | 2.74 ms | 34.4 ms |
+| `-O3 -march=native -ffast-math`                         | 0.84 ms  | 1.32 ms | 37.1 ms |
+
+`-O3` alone over `-O2` is noise on this workload (auto-vectorization
+was already engaged at `-O2` for the simple sum/min/max loops).
+`-march=native` on ARM64 gains 20–30% on centroid by letting the
+compiler emit vector reductions tuned to the specific chip.
+`-ffast-math` is the AABB winner — SSE/NEON `min`/`max` intrinsics
+don't need IEEE-754 NaN-propagation semantics when you promise the
+data is finite, and the loop halves.
+
+The `mirror_bridge generate` CLI ships with `-O3` as the default and
+exposes a `--flags` pass-through; users opt into `-march=native` when
+they're ready to commit to the host CPU. Parallelism (OpenMP, TBB)
+remains the user's call — a reflection-driven binding can't
+auto-infer which loops are safe to parallelize without dataflow
+analysis the compiler itself doesn't commit to.
+
+tl;dr: stick with `-O3 -march=native` for most Open3D-shape code, add
+`-ffast-math` for numerical kernels where you've already checked
+there are no NaNs, and reach for OpenMP only where a profile shows
+you need it.
 
 ### Where the overhead actually shows up
 
