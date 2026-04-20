@@ -28,7 +28,7 @@ Three measured numbers:
 
 Here's how Open3D binds a single method in their production pybind11
 layer. This is `voxel_down_sample_and_trace`
-([pointcloud.cpp L67-L72][o3d-pybind]):
+([pointcloud.cpp L70-L75][o3d-pybind]):
 
 ```cpp
 .def("voxel_down_sample_and_trace",
@@ -72,16 +72,16 @@ with anyone else's), writes one `bind_class<...>` line per discovered
 type, and compiles. Adding a new Open3D class means re-running the
 tool.
 
-Visually:
+Visually, it's a DFS walk of the (file → class → nested) tree:
 
-![Auto-discovery traversal: brace-depth walk, class detection, emitted bind_class lines](visuals/auto_discovery_traversal.png)
+![Auto-discovery as a DFS walk of the file-class-nested tree, with every visited node numbered and one bind_class<T> line emitted per discovery](visuals/auto_discovery_traversal.png)
 
-Left: the parser sees `class HalfEdgeTriangleMesh { ... struct HalfEdge
-{ ... } ... }` and opens a new "discovered" marker each time a
-`class`/`struct`/`enum` token appears at a fresh depth. Middle: the
-brace-depth trace shows why this works, a nested `struct` sits at
-depth 2 and gets the `Parent::Child` qualifier automatically. Right:
-one `bind_class<T>` line per discovery, ready to compile.
+Each discovered type gets a numbered badge showing its DFS visit
+order. When the walk drops into a `struct HalfEdge { ... }` that
+lives inside `class HalfEdgeTriangleMesh`, it's at depth 2, and the
+emitted `bind_class<HalfEdgeTriangleMesh::HalfEdge>` line carries the
+`Parent::Child` qualifier automatically. The whole thing is one pass:
+enter, emit, recurse, return.
 
 The output it emits is short enough to read:
 
@@ -90,13 +90,13 @@ MIRROR_BRIDGE_MODULE(open3d_full,
     mirror_bridge::bind_class<OrientedBoundingBox>(m, "OrientedBoundingBox");
     mirror_bridge::bind_class<AxisAlignedBoundingBox>(m, "AxisAlignedBoundingBox");
     mirror_bridge::bind_class<PointCloud>(m, "PointCloud");
-    // ... 35 more bind_class lines ...
+    // ... 43 more bind_class lines ...
     mirror_bridge::bind_class<AggColorVoxel>(m, "AggColorVoxel");
 )
 ```
 
 **71 lines total**, versus pybind11's 3,610 hand-written lines for
-the same 38 classes. Each `bind_class<T>` pulls in constructors,
+the same 47 classes. Each `bind_class<T>` pulls in constructors,
 every public method, every field, operators, keyword arguments,
 default values, `__repr__`, subclassing, inheritance, and
 polymorphic returns straight from the C++ header. Nothing to re-type
@@ -357,10 +357,9 @@ the library itself; no API changes):
    Force-including keeps every transitive dep resolved; Open3D's
    existing version script still hides SSL from dynamic exports.
 
-Both patches are in [`examples/open3d-full-port/Open3D`][fork] on
-branch `mirror_bridge-fixes` and have been submitted upstream. macOS
-and Windows builds are unchanged: they use system SSL and their own
-linker semantics.
+The diff itself lives at [`examples/open3d-full-port/patches`][fork]
+as a single `.patch` file. macOS and Windows builds are unchanged:
+they use system SSL and their own linker semantics.
 
 With the patched fork, a real Open3D session looks like this
 ([source][runtime]):
