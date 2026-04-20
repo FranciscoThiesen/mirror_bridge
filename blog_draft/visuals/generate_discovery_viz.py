@@ -1,17 +1,7 @@
-"""Auto-discovery visualization: proper tree + DFS traversal path.
-
-Shows the parse as what it actually is: a depth-first traversal of the
-(file → class → nested-class) tree, with each discovery numbered in
-visit order and an explicit arrow path drawn through the numbers.
-
-Layout, left to right:
-   col A   header-file nodes (roots of each per-file subtree)
-   col B   top-level class nodes (depth 1)
-   col C   nested class nodes (depth 2)
-   col D   emitted bind_class<T> line for each visited node
-
-A highlighted dashed path visits every discovered class in DFS
-pre-order. Numbered badges on each node show the visit order.
+"""Auto-discovery visualization in the style of Anthropic / DeepMind
+research blog posts: warm cream background, sparing accent colours, real
+syntax-highlighted C++ on the left, a receipt-style emission tape on the
+right, and a depth-stack timeline beneath that reveals the algorithm.
 
 Outputs `auto_discovery_traversal.png`.
 """
@@ -23,100 +13,108 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mp
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Circle
-from matplotlib.path import Path as MPath
+from matplotlib.patches import FancyBboxPatch, Rectangle, Circle
 
-# ---- Palette ----------------------------------------------------------
-BG        = "#0B1220"
-PANEL     = "#151E33"
-PANEL_HI  = "#1C2640"
-INK       = "#F1F5F9"
-DIM       = "#94A3B8"
-MUTED     = "#64748B"
-GRID      = "#2A3752"
+# ---- Palette (warm, magazine-quality) ---------------------------------
+BG       = "#FAF7F0"   # cream
+PAPER    = "#FFFFFF"   # panel interior (code windows, cards)
+INK      = "#16161A"   # near-black charcoal
+INK_SOFT = "#32302C"
+DIM      = "#6B6560"   # warm gray
+MUTED    = "#A3998C"
+HAIRLINE = "#E4DED1"
 
-FILE_COL   = "#60A5FA"   # blue  (file nodes)
-TOP_COL    = "#34D399"   # green (top-level class)
-NESTED_COL = "#F472B6"   # pink  (nested class)
-PATH_COL   = "#FBBF24"   # amber (DFS path)
-OUT_COL    = "#A5B4FC"   # indigo (emit line)
+# Accents, used sparingly
+TERRA    = "#C96442"   # terracotta (Anthropic-ish primary)
+NAVY     = "#1D3A8A"   # files
+FOREST   = "#216E4E"   # top-level class
+PLUM     = "#8E2F6D"   # nested class
+GOLD     = "#B8791F"   # algorithm highlights
 
-MONO = "DejaVu Sans Mono"
+# Code syntax colours (muted, paper-friendly)
+KW       = "#8E2F6D"   # plum for keywords
+TYPE     = "#1D3A8A"   # navy for type names
+STR      = "#216E4E"   # green for strings
+CMT      = "#9E968B"   # gray for comments
 
-# ---- The tree we're going to draw -------------------------------------
-# Each file has one or more top-level classes. Each top-level class may
-# have one or more nested classes. This is a realistic slice of Open3D.
-TREE = [
-    {
-        "file": "BoundingVolume.h",
-        "classes": [
-            {"name": "OrientedBoundingBox",     "nested": []},
-            {"name": "AxisAlignedBoundingBox",  "nested": []},
-        ],
-    },
-    {
-        "file": "TriangleMesh.h",
-        "classes": [
-            {"name": "TriangleMesh", "nested": []},
-            {"name": "Material",     "nested": ["MaterialParameter"]},
-        ],
-    },
-    {
-        "file": "HalfEdgeTriangleMesh.h",
-        "classes": [
-            {"name": "HalfEdgeTriangleMesh", "nested": ["HalfEdge"]},
-        ],
-    },
-    {
-        "file": "KDTreeSearchParam.h",
-        "classes": [
-            {"name": "KDTreeSearchParam", "nested": ["SearchType"]},
-        ],
-    },
+SERIF = "DejaVu Serif"
+SANS  = "DejaVu Sans"
+MONO  = "DejaVu Sans Mono"
+
+# ---- Content ----------------------------------------------------------
+# A real, compact source slice that demonstrates both a depth-1 class and
+# a depth-2 nested struct. Each entry: (code, depth_after, discovery_qn).
+ZOOM_FILE = "HalfEdgeTriangleMesh.h"
+LINES = [
+    ("// Compact view. Full file: github.com/isl-org/Open3D",  0, None),
+    ("",                                                        0, None),
+    ("class HalfEdgeTriangleMesh",                              1, "HalfEdgeTriangleMesh"),
+    ("      : public MeshBase {",                               1, None),
+    ("public:",                                                  1, None),
+    ("    struct HalfEdge {",                                   2, "HalfEdgeTriangleMesh::HalfEdge"),
+    ("        int vertex_indices[2];",                          2, None),
+    ("        int triangle_index;",                             2, None),
+    ("    };",                                                   1, None),
+    ("    std::vector<HalfEdge> edges_;",                       1, None),
+    ("};",                                                       0, None),
+    ("",                                                        0, None),
+    ("// next file →  KDTreeSearchParam.h ...",                 0, None),
 ]
 
-# ---- Flatten to DFS pre-order visit list ------------------------------
-# Each visit gets a number, a depth (1 or 2), a qualified name, and
-# an index back to its file.
-class Visit:
-    __slots__ = ("idx", "name", "qualname", "depth", "file", "parent",
-                 "x", "y")
+# Emissions in DFS order across the whole geometry module. The first
+# eight are annotated concretely; everything afterwards is elided.
+EMISSIONS = [
+    ("01", "bind_class<OrientedBoundingBox>",                    "top"),
+    ("02", "bind_class<AxisAlignedBoundingBox>",                 "top"),
+    ("03", "bind_class<PointCloud>",                             "top"),
+    ("04", "bind_class<TriangleMesh>",                           "top"),
+    ("05", "bind_class<Material>",                               "top"),
+    ("06", "bind_class<Material::MaterialParameter>",            "nested"),
+    ("07", "bind_class<HalfEdgeTriangleMesh>",                   "top"),
+    ("08", "bind_class<HalfEdgeTriangleMesh::HalfEdge>",         "nested"),
+    ("…",  "… 39 more bind_class<T> calls",                      "more"),
+]
 
-    def __init__(self, idx, name, qualname, depth, file, parent):
-        self.idx = idx
-        self.name = name
-        self.qualname = qualname
-        self.depth = depth
-        self.file = file
-        self.parent = parent
-        self.x = 0.0
-        self.y = 0.0
-
-visits: list[Visit] = []
-for f in TREE:
-    for c in f["classes"]:
-        idx = len(visits) + 1
-        v_top = Visit(idx, c["name"], c["name"], 1, f["file"], None)
-        visits.append(v_top)
-        for n in c["nested"]:
-            idx2 = len(visits) + 1
-            qual = f"{c['name']}::{n}"
-            visits.append(Visit(idx2, n, qual, 2, f["file"], v_top))
-
-TOTAL_DISCOVERED = 47
-TOTAL_FILES      = 38
+# Depth-over-time series for the bottom timeline. Each tick = one token.
+# Rises as the parser enters a scope, falls when it leaves. Annotations
+# mark discovery events with their emission index.
+DEPTH_SERIES = [
+    (0, 0, None),                                   # start
+    (1, 0, None),                                   # before BV.h
+    (2, 1, "01"),                                   # enter OrientedBoundingBox
+    (3, 1, None),
+    (4, 0, None),                                   # exit
+    (5, 1, "02"),                                   # enter AABB
+    (6, 0, None),
+    (7, 0, None),                                   # gap
+    (8, 1, "03"),                                   # PointCloud
+    (9, 0, None),
+    (10, 1, "04"),                                  # TriangleMesh
+    (11, 0, None),
+    (12, 1, "05"),                                  # Material
+    (13, 2, "06"),                                  # Material::MatParam (nested)
+    (14, 1, None),
+    (15, 0, None),
+    (16, 1, "07"),                                  # HalfEdgeTriangleMesh
+    (17, 2, "08"),                                  # HalfEdge (nested)
+    (18, 1, None),
+    (19, 0, None),
+    (20, 0, None),                                  # ... more files
+    (21, 1, None),
+    (22, 1, None),
+    (23, 0, None),
+]
 
 # ---- Figure -----------------------------------------------------------
-fig = plt.figure(figsize=(16, 9.2), facecolor=BG)
+fig = plt.figure(figsize=(16, 10.4), facecolor=BG)
+# Overall structure: header (h), main body (m), timeline footer (t)
+outer = fig.add_gridspec(3, 1, height_ratios=[0.12, 0.60, 0.28],
+                         left=0.038, right=0.962, top=0.97, bottom=0.035,
+                         hspace=0.06)
 
-outer = fig.add_gridspec(
-    2, 1, height_ratios=[0.11, 0.89],
-    left=0.02, right=0.98, top=0.975, bottom=0.03,
-    hspace=0.01,
-)
-
-# ---- HEADER -----------------------------------------------------------
+# =======================================================================
+# HEADER
+# =======================================================================
 axH = fig.add_subplot(outer[0, 0])
 axH.set_facecolor(BG)
 axH.set_xlim(0, 1); axH.set_ylim(0, 1)
@@ -124,259 +122,343 @@ axH.set_xticks([]); axH.set_yticks([])
 for s in axH.spines.values():
     s.set_visible(False)
 
-axH.text(0.005, 0.76, "Auto-discovery",
-         fontsize=22, color=INK, weight="bold", family=MONO,
-         va="center")
-axH.text(0.005, 0.28,
-         "DFS walk of the (file → class → nested) tree"
-         "  ·  one bind_class<T> per discovery  ·  zero glue",
-         fontsize=12, color=DIM, style="italic", family=MONO,
-         va="center")
+# Small eyebrow label
+axH.text(0.002, 0.88, "MIRROR_BRIDGE  ·  AUTO-DISCOVERY",
+         fontsize=9.2, color=TERRA, family=SANS, weight="bold",
+         va="top", ha="left")
 
-def stat(ax, x_right, num, label, color):
-    ax.text(x_right, 0.74, num, fontsize=26, color=color,
-            weight="bold", va="center", ha="right", family=MONO)
-    ax.text(x_right + 0.006, 0.74, label, fontsize=11, color=DIM,
-            va="center", ha="left", family=MONO)
+# Big serif title + subtitle
+axH.text(0.002, 0.58, "A single depth-first pass through the source tree.",
+         fontsize=24, color=INK, family=SERIF, weight="bold",
+         va="center", ha="left")
+axH.text(0.002, 0.10,
+         "Open3D's geometry headers are consumed once; every "
+         "class, struct and enum becomes a bind_class<T> line.",
+         fontsize=12.5, color=DIM, family=SERIF, style="italic",
+         va="center", ha="left")
 
-stat(axH, 0.47, str(TOTAL_DISCOVERED), "  classes discovered",    TOP_COL)
-stat(axH, 0.71, str(TOTAL_FILES),      "  headers scanned",       FILE_COL)
-stat(axH, 0.92, "0",                   "  lines of binding code", NESTED_COL)
+# Inline stats: three big numbers, each paired with its caption directly
+# beneath, with generous horizontal spacing so labels don't crowd each
+# other.
+def stat(ax, x_anchor, big, small, color):
+    # Anchor numbers against their own right edge, captions against their
+    # own left edge starting at the same anchor. Gives consistent spacing
+    # regardless of how many digits the number has.
+    ax.text(x_anchor, 0.66, big, fontsize=28, color=color, family=SERIF,
+            weight="bold", va="center", ha="left")
+    ax.text(x_anchor, 0.18, small, fontsize=9.2, color=DIM,
+            family=SANS, va="center", ha="left")
 
-axH.plot([0.005, 0.995], [0.02, 0.02], color=GRID, lw=0.8)
+# Spread three stats across the right 30% of the header, with room for the
+# longest caption ("lines of hand-written binding") on the far right.
+stat(axH, 0.70, "47",  "classes discovered",              FOREST)
+stat(axH, 0.79, "38",  "headers scanned",                 NAVY)
+stat(axH, 0.88, "0",   "hand-written lines",              TERRA)
 
-# ---- MAIN TREE PANEL --------------------------------------------------
-axT = fig.add_subplot(outer[1, 0])
+# Divider
+axH.plot([0.002, 0.998], [-0.06, -0.06], color=HAIRLINE, lw=0.8,
+         clip_on=False)
+
+# =======================================================================
+# MAIN BODY  :  code window (left 58%) + emission tape (right 42%)
+# =======================================================================
+body = outer[1, 0].subgridspec(1, 2, width_ratios=[1.35, 1.0], wspace=0.05)
+
+# -----------------------------------------------------------------------
+# Left: syntax-highlighted code window with depth gutter and discovery markers
+# -----------------------------------------------------------------------
+axC = fig.add_subplot(body[0, 0])
+axC.set_facecolor(BG)
+axC.set_xlim(0, 1); axC.set_ylim(0, 1)
+axC.set_xticks([]); axC.set_yticks([])
+for s in axC.spines.values():
+    s.set_visible(False)
+
+# Panel eyebrow + heading
+axC.text(0.0, 0.98, "1  THE PARSER'S VIEW",
+         fontsize=10, color=TERRA, weight="bold", family=SANS, va="top")
+axC.text(0.0, 0.945, f"zoomed in on {ZOOM_FILE}",
+         fontsize=10, color=DIM, family=SANS, style="italic", va="top")
+
+# Card
+cx, cy_top, cw, ch = 0.0, 0.895, 1.0, 0.86
+card = FancyBboxPatch(
+    (cx, cy_top - ch), cw, ch,
+    boxstyle="round,pad=0,rounding_size=0.012",
+    linewidth=0.9, edgecolor=HAIRLINE, facecolor=PAPER,
+    transform=axC.transAxes,
+)
+axC.add_patch(card)
+# Title bar (lighter cream)
+tb_h = 0.06
+tb = FancyBboxPatch(
+    (cx, cy_top - tb_h), cw, tb_h,
+    boxstyle="round,pad=0,rounding_size=0.012",
+    linewidth=0, facecolor="#F1EBDA", transform=axC.transAxes,
+)
+axC.add_patch(tb)
+axC.text(cx + cw / 2, cy_top - tb_h / 2, ZOOM_FILE,
+         fontsize=11, color=INK_SOFT, family=MONO,
+         va="center", ha="center", transform=axC.transAxes)
+# Breadcrumb-style path on left edge of title bar
+axC.text(cx + 0.02, cy_top - tb_h / 2,
+         "open3d / geometry /",
+         fontsize=9, color=DIM, family=SANS, style="italic",
+         va="center", ha="left", transform=axC.transAxes)
+
+def draw_code_line(ax, line_num, code, depth, discovery, y):
+    """Render one code line: gutter line number, stacked depth bars, the
+    code itself (single text call, uniform colour for reliability), and
+    an optional discovery pill on the right edge.
+
+    Comments render in a muted grey; everything else renders in the ink
+    tone. Semantic colour is carried by the depth bars in the gutter and
+    by the discovery pill.
+    """
+    # Line number in the far-left gutter
+    ax.text(0.022, y, f"{line_num:>2}",
+            fontsize=9, color=MUTED, family=MONO,
+            va="center", ha="right", transform=ax.transAxes)
+
+    # Depth bars: one bar per active scope level, coloured by depth
+    bar_w = 0.010
+    bar_x0 = 0.032
+    for d in range(1, depth + 1):
+        col = FOREST if d == 1 else PLUM
+        rect = Rectangle(
+            (bar_x0 + (d - 1) * (bar_w + 0.004), y - 0.014),
+            bar_w, 0.028,
+            facecolor=col, alpha=0.85 if discovery else 0.55,
+            edgecolor="none", transform=ax.transAxes,
+        )
+        ax.add_patch(rect)
+
+    # Code text: single uniform-colour text call. Comments dim; code ink.
+    is_comment = code.lstrip().startswith("//")
+    text_color = CMT if is_comment else INK
+    font_style = "italic" if is_comment else "normal"
+    ax.text(0.082, y, code,
+            fontsize=10.5, color=text_color,
+            family=MONO, style=font_style,
+            va="center", ha="left", transform=ax.transAxes)
+
+    # Discovery pill on the right edge
+    if discovery:
+        is_nested = "::" in discovery
+        col = PLUM if is_nested else FOREST
+        label = discovery if len(discovery) <= 28 else discovery[:26] + "…"
+        # Approximate pill width from label length so it never overflows
+        text_w = 0.0065 * len(label) + 0.045
+        pill_x = 1.0 - 0.02 - text_w
+        pill = FancyBboxPatch(
+            (pill_x, y - 0.017), text_w, 0.034,
+            boxstyle="round,pad=0,rounding_size=0.008",
+            linewidth=0, facecolor=col, alpha=0.12,
+            transform=ax.transAxes,
+        )
+        ax.add_patch(pill)
+        # Left accent bar
+        ax.add_patch(Rectangle(
+            (pill_x, y - 0.017), 0.003, 0.034,
+            facecolor=col, edgecolor="none", transform=ax.transAxes,
+        ))
+        ax.text(pill_x + 0.017, y, "✓ " + label,
+                fontsize=8.8, color=col, family=MONO, weight="bold",
+                va="center", ha="left", transform=ax.transAxes)
+
+# Compute line positions
+n_lines = len(LINES)
+code_top = cy_top - tb_h - 0.03
+code_bot = cy_top - ch + 0.04
+line_spacing = (code_top - code_bot) / max(n_lines, 1)
+
+for i, (code, depth, discovery) in enumerate(LINES):
+    y = code_top - (i + 0.5) * line_spacing
+    draw_code_line(axC, i + 1, code, depth, discovery, y)
+
+# -----------------------------------------------------------------------
+# Right: "Emission tape" showing bind_class<T> lines in visit order
+# -----------------------------------------------------------------------
+axE = fig.add_subplot(body[0, 1])
+axE.set_facecolor(BG)
+axE.set_xlim(0, 1); axE.set_ylim(0, 1)
+axE.set_xticks([]); axE.set_yticks([])
+for s in axE.spines.values():
+    s.set_visible(False)
+
+axE.text(0.0, 0.98, "2  EMISSIONS  (in visit order)",
+         fontsize=10, color=TERRA, weight="bold", family=SANS, va="top")
+axE.text(0.0, 0.945, "one bind_class<T> per discovery",
+         fontsize=10, color=DIM, family=SANS, style="italic", va="top")
+
+# Card background (slightly warmer to contrast with code pane)
+ex, ey_top, ew, eh = 0.0, 0.895, 1.0, 0.86
+ecard = FancyBboxPatch(
+    (ex, ey_top - eh), ew, eh,
+    boxstyle="round,pad=0,rounding_size=0.012",
+    linewidth=0.9, edgecolor=HAIRLINE, facecolor=PAPER,
+    transform=axE.transAxes,
+)
+axE.add_patch(ecard)
+
+# Title strip
+tb2 = FancyBboxPatch(
+    (ex, ey_top - tb_h), ew, tb_h,
+    boxstyle="round,pad=0,rounding_size=0.012",
+    linewidth=0, facecolor="#F1EBDA", transform=axE.transAxes,
+)
+axE.add_patch(tb2)
+axE.text(ex + 0.02, ey_top - tb_h / 2, "open3d_full.cpp",
+         fontsize=11, color=INK_SOFT, family=MONO, weight="bold",
+         va="center", ha="left", transform=axE.transAxes)
+axE.text(ex + ew - 0.02, ey_top - tb_h / 2, "AUTO-GENERATED",
+         fontsize=8.6, color=TERRA, family=SANS, weight="bold",
+         va="center", ha="right", transform=axE.transAxes)
+
+# Emission rows
+em_top = ey_top - tb_h - 0.03
+em_bot = ey_top - eh + 0.08
+em_rows = len(EMISSIONS)
+em_sp = (em_top - em_bot) / max(em_rows, 1)
+
+for i, (num, text, kind) in enumerate(EMISSIONS):
+    y = em_top - (i + 0.5) * em_sp
+
+    # Index pill on the far left
+    if kind != "more":
+        pill_w = 0.055
+        pill = FancyBboxPatch(
+            (0.025, y - 0.019), pill_w, 0.038,
+            boxstyle="round,pad=0,rounding_size=0.008",
+            linewidth=0, facecolor=GOLD, alpha=0.10,
+            transform=axE.transAxes,
+        )
+        axE.add_patch(pill)
+        axE.text(0.025 + pill_w / 2, y, num,
+                 fontsize=9.5, color=GOLD, family=MONO, weight="bold",
+                 va="center", ha="center", transform=axE.transAxes)
+    else:
+        axE.text(0.052, y, num, fontsize=11, color=MUTED,
+                 family=MONO, va="center", ha="center",
+                 transform=axE.transAxes)
+
+    # Kind dot
+    if kind in {"top", "nested"}:
+        dot_col = FOREST if kind == "top" else PLUM
+        dot = Circle((0.112, y), 0.010, facecolor=dot_col,
+                     edgecolor="none", transform=axE.transAxes)
+        axE.add_patch(dot)
+
+    # Emission text: always one uniform text call so there's no chance of
+    # manual positioning drifting out of sync with matplotlib's actual
+    # glyph advance.
+    if kind == "more":
+        axE.text(0.135, y, text,
+                 fontsize=10.5, color=DIM, family=MONO, style="italic",
+                 va="center", ha="left", transform=axE.transAxes)
+    else:
+        axE.text(0.135, y, text,
+                 fontsize=10.5, color=INK, family=MONO,
+                 va="center", ha="left", transform=axE.transAxes)
+
+# Legend inside the emission card (bottom strip)
+leg_y = ey_top - eh + 0.04
+axE.plot([ex + 0.025, ex + ew - 0.025],
+         [leg_y + 0.030, leg_y + 0.030],
+         color=HAIRLINE, lw=0.7, transform=axE.transAxes)
+Circle_ = Circle  # alias
+axE.add_patch(Circle_((0.040, leg_y), 0.009, facecolor=FOREST,
+                      edgecolor="none", transform=axE.transAxes))
+axE.text(0.063, leg_y, "top-level", fontsize=9.5, color=DIM,
+         family=SANS, va="center", ha="left", transform=axE.transAxes)
+axE.add_patch(Circle_((0.215, leg_y), 0.009, facecolor=PLUM,
+                      edgecolor="none", transform=axE.transAxes))
+axE.text(0.238, leg_y, "nested (Parent::Child)", fontsize=9.5,
+         color=DIM, family=SANS, va="center", ha="left",
+         transform=axE.transAxes)
+
+# =======================================================================
+# FOOTER  :  depth-stack timeline (reveals the mechanism)
+# =======================================================================
+axT = fig.add_subplot(outer[2, 0])
 axT.set_facecolor(BG)
-axT.set_xlim(0, 1); axT.set_ylim(0, 1)
-axT.set_xticks([]); axT.set_yticks([])
 for s in axT.spines.values():
     s.set_visible(False)
 
-# Column x-anchors
-X_FILE  = 0.08
-X_TOP   = 0.30
-X_NEST  = 0.54
-X_OUT   = 0.78
-X_OUT_END = 0.98
+axT.text(0, 1.17, "3  DEPTH-STACK TIMELINE",
+         fontsize=10, color=TERRA, weight="bold", family=SANS,
+         transform=axT.transAxes, va="bottom", clip_on=False)
+axT.text(0, 1.03,
+         "The brace-depth parser maintains a scope stack. "
+         "Every new `class` / `struct` / `enum` at a new depth triggers an emission, "
+         "qualified by prefix stack.",
+         fontsize=10.5, color=DIM, family=SERIF, style="italic",
+         transform=axT.transAxes, va="bottom", clip_on=False)
 
-# Column header labels
-def col_label(ax, x, text, color=DIM):
-    ax.text(x, 0.965, text, fontsize=10, color=color, weight="bold",
-            family=MONO, va="top", ha="left")
+# Data for the chart
+xs = [p[0] for p in DEPTH_SERIES]
+ys = [p[1] for p in DEPTH_SERIES]
 
-col_label(axT, X_FILE,  "HEADERS",                FILE_COL)
-col_label(axT, X_TOP,   "TOP-LEVEL  (depth 1)",   TOP_COL)
-col_label(axT, X_NEST,  "NESTED  (depth 2)",      NESTED_COL)
-col_label(axT, X_OUT,   "EMITTED",                OUT_COL)
+axT.set_xlim(min(xs) - 0.3, max(xs) + 0.3)
+axT.set_ylim(-0.12, 2.55)
+axT.set_yticks([0, 1, 2])
+axT.set_yticklabels(["0", "1", "2"], color=DIM, fontsize=9, family=MONO)
+axT.tick_params(axis="y", colors=DIM, length=0)
+axT.set_xticks([])
+axT.grid(axis="y", color=HAIRLINE, linestyle="-", linewidth=0.6, alpha=0.8)
+axT.set_axisbelow(True)
 
-# Sub-label underneath the columns
-axT.text(X_FILE, 0.932, "38 files scanned, 4 shown",
-         fontsize=8.5, color=MUTED, style="italic", family=MONO, va="top")
-axT.text(X_TOP, 0.932, "DFS visit order shown in badge",
-         fontsize=8.5, color=MUTED, style="italic", family=MONO, va="top")
+# Curve + filled area (soft terracotta)
+axT.plot(xs, ys, drawstyle="steps-post", color=TERRA, linewidth=2.2,
+         solid_capstyle="round")
+axT.fill_between(xs, 0, ys, step="post", color=TERRA, alpha=0.10)
 
-# ---- Compute vertical positions --------------------------------------
-# Each visit (row) gets a y slot. Uniform spacing, oldest-first on top.
-Y_TOP   = 0.88
-Y_BOT   = 0.15
-row_gap = (Y_TOP - Y_BOT) / max(len(visits) - 1, 1)
-
-for i, v in enumerate(visits):
-    v.y = Y_TOP - i * row_gap
-    v.x = X_NEST if v.depth == 2 else X_TOP
-
-# File y = mean y of its classes
-file_y: dict[str, float] = {}
-file_class_count: dict[str, int] = {}
-for v in visits:
-    file_y.setdefault(v.file, 0.0)
-    file_y[v.file] += v.y
-    file_class_count[v.file] = file_class_count.get(v.file, 0) + 1
-for k in file_y:
-    file_y[k] /= file_class_count[k]
-
-# ---- Draw the edges first (behind the nodes) -------------------------
-def draw_edge(ax, x0, y0, x1, y1, color, lw=1.3, alpha=0.55, style="-"):
-    """Right-angle routed edge: horizontal then vertical then horizontal."""
-    mid_x = (x0 + x1) / 2
-    verts = [(x0, y0), (mid_x, y0), (mid_x, y1), (x1, y1)]
-    codes = [MPath.MOVETO, MPath.LINETO, MPath.LINETO, MPath.LINETO]
-    path = MPath(verts, codes)
-    patch = mp.PathPatch(path, fill=False, edgecolor=color,
-                         linewidth=lw, alpha=alpha, linestyle=style)
-    ax.add_patch(patch)
-
-# Edges: file → each of its top-level classes
-NODE_W_FILE = 0.20
-NODE_W_CLS  = 0.22
-NODE_H      = 0.055
-
-for file, fy in file_y.items():
-    for v in visits:
-        if v.file == file and v.depth == 1:
-            x0 = X_FILE + NODE_W_FILE
-            x1 = v.x
-            draw_edge(axT, x0, fy, x1, v.y, FILE_COL, lw=1.4, alpha=0.55)
-
-# Edges: top-level → nested
-for v in visits:
-    if v.depth == 2 and v.parent is not None:
-        p = v.parent
-        x0 = p.x + NODE_W_CLS
-        x1 = v.x
-        draw_edge(axT, x0, p.y, x1, v.y, TOP_COL, lw=1.4, alpha=0.55)
-
-# Edges: class → its emit line (subtle dashed)
-for v in visits:
-    x0 = v.x + NODE_W_CLS
-    y0 = v.y
-    x1 = X_OUT - 0.01
-    y1 = v.y
-    draw_edge(axT, x0, y0, x1, y1, OUT_COL, lw=0.8, alpha=0.35,
-              style=":")
-
-# ---- Draw file-nodes (rounded rectangles) ----------------------------
-def rounded_box(ax, x, y_center, w, h, fill, edge, lw=1.5, rounding=0.012):
-    box = FancyBboxPatch(
-        (x, y_center - h / 2), w, h,
-        boxstyle=f"round,pad=0,rounding_size={rounding}",
-        linewidth=lw, edgecolor=edge, facecolor=fill,
+# Discovery markers with emission index
+annotated_top_y_flip = False
+for x, y, tag in DEPTH_SERIES:
+    if tag is None:
+        continue
+    col = PLUM if y >= 2 else FOREST
+    axT.plot(x, y, marker="o", markersize=10, markerfacecolor=col,
+             markeredgecolor=BG, markeredgewidth=1.6, zorder=5)
+    # Label placement: alternate above/below the point for readability
+    offset_y = 0.28
+    axT.annotate(
+        f"#{tag}",
+        xy=(x, y), xytext=(x, y + offset_y),
+        ha="center", va="center", fontsize=8.8, color=col,
+        family=MONO, weight="bold",
     )
-    ax.add_patch(box)
 
-for file, fy in file_y.items():
-    rounded_box(axT, X_FILE, fy, NODE_W_FILE, NODE_H,
-                fill=PANEL, edge=FILE_COL, lw=1.6)
-    # left accent strip
-    strip = mp.Rectangle(
-        (X_FILE, fy - NODE_H / 2), 0.006, NODE_H,
-        facecolor=FILE_COL, edgecolor="none",
-    )
-    axT.add_patch(strip)
-    axT.text(X_FILE + 0.022, fy + 0.001, file,
-             fontsize=10.5, color=INK, family=MONO, weight="bold",
-             va="center", ha="left")
+# Stage annotations beneath the curve
+stage_color = GOLD
+def stage(x, text):
+    axT.axvline(x, ymin=0.02, ymax=0.15, color=stage_color, linewidth=1.0,
+                alpha=0.7, linestyle=":")
+    axT.text(x, -0.05, text, ha="center", va="top",
+             fontsize=8.6, color=stage_color, family=MONO, style="italic")
 
-# "... more files" placeholder below last file
-more_y = min(file_y.values()) - 0.075
-axT.text(X_FILE + NODE_W_FILE / 2, more_y,
-         "· · · 34 more files · · ·",
-         fontsize=9.5, color=MUTED, family=MONO, style="italic",
-         va="center", ha="center")
+stage(4.0,  "BoundingVolume.h")
+stage(9.0,  "PointCloud.h")
+stage(13.0, "TriangleMesh.h")
+stage(17.0, "HalfEdgeTriangleMesh.h")
+stage(22.0, "· · · 34 more files · · ·")
 
-# ---- Draw class nodes ------------------------------------------------
-def class_node(ax, v: Visit):
-    color = TOP_COL if v.depth == 1 else NESTED_COL
-    w = NODE_W_CLS
-    # Node box
-    rounded_box(ax, v.x, v.y, w, NODE_H,
-                fill=PANEL_HI, edge=color, lw=1.8)
-    # Class name
-    name = v.name if len(v.name) <= 22 else v.name[:20] + "…"
-    ax.text(v.x + 0.050, v.y + 0.001, name,
-            fontsize=10.3, color=INK, family=MONO, weight="bold",
-            va="center", ha="left")
-    # Depth label small
-    ax.text(v.x + w - 0.012, v.y + 0.001,
-            f"d={v.depth}",
-            fontsize=8.5, color=color, family=MONO,
-            va="center", ha="right", weight="bold")
-    # Numbered badge on the left end of the node
-    badge_cx = v.x + 0.022
-    badge_cy = v.y
-    circ = Circle((badge_cx, badge_cy), 0.016,
-                  facecolor=PATH_COL, edgecolor=BG, linewidth=1.8,
-                  zorder=4)
-    ax.add_patch(circ)
-    ax.text(badge_cx, badge_cy, str(v.idx),
-            fontsize=10, color=BG, family=MONO, weight="bold",
-            va="center", ha="center", zorder=5)
+# Axis labels
+axT.text(-0.012, 1.0, "depth", rotation=90, fontsize=9, color=DIM,
+         family=SANS, va="top", ha="right", transform=axT.transAxes)
+axT.text(1.00, -0.28, "token stream →",
+         fontsize=9, color=DIM, family=SANS, ha="right",
+         transform=axT.transAxes)
 
-for v in visits:
-    class_node(axT, v)
-
-# ---- Draw the DFS traversal path -------------------------------------
-# Path goes from badge center of visit[i] → badge center of visit[i+1].
-# Style: thick dashed amber arrow segments for each hop.
-for i in range(len(visits) - 1):
-    a = visits[i]; b = visits[i + 1]
-    x0, y0 = a.x + 0.022, a.y
-    x1, y1 = b.x + 0.022, b.y
-    # Offset start/end to the badge edge so the arrow isn't buried.
-    arrow = FancyArrowPatch(
-        (x0, y0), (x1, y1),
-        connectionstyle="arc3,rad=-0.25",
-        arrowstyle="-|>", mutation_scale=18,
-        color=PATH_COL, lw=1.8, linestyle=(0, (4, 3)),
-        alpha=0.85, shrinkA=14, shrinkB=14,
-        zorder=3,
-    )
-    axT.add_patch(arrow)
-
-# Callout labeling the path
-path_label_x = 0.50
-path_label_y = 0.075
-box = FancyBboxPatch(
-    (path_label_x - 0.12, path_label_y - 0.024), 0.24, 0.050,
-    boxstyle="round,pad=0,rounding_size=0.014",
-    linewidth=1.2, edgecolor=PATH_COL, facecolor=PANEL,
-)
-axT.add_patch(box)
-axT.text(path_label_x, path_label_y, "DFS pre-order: 1 → 2 → 3 → … → 9",
-         fontsize=10, color=PATH_COL, family=MONO, weight="bold",
-         va="center", ha="center")
-
-# ---- Emitted lines on the right --------------------------------------
-def emit_line(ax, v: Visit):
-    color = NESTED_COL if v.depth == 2 else TOP_COL
-    # Dot
-    dot = Circle((X_OUT + 0.002, v.y), 0.008, facecolor=color,
-                 edgecolor="none")
-    ax.add_patch(dot)
-    # Text
-    # Build the bind_class<T> string using the qualified name
-    qn = v.qualname
-    if len(qn) > 24:
-        qn_short = qn
-    else:
-        qn_short = qn
-    line = f"bind_class<{qn_short}>"
-    ax.text(X_OUT + 0.020, v.y, line,
-            fontsize=9.7, color=INK, family=MONO, va="center")
-
-for v in visits:
-    emit_line(axT, v)
-
-# "...more..." below emit column
-axT.text((X_OUT + X_OUT_END) / 2, more_y,
-         "· · · 38 more bind_class<T> lines · · ·",
-         fontsize=9.5, color=MUTED, family=MONO, style="italic",
-         va="center", ha="center")
-
-# Footer: legend (bottom of panel)
-legend_y = 0.02
-def chip(ax, x, y, color, text):
-    ax.add_patch(Circle((x, y), 0.008, facecolor=color, edgecolor="none"))
-    ax.text(x + 0.018, y, text,
-            fontsize=9.5, color=DIM, family=MONO,
-            va="center", ha="left")
-
-chip(axT, 0.07, legend_y, FILE_COL,   "header file")
-chip(axT, 0.22, legend_y, TOP_COL,    "top-level class")
-chip(axT, 0.40, legend_y, NESTED_COL, "nested class (Parent::Child)")
-# Dashed-line legend entry for the DFS path
-axT.plot([0.68, 0.71], [legend_y, legend_y],
-         color=PATH_COL, lw=2, linestyle=(0, (4, 3)), alpha=0.9)
-axT.text(0.72, legend_y, "DFS traversal order",
-         fontsize=9.5, color=DIM, family=MONO,
-         va="center", ha="left")
-
-# ---- Save -----------------------------------------------------------------
+# =======================================================================
+# SAVE
+# =======================================================================
 out_dir = os.path.dirname(os.path.abspath(__file__))
 out_path = os.path.join(out_dir, "auto_discovery_traversal.png")
 fig.savefig(out_path, dpi=100, facecolor=BG, bbox_inches="tight",
-            pad_inches=0.2)
+            pad_inches=0.25)
+
 try:
     from PIL import Image
     Image.open(out_path).save(out_path, "PNG", optimize=True)
