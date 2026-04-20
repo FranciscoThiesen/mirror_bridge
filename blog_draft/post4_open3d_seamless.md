@@ -72,6 +72,17 @@ with anyone else's), writes one `bind_class<...>` line per discovered
 type, and compiles. Adding a new Open3D class means re-running the
 tool.
 
+Visually:
+
+![Auto-discovery traversal: brace-depth walk, class detection, emitted bind_class lines](visuals/auto_discovery_traversal.png)
+
+Left: the parser sees `class HalfEdgeTriangleMesh { ... struct HalfEdge
+{ ... } ... }` and opens a new "discovered" marker each time a
+`class`/`struct`/`enum` token appears at a fresh depth. Middle: the
+brace-depth trace shows why this works, a nested `struct` sits at
+depth 2 and gets the `Parent::Child` qualifier automatically. Right:
+one `bind_class<T>` line per discovery, ready to compile.
+
 The output it emits is short enough to read:
 
 ```cpp
@@ -456,7 +467,7 @@ community. None of this is possible without their reflection work.*
 [repo]:    https://github.com/FranciscoThiesen/mirror_bridge
 [bench]:   https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/open3d-comprehensive/bench_three_way.py
 [runtime]: https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-runtime
-[fork]:    https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-full-port/Open3D
+[fork]:    https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-full-port/patches
 [o3d-pybind]: https://github.com/isl-org/Open3D/blob/main/cpp/pybind/geometry/pointcloud.cpp
 [repro]:   https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/open3d-comprehensive/bench_three_way.py
 [asm-bench]: https://github.com/FranciscoThiesen/mirror_bridge/tree/main/asm_study
