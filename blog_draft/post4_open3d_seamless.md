@@ -48,32 +48,7 @@ files** ([counted][repro]).
 
 ## What mirror_bridge asks you to write
 
-```cpp
-mirror_bridge::bind_class<PointCloud>(m, "PointCloud");
-```
-
-That's the entire binding for PointCloud. Constructors, every public
-method, every field, operators, keyword arguments, default values,
-`__repr__`, subclassing, inheritance, polymorphic returns. All
-handled automatically from the C++ header.
-
-For the whole geometry module, **38 classes including abstract bases,
-nested types, and every Octree node variant**, it looks like this:
-
-```cpp
-MIRROR_BRIDGE_MODULE(open3d_full,
-    mirror_bridge::bind_class<OrientedBoundingBox>(m, "OrientedBoundingBox");
-    mirror_bridge::bind_class<AxisAlignedBoundingBox>(m, "AxisAlignedBoundingBox");
-    mirror_bridge::bind_class<PointCloud>(m, "PointCloud");
-    // ... 35 more bind_class lines ...
-    mirror_bridge::bind_class<AggColorVoxel>(m, "AggColorVoxel");
-)
-```
-
-**71 lines total.** 51× less code than pybind11 for the same API
-surface. And you don't write those 71 lines either.
-
-### The tool emits those 71 lines for you
+**Nothing.** One command, zero hand-written binding code:
 
 ```
 $ mirror_bridge generate Open3D/cpp/open3d/geometry \
@@ -93,9 +68,31 @@ $ mirror_bridge generate Open3D/cpp/open3d/geometry \
 A brace-depth parser walks Open3D's geometry directory, finds every
 class/struct/enum, qualifies nested ones correctly
 (`HalfEdgeTriangleMesh::HalfEdge`, not a bare `HalfEdge` colliding
-with anyone else's), emits the binding file, and compiles. 47 bound
-classes in one command. Adding a new Open3D class means re-running
-the tool.
+with anyone else's), writes one `bind_class<...>` line per discovered
+type, and compiles. Adding a new Open3D class means re-running the
+tool.
+
+The output it emits is short enough to read:
+
+```cpp
+MIRROR_BRIDGE_MODULE(open3d_full,
+    mirror_bridge::bind_class<OrientedBoundingBox>(m, "OrientedBoundingBox");
+    mirror_bridge::bind_class<AxisAlignedBoundingBox>(m, "AxisAlignedBoundingBox");
+    mirror_bridge::bind_class<PointCloud>(m, "PointCloud");
+    // ... 35 more bind_class lines ...
+    mirror_bridge::bind_class<AggColorVoxel>(m, "AggColorVoxel");
+)
+```
+
+**71 lines total**, versus pybind11's 3,610 hand-written lines for
+the same 38 classes. Each `bind_class<T>` pulls in constructors,
+every public method, every field, operators, keyword arguments,
+default values, `__repr__`, subclassing, inheritance, and
+polymorphic returns straight from the C++ header. Nothing to re-type
+or keep in sync.
+
+You can write a `bind_class<T>` line by hand if you want, but for
+Open3D's geometry module we never did.
 
 ## The performance punchline
 
@@ -122,6 +119,22 @@ mirror_bridge wins every row, including against Open3D's own shipped
 pybind11 binding. A straight C++ loop with reflection-generated
 dispatch beats production-quality hand-tuned binding code by 2.2× on
 a hot path.
+
+**Fair-play note on these numbers.** The Open3D 0.18 wheel
+(`pip install open3d`) was compiled by the Open3D team with clang 7,
+CMake `Release` mode (`-O3 -DNDEBUG`), and links `libgomp` for
+OpenMP. That means Open3D's `voxel_down_sample` runs *multi-threaded*
+while mirror_bridge's version is a plain single-threaded loop. On
+Centroid and AABB (both strictly single-threaded in Open3D too) the
+win is purely binding-layer overhead. On Voxel, Open3D has the
+parallelism advantage and still loses, because the binding overhead
+dominates the per-call cost even with threads.
+
+The assembly snippets in the next section are a stricter test: both
+bindings built with the same clang-p2996, same `-O3`, same libc++,
+same source C++ for `PointCloud::get_center`. Only the binding
+framework differs. That's as apples-to-apples as this comparison can
+get ([reproduce][asm-bench]).
 
 Against numpy the gap widens to 6-7× on simple operations. numpy is
 still the fastest Python-native API you can write, but it pays for
