@@ -72,16 +72,24 @@ with anyone else's), writes one `bind_class<...>` line per discovered
 type, and compiles. Adding a new Open3D class means re-running the
 tool.
 
-Visually, it's a DFS walk of the (file → class → nested) tree:
+Dependencies are the real work. A `PointCloud` has a
+`get_aabb()` that returns `AxisAlignedBoundingBox`, so AABB must be
+bound first. `HalfEdgeTriangleMesh` inherits from `TriangleMesh`, so
+the base goes first. `Material::MaterialParameter` is nested two
+levels deep, so its enclosing scopes need names already. The
+generator resolves all of this by topologically sorting the class
+dependency graph before emitting anything:
 
-![Auto-discovery as a DFS walk of the file-class-nested tree, with every visited node numbered and one bind_class<T> line emitted per discovery](visuals/auto_discovery_traversal.png)
+![Class dependency DAG for a slice of Open3D's geometry module, with numbered badges showing the topological order the generator emits bind_class<T> calls in](visuals/auto_discovery_traversal.png)
 
-Each discovered type gets a numbered badge showing its DFS visit
-order. When the walk drops into a `struct HalfEdge { ... }` that
-lives inside `class HalfEdgeTriangleMesh`, it's at depth 2, and the
-emitted `bind_class<HalfEdgeTriangleMesh::HalfEdge>` line carries the
-`Parent::Child` qualifier automatically. The whole thing is one pass:
-enter, emit, recurse, return.
+Three edge kinds, three reflection queries. Inheritance comes from
+`std::meta::bases_of(T)`. Nesting falls out of the enclosing scope on
+each reflection info. "Uses" — fields, parameters, return types —
+comes from `parameters_of` and the reflected return type. Every edge
+in the graph is something the generator actually inspects; nothing
+here is heuristic. The numbered badges on each node show the
+binding order: 1 is emitted first, 9 last, and every dependency
+target appears with a smaller number than its dependants.
 
 The output it emits is short enough to read:
 
