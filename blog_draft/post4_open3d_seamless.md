@@ -1,4 +1,4 @@
-# mirror_bridge vs Open3D: 25,262 hand-written binding lines → 71 auto-generated, at pybind11-level speed
+# mirror_bridge vs Open3D: 25,262 hand-written binding lines → 71 auto-generated
 
 ![Real C++ point clouds, processed via mirror_bridge](visuals/mirror_bridge_open3d_demo.png)
 
@@ -7,26 +7,19 @@ through a binding I didn't write. No `.def()`, no trampoline classes,
 no keyword-arg boilerplate. Just `bind_class<PointCloud>(m, "PointCloud")`.
 Reflection fills in the rest at compile time.
 
-|                                         | pybind11 | mirror_bridge                          |
-|-----------------------------------------|---------:|----------------------------------------|
-| Hand-written binding lines (Open3D geom)| 3,610    | **71**  (51× less, auto-generated)     |
-| `get_center` on 1M points               | 0.85 ms  | **0.74 ms**  (parity, within noise)    |
-| `size()` dispatch overhead              | 0.25 µs  | **0.13 µs**  (2× faster)               |
-| `PointCloud(list_of_1M_points)` ctor    | 565 ms   | **17 ms**   (33× faster)               |
-
-(Fair bench: same C++ source, same clang-p2996, same `-O3 -stdlib=libc++`,
-only the binding framework differs.)
+|                                         | pybind11 | mirror_bridge                        |
+|-----------------------------------------|---------:|--------------------------------------|
+| Hand-written binding lines (Open3D geom)| 3,610    | **71**  (51× less, auto-generated)   |
+| `PointCloud(list_of_1M_points)` ctor    | 585 ms   | **19.6 ms**  (30× faster, §3)        |
 
 **TL;DR**
 
 - 47 Open3D geometry classes bind with **0 hand-written lines**.
   `mirror_bridge generate` emits the whole 71-line module.
-- Runtime is at pybind11 parity on compute-heavy calls. The wins show
-  up where the binding layer is the entire cost: dispatch (2×) and
-  list-to-vector constructors (33×).
-- The mechanism is *inlining*. Reflection gives the C++ compiler a
-  concrete member reference where pybind11 has only an opaque
-  pointer, and the assembly confirms it.
+- On the list-to-`std::vector<Eigen::Vector3d>` ingest primitive,
+  mirror_bridge is **30-35× faster than pybind11**, stable across
+  10K-1M points. On compute-heavy calls the binding layer rounds to
+  zero and the two frameworks are at parity. Full case study in §3.
 - Apache 2.0. One `docker run` reproduces every number in under ten
   minutes.
 
@@ -101,163 +94,143 @@ MIRROR_BRIDGE_MODULE(open3d_full,
 fields, operators, kwargs, defaults, `__repr__`, subclassing,
 inheritance and polymorphic returns straight from the header.
 
-## 3. Runtime: pybind11 parity, with two clear wins
+## 3. Deep dive: 30× faster on list → vector<Eigen::Vector3d>
 
-The binding layer is cheap. The fair test is to change *only* the
-binding framework and measure: same `PointCloud` source, same
-clang-p2996, same `-O3 -stdlib=libc++ -fPIC` ([source][asm-bench]):
+The binding layer only matters when it *is* the whole cost. Computing
+a centroid on a million points is SIMD math; the dispatcher rounds to
+zero. But constructing the point cloud from a Python list is pure
+binding-layer work, and that's where mirror_bridge is dramatically
+faster than pybind11.
 
-| Operation                          | pybind11   | mirror_bridge | ratio                       |
-|------------------------------------|-----------:|--------------:|-----------------------------|
-| `get_center` on 1M points          | 0.85 ms    | 0.74 ms       | **parity** (within run-to-run noise)  |
-| `size()` (near-empty dispatch)     | 0.25 µs    | 0.13 µs       | **2× faster**               |
-| Constructor from 1M-point list     | 565 ms     | 17 ms         | **33× faster**              |
+### The measurement
 
-Three different regimes, three different answers:
+Both bindings are compiled against the same `demo::PointCloud` source
+in `asm_study/geometry_min.hpp`, with the same clang-p2996 and the
+same `-O3 -stdlib=libc++ -fPIC -shared` flags. The only thing that
+changes between `pc_pybind.so` and `pc_mb.so` is the binding
+framework.
 
-- **Compute-heavy ops are already fast.** `get_center` is 1M
-  fused-multiply-adds in SIMD. Binding-layer overhead rounds to zero
-  compared to the math. mirror_bridge and pybind11 end up
-  indistinguishable here.
-- **Dispatch-dominated ops show the binding cost.** `size()` is a
-  one-word load; the entire cost *is* the dispatcher. mirror_bridge's
-  inlined dispatcher wins cleanly.
-- **Container conversions are a different cost model.** pybind11's
-  generic `list → std::vector<Eigen::Vector3d>` path runs through a
-  type-caster per element. mirror_bridge's reflection-specialised
-  path bulk-copies. Big win for data ingest.
+Constructor scaling on a list of 3-element float sublists, median of
+3 runs with one warmup ([source][asm-bench]):
 
-### A note on the Open3D wheel benchmark
+| N points    | pybind11   | mirror_bridge | ratio   |
+|-------------|-----------:|--------------:|--------:|
+| 10,000      | 5.3 ms     | 0.15 ms       | **35.2×** |
+| 100,000     | 60.5 ms    | 1.8 ms        | **33.4×** |
+| 1,000,000   | 585 ms     | 19.6 ms       | **29.9×** |
 
-An earlier draft compared against Open3D 0.18's shipped wheel
-(`pip install open3d`) and showed mirror_bridge winning on centroid
-(2.2×), AABB (1.4×) and voxel downsample (1.4×). That table is
-available ([bench source][bench]) but the comparison conflates three
-factors:
+The ratio is stable. This is a constant-factor binding-layer
+difference, not a scaling artefact.
 
-1. Binding-layer overhead.
-2. Compiler version (Open3D's wheel is built with clang 7, ours is
-   clang 21).
-3. Threading model (Open3D links libgomp and parallelises
-   `voxel_down_sample`; mirror_bridge's demo C++ is single-threaded).
+For context, at N = 1M on the same build:
 
-The fair-bench table above is the pure binding-layer number. The
-Open3D comparison is a real-world "what does `pip install open3d`
-give you vs. what does `mirror_bridge generate Open3D/` give you"
-data point, not a pybind11-vs-mirror_bridge head-to-head.
+| operation                        | pybind11    | mirror_bridge | ratio    |
+|----------------------------------|------------:|--------------:|---------:|
+| `get_center` (compute-heavy)     | 0.83 ms     | 0.84 ms       | 0.99×    |
+| `size()` (pure dispatch overhead)| 0.08 µs     | 0.03 µs       | 2.96×    |
 
-## 4. Why dispatch is cheaper: proof in the assembly
+Parity on compute. A clean 3× on dispatch. **30× on the ingest
+primitive.**
 
-The dispatch win (the `size()` row above) comes from a specific
-mechanism. Reflection gives the C++ compiler something pybind11
-can't: a concrete, splice-called member function at the dispatcher
-site. The optimiser inlines the method body directly into the
-binding.
+### Why pybind11 pays that cost
 
-All snippets below are clang-p2996 at `-O3`, linux-aarch64, libc++,
-same `PointCloud::get_center()` source. Only the binding layer
-changes ([source][asm-bench]).
+pybind11's `type_caster<Eigen::Matrix<double, 3, 1>>` is designed
+first for numpy compatibility and second for Python lists. On every
+element, it:
 
-**pybind11 crosses four function boundaries before the loop runs:**
+1. Constructs a caster object.
+2. Checks whether the element is a numpy array of the right dtype
+   and shape.
+3. Falls through to the Python buffer protocol.
+4. Falls through to the "length-3 sequence of floats" path.
+5. Constructs a fresh `Eigen::Vector3d` and emits a `move` into the
+   destination vector.
 
-```asm
-; pybind11 cpp_function::initialize<...>::__invoke body
-bl    pybind11::detail::type_caster_generic::type_caster_generic(...)  ; 1
-bl    pybind11::detail::type_caster_generic::load_impl<...>(...)        ; 2
-ldr   x9, [x8, x9]                  ; member-function-ptr resolution
-blr   x9                            ; 3: indirect call → get_center()
-bl    type_caster<Eigen::Matrix<...>>::cast_impl<...>(...)              ; 4
+Every one of a million elements pays steps 1-5. For list input, the
+numpy and buffer-protocol checks are pure overhead.
+
+### Why mirror_bridge doesn't
+
+mirror_bridge's `eigen_vector_from_python` is specialised for the
+list shape. No numpy branches, no caster objects, no detours:
+
+```cpp
+// from python/mirror_bridge_eigen.hpp (abridged)
+template<typename Scalar, int N>
+inline bool eigen_vector_from_python(PyObject* obj,
+                                     Eigen::Matrix<Scalar, N, 1>& out) {
+    if (!PySequence_Check(obj) || PySequence_Size(obj) != N) return false;
+    for (int i = 0; i < N; i++) {
+        PyObject* item = PySequence_GetItem(obj, i);
+        out[i] = static_cast<Scalar>(PyFloat_AsDouble(item));
+        Py_DECREF(item);
+    }
+    return true;
+}
 ```
 
-`get_center` stays a separate symbol in the binary. The dispatcher
-calls it; it can't see it.
+The outer list→vector loop (in `mirror_bridge_python.hpp`) calls this
+per element. Three `PyFloat_AsDouble` calls and a direct write into
+the Eigen object. No intermediate ceremony.
 
-**mirror_bridge has no such boundary.** The reflection splice
-`((*wrapper->cpp_object).[:member_func:])(...)` lets the compiler
-inline the full method body into the dispatcher:
+Reflection is what makes this specialisation possible: at binding-
+generation time, mirror_bridge knows the parameter type is
+`std::vector<Eigen::Vector3d>`, so it can emit the specialised
+converter in the call site. pybind11's type caster has no comparable
+compile-time information and has to handle the general case every
+time.
 
-```asm
-; mirror_bridge invoke_with_n_args<PointCloud, 0> body, -O3
-ldr   x8, [x0, #8]
-ldr   x8, [x8]
-ldr   x9, [x8, #16]
-ldp   x8, x9, [x9]
-.LBB35_2:                           ; INLINED get_center loop
-    ldr   q2, [x10]
-    ldr   d3, [x10, #16]
-    fadd  v1.2d, v1.2d, v2.2d       ; no function call
-    fadd  d0, d0, d3                ; between Python and math
-    b.ne  .LBB35_2
-bl    PyList_New                    ; return marshalling:
-bl    PyFloat_FromDouble            ; exactly four CPython calls,
-bl    PyFloat_FromDouble            ; nothing else
-bl    PyFloat_FromDouble
-ret
-```
-
-The `PointCloud::get_center()` symbol doesn't exist in the
-mirror_bridge object file. Verified:
+### Reproduce in 5 minutes
 
 ```bash
-$ grep -c 'PointCloud.*get_centerEv' bind_mb.s
-0
-$ grep -c 'PointCloud.*get_centerEv' bind_pybind.s
-8
+git clone https://github.com/FranciscoThiesen/mirror_bridge
+cd mirror_bridge
+./docker_build.sh
+
+docker run --rm -v $(pwd):/workspace -w /workspace/asm_study \
+    mirror_bridge:latest bash -c '\
+        pip install pybind11 numpy --quiet && \
+        ./build_fair.sh && \
+        python3 bench_fair.py'
 ```
 
-Why pybind11 can't inline: its dispatcher template holds a
-`Ret (Class::*)(...)` pointer, opaque at instantiation time. The
-reflection splice gives the compiler a concrete member info instead.
+The `build_fair.sh` script compiles both `bind_mb.cpp` and
+`bind_pybind.cpp` with identical flags, printing the exact compiler
+line. `bench_fair.py` then prints the scaling table above plus the
+context rows. Expect constants in the 25-40× range depending on
+hardware; the scaling pattern holds.
 
-### Scope check: the whole object file
+### When it matters in practice
 
-Same one-class binding, same flags:
+- **Data pipelines that parse JSON / CSV / dicts** into C++ types hit
+  this ingest primitive. The 30× compounds across a batch job.
+- **Compute-dominated workflows** where you load a million points
+  once and then run a dozen C++ methods on them: ingest amortises,
+  the rest is at parity. No win, no loss.
+- **Numpy already**: both frameworks can use the buffer protocol for
+  near-zero-copy access. If your data is already a numpy array, use
+  that. mirror_bridge has an open item to expose
+  `PointCloud.points` through the buffer protocol directly, which
+  would collapse this entire cost to a pointer handoff.
 
-| File            | `.s` size  | `bl`/`blr` instructions |
-|-----------------|-----------:|------------------------:|
-| `bind_mb.s`     | 240 KB     | 271                     |
-| `bind_pybind.s` | 2,762 KB   | 4,420                   |
+## 4. What the FFI still costs
 
-11.5× more assembly, 16× more calls. The overhead is pybind11's
-`type_caster<...>` specialisations for every primitive it *might*
-convert. Reflection-based dispatch doesn't emit what it doesn't need.
+Even on the fast side, crossing the FFI isn't free:
 
-## 5. Build flags matter
-
-| Build flags                          | Centroid | AABB         | Voxel    |
-|--------------------------------------|----------|--------------|----------|
-| `-O2`                                | 0.91 ms  | 2.28 ms      | 36.6 ms  |
-| `-O3`                                | 0.93 ms  | 2.63 ms      | 34.7 ms  |
-| `-O3 -march=native`                  | 0.71 ms  | 2.74 ms      | 34.4 ms  |
-| `-O3 -march=native -ffast-math`      | 0.84 ms  | **1.32 ms**  | 37.1 ms  |
-
-`-O3` over `-O2` is noise. `-march=native` buys 20-30% on Centroid
-through chip-specific vector reductions. `-ffast-math` halves AABB
-because NEON's min/max drops its NaN-propagation branch when finite
-data is promised. Parallelism (OpenMP, TBB) stays the user's call.
-Reflection can't tell which loops are safe to parallelise.
-
-## 6. What the FFI still costs
-
-The binding layer is cheap. Crossing the FFI is not:
-
-| Operation                              | Cost     |
-|----------------------------------------|----------|
-| `PointCloud(list_of_1M_points)`        | ~18 ms   |
-| `len(pcd.points)` (reads 1M points out)| ~270 ms  |
+| Operation                              | mirror_bridge cost |
+|----------------------------------------|-------------------:|
+| `PointCloud(list_of_1M_points)`        | ~18 ms             |
+| `len(pcd.points)` (reads 1M points out)| ~270 ms            |
 
 Handing a million points into C++ is a real 1M-vector copy. Reading
 them back as a Python list re-materialises a million Python objects.
 
 **Rule of thumb: keep data inside C++ as long as possible, and only
-extract what you display.** Every speedup above holds because the
-points live in the C++ `PointCloud`, and each operation is one method
-call plus a scalar return.
+extract what you display.** Every parity number above holds because
+the points live in the C++ `PointCloud` and each method call returns
+a small scalar.
 
-A roadmapped follow-up exposes `.points` through the Python buffer
-protocol so numpy can share the memory zero-copy.
-
-## 7. Everything reflection can see is free
+## 5. Everything reflection can see is free
 
 Auto-generated per class, no user input:
 
@@ -299,9 +272,9 @@ class TaggedPointCloud(o3d.PointCloud):
 ```
 
 No `PYBIND11_OVERRIDE`, no dispatch helper, no trampoline
-boilerplate. (Caveat: works on Linux and macOS today; see §10.)
+boilerplate. (Caveat: works on Linux and macOS today; see §8.)
 
-## 8. Running against real libOpen3D.so
+## 6. Running against real libOpen3D.so
 
 This isn't a theoretical exercise. The binding loads and calls into
 a real `libOpen3D.so` built from source. Getting there took **two
@@ -343,7 +316,7 @@ class TaggedPointCloud(o3d.PointCloud):
 
 Zero `.def` calls.
 
-## 9. Try it yourself (10 minutes)
+## 7. Try it yourself (10 minutes)
 
 ```bash
 git clone https://github.com/FranciscoThiesen/mirror_bridge
@@ -356,15 +329,18 @@ docker run -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest
 cd examples/open3d-comprehensive
 ./build_and_test.sh                 # 10 feature groups pass
 python3 visual_demo.py              # renders mirror_bridge_open3d_demo.png
-python3 bench_three_way.py          # the 3-way benchmark above
 
 cd ../open3d-runtime
 ./build_and_test.sh                 # 10 tests against libOpen3D.so
+
+# The §3 ingest benchmark:
+cd ../../asm_study
+pip install pybind11 numpy --quiet && ./build_fair.sh && python3 bench_fair.py
 ```
 
 Every table, every number, every image reproduces.
 
-## 10. What it isn't yet
+## 8. What it isn't yet
 
 - **Compiler support.** Needs C++26 reflection (P2996). That means
   clang-p2996 today (pinned in the Docker image) or GCC trunk's
@@ -406,7 +382,6 @@ repo is small and feedback drives priorities.
 community. None of this is possible without their reflection work.*
 
 [repo]:       https://github.com/FranciscoThiesen/mirror_bridge
-[bench]:      https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/open3d-comprehensive/bench_three_way.py
 [runtime]:    https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-runtime
 [fork]:       https://github.com/FranciscoThiesen/mirror_bridge/tree/main/examples/open3d-full-port/patches
 [o3d-pybind]: https://github.com/isl-org/Open3D/blob/main/cpp/pybind/geometry/pointcloud.cpp
