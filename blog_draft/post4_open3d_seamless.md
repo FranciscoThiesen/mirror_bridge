@@ -180,12 +180,16 @@ converter in the call site. pybind11's type caster has no comparable
 compile-time information and has to handle the general case every
 time.
 
-### Reproduce in 5 minutes
+### Reproduce
+
+One-time: the `docker_build.sh` step compiles clang-p2996 from
+source and takes 30-60 minutes on first run. Everything after the
+image is built is ~10 seconds.
 
 ```bash
 git clone https://github.com/FranciscoThiesen/mirror_bridge
 cd mirror_bridge
-./docker_build.sh
+./docker_build.sh                   # one-time, 30-60 min
 
 docker run --rm -v $(pwd):/workspace -w /workspace/asm_study \
     mirror_bridge:latest bash -c '\
@@ -194,11 +198,11 @@ docker run --rm -v $(pwd):/workspace -w /workspace/asm_study \
         python3 bench_fair.py'
 ```
 
-The `build_fair.sh` script compiles both `bind_mb.cpp` and
-`bind_pybind.cpp` with identical flags, printing the exact compiler
-line. `bench_fair.py` then prints the scaling table above plus the
-context rows. Expect constants in the 25-40× range depending on
-hardware; the scaling pattern holds.
+`build_fair.sh` compiles both `bind_mb.cpp` and `bind_pybind.cpp`
+with identical flags, printing the exact compiler line.
+`bench_fair.py` prints the scaling table above plus the context
+rows. Expect constants in the 25-40× range depending on hardware;
+the scaling pattern holds.
 
 ### When it matters in practice
 
@@ -316,29 +320,52 @@ class TaggedPointCloud(o3d.PointCloud):
 
 Zero `.def` calls.
 
-## 7. Try it yourself (10 minutes)
+## 7. Try it yourself
+
+The one-time toolchain build takes 30-60 minutes (it's compiling
+clang-p2996 from source). Once the image exists, the reproduction
+steps below are quick.
 
 ```bash
 git clone https://github.com/FranciscoThiesen/mirror_bridge
 cd mirror_bridge
-./docker_build.sh
+./docker_build.sh                   # one-time, 30-60 min
+```
 
+### Quick reproduction (~3-5 minutes in a built image)
+
+```bash
 docker run -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest
 # --- inside the container ---
 
-cd examples/open3d-comprehensive
+# The §3 ingest benchmark:
+cd asm_study
+pip install pybind11 numpy --quiet && ./build_fair.sh && python3 bench_fair.py
+
+# The 6-panel visual at the top of this post:
+cd ../examples/open3d-comprehensive
 ./build_and_test.sh                 # 10 feature groups pass
 python3 visual_demo.py              # renders mirror_bridge_open3d_demo.png
-
-cd ../open3d-runtime
-./build_and_test.sh                 # 10 tests against libOpen3D.so
-
-# The §3 ingest benchmark:
-cd ../../asm_study
-pip install pybind11 numpy --quiet && ./build_fair.sh && python3 bench_fair.py
 ```
 
-Every table, every number, every image reproduces.
+These paths don't need any external downloads beyond what
+`./docker_build.sh` already pulled.
+
+### Extended: link against real libOpen3D.so (separate ~1 hour build)
+
+The `examples/open3d-runtime/` demo links against a patched
+libOpen3D.so that you build from source once. Apply the CMake patch
+from [`examples/open3d-full-port/patches`][fork] and build Open3D as
+you normally would (expect 45-90 minutes on a typical laptop — the
+bulk of that is Open3D's own third-party dependencies, not our
+binding). Then:
+
+```bash
+cd examples/open3d-runtime
+./build_and_test.sh                 # 10 tests against libOpen3D.so
+```
+
+Every table, every number, every image in the post reproduces.
 
 ## 8. What it isn't yet
 

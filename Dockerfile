@@ -1,13 +1,27 @@
-FROM archlinux:latest
+FROM ubuntu:22.04
 
-# Install essential build tools, Python, Node.js, Lua, and V8 development files
-RUN pacman -Syu --noconfirm base-devel sudo ninja vim cmake git python python-pip nodejs npm lua wget ca-certificates
+# Non-interactive apt for the whole image build.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Essential build tools + Python + Node.js + Lua + C++ deps used by
+# downstream binding targets (Eigen, fmt, jsoncpp, nanoflann).
+# Kept as a single RUN so the image cache stays useful and so the
+# cleanup of /var/lib/apt/lists is correctly scoped.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential sudo ninja-build vim cmake git wget ca-certificates \
+        python3 python3-pip python3-dev \
+        nodejs npm \
+        lua5.4 liblua5.4-dev \
+        libeigen3-dev libfmt-dev libjsoncpp-dev libnanoflann-dev \
+ && ln -sf /usr/bin/python3 /usr/local/bin/python \
+ && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
+ && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js native addon tools
 RUN npm install -g node-gyp node-addon-api
 
 # Install Jupyter for interactive notebooks
-RUN pip install --no-cache-dir --break-system-packages jupyter notebook ipython
+RUN pip3 install --no-cache-dir --break-system-packages jupyter notebook ipython
 
 # Build and install clang-p2996 with reflection support AND libcxx
 # This branch implements the C++26 reflection proposal (P2996)
@@ -51,13 +65,6 @@ RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/libc++.conf && ldconfig
 
 # Set LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-
-# Install common deps used by Open3D-style binding targets (Eigen, fmt, jsoncpp,
-# nanoflann). These are optional for mirror_bridge itself but let downstream
-# projects build bindings without additional setup.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libeigen3-dev libfmt-dev libjsoncpp-dev libnanoflann-dev \
- && rm -rf /var/lib/apt/lists/*
 
 # Work around a clang-p2996 + fmt 8.1 incompatibility. FMT_STRING calls in
 # fmt/format-inl.h bigint printing fail consteval under the reflection

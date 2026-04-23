@@ -101,15 +101,21 @@
   #error "This library requires C++26 reflection (P2996) from 2023-06 or later"
 #endif
 
-// Library version and capabilities
-#define MIRROR_BRIDGE_VERSION_MAJOR 0
-#define MIRROR_BRIDGE_VERSION_MINOR 1
-#define MIRROR_BRIDGE_VERSION_PATCH 0
+// Library version and capabilities. Guarded so we don't redefine the
+// constants already set in mirror_bridge_core.hpp (and to keep the
+// two headers from disagreeing at every user build).
+#ifndef MIRROR_BRIDGE_VERSION_MAJOR
+  #define MIRROR_BRIDGE_VERSION_MAJOR 0
+  #define MIRROR_BRIDGE_VERSION_MINOR 2
+  #define MIRROR_BRIDGE_VERSION_PATCH 0
+#endif
 
 // Supported reflection features (for client code to check capabilities)
-#define MIRROR_BRIDGE_HAS_REFLECTION 1
-#define MIRROR_BRIDGE_HAS_ENUMERATORS_OF 1  // Uses std::meta::enumerators_of for enum validation
-#define MIRROR_BRIDGE_HAS_TYPE_SIGNATURES 1  // Generates full type signatures with methods
+#ifndef MIRROR_BRIDGE_HAS_REFLECTION
+  #define MIRROR_BRIDGE_HAS_REFLECTION 1
+  #define MIRROR_BRIDGE_HAS_ENUMERATORS_OF 1  // std::meta::enumerators_of for enum validation
+  #define MIRROR_BRIDGE_HAS_TYPE_SIGNATURES 1  // full type signatures with methods
+#endif
 
 namespace mirror_bridge {
 
