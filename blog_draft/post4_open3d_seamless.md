@@ -68,7 +68,7 @@ $ mirror_bridge generate Open3D/cpp/open3d/geometry \
 
 A brace-depth parser finds every class, struct and enum. Nested types
 get qualified correctly (`HalfEdgeTriangleMesh::HalfEdge`, not a bare
-`HalfEdge` colliding with another file's).
+`HalfEdge` that would collide with another file's `HalfEdge`).
 
 Dependencies are resolved by reflection, not by the parser.
 `std::meta::bases_of(T)` gives inheritance edges. The enclosing scope
@@ -281,7 +281,8 @@ boilerplate. (Caveat: works on Linux and macOS today; see §8.)
 
 This isn't a theoretical exercise. The binding loads and calls into
 a real `libOpen3D.so` built from source. Getting there took **two
-one-line CMake patches**:
+small CMake patches** to a single file
+(`3rdparty/find_dependencies.cmake`):
 
 1. **Forward `CMAKE_CXX_FLAGS` to ExternalProjects** so 3rdparty
    libraries (VTK, embree, zmq, ...) inherit `-stdlib=libc++` from
@@ -334,7 +335,7 @@ cd mirror_bridge
 ### Quick reproduction (~20 seconds in a built image)
 
 ```bash
-docker run --rm -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest bash -c '
+docker run --rm -v $(pwd):/workspace -w /workspace mirror_bridge:latest bash -c '
     # The §3 ingest benchmark:
     cd asm_study && ./build_fair.sh && python3 bench_fair.py && \
     # The 6-panel visual at the top of this post:
@@ -343,10 +344,11 @@ docker run --rm -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest bash
 '
 ```
 
-Measured end-to-end: ~18 seconds on an Apple silicon laptop. The
-`build_and_test.sh` step verifies 10 feature groups; `visual_demo.py`
-writes `mirror_bridge_open3d_demo.png`. No external downloads
-required beyond what `./docker_build.sh` already pulled.
+Measured end-to-end: ~18 seconds on an Apple Silicon laptop.
+`open3d-comprehensive/build_and_test.sh` verifies 10 feature
+groups; `visual_demo.py` writes `mirror_bridge_open3d_demo.png`. No
+external downloads required beyond what `./docker_build.sh` already
+pulled.
 
 ### Extended: link against real libOpen3D.so (~15 minutes extra)
 
@@ -368,7 +370,9 @@ cmake -G Ninja \
   -DBUILD_WEBRTC=OFF -DBUILD_LIBREALSENSE=OFF -DBUILD_AZURE_KINECT=OFF \
   -DUSE_SYSTEM_EIGEN3=ON \
   /workspace/examples/open3d-full-port/Open3D
-ninja ext_openblas   # openblas first; avoids a known dep-order bug
+ninja ext_openblas   # openblas first; Open3D's ExternalProject
+                     # wiring otherwise asks for libopenblas.a
+                     # before it's been staged.
 ninja                # the rest (~3-4 minutes)
 
 # Build and run the mirror_bridge binding against it (~17 seconds):
@@ -389,9 +393,9 @@ the mirror_bridge binding's ABI, which stays pure libc++.
 ## 8. What it isn't yet
 
 - **Compiler support.** Needs C++26 reflection (P2996). That means
-  clang-p2996 today (pinned in the Docker image) or GCC trunk's
-  15-series. **MSVC hasn't implemented P2996.** That's the real
-  portability ceiling right now.
+  clang-p2996 today (pinned in the Docker image) or GCC 15 trunk.
+  **MSVC hasn't implemented P2996.** That's the real portability
+  ceiling right now.
 
 - **Auto-trampoline is Linux/macOS only** (Itanium ABI). On MSVC the
   portable `bind_class<T, Trampoline>` path still works: you write a
