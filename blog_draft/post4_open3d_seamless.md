@@ -1,4 +1,4 @@
-# mirror_bridge vs Open3D: 25,262 hand-written binding lines → 71 auto-generated
+# Porting Open3D with mirror_bridge: 25,262 hand-written binding lines → 71 auto-generated
 
 ![Real C++ point clouds, processed via mirror_bridge](visuals/mirror_bridge_open3d_demo.png)
 
