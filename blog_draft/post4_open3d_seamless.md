@@ -182,18 +182,17 @@ time.
 
 ### Reproduce
 
-One-time: the `docker_build.sh` step compiles clang-p2996 from
-source and takes 30-60 minutes on first run. Everything after the
-image is built is ~10 seconds.
+One-time: `./docker_build.sh` compiles clang-p2996 and libc++ from
+source (~18 minutes on a modern laptop, measured). Every run after
+the image is built is ~15 seconds.
 
 ```bash
 git clone https://github.com/FranciscoThiesen/mirror_bridge
 cd mirror_bridge
-./docker_build.sh                   # one-time, 30-60 min
+./docker_build.sh                   # one-time, ~18 min
 
 docker run --rm -v $(pwd):/workspace -w /workspace/asm_study \
     mirror_bridge:latest bash -c '\
-        pip install pybind11 numpy --quiet && \
         ./build_fair.sh && \
         python3 bench_fair.py'
 ```
@@ -322,41 +321,39 @@ Zero `.def` calls.
 
 ## 7. Try it yourself
 
-The one-time toolchain build takes 30-60 minutes (it's compiling
-clang-p2996 from source). Once the image exists, the reproduction
-steps below are quick.
+The one-time toolchain build takes ~18 minutes (compiling
+clang-p2996 + libc++ from source). After that, the reproduction
+steps below run in well under a minute.
 
 ```bash
 git clone https://github.com/FranciscoThiesen/mirror_bridge
 cd mirror_bridge
-./docker_build.sh                   # one-time, 30-60 min
+./docker_build.sh                   # one-time, ~18 min
 ```
 
-### Quick reproduction (~3-5 minutes in a built image)
+### Quick reproduction (~20 seconds in a built image)
 
 ```bash
-docker run -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest
-# --- inside the container ---
-
-# The §3 ingest benchmark:
-cd asm_study
-pip install pybind11 numpy --quiet && ./build_fair.sh && python3 bench_fair.py
-
-# The 6-panel visual at the top of this post:
-cd ../examples/open3d-comprehensive
-./build_and_test.sh                 # 10 feature groups pass
-python3 visual_demo.py              # renders mirror_bridge_open3d_demo.png
+docker run --rm -it -v $(pwd):/workspace -w /workspace mirror_bridge:latest bash -c '
+    # The §3 ingest benchmark:
+    cd asm_study && ./build_fair.sh && python3 bench_fair.py && \
+    # The 6-panel visual at the top of this post:
+    cd ../examples/open3d-comprehensive && \
+    ./build_and_test.sh && python3 visual_demo.py
+'
 ```
 
-These paths don't need any external downloads beyond what
-`./docker_build.sh` already pulled.
+Measured end-to-end: ~18 seconds on an Apple silicon laptop. The
+`build_and_test.sh` step verifies 10 feature groups; `visual_demo.py`
+writes `mirror_bridge_open3d_demo.png`. No external downloads
+required beyond what `./docker_build.sh` already pulled.
 
 ### Extended: link against real libOpen3D.so (separate ~1 hour build)
 
 The `examples/open3d-runtime/` demo links against a patched
 libOpen3D.so that you build from source once. Apply the CMake patch
 from [`examples/open3d-full-port/patches`][fork] and build Open3D as
-you normally would (expect 45-90 minutes on a typical laptop — the
+you normally would (expect 45-90 minutes on a typical laptop; the
 bulk of that is Open3D's own third-party dependencies, not our
 binding). Then:
 

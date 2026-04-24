@@ -20,8 +20,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Node.js native addon tools
 RUN npm install -g node-gyp node-addon-api
 
-# Install Jupyter for interactive notebooks
-RUN pip3 install --no-cache-dir --break-system-packages jupyter notebook ipython
+# Python data-science stack used by the demos, benchmarks and visuals
+# shipped with mirror_bridge. Jupyter is here because a few of the
+# experiments are notebooks; numpy / matplotlib / Pillow are what the
+# Open3D-comprehensive visual demo imports directly; pybind11 is kept so
+# readers can run the fair binding-layer benchmark without an extra pip.
+# The --break-system-packages flag is only needed on pip >= 23
+# (PEP 668 marker). Ubuntu 22.04 ships pip 22.0.2 which rejects it; drop.
+RUN pip3 install --no-cache-dir \
+        jupyter notebook ipython \
+        numpy matplotlib pillow \
+        pybind11
 
 # Build and install clang-p2996 with reflection support AND libcxx
 # This branch implements the C++26 reflection proposal (P2996)
