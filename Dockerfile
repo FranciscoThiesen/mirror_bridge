@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs npm \
         lua5.4 liblua5.4-dev \
         libeigen3-dev libfmt-dev libjsoncpp-dev libnanoflann-dev \
+        # Build deps for the §7 extended path: Open3D from source. Keeping
+        # them in the base image means a reader doesn't need a second
+        # `apt-get install` inside the container.
+        gfortran libssl-dev libtbb-dev libudev-dev libusb-1.0-0-dev \
+        libglu1-mesa-dev libosmesa6-dev libxcb-shm0 autoconf libtool \
+        xorg-dev libwayland-dev libwayland-bin libxkbcommon-dev \
  && ln -sf /usr/bin/python3 /usr/local/bin/python \
  && ln -sf /usr/bin/pip3 /usr/local/bin/pip \
  && rm -rf /var/lib/apt/lists/*
@@ -21,16 +27,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g node-gyp node-addon-api
 
 # Python data-science stack used by the demos, benchmarks and visuals
-# shipped with mirror_bridge. Jupyter is here because a few of the
-# experiments are notebooks; numpy / matplotlib / Pillow are what the
-# Open3D-comprehensive visual demo imports directly; pybind11 is kept so
-# readers can run the fair binding-layer benchmark without an extra pip.
-# The --break-system-packages flag is only needed on pip >= 23
-# (PEP 668 marker). Ubuntu 22.04 ships pip 22.0.2 which rejects it; drop.
+# shipped with mirror_bridge. Jupyter for notebooks; numpy/matplotlib/
+# Pillow for the Open3D-comprehensive visual demo; pybind11 for the
+# fair binding-layer benchmark. cmake>=3.24 is installed via pip
+# because Ubuntu 22.04 ships 3.22.1 and Open3D's CMakeLists requires
+# 3.24+. The --break-system-packages flag is only needed on pip >= 23
+# (PEP 668); Ubuntu 22.04 ships pip 22.0.2 which rejects it.
 RUN pip3 install --no-cache-dir \
         jupyter notebook ipython \
         numpy matplotlib pillow \
-        pybind11
+        pybind11 \
+        'cmake>=3.24,<4'
 
 # Build and install clang-p2996 with reflection support AND libcxx
 # This branch implements the C++26 reflection proposal (P2996)

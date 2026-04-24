@@ -348,21 +348,43 @@ Measured end-to-end: ~18 seconds on an Apple silicon laptop. The
 writes `mirror_bridge_open3d_demo.png`. No external downloads
 required beyond what `./docker_build.sh` already pulled.
 
-### Extended: link against real libOpen3D.so (separate ~1 hour build)
+### Extended: link against real libOpen3D.so (~15 minutes extra)
 
-The `examples/open3d-runtime/` demo links against a patched
-libOpen3D.so that you build from source once. Apply the CMake patch
-from [`examples/open3d-full-port/patches`][fork] and build Open3D as
-you normally would (expect 45-90 minutes on a typical laptop; the
-bulk of that is Open3D's own third-party dependencies, not our
-binding). Then:
+The `examples/open3d-runtime/` demo links against a real
+libOpen3D.so you build once from the patched fork. The full recipe
+(inside the Docker container, from the repo root):
 
 ```bash
-cd examples/open3d-runtime
-./build_and_test.sh                 # 10 tests against libOpen3D.so
+# Build libOpen3D.so. ~5 minutes on a modern laptop; the 3rdparty
+# tarballs are already cached in examples/open3d-full-port/Open3D/
+# 3rdparty_downloads so no internet round trips are needed.
+mkdir -p /tmp/o3d_fork_build && cd /tmp/o3d_fork_build
+cmake -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+  -DBUILD_SHARED_LIBS=ON \
+  -DBUILD_GUI=OFF -DBUILD_PYTHON_MODULE=OFF -DBUILD_EXAMPLES=OFF \
+  -DBUILD_TESTS=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_WEBRTC=OFF -DBUILD_LIBREALSENSE=OFF -DBUILD_AZURE_KINECT=OFF \
+  -DUSE_SYSTEM_EIGEN3=ON \
+  /workspace/examples/open3d-full-port/Open3D
+ninja ext_openblas   # openblas first; avoids a known dep-order bug
+ninja                # the rest (~3-4 minutes)
+
+# Build and run the mirror_bridge binding against it (~17 seconds):
+cd /workspace/examples/open3d-runtime
+export O3D_BUILD=/tmp/o3d_fork_build
+./build_and_test.sh                 # 5 feature groups pass
 ```
 
-Every table, every number, every image in the post reproduces.
+A note on `LD_PRELOAD`. Open3D's vendored 3rdparty deps (curl, zmq,
+parts of VTK) compile with libstdc++ even when the top-level build
+requests libc++, so the resulting `libOpen3D.so` carries unresolved
+`std::__cxx11::*` symbols. libc++ and libstdc++ use different symbol
+namespaces (`std::__1::` vs `std::__cxx11::`), so the two can
+coexist in one process; `build_and_test.sh` preloads libstdc++ so
+the loader finds those symbols at dlopen time. This does not affect
+the mirror_bridge binding's ABI, which stays pure libc++.
 
 ## 8. What it isn't yet
 

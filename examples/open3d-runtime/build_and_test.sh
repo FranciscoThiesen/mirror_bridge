@@ -18,4 +18,13 @@ clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
     -Wl,-rpath,"$O3D_BUILD/lib/Release" \
     -o build/real_open3d.so
 
-python3 test_real_open3d.py
+# LD_PRELOAD note: Open3D's vendored 3rdparty deps (curl, zmq, some
+# VTK pieces) compile with libstdc++ even when we request libc++ for
+# the top-level build — they don't honour CMAKE_CXX_FLAGS cleanly.
+# The resulting libOpen3D.so carries unresolved libstdc++ symbols
+# (std::__cxx11::*) that need to be satisfied at load time. libc++
+# and libstdc++ use different symbol namespaces (std::__1:: vs
+# std::__cxx11::), so they coexist peacefully in the same process
+# — preloading libstdc++ simply gives the ELF loader a place to
+# find the missing symbols without changing our binding's ABI.
+LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}libstdc++.so.6" python3 test_real_open3d.py
