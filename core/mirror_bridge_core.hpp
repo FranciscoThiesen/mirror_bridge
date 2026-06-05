@@ -537,8 +537,14 @@ consteval bool is_param_bindable() {
 template<typename ParamType>
 struct param_storage {
     using Clean = std::remove_cvref_t<ParamType>;
+    // Smart pointers fail is_value_bindable (unique_ptr isn't copy-
+    // assignable) but must still be stored by value: the SmartPointer
+    // from_python overload materializes a fresh pointee from the Python
+    // value, and forward_arg then moves the smart pointer into the call.
+    // Pointer storage would dereference to an lvalue and try to copy a
+    // move-only type at the call site, which doesn't compile.
     using type = std::conditional_t<
-        is_value_bindable<Clean>(),
+        is_value_bindable<Clean>() || SmartPointer<Clean>,
         Clean,     // value storage
         Clean*     // pointer storage (class types extracted from Python wrapper)
     >;
