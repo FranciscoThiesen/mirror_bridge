@@ -1228,7 +1228,9 @@ main() {
         config) cmd_config "$@" ;;
         diff) cmd_diff "$@" ;;
         watch) cmd_watch "$@" ;;
-        doctor) exec "$PROJECT_ROOT/mirror_bridge_doctor" "$@" ;;
+        # Invoked via bash so the doctor script works even when the
+        # executable bit was lost (e.g. mounted from a pip install).
+        doctor) exec bash "$PROJECT_ROOT/mirror_bridge_doctor" "$@" ;;
         init) echo "Not yet implemented"; exit 1 ;;
         version|--version|-v) cmd_version ;;
         help|--help|-h) show_help ;;

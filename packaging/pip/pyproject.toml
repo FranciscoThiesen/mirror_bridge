@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirror-bridge"
+version = "0.2.0"
+description = "C++26 reflection-based binding generator: write C++ once, get Python, Lua, and JavaScript bindings with zero boilerplate"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Francisco Geiman Thiesen" }]
+requires-python = ">=3.9"
+keywords = ["bindings", "c++", "reflection", "pybind11-alternative", "ffi", "code-generation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Code Generators",
+]
+
+[project.urls]
+Homepage = "https://github.com/FranciscoThiesen/mirror_bridge"
+Documentation = "https://github.com/FranciscoThiesen/mirror_bridge/tree/main/docs"
+Changelog = "https://github.com/FranciscoThiesen/mirror_bridge/blob/main/CHANGELOG.md"
+
+[project.scripts]
+mirror_bridge = "mirror_bridge_cli:main"
+mirror-bridge = "mirror_bridge_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The _runtime tree (headers + CLI scripts staged by build_wheel.sh) is
+# data, not Python code, so it must be declared explicitly.
+[tool.setuptools.package-data]
+mirror_bridge_cli = ["_runtime/**/*"]
