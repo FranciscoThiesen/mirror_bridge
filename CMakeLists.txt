@@ -34,11 +34,20 @@ project(mirror_bridge
     LANGUAGES CXX
 )
 
+# Whether this is the top-level project or consumed via FetchContent /
+# add_subdirectory. Drives defaults: as a dependency we must not build
+# tests or push global compile flags into the parent project.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(MIRROR_BRIDGE_IS_TOP_LEVEL ON)
+else()
+    set(MIRROR_BRIDGE_IS_TOP_LEVEL OFF)
+endif()
+
 # ============================================================================
 # Options
 # ============================================================================
 
-option(MIRROR_BRIDGE_BUILD_TESTS "Build tests" ON)
+option(MIRROR_BRIDGE_BUILD_TESTS "Build tests" ${MIRROR_BRIDGE_IS_TOP_LEVEL})
 option(MIRROR_BRIDGE_BUILD_PYTHON "Build Python bindings" ON)
 option(MIRROR_BRIDGE_BUILD_LUA "Build Lua bindings" ON)
 option(MIRROR_BRIDGE_BUILD_JS "Build JavaScript/Node.js bindings" ON)
@@ -64,9 +73,14 @@ set(MIRROR_BRIDGE_CXX_FLAGS
     -stdlib=libc++
 )
 
-# Add C++26 and reflection flags globally
-add_compile_options(${MIRROR_BRIDGE_CXX_FLAGS})
-add_link_options(-stdlib=libc++)
+# Add C++26 and reflection flags globally — but only when building
+# mirror_bridge itself. As a dependency (FetchContent/add_subdirectory)
+# the flags travel on the mirror_bridge INTERFACE target instead, so the
+# parent project's own targets are untouched.
+if(MIRROR_BRIDGE_IS_TOP_LEVEL)
+    add_compile_options(${MIRROR_BRIDGE_CXX_FLAGS})
+    add_link_options(-stdlib=libc++)
+endif()
 
 # Set up library paths for libc++
 if(EXISTS "/usr/local/lib/x86_64-unknown-linux-gnu")
@@ -82,9 +96,26 @@ endif()
 # ============================================================================
 
 add_library(mirror_bridge INTERFACE)
+add_library(mirror_bridge::mirror_bridge ALIAS mirror_bridge)
+
+# The install include root mirrors the repo layout (core/, python/, ...)
+# so the headers' repo-root-relative includes ("core/mirror_bridge_core.hpp",
+# "../core/...") resolve identically from the build tree and an install.
 target_include_directories(mirror_bridge INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include/mirror_bridge>
+)
+
+# Usage requirements for consumers (find_package / FetchContent): linking
+# mirror_bridge::mirror_bridge is enough to get the reflection flags.
+# Restricted to Clang since only clang-p2996 understands -freflection.
+# Quoted so the ;-separated flag list stays inside one generator
+# expression instead of splitting into broken arguments.
+target_compile_options(mirror_bridge INTERFACE
+    "$<$<COMPILE_LANG_AND_ID:CXX,Clang>:${MIRROR_BRIDGE_CXX_FLAGS}>"
+)
+target_link_options(mirror_bridge INTERFACE
+    "$<$<LINK_LANG_AND_ID:CXX,Clang>:-stdlib=libc++>"
 )
 
 # ============================================================================
@@ -296,18 +327,34 @@ install(TARGETS mirror_bridge
     EXPORT mirror_bridge-targets
 )
 
-install(DIRECTORY core/ python/ lua/ javascript/
+# No trailing slashes: preserve the core/python/lua/javascript directory
+# structure under include/mirror_bridge so inter-header includes resolve
+# (a flattened install would break "core/mirror_bridge_core.hpp").
+install(DIRECTORY core python lua javascript rust
     DESTINATION include/mirror_bridge
     FILES_MATCHING PATTERN "*.hpp"
 )
 
-install(FILES mirror_bridge.hpp
+install(FILES mirror_bridge.hpp mirror_bridge_pch.hpp
     DESTINATION include/mirror_bridge
 )
 
 install(EXPORT mirror_bridge-targets
     FILE mirror_bridge-config.cmake
     NAMESPACE mirror_bridge::
+    DESTINATION lib/cmake/mirror_bridge
+)
+
+# Version file so `find_package(mirror_bridge 0.2 REQUIRED)` can check
+# compatibility. ARCH_INDEPENDENT because the library is header-only.
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion
+    ARCH_INDEPENDENT
+)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config-version.cmake"
     DESTINATION lib/cmake/mirror_bridge
 )
 
