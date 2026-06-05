@@ -13,7 +13,10 @@ echo
 
 CXX="clang++"
 COMMON_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++ -fPIC -shared -O2"
-INCLUDES="-I/workspace -I/workspace/tests/expected"
+# Derive include paths from the script location: the repo isn't always
+# checked out at /workspace (CI uses /__w/mirror_bridge/mirror_bridge).
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+INCLUDES="-I$PROJECT_ROOT -I$SCRIPT_DIR"
 PYTHON_FLAGS=$(python3-config --includes)
 
 # Test 1: Unconvertible type should fail to compile

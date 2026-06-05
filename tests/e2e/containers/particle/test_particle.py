@@ -29,8 +29,8 @@ def test_particle_containers():
     print(f"  ✓ Default velocity (vector): {p.velocity}")
     print(f"  ✓ Default acceleration (array): {p.acceleration}")
     assert p.mass == 1.0, "Default mass should be 1.0"
-    assert p.position == [0.0, 0.0, 0.0], "Default position should be [0, 0, 0]"
-    assert p.velocity == [0.0, 0.0, 0.0], "Default velocity should be [0, 0, 0]"
+    assert list(p.position) == [0.0, 0.0, 0.0], "Default position should be [0, 0, 0]"
+    assert list(p.velocity) == [0.0, 0.0, 0.0], "Default velocity should be [0, 0, 0]"
     assert list(p.acceleration) == [0.0, 0.0, 0.0], "Default acceleration should be [0, 0, 0]"
     print()
 
@@ -40,8 +40,8 @@ def test_particle_containers():
     p.velocity = [0.5, 0.0, -0.5]
     print(f"  Set position: {p.position}")
     print(f"  Set velocity: {p.velocity}")
-    assert p.position == [1.0, 2.0, 3.0], "Position should be updated"
-    assert p.velocity == [0.5, 0.0, -0.5], "Velocity should be updated"
+    assert list(p.position) == [1.0, 2.0, 3.0], "Position should be updated"
+    assert list(p.velocity) == [0.5, 0.0, -0.5], "Velocity should be updated"
     print(f"  ✓ Vector containers work correctly")
     print()
 

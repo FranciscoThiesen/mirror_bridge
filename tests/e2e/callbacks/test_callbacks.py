@@ -97,7 +97,7 @@ processor.set_transform(lambda x: x * x)
 
 values = [1.0, 2.0, 3.0, 4.0]
 result = processor.process(values)
-assert result == [1.0, 4.0, 9.0, 16.0], f"Expected [1.0, 4.0, 9.0, 16.0], got {result}"
+assert list(result) == [1.0, 4.0, 9.0, 16.0], f"Expected [1.0, 4.0, 9.0, 16.0], got {result}"
 print(f"  process([1,2,3,4]) with square = {result}")
 
 # Sum after square transform

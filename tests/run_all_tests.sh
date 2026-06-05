@@ -95,6 +95,16 @@ while IFS= read -r -d '' binding_file; do
     module_name=$(basename "$binding_file" _binding.cpp)
     module_name=$(basename "$module_name" .cpp)
 
+    # The loadable module's basename must equal the name declared in the
+    # MIRROR_BRIDGE_*MODULE macro: CPython resolves PyInit_<name> from the
+    # filename, and Lua/Node do the equivalent. Several test files declare
+    # a module name that differs from their filename (e.g. binding.cpp
+    # declaring exceptions_test), so trust the declaration over the
+    # filename whenever one is present.
+    declared_module=$(grep -ohE '(MIRROR_BRIDGE_MODULE|MIRROR_BRIDGE_LUA_MODULE|MIRROR_BRIDGE_JS_MODULE)[[:space:]]*\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*' "$binding_file" 2>/dev/null \
+        | head -1 | sed -E 's/.*\([[:space:]]*//')
+    [ -n "$declared_module" ] && module_name="$declared_module"
+
     # Get the directory of the binding file for proper includes
     binding_dir=$(dirname "$binding_file")
 
@@ -132,8 +142,10 @@ while IFS= read -r -d '' binding_file; do
     # Compile the binding - capture output
     # Add both project root and binding dir to include paths
     # Use || true to prevent set -e from exiting on compile failure
+    # -Ipython lets bindings include language-backend headers directly
+    # (e.g. auto_trampoline's mirror_bridge_auto_trampoline.hpp).
     compile_output=$(cd "$binding_dir" && $CXX_COMPILER $CXX_FLAGS \
-        -I"$PROJECT_ROOT" -I. -fPIC -shared \
+        -I"$PROJECT_ROOT" -I"$PROJECT_ROOT/python" -I. -fPIC -shared \
         $includes \
         "$(basename "$binding_file")" -o "$BUILD_DIR/${output_name}${output_ext}" 2>&1) || true
 
@@ -160,8 +172,10 @@ while IFS= read -r -d '' binding_file; do
         fi
     fi
     echo ""
-# Exclude v8/ directory - V8 tests are built separately in Step 2d
-done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -print0)
+# Exclude v8/ directory - V8 tests are built separately in Step 2d.
+# Exclude test_validation.cpp - it's a negative compile test (it MUST fail
+# to compile) driven by tests/expected/test_validation.sh in Step 3.
+done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -name "test_validation.cpp" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"
@@ -175,6 +189,9 @@ export PYTHONPATH="$BUILD_DIR:$PYTHONPATH"
 SKIP_TESTS=(
     # auto_discovery_funcs has its own shell script that builds and tests
     "auto_discovery_funcs/test_funcs.py:Run via test_auto_discovery_funcs.sh instead"
+    # inheritance's module is produced by the CLI generator, not a checked-in
+    # binding .cpp, so the generic build step never creates inherit_mod.so
+    "inheritance/test_inheritance.py:Run via test_inheritance_cli.sh (module built by CLI generate)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)

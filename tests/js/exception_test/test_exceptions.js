@@ -1,7 +1,14 @@
 // Tests for C++ exception handling in JavaScript bindings
 // C++ exceptions should be caught and converted to JavaScript errors
 
-const mod = require('./build/Release/exception_test');
+// Prefer the node-gyp build (build_and_test.sh); fall back to the module
+// the generic test harness compiles into the repo-level build/ directory.
+let mod;
+try {
+    mod = require('./build/Release/exception_test');
+} catch (e) {
+    mod = require('../../../build/exception_test_js.node');
+}
 
 let pass = 0;
 let fail = 0;

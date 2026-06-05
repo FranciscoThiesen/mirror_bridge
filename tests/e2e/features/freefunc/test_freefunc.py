@@ -75,10 +75,10 @@ def test_multi_arg_function():
 def test_returning_vector():
     """Test function returning vector."""
     result = freefunc.range(5)
-    assert result == [0, 1, 2, 3, 4]
+    assert list(result) == [0, 1, 2, 3, 4]
 
     result = freefunc.range(0)
-    assert result == []
+    assert list(result) == []
 
     print("✓ Vector returning function works")
 
