@@ -15,11 +15,32 @@ NC='\033[0m'
 # Options
 VERBOSE=0
 FIX_MODE=0
+JSON_MODE=0
 
 # Counters
 CHECKS_PASSED=0
 CHECKS_FAILED=0
 CHECKS_WARNED=0
+
+# JSON accumulation: one object per check, joined at the end. In JSON mode
+# all pretty-printing is suppressed so stdout carries exactly one JSON
+# object (the contract shared with `mirror_bridge generate --json`).
+CHECKS_JSON=""
+CURRENT_SECTION=""
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+json_record() {
+    # $1 = status (pass|warn|fail), $2 = check text, $3 = hint
+    CHECKS_JSON+="{\"section\":\"$(json_escape "$CURRENT_SECTION")\",\"status\":\"$1\",\"check\":\"$(json_escape "$2")\",\"hint\":\"$(json_escape "${3:-}")\"},"
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -32,6 +53,10 @@ while [[ $# -gt 0 ]]; do
             FIX_MODE=1
             shift
             ;;
+        --json)
+            JSON_MODE=1
+            shift
+            ;;
         -h|--help)
             cat << EOF
 Mirror Bridge Doctor - Diagnose setup issues
@@ -41,6 +66,7 @@ Usage: mirror_bridge_doctor [options]
 Options:
   -v, --verbose    Show detailed output for each check
   --fix            Attempt to fix common issues (experimental)
+  --json           Emit one JSON object on stdout instead of pretty output
   -h, --help       Show this help message
 
 Checks performed:
@@ -66,43 +92,62 @@ EOF
     esac
 done
 
-echo -e "${BOLD}${BLUE}=======================================${NC}"
-echo -e "${BOLD}${BLUE}  Mirror Bridge Doctor${NC}"
-echo -e "${BOLD}${BLUE}=======================================${NC}"
-echo ""
+# In JSON mode stdout must carry only the final JSON object: park the real
+# stdout on fd 3 and route everything else (including stray echoes from
+# verbose paths) to stderr.
+if [ $JSON_MODE -eq 1 ]; then
+    exec 3>&1 1>&2
+fi
+
+if [ $JSON_MODE -eq 0 ]; then
+    echo -e "${BOLD}${BLUE}=======================================${NC}"
+    echo -e "${BOLD}${BLUE}  Mirror Bridge Doctor${NC}"
+    echo -e "${BOLD}${BLUE}=======================================${NC}"
+    echo ""
+fi
 
 # Helper functions
 check_pass() {
-    echo -e "${GREEN}✓${NC} $1"
+    [ $JSON_MODE -eq 0 ] && echo -e "${GREEN}✓${NC} $1"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
+    json_record "pass" "$1" ""
 }
 
 check_fail() {
-    echo -e "${RED}✗${NC} $1"
-    CHECKS_FAILED=$((CHECKS_FAILED + 1))
-    if [ -n "$2" ]; then
-        echo -e "  ${YELLOW}Hint: $2${NC}"
+    if [ $JSON_MODE -eq 0 ]; then
+        echo -e "${RED}✗${NC} $1"
+        if [ -n "$2" ]; then
+            echo -e "  ${YELLOW}Hint: $2${NC}"
+        fi
     fi
+    CHECKS_FAILED=$((CHECKS_FAILED + 1))
+    json_record "fail" "$1" "${2:-}"
 }
 
 check_warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
-    CHECKS_WARNED=$((CHECKS_WARNED + 1))
-    if [ -n "$2" ]; then
-        echo -e "  ${BLUE}Note: $2${NC}"
+    if [ $JSON_MODE -eq 0 ]; then
+        echo -e "${YELLOW}⚠${NC} $1"
+        if [ -n "$2" ]; then
+            echo -e "  ${BLUE}Note: $2${NC}"
+        fi
     fi
+    CHECKS_WARNED=$((CHECKS_WARNED + 1))
+    json_record "warn" "$1" "${2:-}"
 }
 
 verbose() {
-    if [ $VERBOSE -eq 1 ]; then
+    if [ $VERBOSE -eq 1 ] && [ $JSON_MODE -eq 0 ]; then
         echo -e "  ${BLUE}$1${NC}"
     fi
 }
 
 section() {
-    echo ""
-    echo -e "${BOLD}$1${NC}"
-    echo -e "${BLUE}$(printf '%.0s─' {1..40})${NC}"
+    CURRENT_SECTION="$1"
+    if [ $JSON_MODE -eq 0 ]; then
+        echo ""
+        echo -e "${BOLD}$1${NC}"
+        echo -e "${BLUE}$(printf '%.0s─' {1..40})${NC}"
+    fi
 }
 
 # ============================================================================
@@ -420,6 +465,14 @@ rm -rf "$QUICK_TEST_DIR"
 # ============================================================================
 # Summary
 # ============================================================================
+if [ $JSON_MODE -eq 1 ]; then
+    STATUS="ok"
+    [ $CHECKS_FAILED -gt 0 ] && STATUS="error"
+    printf '{"status":"%s","passed":%d,"warnings":%d,"failed":%d,"checks":[%s]}\n' \
+        "$STATUS" "$CHECKS_PASSED" "$CHECKS_WARNED" "$CHECKS_FAILED" "${CHECKS_JSON%,}" >&3
+    [ $CHECKS_FAILED -eq 0 ] && exit 0 || exit 1
+fi
+
 echo ""
 echo -e "${BOLD}${BLUE}=======================================${NC}"
 echo -e "${BOLD}${BLUE}  Summary${NC}"

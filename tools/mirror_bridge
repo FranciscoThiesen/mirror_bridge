@@ -9,6 +9,9 @@
 #   pch         Build precompiled header for faster compilation
 #   build       Compile a manually-written binding file
 #   config      Generate bindings from a configuration file
+#   diff        Show binding surface changes since last build
+#   watch       Watch headers and auto-recompile bindings on change
+#   doctor      Diagnose environment and setup issues
 #   init        Initialize a new Mirror Bridge project
 #   version     Show version information
 
@@ -38,6 +41,53 @@ USE_PCH=""
 PCH_PATH=""
 LANG="python"
 
+# JSON output support (--json on generate/diff/doctor). Contract: in JSON
+# mode stdout carries exactly one JSON object and all human-readable
+# progress goes to stderr, so scripts and AI agents can parse results
+# reliably. Commands that support it open fd 3 on the real stdout and
+# write the final object there.
+JSON_MODE=0
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Emit a JSON error object (when in JSON mode) and exit non-zero.
+# $1 = stage, $2 = reason, $3 = suggestion (optional)
+json_fail() {
+    if [ $JSON_MODE -eq 1 ]; then
+        printf '{"status":"error","stage":"%s","reason":"%s","suggestion":"%s","docs":"https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/errors.md"}\n' \
+            "$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "${3:-}")" >&3
+    fi
+    exit 1
+}
+
+# Map a failed compile log to an actionable one-line suggestion so callers
+# (humans or agents) don't have to dig through raw compiler output.
+suggest_fix() {
+    local log="$1"
+    if echo "$log" | grep -q "cannot convert"; then
+        echo "A member type has no converter. Mark it [[=exclude{}]] or add a custom converter. See docs/reference/type-conversion.md"
+    elif echo "$log" | grep -qE "'meta' file not found|freflection"; then
+        echo "Compiler lacks C++26 reflection support. Run inside the mirror_bridge container (./start_dev_container.sh)"
+    elif echo "$log" | grep -q "Eigen"; then
+        echo "Eigen headers not found. Install libeigen3-dev or pass -I /path/to/eigen3"
+    elif echo "$log" | grep -q "Python.h"; then
+        echo "Python dev headers missing. Install python3-dev"
+    elif echo "$log" | grep -q "lua.h"; then
+        echo "Lua dev headers missing. Install liblua5.4-dev"
+    elif echo "$log" | grep -q "node_api.h"; then
+        echo "Node.js N-API headers missing. Headers normally ship with the Node.js installation"
+    else
+        echo "Re-run with --verbose for the full compiler output"
+    fi
+}
+
 # Show main help
 show_help() {
     cat << EOF
@@ -53,8 +103,13 @@ ${YELLOW}Commands:${NC}
   config      Generate bindings from a configuration file
   diff        Show binding surface changes since last build
   watch       Watch headers and auto-recompile bindings on change
+  doctor      Diagnose environment and setup issues
   init        Initialize a new Mirror Bridge project
   version     Show version information
+
+${YELLOW}Machine-readable output:${NC}
+  generate, diff, and doctor accept --json: stdout carries exactly one
+  JSON object and human-readable progress goes to stderr.
 
 ${YELLOW}Examples:${NC}
   mirror_bridge generate src/ --module my_module --lang python
@@ -89,6 +144,7 @@ ${YELLOW}Options:${NC}
   --pch [PATH]        Use precompiled header (auto-detect or specify path)
   -f, --force         Force rebuild even if sources haven't changed
   -I DIR              Add include directory
+  --json              Emit one JSON result object on stdout (progress -> stderr)
   -h, --help          Show this help
 
 ${YELLOW}Auto-Discovery:${NC}
@@ -530,15 +586,24 @@ compile_binding() {
 
     cmd="$cmd $compile_flags $binding_file -o $output_file $link_flags"
 
+    # Capture the full compiler output so failures can be reported with
+    # context (and machine-readably in --json mode via LAST_COMPILE_LOG).
+    # Track the exit code explicitly: checking only for the output file
+    # would let a stale .so from a previous run mask a failed compile.
+    LAST_COMPILE_LOG=""
+    local compile_rc=0
     if [ $VERBOSE -eq 1 ]; then
         echo -e "${BLUE}$cmd${NC}"
-        eval "$cmd"
+        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
+        [ -n "$LAST_COMPILE_LOG" ] && echo "$LAST_COMPILE_LOG"
     else
-        eval "$cmd" 2>&1 | grep -E "(error|Error)" || true
+        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
+        echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
     fi
 
-    if [ -f "$output_file" ]; then
+    if [ $compile_rc -eq 0 ] && [ -f "$output_file" ]; then
         echo -e "${GREEN}✓ Built: $output_file${NC}"
+        LAST_OUTPUT_FILE="$output_file"
         return 0
     else
         echo -e "${RED}✗ Failed to build: $output_file${NC}"
@@ -562,6 +627,7 @@ cmd_generate() {
             -k|--keep-generated) KEEP_GENERATED=1; shift ;;
             -v|--verbose) VERBOSE=1; shift ;;
             -f|--force) FORCE_REBUILD=1; shift ;;
+            --json) JSON_MODE=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
             --pch)
                 USE_PCH="1"
@@ -585,10 +651,16 @@ cmd_generate() {
         esac
     done
 
+    # In JSON mode stdout must carry only the final JSON object: park the
+    # real stdout on fd 3 and route all progress chatter to stderr.
+    if [ $JSON_MODE -eq 1 ]; then
+        exec 3>&1 1>&2
+    fi
+
     # Validate
-    [ -z "$src_dir" ] && { echo -e "${RED}Error: No source directory specified${NC}"; show_generate_help; exit 1; }
-    [ -z "$module_name" ] && { echo -e "${RED}Error: No module name specified (use --module)${NC}"; show_generate_help; exit 1; }
-    [ ! -d "$src_dir" ] && { echo -e "${RED}Error: Directory not found: $src_dir${NC}"; exit 1; }
+    [ -z "$src_dir" ] && { echo -e "${RED}Error: No source directory specified${NC}"; show_generate_help; json_fail "args" "No source directory specified"; }
+    [ -z "$module_name" ] && { echo -e "${RED}Error: No module name specified (use --module)${NC}"; show_generate_help; json_fail "args" "No module name specified (use --module)"; }
+    [ ! -d "$src_dir" ] && { echo -e "${RED}Error: Directory not found: $src_dir${NC}"; json_fail "args" "Directory not found: $src_dir"; }
 
     src_dir=$(realpath "$src_dir")
     OUTPUT_DIR=$(realpath "$OUTPUT_DIR" 2>/dev/null || echo "$OUTPUT_DIR")
@@ -612,7 +684,8 @@ cmd_generate() {
 
     if [ ${#CLASSES[@]} -eq 0 ]; then
         echo -e "${RED}Error: No classes found in $src_dir${NC}"
-        exit 1
+        json_fail "discover" "No classes found in $src_dir" \
+            "Check that headers contain struct/class definitions and are not all marked MIRROR_BRIDGE_SKIP_FILE"
     fi
 
     echo ""
@@ -644,10 +717,16 @@ cmd_generate() {
     case "$LANG" in
         all) languages=("python" "lua" "js") ;;
         python|lua|js|javascript) languages=("$LANG") ;;
-        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; exit 1 ;;
+        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, all" ;;
     esac
 
-    # Generate and compile for each language
+    # Generate and compile for each language. A failed language no longer
+    # aborts the whole run (previously set -e killed the script on the first
+    # failure): remaining languages still get built, failures are collected,
+    # and the exit code reflects the overall result.
+    local -a built_outputs=()
+    local -a failed_langs=()
+    local errors_json=""
     for lang in "${languages[@]}"; do
         echo -e "${YELLOW}Generating $lang bindings...${NC}"
 
@@ -655,14 +734,43 @@ cmd_generate() {
         generate_binding_file "$lang" "$module_name" "$binding_file" CLASSES HEADERS "$src_dir"
 
         echo -e "${YELLOW}Compiling $lang module...${NC}"
-        compile_binding "$lang" "$module_name" "$binding_file" "$OUTPUT_DIR" "$src_dir" "$PCH_PATH" "${include_dirs[@]:-}"
+        if compile_binding "$lang" "$module_name" "$binding_file" "$OUTPUT_DIR" "$src_dir" "$PCH_PATH" "${include_dirs[@]:-}"; then
+            built_outputs+=("$LAST_OUTPUT_FILE")
+        else
+            failed_langs+=("$lang")
+            local first_err
+            first_err=$(echo "$LAST_COMPILE_LOG" | grep -m1 -E "error" || echo "compilation failed")
+            errors_json+="{\"lang\":\"$(json_escape "$lang")\",\"reason\":\"$(json_escape "$first_err")\",\"suggestion\":\"$(json_escape "$(suggest_fix "$LAST_COMPILE_LOG")")\"},"
+        fi
 
         if [ $KEEP_GENERATED -eq 0 ]; then
             rm -f "$binding_file"
         fi
     done
 
+    if [ $JSON_MODE -eq 1 ]; then
+        local classes_json="" langs_json="" outputs_json="" i
+        for i in "${!CLASSES[@]}"; do
+            classes_json+="{\"name\":\"$(json_escape "${CLASSES[$i]}")\",\"header\":\"$(json_escape "${HEADERS[$i]}")\"},"
+        done
+        for lang in "${languages[@]}"; do
+            langs_json+="\"$(json_escape "$lang")\","
+        done
+        for out in "${built_outputs[@]}"; do
+            outputs_json+="\"$(json_escape "$out")\","
+        done
+        local status="ok"
+        [ ${#failed_langs[@]} -gt 0 ] && status="error"
+        printf '{"status":"%s","module":"%s","languages":[%s],"classes":[%s],"outputs":[%s],"errors":[%s]}\n' \
+            "$status" "$(json_escape "$module_name")" "${langs_json%,}" \
+            "${classes_json%,}" "${outputs_json%,}" "${errors_json%,}" >&3
+    fi
+
     echo ""
+    if [ ${#failed_langs[@]} -gt 0 ]; then
+        echo -e "${RED}✗ Failed languages: ${failed_langs[*]}${NC}"
+        exit 1
+    fi
     echo -e "${GREEN}✓ Successfully built bindings for: ${languages[*]}${NC}"
 }
 
@@ -827,17 +935,24 @@ cmd_config() {
 cmd_diff() {
     local src_dir=""
     local update_snapshot=0
+    local check_mode=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --help|-h) show_diff_help; exit 0 ;;
             --output|-o) OUTPUT_DIR="$2"; shift 2 ;;
             --update|-u) update_snapshot=1; shift ;;
+            --check) check_mode=1; shift ;;
+            --json) JSON_MODE=1; shift ;;
             *) src_dir="$1"; shift ;;
         esac
     done
 
-    [ -z "$src_dir" ] && { echo -e "${RED}Error: Source directory required${NC}"; exit 1; }
+    if [ $JSON_MODE -eq 1 ]; then
+        exec 3>&1 1>&2
+    fi
+
+    [ -z "$src_dir" ] && { echo -e "${RED}Error: Source directory required${NC}"; json_fail "args" "Source directory required"; }
 
     local snapshot_dir="$OUTPUT_DIR/.mirror_bridge"
     local snapshot_file="$snapshot_dir/binding_snapshot.txt"
@@ -846,10 +961,25 @@ cmd_diff() {
     current_sig=$(scan_binding_signatures "$src_dir")
 
     if [ ! -f "$snapshot_file" ]; then
+        # In check mode a missing snapshot is an error, not a fresh start:
+        # CI should compare against a committed snapshot, never silently
+        # create one and pass.
+        if [ $check_mode -eq 1 ]; then
+            echo -e "${RED}Error: No snapshot found at $snapshot_file${NC}"
+            echo -e "${YELLOW}Run 'mirror_bridge diff $src_dir --update' locally and commit the snapshot.${NC}"
+            if [ $JSON_MODE -eq 1 ]; then
+                printf '{"status":"error","changed":null,"reason":"no snapshot found","snapshot":"%s"}\n' \
+                    "$(json_escape "$snapshot_file")" >&3
+            fi
+            exit 2
+        fi
         echo -e "${YELLOW}No previous snapshot found. Creating initial snapshot.${NC}"
         mkdir -p "$snapshot_dir"
         printf '%s\n' "$current_sig" > "$snapshot_file"
         echo -e "${GREEN}Snapshot saved to $snapshot_file${NC}"
+        if [ $JSON_MODE -eq 1 ]; then
+            printf '{"status":"ok","changed":false,"snapshot_created":true}\n' >&3
+        fi
         return 0
     fi
 
@@ -858,6 +988,9 @@ cmd_diff() {
 
     if [ "$current_sig" = "$previous_sig" ]; then
         echo -e "${GREEN}No binding surface changes detected.${NC}"
+        if [ $JSON_MODE -eq 1 ]; then
+            printf '{"status":"ok","changed":false}\n' >&3
+        fi
         return 0
     fi
 
@@ -872,6 +1005,17 @@ cmd_diff() {
 
     echo ""
     echo -e "  ${GREEN}+ $added added${NC}  ${RED}- $removed removed${NC}"
+
+    if [ $JSON_MODE -eq 1 ]; then
+        printf '{"status":"ok","changed":true,"added":%s,"removed":%s}\n' "$added" "$removed" >&3
+    fi
+
+    # In check mode drift is a failure: exit non-zero so CI/agents catch
+    # binding-surface changes that weren't snapshotted intentionally.
+    if [ "$check_mode" -eq 1 ]; then
+        echo -e "${RED}Binding surface drifted from snapshot (--check).${NC}"
+        exit 1
+    fi
 
     # Update snapshot: via flag, or interactively if terminal is attached
     if [ "$update_snapshot" -eq 1 ]; then
@@ -940,10 +1084,15 @@ accidental ABI breaks during development.
 ${YELLOW}Options:${NC}
   --output, -o    Build directory for storing snapshots (default: build)
   --update, -u    Update the snapshot without prompting (CI-friendly)
+  --check         Exit 1 if the surface drifted, 2 if no snapshot exists.
+                  Never modifies the snapshot. Use in CI to catch
+                  unintentional binding-surface changes.
+  --json          Emit one JSON result object on stdout (progress -> stderr)
 
 ${YELLOW}Example:${NC}
   mirror_bridge diff src/
   mirror_bridge diff src/ --update      # Non-interactive update
+  mirror_bridge diff src/ --check       # CI gate: fail on drift
   mirror_bridge diff src/ --output build/
 EOF
 }
@@ -1079,6 +1228,7 @@ main() {
         config) cmd_config "$@" ;;
         diff) cmd_diff "$@" ;;
         watch) cmd_watch "$@" ;;
+        doctor) exec "$PROJECT_ROOT/mirror_bridge_doctor" "$@" ;;
         init) echo "Not yet implemented"; exit 1 ;;
         version|--version|-v) cmd_version ;;
         help|--help|-h) show_help ;;
