@@ -2292,6 +2292,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `--pch [PATH]` | Use precompiled header (auto-detect or specify path) |
 | `-f, --force` | Force rebuild even if sources haven't changed |
 | `-I DIR` | Add include directory |
+| `--json` | Emit one JSON result object on stdout (see [Machine-readable output](#machine-readable-output)) |
 
 **Examples:**
 
@@ -2459,6 +2460,8 @@ mirror_bridge diff <src_dir> [options]
 |--------|-------------|
 | `-o, --output DIR` | Build directory for storing snapshots (default: `build/`) |
 | `-u, --update` | Update the snapshot without prompting (CI-friendly) |
+| `--check` | Never modify the snapshot; exit `1` on drift, `2` if no snapshot exists |
+| `--json` | Emit one JSON result object on stdout |
 
 The first run creates an initial snapshot. Subsequent runs compare against it and show added/removed binding surface elements.
 
@@ -2470,6 +2473,10 @@ mirror_bridge diff src/
 
 # Non-interactive update (for CI pipelines)
 mirror_bridge diff src/ --update
+
+# CI gate: fail the build if the binding surface drifted from the
+# committed snapshot
+mirror_bridge diff src/ --check
 
 # Custom snapshot location
 mirror_bridge diff src/ --output build/
@@ -2510,6 +2517,33 @@ mirror_bridge watch src/ --module my_lib --lang all --interval 1
 
 # With precompiled header for fast iteration
 mirror_bridge watch src/ --module my_lib --lang python --pch
+```
+
+### `doctor` - Diagnose Setup Issues
+
+Run environment diagnostics: compiler and reflection support, Python/Lua/Node
+development files, library paths, the Mirror Bridge installation itself, and a
+quick end-to-end binding compile + import test.
+
+```bash
+mirror_bridge doctor [options]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Show detailed output for each check |
+| `--fix` | Attempt to fix common issues (experimental) |
+| `--json` | Emit one JSON object on stdout instead of pretty output |
+
+Exits `0` when no check failed (warnings allowed), `1` otherwise.
+
+**Examples:**
+
+```bash
+mirror_bridge doctor             # Pretty diagnostic report
+mirror_bridge doctor --json      # Machine-readable report
 ```
 
 ### `init` - Initialize Project
@@ -2574,12 +2608,52 @@ Skip entire files:
 
 By default, `generate` tracks source file changes and only recompiles when header files have been modified since the last build. Use `--force` to bypass this check.
 
+## Machine-readable Output
+
+`generate`, `diff`, and `doctor` accept `--json`. The contract: **stdout
+carries exactly one JSON object** and all human-readable progress goes to
+stderr, so scripts, CI pipelines, and AI agents can parse results without
+scraping log text.
+
+`generate --json` on success:
+
+```json
+{
+  "status": "ok",
+  "module": "my_module",
+  "languages": ["python"],
+  "classes": [{"name": "Greeter", "header": "greeter.hpp"}],
+  "outputs": ["/path/to/build/my_module.so"],
+  "errors": []
+}
+```
+
+On failure, each entry in `errors` carries the first compiler error plus an
+actionable suggestion:
+
+```json
+{
+  "status": "error",
+  "errors": [{
+    "lang": "python",
+    "reason": "python/mirror_bridge_python.hpp:1127:14: error: no matching function for call to 'from_python'",
+    "suggestion": "A member type has no converter. Mark it [[=exclude{}]] or add a custom converter. See docs/reference/type-conversion.md"
+  }]
+}
+```
+
+`diff --json` reports `{"status": "ok", "changed": true, "added": 1, "removed": 0}`.
+`doctor --json` reports pass/warn/fail per check with a `hint` for each
+non-pass. See the [Error Catalog](errors.md) for the full symptom-to-fix
+reference the suggestions link to.
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Error (invalid arguments, compilation failure, etc.) |
+| 1 | Error (invalid arguments, compilation failure, binding-surface drift with `diff --check`, failed `doctor` checks) |
+| 2 | `diff --check` ran without a stored snapshot to compare against |
 
 ## Environment Variables
 
@@ -4621,6 +4695,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `--json` machine-readable output for `generate`, `diff`, and `doctor`: stdout carries exactly one JSON object (status, discovered classes, built outputs, and per-language errors with actionable suggestions); human-readable progress goes to stderr
+- `mirror_bridge doctor` subcommand integrating the diagnostic tool into the unified CLI
+- `mirror_bridge diff --check` CI gate: exits non-zero when the binding surface drifted from the committed snapshot, without ever modifying it
+- CMake package support: `find_package(mirror_bridge)` and FetchContent/`add_subdirectory` consumption via the exported `mirror_bridge::mirror_bridge` target, which now carries the reflection compile flags; version compatibility file; header installs preserve directory structure; as a dependency, mirror_bridge no longer injects global compile flags into the parent project
+- `AGENTS.md` operating manual for AI coding agents and `llms.txt`/`llms-full.txt` documentation bundles (generated by `tools/gen_llms_txt.sh`)
+- Error catalog (`docs/reference/errors.md`): every known failure mode with exact symptom, cause, and fix
+
+### Fixed
+- `generate` no longer reports success when a stale `.so` from a previous run exists but the current compile failed
+- `generate --lang all` now attempts every language and reports all failures instead of aborting on the first one
 - Rust FFI binding generation: `generate_bindings<T>()` produces extern "C" wrappers, C headers, and safe Rust wrapper types with Drop, Send, Sync, and idiomatic getters/setters
 - `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
 - `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
