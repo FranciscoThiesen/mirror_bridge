@@ -1,0 +1,4694 @@
+---
+# FILE: README.md
+---
+
+# Mirror Bridge
+
+**Write C++ once, bind everywhere — automatically.**
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespaces-Open-blue?logo=github)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
+
+Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
+
+> **Experimental**: Requires C++26 reflection (P2996) via [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996).
+
+## One C++ Class, Three Languages
+
+```cpp
+struct Calculator {
+    double value = 0.0;
+    double add(double x) { return value += x; }
+    double subtract(double x) { return value -= x; }
+};
+```
+
+```bash
+mirror_bridge generate src/ --module calc --lang all
+```
+
+**Python** | **Lua** | **JavaScript**
+```python
+import calc
+c = calc.Calculator()
+c.add(10)
+print(c.value)  # 10.0
+```
+
+## Try It Now
+
+No installation required — run in your browser or with Docker:
+
+**[Interactive Playground](docs/playground.md)** - Godbolt examples showing C++26 reflection in action
+
+**GitHub Codespaces** (browser-based, ~2 min):
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
+
+**Docker** (local, one command):
+
+```bash
+docker run -it --rm -v $(pwd):/workspace ghcr.io/franciscothiesen/mirror_bridge:latest
+```
+
+Then inside the container:
+```bash
+cd examples/01-hello-world
+../../tools/mirror_bridge generate src/ --module greeter --lang python
+python3 test_greeter.py
+```
+
+## Quick Start
+
+```bash
+# 1. Get the environment
+./start_dev_container.sh  # Choose option 1 for pre-built image
+
+# 2. Verify
+./tests/run_all_tests.sh
+
+# 3. Try an example
+cd examples/01-hello-world
+../../tools/mirror_bridge generate src/ --module greeter --lang python
+python3 test_greeter.py
+```
+
+**[Full Quick Start Guide →](docs/getting-started/quickstart.md)**
+
+## Features
+
+### Language Support
+
+| Language | Status | Auto-Discovery |
+|----------|--------|----------------|
+| Python | Stable | `--lang python` |
+| Lua | Stable | `--lang lua` |
+| JavaScript (Node.js) | Stable | `--lang js` |
+| Rust | Beta | Code generation |
+
+### Feature Matrix
+
+| Feature | Python | Lua | JavaScript |
+|---------|:------:|:---:|:----------:|
+| **Data Members** | ✅ | ✅ | ✅ |
+| **Methods (any arity)** | ✅ | ✅ | ✅ |
+| **Constructors** | ✅ | ✅ | ✅ |
+| **Containers (vector/array)** | ✅ | ✅ | ✅ |
+| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
+| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
+| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
+| **Variants (std::variant)** | ✅ | ✅ | ✅ |
+| **Nested Objects** | ✅ | ✅ | ✅ |
+| **Enums** | ✅ | ✅ | ✅ |
+| **Inheritance** | ✅ | ✅ | ✅ |
+| **Method Overloading** | ✅ | ⚠️ | ⚠️ |
+| **Smart Pointers** | ✅ | ⚠️ | ⚠️ |
+| **Exception Handling** | ✅ | ✅ | ✅ |
+| **Cross-Module Types** | ✅ | ❌ | ❌ |
+| **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
+| **Async/Await** | ✅ | ❌ | ✅ |
+| **std::optional** | ✅ | ✅ | ✅ |
+| **std::expected** | ✅ | ✅ | ✅ |
+
+✅ Full support  ⚠️ Partial support  ❌ Not supported
+
+### Additional Features
+
+- **Precompiled headers**: 3-6x faster builds
+- **Auto-discovery**: Zero binding code required
+- **Type stubs**: `.pyi` generation for Python IDE support
+
+## Documentation
+
+| Topic | Description |
+|-------|-------------|
+| **[Getting Started](docs/getting-started/)** | Quick start, installation, first binding |
+| **[Guides](docs/guides/)** | Workflow, PCH, multi-language, contributing |
+| **[Reference](docs/reference/)** | CLI, API, configuration, type conversion |
+| **[Architecture](docs/internals/architecture.md)** | System design and internals |
+| **[Examples](examples/)** | Progressive examples from hello-world to production |
+
+## CLI Usage
+
+```bash
+# Auto-discover and compile
+mirror_bridge generate src/ --module my_mod --lang python
+
+# With precompiled header (faster)
+mirror_bridge pch --output build/ --type release
+mirror_bridge generate src/ --module my_mod --lang python --pch
+
+# Multiple languages
+mirror_bridge generate src/ --module my_mod --lang all
+```
+
+**[Full CLI Reference →](docs/reference/cli.md)**
+
+## Performance
+
+| Metric | Mirror Bridge | pybind11 | Speedup |
+|--------|--------------|----------|---------|
+| **Function call** | 35ns | 127ns | **3.6x faster** |
+| **Object creation** | 47ns | 256ns | **5.4x faster** |
+| **Property access** | 12ns | 45ns | **3.8x faster** |
+| **Compile time** (with PCH) | 194ms | 1,938ms | **10x faster** |
+| **Binding code** | 0 lines | 18+ lines/class | **Zero boilerplate** |
+
+Measured with `-O3 -DNDEBUG` on identical hardware. See **[Benchmark Details →](docs/internals/benchmarks.md)** for full methodology and container/string benchmarks.
+
+## Project Structure
+
+```
+mirror_bridge/
+├── core/                    # Language-agnostic reflection
+├── python/                  # Python C API bindings
+├── lua/                     # Lua C API bindings
+├── javascript/              # Node.js N-API bindings
+├── tools/mirror_bridge      # Unified CLI
+├── docs/                    # Documentation
+├── examples/                # Progressive examples
+└── tests/                   # Test suite
+```
+
+## Requirements
+
+- **Compiler**: Bloomberg clang-p2996 (provided via Docker)
+- **Python**: 3.7+ | **Lua**: 5.4 | **Node.js**: 14+
+
+## Contributing
+
+See **[Contributing Guide](docs/guides/contributing.md)** for development setup and guidelines.
+
+## License
+
+Apache License 2.0 — See [LICENSE](LICENSE)
+
+---
+
+**[Documentation](docs/)** · **[Examples](examples/)** · **[Issues](https://github.com/FranciscoThiesen/mirror_bridge/issues)**
+
+
+---
+# FILE: docs/getting-started/first-binding.md
+---
+
+# Your First Binding
+
+This tutorial walks you through creating your first C++ to Python binding with Mirror Bridge.
+
+## Goal
+
+We'll create a simple `Greeter` class in C++ and use it from Python.
+
+## Step 1: Write Your C++ Class
+
+Create a file `greeter.hpp`:
+
+```cpp
+#pragma once
+#include <string>
+
+struct Greeter {
+    std::string name = "World";
+    int greeting_count = 0;
+
+    std::string greet() {
+        greeting_count++;
+        return "Hello, " + name + "!";
+    }
+
+    void reset() {
+        greeting_count = 0;
+    }
+};
+```
+
+That's it! No special macros, no registration code, just plain C++.
+
+## Step 2: Generate Bindings
+
+Run the Mirror Bridge CLI:
+
+```bash
+mirror_bridge generate . --module greeter --lang python
+```
+
+This command:
+1. Scans all `.hpp` and `.h` files in the current directory
+2. Discovers the `Greeter` class using C++26 reflection
+3. Generates Python C API binding code
+4. Compiles it to `build/greeter.so`
+
+## Step 3: Use from Python
+
+Create `test_greeter.py`:
+
+```python
+import sys
+sys.path.insert(0, 'build')
+import greeter
+
+# Create an instance
+g = greeter.Greeter()
+
+# Access properties
+print(g.name)           # "World"
+print(g.greeting_count) # 0
+
+# Modify properties
+g.name = "Mirror Bridge"
+
+# Call methods
+message = g.greet()
+print(message)          # "Hello, Mirror Bridge!"
+print(g.greeting_count) # 1
+
+# Call more methods
+g.greet()
+g.greet()
+print(g.greeting_count) # 3
+
+g.reset()
+print(g.greeting_count) # 0
+```
+
+Run it:
+
+```bash
+python3 test_greeter.py
+```
+
+## What Got Bound?
+
+Mirror Bridge automatically discovered and bound:
+
+| C++ Feature | Python Access |
+|-------------|---------------|
+| `std::string name` | `g.name` (read/write property) |
+| `int greeting_count` | `g.greeting_count` (read/write property) |
+| `std::string greet()` | `g.greet()` (method returning string) |
+| `void reset()` | `g.reset()` (void method) |
+| Default constructor | `greeter.Greeter()` |
+
+## Adding More Features
+
+Let's extend our class with more C++ features:
+
+```cpp
+#pragma once
+#include <string>
+#include <vector>
+
+struct Greeter {
+    std::string name = "World";
+    int greeting_count = 0;
+    std::vector<std::string> history;
+
+    std::string greet() {
+        greeting_count++;
+        std::string msg = "Hello, " + name + "!";
+        history.push_back(msg);
+        return msg;
+    }
+
+    // Multiple parameters
+    std::string greet_custom(std::string prefix, std::string suffix) {
+        greeting_count++;
+        std::string msg = prefix + name + suffix;
+        history.push_back(msg);
+        return msg;
+    }
+
+    // Return container
+    std::vector<std::string> get_history() const {
+        return history;
+    }
+
+    void reset() {
+        greeting_count = 0;
+        history.clear();
+    }
+};
+```
+
+Regenerate and test:
+
+```bash
+mirror_bridge generate . --module greeter --lang python
+```
+
+```python
+import greeter
+
+g = greeter.Greeter()
+g.name = "Developer"
+
+g.greet()
+g.greet_custom("Hi there, ", "!")
+g.greet_custom("Welcome, ", " to Mirror Bridge!")
+
+# Containers work automatically
+history = g.get_history()
+for msg in history:
+    print(msg)
+
+# Output:
+# Hello, Developer!
+# Hi there, Developer!
+# Welcome, Developer to Mirror Bridge!
+```
+
+## Skipping Classes
+
+If you have internal classes you don't want to expose:
+
+```cpp
+// This will be bound
+struct PublicAPI {
+    void do_something();
+};
+
+// MIRROR_BRIDGE_SKIP
+// This will NOT be bound
+struct InternalHelper {
+    void internal_stuff();
+};
+```
+
+## Next Steps
+
+- **[Examples](../../examples/)** - More comprehensive examples
+- **[CLI Reference](../reference/cli.md)** - All generation options
+- **[Type Conversion](../reference/type-conversion.md)** - How types map between languages
+- **[Multi-Language](../guides/multi-language.md)** - Add Lua and JavaScript bindings
+
+
+---
+# FILE: docs/getting-started/installation.md
+---
+
+# Installation Guide
+
+Mirror Bridge requires a C++26 compiler with reflection support. The easiest way to get started is using Docker.
+
+## Docker Setup (Recommended)
+
+We provide a Docker environment with everything pre-configured.
+
+### Quick Start
+
+```bash
+git clone https://github.com/FranciscoThiesen/mirror_bridge
+cd mirror_bridge
+./start_dev_container.sh
+```
+
+Choose an option:
+1. **Pull pre-built image** (~2 minutes) - Recommended for most users
+2. **Build from source** (~60 minutes) - For customization or offline use
+
+### What's Included
+
+The Docker container includes:
+- Bloomberg clang-p2996 with C++26 reflection support
+- libc++ with reflection enabled (`<meta>` header)
+- Python 3.10+ development headers
+- Lua 5.4 development headers
+- Node.js with N-API headers
+- All your changes preserved between sessions
+
+### Container Management
+
+```bash
+# Start/attach to container
+./start_dev_container.sh
+
+# Stop container (preserves state)
+docker stop mirror_bridge_dev
+
+# Remove container (lose state)
+docker rm mirror_bridge_dev
+
+# Remove image (forces re-download/rebuild)
+docker rmi mirror_bridge:latest
+```
+
+### Persistent Storage
+
+| Location | Persisted? |
+|----------|-----------|
+| `/workspace` (source code) | Yes (volume mount) |
+| Compiled bindings | Yes |
+| Installed packages | Yes |
+| Shell history | Yes |
+| `/tmp` contents | No |
+| Running processes | No |
+
+## Manual Installation
+
+If you need to build without Docker, you'll need Bloomberg's clang-p2996.
+
+### Prerequisites
+
+- CMake 3.16+
+- Python 3.7+ development headers
+- Lua 5.4 development headers (optional)
+- Node.js 14+ with N-API (optional)
+
+### Build clang-p2996
+
+```bash
+git clone https://github.com/bloomberg/clang-p2996
+cd clang-p2996
+mkdir build && cd build
+cmake -G Ninja \
+    -DLLVM_ENABLE_PROJECTS="clang" \
+    -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+    -DCMAKE_BUILD_TYPE=Release \
+    ../llvm
+ninja clang
+ninja cxx cxxabi
+```
+
+### Configure Environment
+
+```bash
+export CXX=/path/to/clang-p2996/build/bin/clang++
+export LD_LIBRARY_PATH=/path/to/clang-p2996/build/lib:$LD_LIBRARY_PATH
+```
+
+### Verify Installation
+
+```bash
+cd mirror_bridge
+./tests/run_all_tests.sh
+```
+
+## CMake Integration
+
+For projects using CMake, Mirror Bridge provides helper functions:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_project)
+
+# Add Mirror Bridge
+add_subdirectory(mirror_bridge)
+
+# Create a Python module
+mirror_bridge_python_module(my_module
+    SOURCES src/my_class.hpp
+)
+
+# Create a Lua module
+mirror_bridge_lua_module(my_module_lua
+    SOURCES src/my_class.hpp
+)
+```
+
+See the [CMake Integration Guide](../guides/cmake.md) for full details.
+
+## Troubleshooting
+
+### "libc++.so.1: cannot open shared object file"
+
+The libc++ library path isn't set. Add to your environment:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/lib/aarch64-unknown-linux-gnu:$LD_LIBRARY_PATH
+```
+
+The Docker container and test scripts set this automatically.
+
+### "error: no member named 'meta' in namespace 'std'"
+
+Your compiler doesn't have reflection support. Ensure you're using Bloomberg's clang-p2996.
+
+### "reflection support is experimental"
+
+This warning is expected. The P2996 proposal is still being standardized.
+
+## Next Steps
+
+- **[Quick Start](quickstart.md)** - Get running in 5 minutes
+- **[First Binding](first-binding.md)** - Create your first binding
+
+
+---
+# FILE: docs/getting-started/quickstart.md
+---
+
+# Quick Start (5 Minutes)
+
+Get C++ performance in Python/JavaScript/Lua with zero binding code.
+
+## Step 1: Get the Environment
+
+```bash
+git clone https://github.com/FranciscoThiesen/mirror_bridge
+cd mirror_bridge
+./start_dev_container.sh
+```
+
+**First time?** Choose option 1 to pull the pre-built image (~2 minutes) or option 2 to build from source (~60 minutes).
+
+## Step 2: Verify Installation
+
+```bash
+cd /workspace
+./tests/run_all_tests.sh
+```
+
+Expected output: `ALL TESTS PASSED!`
+
+## Step 3: Try an Example
+
+```bash
+cd examples/01-hello-world
+
+# Auto-generate Python bindings
+mirror_bridge generate src/ --module greeter --lang python
+
+# Test it
+python3 test_greeter.py
+```
+
+## Step 4: Create Your Own
+
+**Write C++:**
+```cpp
+// my_class.hpp
+struct Calculator {
+    double value = 0.0;
+    double add(double x) { return value += x; }
+};
+```
+
+**Generate binding (one command):**
+```bash
+mirror_bridge generate . --module my_calc --lang python
+```
+
+**Use from Python:**
+```python
+import sys; sys.path.insert(0, 'build')
+import my_calc
+
+calc = my_calc.Calculator()
+calc.add(10)
+print(calc.value)  # 10.0
+```
+
+## What Just Happened?
+
+1. Mirror Bridge scanned your C++ headers using reflection
+2. Discovered all classes, methods, and members automatically
+3. Generated Python bindings at compile-time
+4. No manual binding code needed!
+
+## Next Steps
+
+- **[First Binding Tutorial](first-binding.md)** - Step-by-step walkthrough
+- **[CLI Reference](../reference/cli.md)** - All command options
+- **[Examples](../../examples/)** - Progressive learning examples
+- **[Workflow Guide](../guides/workflow.md)** - PCH optimization for faster builds
+
+## Multi-Language Support
+
+Mirror Bridge supports multiple languages with the same workflow:
+
+```bash
+# Python
+mirror_bridge generate src/ --module my_module --lang python
+
+# Lua
+mirror_bridge generate src/ --module my_module --lang lua
+
+# JavaScript (Node.js)
+mirror_bridge generate src/ --module my_module --lang js
+
+# All languages at once
+mirror_bridge generate src/ --module my_module --lang all
+```
+
+See the [Multi-Language Guide](../guides/multi-language.md) for details.
+
+
+---
+# FILE: docs/guides/contributing.md
+---
+
+# Contributing Guide
+
+This guide covers everything you need to develop, test, and contribute to Mirror Bridge.
+
+## Development Environment
+
+### Quick Setup
+
+```bash
+# One command to get started
+./start_dev_container.sh
+```
+
+First run takes ~2-60 minutes depending on whether you pull or build the image.
+
+The Docker container includes:
+- Bloomberg clang-p2996 with C++26 reflection support
+- libc++ with reflection enabled (`<meta>` header)
+- Python 3.10+ development headers
+- Lua 5.4 development headers
+- Node.js with N-API headers
+- All your changes preserved between sessions
+
+### Daily Workflow
+
+```bash
+# Attach to container
+./start_dev_container.sh
+
+# Inside container - run tests
+cd /workspace
+./tests/run_all_tests.sh
+
+# Try examples
+cd examples/01-hello-world
+mirror_bridge generate src/ --module greeter --lang python
+python3 test_greeter.py
+
+# Exit (container stays running)
+exit
+```
+
+### What's Persisted?
+
+| Location | Persisted? |
+|----------|-----------|
+| `/workspace` (source code) | Yes |
+| Compiled bindings | Yes |
+| Installed packages | Yes |
+| Shell history | Yes |
+| `/tmp` contents | No |
+| Running processes | No |
+
+## Testing
+
+### Run All Tests
+
+```bash
+./tests/run_all_tests.sh
+```
+
+Expected output: `ALL TESTS PASSED!`
+
+### Test Structure
+
+```
+tests/
+├── e2e/
+│   ├── basic/           # Point2D, Vector3, Calculator
+│   ├── containers/      # std::vector, std::array
+│   ├── nesting/         # Nested classes, cross-file
+│   └── advanced/        # New features
+│       ├── variadic/    # Methods with 3-6 parameters
+│       ├── constructors/# Parameterized constructors
+│       ├── overloading/ # Method overloading
+│       └── smart_ptrs/  # unique_ptr, shared_ptr
+├── lua/                 # Lua-specific tests
+├── js/                  # JavaScript-specific tests
+└── run_all_tests.sh
+```
+
+### Writing Tests
+
+Each test consists of three files:
+
+**1. C++ Header** (`my_class.hpp`):
+```cpp
+struct MyClass {
+    double value;
+    double compute(double x, double y);
+};
+```
+
+**2. Binding File** (`my_class_binding.cpp`):
+```cpp
+#include "mirror_bridge.hpp"
+#include "my_class.hpp"
+
+MIRROR_BRIDGE_MODULE(my_module,
+    mirror_bridge::bind_class<MyClass>(m, "MyClass");
+)
+```
+
+**3. Test Script** (`test_my_class.py`):
+```python
+import sys
+sys.path.insert(0, '../../build')
+import my_module
+
+obj = my_module.MyClass()
+obj.value = 10.0
+assert obj.compute(5, 3) == 8.0
+print("Test passed!")
+```
+
+Tests are automatically discovered and run by `run_all_tests.sh`.
+
+## Code Style & Conventions
+
+### Modern C++ Practices
+
+This library showcases modern C++26:
+
+**Reflection (P2996R10 syntax):**
+```cpp
+auto members = std::meta::members_of(^^T, std::meta::access_context::current());
+constexpr auto name = std::meta::identifier_of(member);
+auto& value = obj.[:member:];  // Splicer
+```
+
+**Concepts:**
+```cpp
+template<Arithmetic T>
+PyObject* to_python(const T& value);
+
+template<SmartPointer T>
+PyObject* to_python(const T& ptr);
+```
+
+**Variadic Templates:**
+```cpp
+([&] {
+    process_parameter<Is>();
+}(), ...);  // Fold expression
+```
+
+### Documentation Standards
+
+- **Complex logic needs comments**: Explain WHY, not just WHAT
+- **Use section headers**: Clearly delineate different parts
+- **Document modern techniques**: Help readers learn from the code
+- **Avoid redundant comments**: Don't comment self-documenting code
+
+### Commit Guidelines
+
+```bash
+# Good commit messages
+git commit -m "Add smart pointer support for unique_ptr and shared_ptr"
+git commit -m "Fix template instantiation for nested bindable types"
+
+# Bad commit messages
+git commit -m "fix bug"
+git commit -m "updates"
+```
+
+## Pull Request Process
+
+1. Fork and create a feature branch
+2. Make your changes with clear commits
+3. Ensure all tests pass: `./tests/run_all_tests.sh`
+4. Update documentation if needed
+5. Submit PR with description of changes
+
+### Areas Needing Work
+
+- **Reference parameters**: Passing bound classes by reference
+- **Template classes**: Automatic template instantiation detection
+- **Const method overloads**: Distinguish const vs non-const methods
+- **Additional language backends**: Ruby, Go, Rust
+- **Python stub generation**: `.pyi` files for IDE support
+
+## Project Structure
+
+```
+mirror_bridge/
+├── core/                    # Language-agnostic reflection
+├── python/                  # Python C API bindings
+├── lua/                     # Lua C API bindings
+├── javascript/              # Node.js N-API bindings
+├── tools/                   # CLI tools
+├── docs/                    # Documentation
+├── examples/                # Progressive examples
+├── tests/                   # Test suite
+├── single_header/           # Amalgamated headers
+└── benchmarks/              # Performance tests
+```
+
+## Common Issues
+
+### "libc++.so.1: cannot open shared object file"
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/lib/aarch64-unknown-linux-gnu:$LD_LIBRARY_PATH
+```
+
+The test runner sets this automatically.
+
+### Container management
+
+```bash
+docker stop mirror_bridge_dev     # Stop container
+docker rm mirror_bridge_dev       # Remove container
+docker rmi mirror_bridge:latest   # Remove image
+```
+
+## License
+
+Apache License 2.0 - See LICENSE for details.
+
+
+---
+# FILE: docs/guides/multi-language.md
+---
+
+# Multi-Language Support
+
+Mirror Bridge supports **three languages** using a single, elegant reflection-based architecture:
+
+- **Python** (Python C API)
+- **JavaScript** (Node.js N-API)
+- **Lua** (Lua C API)
+
+All three share the same core reflection infrastructure, ensuring consistent behavior and minimal code duplication.
+
+## Quick Start
+
+### Same C++, Multiple Languages
+
+Write your C++ once:
+
+```cpp
+// calculator.hpp
+struct Calculator {
+    double value = 0.0;
+    double add(double x) { return value += x; }
+    double subtract(double x) { return value -= x; }
+    std::string to_string() const {
+        return "Calculator(value=" + std::to_string(value) + ")";
+    }
+};
+```
+
+Generate bindings for each language:
+
+```bash
+# Python
+mirror_bridge generate src/ --module calc --lang python
+
+# Lua
+mirror_bridge generate src/ --module calc --lang lua
+
+# JavaScript
+mirror_bridge generate src/ --module calc --lang js
+
+# All at once
+mirror_bridge generate src/ --module calc --lang all
+```
+
+### Language Usage
+
+**Python:**
+```python
+import calc
+c = calc.Calculator()
+c.add(10.0)
+c.subtract(3.0)
+print(c.value)        # 7.0
+print(c.to_string())  # "Calculator(value=7.000000)"
+```
+
+**Lua:**
+```lua
+local calc = require("calc")
+local c = calc.Calculator()
+c:add(10.0)
+c:subtract(3.0)
+print(c.value)        -- 7.0
+print(c:to_string())  -- "Calculator(value=7.000000)"
+```
+
+**JavaScript:**
+```javascript
+const calc = require('./build/calc');
+const c = new calc.Calculator();
+c.add(10.0);
+c.subtract(3.0);
+console.log(c.value);        // 7.0
+console.log(c.to_string());  // "Calculator(value=7.000000)"
+```
+
+## Type Conversion Matrix
+
+| C++ Type | Python | JavaScript | Lua |
+|----------|--------|------------|-----|
+| `int`, `double`, `float` | `int`, `float` | `number` | `number` |
+| `std::string` | `str` | `string` | `string` |
+| `bool` | `bool` | `boolean` | `boolean` |
+| `std::vector<T>` | `list` | `Array` | `table` |
+| `std::array<T, N>` | `list` | `Array` | `table` |
+| `struct {...}` | `dict` | `Object` | `table` |
+| `std::unique_ptr<T>` | Converted value | Converted value | Converted value |
+| `enum` / `enum class` | `int` | `number` | `number` |
+
+## Architecture
+
+```
+mirror_bridge/
+├── core/
+│   └── mirror_bridge_core.hpp          # Language-agnostic reflection engine
+│       ├── Type traits & concepts
+│       ├── Reflection utilities
+│       ├── Metadata registry
+│       └── Member/method caches
+│
+├── python/
+│   └── mirror_bridge_python.hpp        # Python C API bindings
+│
+├── javascript/
+│   └── mirror_bridge_javascript.hpp    # Node.js N-API bindings
+│
+└── lua/
+    └── mirror_bridge_lua.hpp           # Lua C API bindings
+```
+
+### Key Design Principles
+
+**1. Separation of Concerns**
+- **Core**: Language-agnostic C++26 reflection logic
+- **Language Bindings**: Language-specific FFI layer
+
+**2. Zero Code Duplication**
+The core reflection logic is shared across all languages. Each language binding only implements:
+- Type conversion functions
+- FFI-specific wrapper templates
+- Language-specific module macros
+
+**3. Consistent API Surface**
+All three languages expose the same C++ API:
+- Data members as properties
+- Methods with full type conversion
+- Constructors (default + parameterized)
+- Nested objects
+- Containers
+
+## Manual Binding (Advanced)
+
+For fine-grained control, you can write manual binding files:
+
+**Python:**
+```cpp
+#include "python/mirror_bridge_python.hpp"
+#include "calculator.hpp"
+
+MIRROR_BRIDGE_MODULE(calc,
+    mirror_bridge::bind_class<Calculator>(m, "Calculator");
+)
+```
+
+**Lua:**
+```cpp
+#include "lua/mirror_bridge_lua.hpp"
+#include "calculator.hpp"
+
+MIRROR_BRIDGE_LUA_MODULE(calc,
+    mirror_bridge::lua::bind_class<Calculator>(L, "Calculator");
+)
+```
+
+**JavaScript:**
+```cpp
+#include "javascript/mirror_bridge_javascript.hpp"
+#include "calculator.hpp"
+
+MIRROR_BRIDGE_JS_MODULE(calc,
+    mirror_bridge::javascript::bind_class<Calculator>(env, m, "Calculator");
+)
+```
+
+## Build Commands
+
+**Python:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I. -fPIC -shared $(python3-config --includes --ldflags) \
+    binding.cpp -o module.so
+```
+
+**Lua:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I. -I/usr/include/lua5.4 -fPIC -shared \
+    binding.cpp -o module.so -llua5.4
+```
+
+**JavaScript:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I. -I/usr/include/node -fPIC -shared \
+    binding.cpp -o module.node
+```
+
+## Container Support
+
+**C++:**
+```cpp
+struct VectorTest {
+    std::vector<int> numbers;
+    std::vector<std::string> names;
+    int get_sum() const;
+    int count_names() const;
+};
+```
+
+**Python:**
+```python
+v = VectorTest()
+v.numbers = [1, 2, 3, 4, 5]
+v.names = ["Alice", "Bob"]
+print(v.get_sum())     # 15
+print(v.count_names()) # 2
+```
+
+**Lua:**
+```lua
+v = VectorTest()
+v.numbers = {1, 2, 3, 4, 5}
+v.names = {"Alice", "Bob"}
+print(v:get_sum())     -- 15
+print(v:count_names()) -- 2
+```
+
+**JavaScript:**
+```javascript
+const v = new VectorTest();
+v.numbers = [1, 2, 3, 4, 5];
+v.names = ["Alice", "Bob"];
+console.log(v.get_sum());     // 15
+console.log(v.count_names()); // 2
+```
+
+## Nested Object Support
+
+**C++:**
+```cpp
+struct Address {
+    std::string street;
+    std::string city;
+    int zip;
+};
+
+struct Person {
+    std::string name;
+    int age;
+    Address address;
+};
+```
+
+All languages convert nested objects to native dictionaries/objects/tables with full read/write access.
+
+## Performance
+
+All three bindings achieve **zero runtime overhead** through compile-time code generation:
+
+- **Python**: Direct C API calls
+- **JavaScript**: N-API with minimal wrapper objects
+- **Lua**: Lightweight metatable-based access
+
+Compile-time performance is optimized via:
+- Member/method caches (O(1) lookups)
+- Shared reflection infrastructure
+- Template instantiation control
+
+
+---
+# FILE: docs/guides/packaging.md
+---
+
+# Packaging and Distribution
+
+How to distribute mirror_bridge bindings as installable Python packages.
+
+## Quick Start
+
+After generating your bindings, create a pip-installable package:
+
+```bash
+# Generate the binding
+mirror_bridge generate src/ --module my_lib --lang python
+
+# Package it
+cd build/
+pip install .
+```
+
+## Project Layout
+
+A distributable mirror_bridge project looks like:
+
+```
+my_project/
+├── src/
+│   └── my_class.hpp          # Your C++ headers
+├── build/
+│   ├── my_lib_binding.cpp     # Auto-generated binding
+│   └── my_lib.so              # Compiled shared library
+├── pyproject.toml              # Package metadata
+├── setup.py                    # Build configuration
+└── my_lib/
+    ├── __init__.py             # Python package init
+    └── my_lib.so -> ../build/my_lib.so
+```
+
+## pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-lib"
+version = "0.1.0"
+description = "Python bindings for my C++ library via mirror_bridge"
+requires-python = ">=3.7"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+```
+
+## setup.py (for native extensions)
+
+```python
+from setuptools import setup, Extension
+import subprocess
+import os
+
+# Pre-build the binding using mirror_bridge
+def build_binding():
+    """Generate and compile the binding if not already built."""
+    if not os.path.exists("build/my_lib.so"):
+        subprocess.check_call([
+            "mirror_bridge", "generate", "src/",
+            "--module", "my_lib",
+            "--lang", "python"
+        ])
+
+build_binding()
+
+setup(
+    name="my-lib",
+    version="0.1.0",
+    packages=["my_lib"],
+    package_data={"my_lib": ["*.so"]},
+    # Include the compiled .so in the package
+    data_files=[("my_lib", ["build/my_lib.so"])],
+)
+```
+
+## __init__.py
+
+```python
+"""Python bindings for my C++ library."""
+
+import os
+import sys
+
+# Add the package directory to the path so the .so can be found
+_dir = os.path.dirname(os.path.abspath(__file__))
+if _dir not in sys.path:
+    sys.path.insert(0, _dir)
+
+from my_lib import *  # Import all bound classes
+```
+
+## Building a Wheel
+
+```bash
+# Install build tools
+pip install build
+
+# Build the wheel (requires mirror_bridge compiler in PATH)
+python -m build --wheel
+
+# The wheel is in dist/
+ls dist/
+# my_lib-0.1.0-cp310-cp310-linux_x86_64.whl
+```
+
+## Docker-Based Packaging
+
+Since mirror_bridge requires Bloomberg's clang-p2996, you'll typically build inside the Docker container and package the resulting `.so`:
+
+```bash
+# Build inside Docker
+docker run --rm -v $(pwd):/workspace ghcr.io/franciscothiesen/mirror_bridge:latest \
+    bash -c "cd /workspace && mirror_bridge generate src/ --module my_lib --lang python"
+
+# Now package locally (only needs the pre-built .so)
+pip wheel . --no-build-isolation
+```
+
+## Multi-Platform Wheels
+
+For distributing across platforms, build a wheel for each target:
+
+```bash
+# Linux x86_64
+docker run --platform linux/amd64 ...
+
+# Linux ARM64
+docker run --platform linux/arm64 ...
+```
+
+Each produces a platform-specific wheel that can be uploaded to PyPI.
+
+## Publishing to PyPI
+
+```bash
+pip install twine
+
+# Upload to TestPyPI first
+twine upload --repository testpypi dist/*
+
+# Upload to PyPI
+twine upload dist/*
+```
+
+## CMake Integration
+
+For projects using CMake, add the binding as a build target:
+
+```cmake
+# In your CMakeLists.txt
+find_package(Python3 COMPONENTS Development)
+
+mirror_bridge_python_module(my_lib
+    SOURCES src/my_class.hpp
+)
+
+# Install the .so alongside your Python package
+install(TARGETS my_lib DESTINATION my_lib)
+```
+
+## Example: Complete Distributable Project
+
+See [examples/packaging/](../../examples/packaging/) for a complete working example with:
+- C++ source header
+- pyproject.toml configuration
+- setup.py with auto-build
+- __init__.py with proper imports
+- Tests with pytest
+
+## Tips
+
+- **Pin the compiler version**: Use a specific Docker image tag, not `:latest`
+- **Cache the PCH**: Pre-build the precompiled header to speed up CI builds
+- **Version your .so**: Include the version in the .so filename for ABI tracking
+- **Test the wheel**: Install in a clean virtualenv before publishing
+
+
+---
+# FILE: docs/guides/pch-optimization.md
+---
+
+# Precompiled Header (PCH) Guide
+
+Want **66-84% faster compilation**? Use precompiled headers!
+
+## TL;DR - Quick Start
+
+```bash
+# Step 1: Build the PCH once (one-time setup)
+mirror_bridge pch --output build/ --type release
+
+# Step 2: Use the PCH in your bindings
+mirror_bridge generate src/ --module my_module --lang python --pch build/
+```
+
+## Performance Impact
+
+Measured on Bloomberg clang-p2996 with `-O3 -DNDEBUG`:
+
+| Project Size | Without PCH | With PCH | Speedup |
+|--------------|-------------|----------|---------|
+| Simple (1 class) | 567ms | 194ms | **2.9x faster** |
+| Medium (10 classes) | 1580ms | 252ms | **6.3x faster** |
+
+**Key insight**: The larger your project, the bigger the PCH benefit!
+
+## What is a Precompiled Header?
+
+A precompiled header (PCH) is a pre-parsed version of header files that the compiler can reuse across multiple source files. Instead of reparsing `mirror_bridge.hpp`, `<Python.h>`, and `<meta>` every time, the compiler loads the pre-parsed version instantly.
+
+**Benefits:**
+- Dramatically faster compilation (2-6x speedup)
+- Especially helpful for large projects
+- No runtime cost - purely a compilation optimization
+- Compatible with C++26 reflection
+
+**Trade-offs:**
+- Must rebuild PCH if you change compiler flags
+- Need separate PCH for Debug vs Release builds
+- PCH files are large (~16MB) but reusable
+
+## Using the CLI
+
+### Build PCH
+
+```bash
+# Release build
+mirror_bridge pch --output build/ --type release
+
+# Debug build
+mirror_bridge pch --output build/ --type debug
+```
+
+### Generate with PCH
+
+```bash
+# Auto-detect PCH in build/
+mirror_bridge generate src/ --module my_module --lang python --pch
+
+# Specify PCH path explicitly
+mirror_bridge generate src/ --module my_module --lang python --pch /path/to/pch.gch
+```
+
+## Manual Usage
+
+### Step 1: Create the PCH
+
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -fPIC -stdlib=libc++ \
+  -I/usr/include/python3.10 \
+  -O3 -DNDEBUG \
+  -x c++-header mirror_bridge_pch.hpp \
+  -o build/mirror_bridge_pch.hpp.gch
+```
+
+**Important**: Use the **exact same flags** you'll use for your bindings!
+
+### Step 2: Use the PCH
+
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -shared -fPIC -stdlib=libc++ \
+  -I/usr/include/python3.10 \
+  -O3 -DNDEBUG \
+  -include-pch build/mirror_bridge_pch.hpp.gch \
+  my_bindings.cpp -o my_module.so
+```
+
+**Note**: Do NOT `#include "mirror_bridge.hpp"` in your source file when using `-include-pch`. The PCH already includes it.
+
+## Best Practices
+
+### 1. One PCH per build configuration
+
+```bash
+# Debug
+mirror_bridge pch --output build/ --type debug
+
+# Release
+mirror_bridge pch --output build/ --type release
+```
+
+### 2. Rebuild PCH when updating Mirror Bridge
+
+If you update `mirror_bridge.hpp`, rebuild the PCH:
+
+```bash
+rm build/*.gch
+mirror_bridge pch --output build/ --type release
+```
+
+### 3. Share PCH across multiple modules
+
+```bash
+# Build PCH once
+mirror_bridge pch --output build/ --type release
+
+# Use in multiple modules
+mirror_bridge generate mod1/src/ --module mod1 --lang python --pch build/
+mirror_bridge generate mod2/src/ --module mod2 --lang python --pch build/
+mirror_bridge generate mod3/src/ --module mod3 --lang python --pch build/
+```
+
+### 4. PCH is optional
+
+You can always compile without PCH - it's purely a performance optimization.
+
+## Troubleshooting
+
+### Error: "predefined macro was disabled in precompiled file"
+
+**Cause**: PCH was built with different optimization flags than your source file.
+
+**Solution**: Rebuild PCH with matching flags:
+```bash
+# If compiling with -O0 (debug), PCH needs debug mode
+mirror_bridge pch --output build/ --type debug
+
+# If compiling with -O3 (release), PCH needs release mode
+mirror_bridge pch --output build/ --type release
+```
+
+### Error: "is pie differs in precompiled file"
+
+**Cause**: PCH was built without `-fPIC` but you're building a shared library.
+
+**Solution**: The CLI handles this automatically. For manual builds, ensure both use `-fPIC`.
+
+### Error: "PCH file not found"
+
+**Cause**: Wrong path to PCH file.
+
+**Solution**: Check the path or use `--pch` without arguments to auto-detect:
+```bash
+mirror_bridge generate src/ --module my_module --lang python --pch
+```
+
+## How It Works
+
+When you compile normally:
+1. Compiler parses `<meta>` (~100ms)
+2. Compiler parses `<Python.h>` (~200ms)
+3. Compiler parses `mirror_bridge.hpp` (~150ms)
+4. **Total**: ~450ms of header parsing
+
+With PCH:
+1. Compiler loads pre-parsed state (~20ms)
+2. **Total**: ~20ms
+
+**Savings**: 430ms per compilation unit!
+
+## When to Use PCH
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Single small binding file | Optional |
+| Multiple binding files | **Yes** |
+| Large project (10+ classes) | **Absolutely** |
+| Rapid iteration during development | **Yes** |
+| CI/CD builds | **Yes** |
+
+**PCH is free performance** - it's just a different way of compiling the exact same code.
+
+
+---
+# FILE: docs/guides/single-header.md
+---
+
+# Single-Header Distribution Guide
+
+Mirror Bridge provides **single-header versions** for all three supported languages, making it easy to integrate into your projects. Just copy one file and start binding!
+
+## Quick Start
+
+### 1. Get the single-header file you need:
+
+```bash
+# Python
+cp single_header/mirror_bridge_python.hpp /your/project/
+
+# Lua
+cp single_header/mirror_bridge_lua.hpp /your/project/
+
+# JavaScript
+cp single_header/mirror_bridge_javascript.hpp /your/project/
+```
+
+### 2. Create your C++ class:
+
+```cpp
+// robot.hpp
+#pragma once
+#include <string>
+
+struct Robot {
+    std::string name;
+    double battery = 100.0;
+
+    void move_forward(double distance) {
+        battery -= distance * 0.1;
+    }
+
+    std::string get_status() const {
+        return name + " (battery: " + std::to_string(battery) + "%)";
+    }
+};
+```
+
+### 3. Create bindings (3 lines!):
+
+**Python:**
+```cpp
+#include "mirror_bridge_python.hpp"
+#include "robot.hpp"
+
+MIRROR_BRIDGE_MODULE(robot,
+    mirror_bridge::bind_class<Robot>(m, "Robot");
+)
+```
+
+**Lua:**
+```cpp
+#include "mirror_bridge_lua.hpp"
+#include "robot.hpp"
+
+MIRROR_BRIDGE_LUA_MODULE(robot,
+    mirror_bridge::lua::bind_class<Robot>(L, "Robot");
+)
+```
+
+**JavaScript:**
+```cpp
+#include "mirror_bridge_javascript.hpp"
+#include "robot.hpp"
+
+MIRROR_BRIDGE_JS_MODULE(robot,
+    mirror_bridge::javascript::bind_class<Robot>(env, m, "Robot");
+)
+```
+
+### 4. Compile:
+
+**Python:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -fPIC -shared $(python3-config --includes --ldflags) \
+    binding.cpp -o robot.so
+```
+
+**Lua:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I/usr/include/lua5.4 -fPIC -shared \
+    binding.cpp -o robot.so -llua5.4
+```
+
+**JavaScript:**
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I/usr/include/node -fPIC -shared \
+    binding.cpp -o robot.node
+```
+
+### 5. Use:
+
+**Python:**
+```python
+import robot
+r = robot.Robot()
+r.name = "RoboBot"
+r.move_forward(50.0)
+print(r.get_status())  # "RoboBot (battery: 95.0%)"
+```
+
+**Lua:**
+```lua
+local robot = require("robot")
+local r = robot.Robot()
+r.name = "RoboBot"
+r:move_forward(50.0)
+print(r:get_status())  -- "RoboBot (battery: 95.0%)"
+```
+
+**JavaScript:**
+```javascript
+const robot = require('./robot');
+const r = new robot.Robot();
+r.name = "RoboBot";
+r.move_forward(50.0);
+console.log(r.get_status());  // "RoboBot (battery: 95.0%)"
+```
+
+## File Sizes
+
+| Language | File | Lines | Size |
+|----------|------|-------|------|
+| Python | `mirror_bridge_python.hpp` | ~1771 | ~65 KB |
+| Lua | `mirror_bridge_lua.hpp` | ~859 | ~32 KB |
+| JavaScript | `mirror_bridge_javascript.hpp` | ~875 | ~33 KB |
+
+All files are self-contained with **zero external dependencies** (except language headers).
+
+## What Gets Automatically Bound?
+
+When you use `bind_class<T>()`, Mirror Bridge automatically creates bindings for:
+
+- **All public data members** as properties (get/set)
+- **All public methods** with full parameter passing
+- **Const methods** (read-only operations)
+- **Void methods** (no return value)
+- **Methods with multiple parameters**
+- **Return values** (numeric, strings, containers, etc.)
+- **Containers** (vector, array, etc.)
+- **Nested objects** (structs)
+- **Enums** (converted to integers)
+
+**No boilerplate required!** Just `bind_class<YourClass>(...)` and everything is bound.
+
+## Multi-Header vs Single-Header
+
+### Multi-Header (Original)
+```
+your_project/
+├── mirror_bridge/
+│   ├── core/mirror_bridge_core.hpp
+│   ├── python/mirror_bridge_python.hpp
+│   └── lua/mirror_bridge_lua.hpp
+└── your_binding.cpp
+```
+
+**Pros:**
+- Clearer separation of concerns
+- Easier to develop/maintain the library
+- Can switch languages easily
+
+**Cons:**
+- Need to copy entire directory structure
+- More complex include paths
+
+### Single-Header (Amalgamated)
+```
+your_project/
+├── mirror_bridge_python.hpp  (single file!)
+└── your_binding.cpp
+```
+
+**Pros:**
+- Copy just one file
+- Simpler include paths
+- Easier to distribute
+- Less clutter
+
+**Cons:**
+- Slightly larger file size (but still small)
+
+**Both produce identical compiled output!**
+
+## Regenerating Single-Headers
+
+If you modify the library source code, regenerate the single-headers:
+
+```bash
+./amalgamate.sh
+```
+
+This combines:
+1. `core/mirror_bridge_core.hpp` (shared reflection engine)
+2. Language-specific header (`python/`, `lua/`, or `javascript/`)
+
+Into a single self-contained header for each language.
+
+## Distribution Recommendations
+
+| User Type | Recommendation |
+|-----------|---------------|
+| End users (using bindings) | Single-header versions |
+| Library developers | Multi-header versions |
+| Contributors | Multi-header + generate single-headers before releases |
+
+## Compiler Requirements
+
+**Required:**
+- Bloomberg's clang-p2996 (C++26 reflection support)
+- C++2c standard (`-std=c++2c`)
+- Reflection flags: `-freflection -freflection-latest`
+- libc++ standard library (`-stdlib=libc++`)
+
+**Docker Available:**
+```bash
+./start_dev_container.sh
+```
+
+
+---
+# FILE: docs/guides/workflow.md
+---
+
+# Development Workflow Guide
+
+This guide shows the **recommended workflow** for maximum productivity with Mirror Bridge.
+
+## The Ideal Setup: Auto-Discovery + PCH
+
+The recommended workflow combines:
+- **Zero boilerplate code** (auto-discovery)
+- **Fast compilation** (precompiled headers)
+- **Simple workflow** (2-3 commands total)
+
+## Quick Comparison: Mirror Bridge vs Traditional Binding Libraries
+
+### Traditional Approach (pybind11/nanobind)
+
+```cpp
+// bindings.cpp - you must write this manually (18+ lines per class)
+#include <nanobind/nanobind.h>
+#include "my_classes.hpp"
+
+namespace nb = nanobind;
+
+NB_MODULE(my_module, m) {
+    nb::class_<MyClass>(m, "MyClass")
+        .def(nb::init<>())
+        .def(nb::init<int, double, std::string>())
+        .def_rw("id", &MyClass::id)
+        .def_rw("value", &MyClass::value)
+        .def_rw("name", &MyClass::name)
+        .def("compute", &MyClass::compute);
+    // ...repeat for every class
+}
+```
+
+### Mirror Bridge Approach
+
+```cpp
+// NO CODE TO WRITE!
+// Just have your header files with your classes
+```
+
+**Lines of code**: 0 (literally zero)
+
+## Step-by-Step Workflow
+
+### Step 1: One-Time PCH Creation
+
+Create the precompiled header **once per build configuration**:
+
+```bash
+# Build PCH (one-time setup, ~600ms)
+mirror_bridge pch --output build/ --type release
+```
+
+This creates `build/mirror_bridge_pch.hpp.gch` which caches all Mirror Bridge infrastructure.
+
+### Step 2: Auto-Discover and Build
+
+Build your module with a single command:
+
+```bash
+mirror_bridge generate src/ --module my_module --lang python --pch
+```
+
+**What it does**:
+1. Scans all `.hpp` and `.h` files in `src/`
+2. Finds all `struct` and `class` definitions
+3. Auto-generates binding code
+4. Compiles with PCH (fast!)
+5. Produces `build/my_module.so`
+
+**Time cost**: ~194-252ms (3-6x faster than without PCH!)
+
+### Step 3: Use in Your Language
+
+**Python:**
+```python
+import my_module
+
+obj = my_module.MyClass()
+obj.value = 42
+print(obj.compute())
+```
+
+**Lua:**
+```lua
+local my_module = require("my_module")
+
+local obj = my_module.MyClass()
+obj.value = 42
+print(obj:compute())
+```
+
+**JavaScript:**
+```javascript
+const my_module = require('./build/my_module');
+
+const obj = new my_module.MyClass();
+obj.value = 42;
+console.log(obj.compute());
+```
+
+## Multi-Project Setup
+
+If you have multiple binding modules, share the PCH across all of them:
+
+```bash
+# Create PCH once
+mirror_bridge pch --output build/ --type release
+
+# Build multiple modules, all using the same PCH
+mirror_bridge generate project1/src/ --module project1 --lang python --pch build/
+mirror_bridge generate project2/src/ --module project2 --lang python --pch build/
+mirror_bridge generate project3/src/ --module project3 --lang python --pch build/
+```
+
+The PCH cost (~600ms) is **amortized across all projects**!
+
+## Opt-Out: Skipping Classes
+
+If you have internal classes you don't want bound:
+
+```cpp
+// This class will be auto-discovered and bound
+struct PublicAPI {
+    int value;
+    void process();
+};
+
+// MIRROR_BRIDGE_SKIP
+// This class will be ignored by auto-discovery
+struct InternalHelper {
+    void internal_stuff();
+};
+```
+
+Or skip entire files:
+
+```cpp
+// MIRROR_BRIDGE_SKIP_FILE
+// At the top of a header file to skip the entire file
+```
+
+## Performance Comparison
+
+### Simple Project (1 class, ~10 methods)
+
+| Approach | Code Lines | Compile Time |
+|----------|-----------|--------------|
+| nanobind | ~18 lines | 165ms |
+| Mirror Bridge (no PCH) | 0 lines | 567ms |
+| **Mirror Bridge + PCH** | **0 lines** | **194ms** |
+
+### Medium Project (10 classes, ~50 methods)
+
+| Approach | Code Lines | Compile Time |
+|----------|-----------|--------------|
+| nanobind | ~103 lines | 218ms |
+| Mirror Bridge (no PCH) | 0 lines | 1695ms |
+| **Mirror Bridge + PCH** | **0 lines** | **252ms** |
+
+## When to Use PCH
+
+| Scenario | Use PCH? |
+|----------|----------|
+| Single small binding file | Optional |
+| Multiple small files | **Yes** |
+| Medium-large project | **Absolutely** |
+| Active development | **Yes** |
+| CI/CD pipeline | **Yes** |
+| One-off script | No |
+
+## Troubleshooting
+
+### "Error: __OPTIMIZE__ predefined macro was disabled"
+
+**Cause**: PCH built with different optimization flags
+
+**Solution**: Rebuild PCH with matching flags:
+```bash
+# If building with -O3 (release), PCH needs release mode
+mirror_bridge pch --output build/ --type release
+
+# If building with -O0 (debug), PCH needs debug mode
+mirror_bridge pch --output build/ --type debug
+```
+
+### "No classes found in src/"
+
+**Causes**:
+1. No `.hpp` or `.h` files in the directory
+2. All classes marked with `MIRROR_BRIDGE_SKIP`
+
+**Solutions**:
+1. Ensure header files exist
+2. Remove skip markers if unintentional
+
+## Summary
+
+**Mirror Bridge with auto-discovery + PCH gives you:**
+
+- **Zero boilerplate** - No binding code to write
+- **Fast compilation** - Within 15-20% of nanobind
+- **Auto-sync** - Classes automatically available
+- **No maintenance** - Add classes, run command, done
+- **Type safety** - Compile-time checking via reflection
+
+
+---
+# FILE: docs/reference/api.md
+---
+
+# API Reference
+
+This document covers the C++ API for Mirror Bridge, including the core concepts, binding functions, and macros.
+
+## Core Concepts
+
+Mirror Bridge uses C++20 concepts to classify types at compile-time.
+
+### `Arithmetic`
+
+Matches numeric types (int, float, double, etc.).
+
+```cpp
+template<typename T>
+concept Arithmetic = std::is_arithmetic_v<std::remove_cvref_t<T>>;
+```
+
+### `StringLike`
+
+Matches string types.
+
+```cpp
+template<typename T>
+concept StringLike =
+    std::is_same_v<std::remove_cvref_t<T>, std::string> ||
+    std::is_same_v<std::remove_cvref_t<T>, std::string_view> ||
+    std::is_same_v<std::remove_cvref_t<T>, const char*>;
+```
+
+### `Container`
+
+Matches STL containers (vector, array, list, etc.).
+
+```cpp
+template<typename T>
+concept Container = requires {
+    { std::declval<T>().begin() } -> std::input_or_output_iterator;
+    { std::declval<T>().end() } -> std::input_or_output_iterator;
+    { std::declval<T>().size() } -> std::convertible_to<std::size_t>;
+    typename std::remove_cvref_t<T>::value_type;
+} && !StringLike<T> && !SmartPointer<T>;
+```
+
+### `SmartPointer`
+
+Matches `unique_ptr` and `shared_ptr`.
+
+```cpp
+template<typename T>
+concept SmartPointer = requires {
+    typename std::remove_cvref_t<T>::element_type;
+} && (/* is unique_ptr or shared_ptr */);
+```
+
+### `EnumType`
+
+Matches enum and enum class types.
+
+```cpp
+template<typename T>
+concept EnumType = std::is_enum_v<std::remove_cvref_t<T>>;
+```
+
+### `Bindable`
+
+Matches classes that can be reflected and bound.
+
+```cpp
+template<typename T>
+concept Bindable = std::is_class_v<std::remove_cvref_t<T>> && requires {
+    { std::meta::nonstatic_data_members_of(^^std::remove_cvref_t<T>, std::meta::access_context::current()) };
+};
+```
+
+## Python Bindings
+
+### `MIRROR_BRIDGE_MODULE`
+
+Main macro for creating a Python module.
+
+```cpp
+MIRROR_BRIDGE_MODULE(module_name,
+    // binding code here
+)
+```
+
+**Example:**
+```cpp
+MIRROR_BRIDGE_MODULE(my_module,
+    mirror_bridge::bind_class<Calculator>(m, "Calculator");
+    mirror_bridge::bind_class<Vector3>(m, "Vector3");
+)
+```
+
+### `mirror_bridge::bind_class<T>`
+
+Binds a C++ class to Python.
+
+```cpp
+template<Bindable T>
+void bind_class(PyObject* module, const char* name);
+```
+
+**Parameters:**
+- `module` - Python module object (provided as `m` in the macro)
+- `name` - Name of the class in Python
+
+**What it binds:**
+- All public data members as properties
+- All public non-static methods
+- Default constructor
+- Parameterized constructors (if detected)
+- `__repr__` method (automatic)
+
+**Example:**
+```cpp
+mirror_bridge::bind_class<Calculator>(m, "Calculator");
+```
+
+### Type Conversion Functions
+
+#### `to_python<T>`
+
+Converts C++ values to Python objects.
+
+```cpp
+template<Arithmetic T>
+PyObject* to_python(const T& value);
+
+template<StringLike T>
+PyObject* to_python(const T& value);
+
+template<Container T>
+PyObject* to_python(const T& container);
+
+template<SmartPointer T>
+PyObject* to_python(const T& ptr);
+
+template<EnumType T>
+PyObject* to_python(const T& value);
+
+template<Bindable T>
+PyObject* to_python(const T& obj);
+```
+
+#### `from_python<T>`
+
+Converts Python objects to C++ values.
+
+```cpp
+template<typename T>
+T from_python(PyObject* obj);
+```
+
+## Lua Bindings
+
+### `MIRROR_BRIDGE_LUA_MODULE`
+
+Main macro for creating a Lua module.
+
+```cpp
+MIRROR_BRIDGE_LUA_MODULE(module_name,
+    // binding code here
+)
+```
+
+**Example:**
+```cpp
+MIRROR_BRIDGE_LUA_MODULE(my_module,
+    mirror_bridge::lua::bind_class<Calculator>(L, "Calculator");
+)
+```
+
+### `mirror_bridge::lua::bind_class<T>`
+
+Binds a C++ class to Lua.
+
+```cpp
+template<Bindable T>
+void bind_class(lua_State* L, const char* name);
+```
+
+## JavaScript Bindings
+
+### `MIRROR_BRIDGE_JS_MODULE`
+
+Main macro for creating a Node.js module.
+
+```cpp
+MIRROR_BRIDGE_JS_MODULE(module_name,
+    // binding code here
+)
+```
+
+**Example:**
+```cpp
+MIRROR_BRIDGE_JS_MODULE(my_module,
+    mirror_bridge::javascript::bind_class<Calculator>(env, m, "Calculator");
+)
+```
+
+### `mirror_bridge::javascript::bind_class<T>`
+
+Binds a C++ class to JavaScript.
+
+```cpp
+template<Bindable T>
+void bind_class(napi_env env, napi_value exports, const char* name);
+```
+
+## Reflection Utilities
+
+### Member Discovery
+
+```cpp
+// Get number of data members
+template<typename T>
+consteval std::size_t get_data_member_count();
+
+// Get data member at index
+template<typename T, std::size_t I>
+consteval auto get_data_member();
+
+// Get number of methods
+template<typename T>
+consteval std::size_t get_member_function_count();
+
+// Get method at index
+template<typename T, std::size_t I>
+consteval auto get_member_function();
+```
+
+### Method Introspection
+
+```cpp
+// Get method parameter count
+template<typename T, std::size_t FuncIndex>
+consteval std::size_t get_method_param_count();
+
+// Get method parameter type
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+consteval auto get_method_param_type();
+
+// Get method return type
+template<typename T, std::size_t FuncIndex>
+consteval auto get_method_return_type();
+```
+
+### Type Signature Generation
+
+```cpp
+// Generate signature for change detection
+template<Bindable T>
+std::string generate_type_signature(const char* file_hash = nullptr);
+```
+
+## Registry
+
+### `mirror_bridge::core::Registry`
+
+Singleton registry for tracking bound classes.
+
+```cpp
+class Registry {
+public:
+    static Registry& instance();
+
+    void register_class(const std::string& name,
+                        const std::string& signature,
+                        void* type_obj = nullptr);
+
+    const ClassMetadata* get_class(const std::string& name) const;
+    bool is_registered(const std::string& name) const;
+};
+```
+
+## Version Information
+
+```cpp
+#define MIRROR_BRIDGE_VERSION_MAJOR 0
+#define MIRROR_BRIDGE_VERSION_MINOR 2
+#define MIRROR_BRIDGE_VERSION_PATCH 0
+
+#define MIRROR_BRIDGE_HAS_REFLECTION 1
+#define MIRROR_BRIDGE_HAS_ENUMERATORS_OF 1
+#define MIRROR_BRIDGE_HAS_TYPE_SIGNATURES 1
+```
+
+## Include Headers
+
+```cpp
+// Python bindings (default)
+#include "mirror_bridge.hpp"
+
+// Or explicitly:
+#include "python/mirror_bridge_python.hpp"
+
+// Lua bindings
+#include "lua/mirror_bridge_lua.hpp"
+
+// JavaScript bindings
+#include "javascript/mirror_bridge_javascript.hpp"
+
+// Core only (no language bindings)
+#include "core/mirror_bridge_core.hpp"
+```
+
+
+---
+# FILE: docs/reference/cli.md
+---
+
+# CLI Reference
+
+Mirror Bridge provides a unified command-line interface for all binding operations.
+
+## Overview
+
+```bash
+mirror_bridge <command> [options]
+```
+
+## Commands
+
+### `generate` - Generate Bindings
+
+Auto-discover and compile bindings from C++ headers.
+
+```bash
+mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<src_dir>` | Directory containing C++ headers |
+| `--module NAME` | Output module name |
+| `--lang LANG` | Target language: `python`, `lua`, `js`, or `all` |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output DIR` | Output directory (default: `build/`) |
+| `-k, --keep-generated` | Keep generated binding `.cpp` file |
+| `-v, --verbose` | Show compilation output |
+| `--pch [PATH]` | Use precompiled header (auto-detect or specify path) |
+| `-f, --force` | Force rebuild even if sources haven't changed |
+| `-I DIR` | Add include directory |
+
+**Examples:**
+
+```bash
+# Basic Python binding
+mirror_bridge generate src/ --module my_module --lang python
+
+# Lua with verbose output
+mirror_bridge generate src/ --module my_module --lang lua -v
+
+# JavaScript with custom output directory
+mirror_bridge generate src/ --module my_module --lang js -o dist/
+
+# All languages at once
+mirror_bridge generate src/ --module my_module --lang all
+
+# With precompiled header (auto-detect)
+mirror_bridge generate src/ --module my_module --lang python --pch
+
+# With explicit PCH path
+mirror_bridge generate src/ --module my_module --lang python --pch build/pch.gch
+
+# Force rebuild
+mirror_bridge generate src/ --module my_module --lang python -f
+```
+
+### `pch` - Build Precompiled Header
+
+Create a precompiled header for faster compilation.
+
+```bash
+mirror_bridge pch --output <dir> --type <type> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `--output DIR` | Output directory for PCH file |
+| `--type TYPE` | Build type: `release` or `debug` |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--lang LANG` | Target language (default: `python`) |
+| `-v, --verbose` | Show compilation output |
+
+**Examples:**
+
+```bash
+# Release PCH for Python
+mirror_bridge pch --output build/ --type release
+
+# Debug PCH
+mirror_bridge pch --output build/ --type debug
+
+# PCH for Lua
+mirror_bridge pch --output build/ --type release --lang lua
+```
+
+### `build` - Manual Compilation
+
+Compile a manually-written binding file.
+
+```bash
+mirror_bridge build <binding.cpp> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<binding.cpp>` | Binding source file |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output DIR` | Output directory (default: `build/`) |
+| `-I DIR` | Add include directory |
+| `-v, --verbose` | Show compilation output |
+| `--pch [PATH]` | Use precompiled header |
+| `--lang LANG` | Target language (default: `python`) |
+
+**Examples:**
+
+```bash
+# Basic compilation
+mirror_bridge build my_bindings.cpp
+
+# With include directories
+mirror_bridge build my_bindings.cpp -I src/ -I include/
+
+# With PCH
+mirror_bridge build my_bindings.cpp --pch build/pch.gch
+```
+
+### `config` - Config File Generation
+
+Generate bindings from a configuration file.
+
+```bash
+mirror_bridge config <config.mirror> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<config.mirror>` | Configuration file |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output DIR` | Output directory (default: `build/`) |
+| `-k, --keep-generated` | Keep generated binding file |
+| `-v, --verbose` | Show compilation output |
+| `--pch [PATH]` | Use precompiled header |
+
+**Config File Format:**
+
+```
+# Module name (required)
+module: my_module
+
+# Include directories (optional, comma-separated)
+include_dirs: src/, include/
+
+# Class bindings
+# Format: ClassName: header_file [as PythonName]
+Calculator: calculator.hpp
+Vector3: vector3.hpp
+math::Complex: complex.hpp as Complex
+```
+
+**Examples:**
+
+```bash
+# Generate from config
+mirror_bridge config bindings.mirror
+
+# With verbose output
+mirror_bridge config bindings.mirror -v
+```
+
+### `diff` - Binding Surface Diff
+
+Compare current class definitions against a stored snapshot to detect added/removed members and methods.
+
+```bash
+mirror_bridge diff <src_dir> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<src_dir>` | Directory containing C++ headers |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output DIR` | Build directory for storing snapshots (default: `build/`) |
+| `-u, --update` | Update the snapshot without prompting (CI-friendly) |
+
+The first run creates an initial snapshot. Subsequent runs compare against it and show added/removed binding surface elements.
+
+**Examples:**
+
+```bash
+# Check for changes
+mirror_bridge diff src/
+
+# Non-interactive update (for CI pipelines)
+mirror_bridge diff src/ --update
+
+# Custom snapshot location
+mirror_bridge diff src/ --output build/
+```
+
+### `watch` - Live Reload
+
+Watch header files for changes and automatically recompile bindings.
+
+```bash
+mirror_bridge watch <src_dir> --module <name> [options]
+```
+
+**Required Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<src_dir>` | Directory containing C++ headers |
+| `--module NAME` | Output module name |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--lang LANG` | Target language (default: `python`) |
+| `-o, --output DIR` | Output directory (default: `build/`) |
+| `-i, --interval SEC` | Poll interval in seconds (default: `2`) |
+| `--pch` | Use precompiled header for faster builds |
+
+**Examples:**
+
+```bash
+# Watch and rebuild Python bindings on changes
+mirror_bridge watch src/ --module my_lib --lang python
+
+# All languages with faster polling
+mirror_bridge watch src/ --module my_lib --lang all --interval 1
+
+# With precompiled header for fast iteration
+mirror_bridge watch src/ --module my_lib --lang python --pch
+```
+
+### `init` - Initialize Project
+
+Create a new Mirror Bridge project structure.
+
+```bash
+mirror_bridge init [dir] [options]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `[dir]` | Project directory (default: current directory) |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--name NAME` | Module name |
+| `--lang LANG` | Target language(s) |
+
+**Examples:**
+
+```bash
+# Initialize in current directory
+mirror_bridge init --name my_module
+
+# Initialize in new directory
+mirror_bridge init my_project --name my_module --lang all
+```
+
+## Global Options
+
+These options work with all commands:
+
+| Option | Description |
+|--------|-------------|
+| `-h, --help` | Show help message |
+| `--version` | Show version information |
+
+## Auto-Discovery
+
+When using `generate`, Mirror Bridge scans all `.hpp` and `.h` files in the source directory and automatically binds all `struct` and `class` definitions found.
+
+### Opt-Out Mechanism
+
+Skip specific classes:
+```cpp
+// MIRROR_BRIDGE_SKIP
+struct InternalClass { /* won't be bound */ };
+```
+
+Skip entire files:
+```cpp
+// MIRROR_BRIDGE_SKIP_FILE
+// At the top of a header file
+```
+
+## Change Detection
+
+By default, `generate` tracks source file changes and only recompiles when header files have been modified since the last build. Use `--force` to bypass this check.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Error (invalid arguments, compilation failure, etc.) |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MIRROR_BRIDGE_PCH_DIR` | Default PCH directory |
+| `MIRROR_BRIDGE_OUTPUT_DIR` | Default output directory |
+| `CXX` | C++ compiler to use |
+
+
+---
+# FILE: docs/reference/configuration.md
+---
+
+# Configuration Reference
+
+Mirror Bridge supports configuration files for production use cases where you need explicit control over what gets bound.
+
+## Config File Format
+
+Configuration files use the `.mirror` extension by convention.
+
+### Basic Structure
+
+```
+# Module name (required)
+module: my_module
+
+# Include directories (optional)
+include_dirs: src/, include/
+
+# Class bindings
+ClassName: header_file.hpp
+AnotherClass: path/to/header.hpp
+namespace::Class: class.hpp as PythonName
+```
+
+### Comments
+
+Lines starting with `#` are comments:
+
+```
+# This is a comment
+module: my_module  # Inline comments are NOT supported
+```
+
+### Module Name
+
+The `module:` directive is required and specifies the output module name:
+
+```
+module: my_module
+```
+
+This produces `my_module.so` (Python/Lua) or `my_module.node` (JavaScript).
+
+### Include Directories
+
+The `include_dirs:` directive specifies where to find headers:
+
+```
+include_dirs: src/, include/, ../common/
+```
+
+- Comma-separated list
+- Paths are relative to the config file location
+- Added as `-I` flags during compilation
+
+### Class Bindings
+
+Each class binding has the format:
+
+```
+ClassName: header_file.hpp [as ExposedName]
+```
+
+**Examples:**
+
+```
+# Basic binding
+Calculator: calculator.hpp
+
+# Class in subdirectory
+math::Vector3: math/vector3.hpp
+
+# Rename for the target language
+internal::ComplexCalculator: internal/calc.hpp as Calculator
+
+# Namespace handling
+mylib::MyClass: mylib/my_class.hpp as MyClass
+```
+
+## Complete Example
+
+```
+# Math library bindings
+# Generated: 2024-01-15
+
+module: mathlib
+
+include_dirs: src/, include/
+
+# Core types
+Vector2: core/vector2.hpp
+Vector3: core/vector3.hpp
+Matrix4: core/matrix4.hpp
+
+# Math operations
+math::Calculator: math/calculator.hpp as Calculator
+math::Statistics: math/statistics.hpp as Statistics
+
+# Geometry
+geometry::Point: geometry/point.hpp as Point
+geometry::Rectangle: geometry/rectangle.hpp as Rectangle
+geometry::Circle: geometry/circle.hpp as Circle
+```
+
+## Usage
+
+### Generate from Config
+
+```bash
+mirror_bridge config my_module.mirror
+```
+
+### Options
+
+```bash
+mirror_bridge config my_module.mirror [options]
+
+Options:
+  -o, --output DIR      Output directory (default: build/)
+  -k, --keep-generated  Keep generated binding .cpp file
+  -v, --verbose         Show compilation output
+  --pch [PATH]          Use precompiled header
+  --lang LANG           Target language (default: python)
+```
+
+### Multiple Languages
+
+Create separate config files for language-specific bindings:
+
+```bash
+# Python config (all classes)
+mirror_bridge config mathlib_python.mirror --lang python
+
+# Lua config (subset of classes)
+mirror_bridge config mathlib_lua.mirror --lang lua
+```
+
+Or use the same config for multiple languages:
+
+```bash
+mirror_bridge config mathlib.mirror --lang python
+mirror_bridge config mathlib.mirror --lang lua
+mirror_bridge config mathlib.mirror --lang js
+```
+
+## When to Use Config Files
+
+### Use Config Files When:
+
+- Production deployments requiring explicit control
+- Large codebases with selective exposure
+- Multiple modules from the same source
+- Class renaming is needed
+- Version control of binding definitions
+- CI/CD pipeline reproducibility
+
+### Use Auto-Discovery When:
+
+- Rapid prototyping
+- Small to medium projects
+- Binding entire directories
+- Development iterations
+
+## Comparison
+
+| Feature | Auto-Discovery | Config File |
+|---------|---------------|-------------|
+| Setup effort | Minimal | Write config |
+| Control | All or opt-out | Explicit list |
+| New classes | Automatic | Manual add |
+| Renaming | Not supported | Supported |
+| VCS friendly | N/A | Yes |
+| Best for | Development | Production |
+
+## Migration Path
+
+Start with auto-discovery during development, then create a config file for production:
+
+```bash
+# Development: quick iteration
+mirror_bridge generate src/ --module my_module --lang python
+
+# Production: create config with discovered classes
+# (manually create config file listing the classes you want)
+mirror_bridge config my_module.mirror --lang python
+```
+
+## Validation
+
+The config file is validated during generation:
+- Module name must be present
+- Header files must exist
+- Class names must be valid identifiers
+- Duplicate class names are rejected
+
+Errors are reported with line numbers for easy debugging.
+
+
+---
+# FILE: docs/reference/errors.md
+---
+
+# Error Catalog
+
+Paste your error, find your fix. Each entry below pairs the exact message you see with its cause and the precise command or code change that resolves it.
+
+Most issues come from building **outside** the clang-p2996 container. If something fails, first confirm you are inside the Docker environment (`./start_dev_container.sh`) — that single step eliminates the majority of toolchain and linking problems.
+
+## Compile-time errors
+
+### Reflection not available (`<meta>` missing)
+
+**Symptom**
+
+```
+error: no member named 'meta' in namespace 'std'
+fatal error: 'meta' file not found
+```
+
+**Cause** The compiler does not implement C++26 reflection (P2996), so the `<meta>` header and `std::meta::` API are absent.
+
+**Fix** Build with Bloomberg's clang-p2996 and request reflection explicitly. Inside the container this is the default; manually:
+
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ binding.cpp ...
+```
+
+### Reflection feature-test macro version too old
+
+**Symptom**
+
+```
+error: "This library requires C++26 reflection (P2996) from 2023-06 or later"
+```
+
+**Cause** `__cpp_reflection` is defined but reports a value below `202306L`, meaning the compiler implements a pre-P2996-revision of reflection that mirror_bridge does not support.
+
+**Fix** Update clang-p2996 to a current `p2996` branch build (the container ships one). Rebuild the image with `docker rmi mirror_bridge:latest && ./start_dev_container.sh` if you are on an old image.
+
+### Reflection feature-test macro undefined (warning)
+
+**Symptom**
+
+```
+warning: "Compiler does not define __cpp_reflection feature-test macro. Reflection support is experimental and may be incomplete."
+```
+
+**Cause** The experimental clang-p2996 build does not always set `__cpp_reflection`. This is expected and harmless — mirror_bridge falls back to detecting reflection via the `<meta>` header.
+
+**Fix** None needed. If `<meta>` compiles, reflection works. Suppress with `-Wno-#warnings` only if the warning is noisy in your build logs.
+
+### Unconvertible member type (`bind_class` / `MIRROR_BRIDGE_VALIDATE`)
+
+**Symptom**
+
+```
+error: static assertion failed: bind_class<T>: T contains members with types that mirror_bridge cannot convert. Mark unconvertible members with [[=exclude{}]] or add a custom type converter. Supported: arithmetic, std::string, containers, smart pointers, std::optional, std::expected, enums, and nested bindable classes.
+```
+
+**Cause** One of the class's data members has a type mirror_bridge does not know how to marshal (e.g. a raw `void*`, a third-party handle, a `std::mutex`, or a non-bindable nested type).
+
+**Fix** Either exclude the offending member from binding, or provide a custom converter. To exclude:
+
+```cpp
+using mirror_bridge::exclude;
+
+struct MyClass {
+    int value;
+    [[=exclude{}]] std::mutex lock;   // not bound
+};
+```
+
+To pinpoint *which* member fails before reaching `bind_class`, drop in the validator at the definition site:
+
+```cpp
+MIRROR_BRIDGE_VALIDATE(MyClass);   // static_assert with the same message, closer to the type
+```
+
+### Trampoline does not derive from the bound type
+
+**Symptom**
+
+```
+error: static assertion failed: Trampoline must derive from T (or be T itself)
+```
+
+**Cause** `bind_class<T, Trampoline>` was instantiated with a `Trampoline` type that is not `T` and is not derived from `T`, so virtual-override forwarding cannot work.
+
+**Fix** Use the trampoline class emitted by `mirror_bridge generate --trampolines` (it derives from `T` and overrides every virtual), or pass no trampoline at all to bind without Python-side virtual overrides:
+
+```cpp
+mirror_bridge::python::bind_class<MyBase>(module, "MyBase");                  // no overrides
+mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); // with overrides
+```
+
+### Unsupported container shape
+
+**Symptom**
+
+```
+error: static assertion failed: Container must support indexing, push_back, or insert
+```
+
+**Cause** A member is container-like but exposes none of the insertion APIs mirror_bridge writes into (`operator[]`, `push_back`, or `insert`), so values cannot be deserialized back into it from the target language.
+
+**Fix** Use a standard sequence/associative container (`std::vector`, `std::deque`, `std::list`, `std::set`, `std::map`, `std::array`). For a custom container, exclude it with `[[=exclude{}]]` (after `using mirror_bridge::exclude;`) or wrap it behind a getter/setter that uses a supported type.
+
+### `uint8_t` / `unsigned char` size mismatch
+
+**Symptom**
+
+```
+error: static assertion failed: uint8_t and unsigned char must be same size for byte conversion
+```
+
+**Cause** mirror_bridge's fast `vector<unsigned char>` → Python `bytes` path assumes `sizeof(uint8_t) == sizeof(unsigned char)`. This only fails on exotic platforms where that invariant is broken.
+
+**Fix** Use a supported platform/toolchain (the container's x86-64/aarch64 Linux build satisfies this). There is no per-project workaround; the byte-conversion fast path is unavailable on a platform that fails this assert.
+
+### `fmt` 8.1 `FMT_STRING` consteval failure
+
+**Symptom**
+
+```
+error: call to consteval function 'fmt::...' is not a constant expression
+.../fmt/format-inl.h: in bigint formatting: FMT_STRING("{:x}")
+```
+
+**Cause** fmt 8.1's `FMT_STRING` compile-time format checks do not survive consteval evaluation under clang-p2996. The failing calls are only reachable from fmt's debug bigint-printing path, but they break header-only compilation.
+
+**Fix** The provided Docker image already patches this. If you build fmt yourself, either upgrade to fmt ≥ 9, or apply the same replacement that the Dockerfile uses:
+
+```bash
+sed -i \
+  -e 's|format_to(out, FMT_STRING("{:x}"), value)|format_to(out, fmt::string_view("{:x}"), value)|' \
+  -e 's|format_to(out, FMT_STRING("{:08x}"), value)|format_to(out, fmt::string_view("{:08x}"), value)|' \
+  -e 's|format_to(out, FMT_STRING("p{}"),|format_to(out, fmt::string_view("p{}"),|' \
+  /usr/include/fmt/format-inl.h
+```
+
+## Environment & toolchain
+
+### `libc++.so.1` not found
+
+**Symptom**
+
+```
+error while loading shared libraries: libc++.so.1: cannot open shared object file: No such file or directory
+```
+
+**Cause** The reflection-enabled libc++ is not on the dynamic linker's search path.
+
+**Fix** Add the libc++ directory to `LD_LIBRARY_PATH`. The container and test scripts set this automatically; manually:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+# On some images the path is arch-qualified:
+export LD_LIBRARY_PATH=/usr/local/lib/aarch64-unknown-linux-gnu:/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH
+```
+
+### No C++ compiler found when running tests
+
+**Symptom**
+
+```
+Error: No C++ compiler found (clang++ or g++)
+This script must run inside a mirror_bridge Docker container.
+```
+
+**Cause** `tests/run_all_tests.sh` could not find a reflection-capable `clang++` (or `g++`) on `PATH`, which almost always means you are running on the host rather than inside the container.
+
+**Fix** Enter the container first:
+
+```bash
+./start_dev_container.sh
+cd /workspace
+./tests/run_all_tests.sh
+```
+
+### Compiler may not support reflection (warning)
+
+**Symptom**
+
+```
+Warning: Compiler may not support C++26 reflection
+This script requires a reflection-enabled compiler.
+Continue anyway? [y/N]
+```
+
+**Cause** The test runner found a `clang++` whose `--version` string does not mention `reflection`, `p2996`, or `bloomberg`, so it cannot confirm reflection support.
+
+**Fix** Run inside the mirror_bridge container where `clang++` is the clang-p2996 build. If you intentionally point `CXX` at a custom clang-p2996 build whose version string is non-standard, answer `y` to proceed.
+
+### `pip install --break-system-packages` rejected (Ubuntu 22.04)
+
+**Symptom**
+
+```
+Usage:
+  pip install [options] <requirement specifier> [package-index-options] ...
+no such option: --break-system-packages
+```
+
+**Cause** `--break-system-packages` (PEP 668) only exists on pip ≥ 23. Ubuntu 22.04 ships pip 22.0.2, which does not recognize the flag.
+
+**Fix** Drop the flag — on pip 22 it is unnecessary because the environment is not externally managed:
+
+```bash
+pip3 install --no-cache-dir <packages>
+```
+
+If you are on a newer pip that *does* require it (PEP 668 environments), prefer a virtualenv over the flag.
+
+### Missing `wayland-scanner` / Xorg headers building GUI deps from source
+
+**Symptom**
+
+```
+Could NOT find Wayland (missing: Wayland_scanner)
+fatal error: X11/Xlib.h: No such file or directory
+```
+
+**Cause** Building GUI-adjacent dependencies from source (e.g. Open3D's visualization layer) needs the Wayland scanner and Xorg development headers, which are not present in a minimal base image.
+
+**Fix** Install the development packages (already baked into the mirror_bridge image):
+
+```bash
+apt-get install -y xorg-dev libwayland-dev libwayland-bin libxkbcommon-dev libglu1-mesa-dev libosmesa6-dev
+```
+
+## Linking & runtime
+
+### Unresolved `std::__cxx11::` symbols on import
+
+**Symptom**
+
+```
+ImportError: .../real_open3d.so: undefined symbol: _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE...
+undefined symbol: std::__cxx11::basic_string<...>
+```
+
+**Cause** You linked your libc++ binding against an external library (e.g. Open3D) whose vendored 3rdparty deps were compiled with **libstdc++**. The resulting `.so` carries unresolved `std::__cxx11::*` symbols. libc++ and libstdc++ use *different* symbol namespaces (`std::__1::` vs `std::__cxx11::`), so they coexist safely in one process — the loader just needs somewhere to find the libstdc++ symbols.
+
+**Fix** Preload libstdc++ so the ELF loader can satisfy the missing symbols at import time, without changing your binding's ABI:
+
+```bash
+LD_PRELOAD=libstdc++.so.6 python3 your_script.py
+```
+
+This is exactly what `examples/open3d-runtime/build_and_test.sh` does. The cleaner long-term fix is to forward `-stdlib=libc++` into the external library's 3rdparty builds (see the Open3D fork's `CMAKE_CXX_FLAGS` patch) so the whole stack uses a single stdlib.
+
+### Module imports but a method/field is missing after editing the header
+
+**Symptom**
+
+```
+AttributeError: 'MyClass' object has no attribute 'new_method'
+```
+
+**Cause** mirror_bridge's change detection skipped recompilation because it judged the header unchanged, so the stale `.so` is still on disk.
+
+**Fix** Force a rebuild:
+
+```bash
+mirror_bridge generate src/ --module my_module --lang python --force
+```
+
+## Build-system
+
+### CMake 4.x rejects pre-3.5 policy compatibility
+
+**Symptom**
+
+```
+CMake Error: Compatibility with CMake < 3.5 has been removed from CMake.
+Update the VERSION argument <min> value. Or, use the <min>...<max> syntax
+to tell CMake that the project requires at least <min> but has been updated
+to work with policies introduced by <max> or earlier.
+```
+
+**Cause** pip's `cmake` 4.x removed compatibility with `cmake_minimum_required` values below 3.5, which breaks older third-party `CMakeLists.txt` (e.g. VTK 9.1 inside the Open3D dependency tree).
+
+**Fix** Pin CMake to the 3.x line that mirror_bridge's image uses:
+
+```bash
+pip3 install --no-cache-dir 'cmake>=3.24,<4'
+```
+
+For a single problematic subproject you cannot pin globally, pass the bypass policy on the configure line:
+
+```bash
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ...
+```
+
+### No header files / no classes found
+
+**Symptom**
+
+```
+Error: No header files found in src/
+Error: No classes found in src/
+```
+
+**Cause** `mirror_bridge generate` scanned the directory but found no `.hpp`/`.h` files, or none of the files contained a bindable `struct`/`class` (or every class was opted out via `// MIRROR_BRIDGE_SKIP` / `// MIRROR_BRIDGE_SKIP_FILE`).
+
+**Fix** Point at the directory that actually contains your headers and confirm they define a `struct`/`class`:
+
+```bash
+mirror_bridge generate path/to/headers/ --module my_module --lang python
+```
+
+Check that you did not leave a stray `// MIRROR_BRIDGE_SKIP_FILE` at the top of the header.
+
+### Missing required CLI arguments
+
+**Symptom**
+
+```
+Error: No module name specified (use --module)
+Error: No source directory specified
+Error: Directory not found: src/
+```
+
+**Cause** A required `generate` argument is missing or points at a nonexistent path.
+
+**Fix** Supply both the source directory and `--module`, and verify the path exists:
+
+```bash
+mirror_bridge generate src/ --module my_module --lang python
+```
+
+### Config-file generation not available
+
+**Symptom**
+
+```
+Error: Config file generation not available
+```
+
+**Cause** The `mirror_bridge config` command could not locate the config-driven generator backend (the supporting script/binary is absent from the install).
+
+**Fix** Use `mirror_bridge generate` with explicit flags instead of a `.mirror` file, or reinstall/rebuild from a complete checkout so the config backend is present.
+
+
+---
+# FILE: docs/reference/type-conversion.md
+---
+
+# Type Conversion Reference
+
+Mirror Bridge automatically converts types between C++ and target languages. This document details all supported conversions.
+
+## Primitive Types
+
+### Numeric Types
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `bool` | `bool` | `boolean` | `boolean` |
+| `char` | `int` | `number` | `number` |
+| `short` | `int` | `number` | `number` |
+| `int` | `int` | `number` | `number` |
+| `long` | `int` | `number` | `number` |
+| `long long` | `int` | `number` | `number` |
+| `unsigned int` | `int` | `number` | `number` |
+| `float` | `float` | `number` | `number` |
+| `double` | `float` | `number` | `number` |
+
+### String Types
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `std::string` | `str` | `string` | `string` |
+| `std::string_view` | `str` | `string` | `string` |
+| `const char*` | `str` | `string` | `string` |
+
+## Container Types
+
+### Sequential Containers
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `std::vector<T>` (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
+| `std::vector<T>` (other T) | `list` | `table` (array) | `Array` |
+| `std::array<T, N>` | `list` | `table` (array) | `Array` |
+| `std::deque<T>` | `list` | `table` (array) | `Array` |
+| `std::list<T>` | `list` | `table` (array) | `Array` |
+
+**Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings use a single `memcpy` into an `array.array` object instead of element-by-element conversion. This is ~10-50x faster for large arrays. The `from_python` direction accepts both `list` and `array.array` inputs.
+
+**Example:**
+
+```cpp
+struct Container {
+    std::vector<int> numbers;
+    std::vector<std::string> names;
+};
+```
+
+**Python:**
+```python
+c = Container()
+c.numbers = [1, 2, 3, 4, 5]
+c.names = ["Alice", "Bob"]
+print(c.numbers)  # [1, 2, 3, 4, 5]
+```
+
+**Lua:**
+```lua
+c = Container()
+c.numbers = {1, 2, 3, 4, 5}
+c.names = {"Alice", "Bob"}
+```
+
+**JavaScript:**
+```javascript
+const c = new Container();
+c.numbers = [1, 2, 3, 4, 5];
+c.names = ["Alice", "Bob"];
+```
+
+### Associative Containers
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `std::map<K, V>` | `dict` | `table` | `Object` |
+| `std::unordered_map<K, V>` | `dict` | `table` | `Object` |
+
+## Nested Objects
+
+Nested structs/classes are converted to native dictionary/object/table types:
+
+**C++:**
+```cpp
+struct Address {
+    std::string street;
+    std::string city;
+    int zip;
+};
+
+struct Person {
+    std::string name;
+    Address address;
+};
+```
+
+**Python:**
+```python
+p = Person()
+p.name = "Alice"
+p.address = {"street": "123 Main St", "city": "Boston", "zip": 12345}
+
+# Reading nested objects
+addr = p.address  # Returns a dict
+print(addr["city"])  # "Boston"
+```
+
+**Lua:**
+```lua
+p = Person()
+p.name = "Alice"
+p.address = {street = "123 Main St", city = "Boston", zip = 12345}
+```
+
+**JavaScript:**
+```javascript
+const p = new Person();
+p.name = "Alice";
+p.address = {street: "123 Main St", city: "Boston", zip: 12345};
+```
+
+## Smart Pointers
+
+| C++ Type | Conversion |
+|----------|------------|
+| `std::unique_ptr<T>` | Converted to/from value |
+| `std::shared_ptr<T>` | Converted to/from value |
+
+**C++:**
+```cpp
+struct Resource {
+    std::string name;
+    int value;
+};
+
+struct Manager {
+    std::unique_ptr<Resource> resource;
+    std::unique_ptr<Resource> create_resource(std::string n, int v);
+};
+```
+
+**Python:**
+```python
+m = Manager()
+
+# Smart pointers convert to/from dicts
+result = m.create_resource("test", 42)
+print(result)  # {"name": "test", "value": 42}
+
+# Assign dict to smart pointer property
+m.resource = {"name": "data", "value": 123}
+
+# None handling for null pointers
+m.resource = None  # Sets to nullptr
+```
+
+## Enum Types
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `enum` | `int` | `number` | `number` |
+| `enum class` | `int` | `number` | `number` |
+
+**C++:**
+```cpp
+enum class Color { Red = 0, Green = 1, Blue = 2 };
+
+struct ColoredShape {
+    Color color;
+    int get_color_value() const { return static_cast<int>(color); }
+};
+```
+
+**Python:**
+```python
+s = ColoredShape()
+s.color = 1  # Green
+print(s.get_color_value())  # 1
+```
+
+## Method Parameters
+
+All supported types can be used as method parameters:
+
+**C++:**
+```cpp
+struct Processor {
+    // Primitive parameters
+    int add(int a, int b);
+
+    // String parameters
+    void set_name(std::string name);
+
+    // Container parameters
+    double sum(std::vector<double> values);
+
+    // Multiple parameters
+    std::string format(std::string prefix, int value, std::string suffix);
+};
+```
+
+**Python:**
+```python
+p = Processor()
+result = p.add(10, 20)  # 30
+p.set_name("MyProcessor")
+total = p.sum([1.0, 2.0, 3.0])  # 6.0
+text = p.format("Value: ", 42, "!")  # "Value: 42!"
+```
+
+## Return Values
+
+All supported types can be returned from methods:
+
+| Return Type | Conversion |
+|-------------|------------|
+| `void` | `None` / `nil` / `undefined` |
+| Primitive types | Direct conversion |
+| `std::string` | String type |
+| Containers | List/Array/Table |
+| Nested objects | Dict/Object/Table |
+| Smart pointers | Converted value or null |
+
+## Const Correctness
+
+Const methods are supported and bound correctly:
+
+```cpp
+struct Data {
+    int value;
+
+    int get_value() const { return value; }  // Bound
+    void set_value(int v) { value = v; }      // Bound
+};
+```
+
+## std::optional
+
+| C++ Type | Python | Lua | JavaScript |
+|----------|--------|-----|------------|
+| `std::optional<T>` (with value) | Converted `T` | Converted `T` | Converted `T` |
+| `std::optional<T>` (empty) | `None` | `nil` | `null` |
+
+## std::expected
+
+C++23's `std::expected<T, E>` maps naturally to each language's error handling idiom:
+
+| C++ State | Python | Lua | JavaScript |
+|-----------|--------|-----|------------|
+| Success (has value) | Returns `T` | Returns `value, nil` | Returns `T` |
+| Error (!has_value) | Raises `ValueError` | Returns `nil, error_string` | Throws `Error` |
+
+**C++:**
+```cpp
+struct Service {
+    std::expected<double, std::string> safe_divide(double a, double b) {
+        if (b == 0.0) return std::unexpected("division by zero");
+        return a / b;
+    }
+};
+```
+
+**Python:**
+```python
+svc = Service()
+result = svc.safe_divide(10.0, 2.0)  # Returns 5.0
+try:
+    svc.safe_divide(10.0, 0.0)       # Raises ValueError("division by zero")
+except ValueError as e:
+    print(e)
+```
+
+**Lua:**
+```lua
+local svc = Service()
+local result, err = svc:safe_divide(10.0, 2.0)  -- result=5.0, err=nil
+local result, err = svc:safe_divide(10.0, 0.0)  -- result=nil, err="division by zero"
+```
+
+**JavaScript:**
+```javascript
+const svc = new Service();
+const result = svc.safe_divide(10.0, 2.0);  // 5.0
+try {
+    svc.safe_divide(10.0, 0.0);  // throws Error("division by zero")
+} catch (e) { console.error(e.message); }
+```
+
+## Limitations
+
+### Not Currently Supported
+
+| Type | Status |
+|------|--------|
+| Raw pointers (T*) | Not supported |
+| References as parameters | Partial support |
+| Function pointers | Not supported |
+| `weak_ptr` | Not supported |
+
+### Template Classes
+
+Template classes must be explicitly instantiated before binding:
+
+```cpp
+template<typename T>
+struct Container {
+    T value;
+};
+
+// Explicit instantiation
+using IntContainer = Container<int>;
+using StringContainer = Container<std::string>;
+
+// Now can be bound
+MIRROR_BRIDGE_MODULE(my_module,
+    mirror_bridge::bind_class<IntContainer>(m, "IntContainer");
+    mirror_bridge::bind_class<StringContainer>(m, "StringContainer");
+)
+```
+
+
+---
+# FILE: docs/internals/architecture.md
+---
+
+# Architecture Overview
+
+This document describes the internal architecture of Mirror Bridge, intended for contributors and those who want to understand how the system works.
+
+## High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         User Interface Layer                            │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────┐  │
+│  │  CLI Tool       │  │  Config Files   │  │  Direct C++ API         │  │
+│  │  (mirror_bridge)│  │  (.mirror)      │  │  (bind_class<T>)        │  │
+│  └────────┬────────┘  └────────┬────────┘  └───────────┬─────────────┘  │
+└───────────┼────────────────────┼───────────────────────┼────────────────┘
+            │                    │                       │
+            ▼                    ▼                       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Binding Generation Layer                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    Auto-Discovery Engine                         │   │
+│  │  • Header scanning                                               │   │
+│  │  • Class detection (struct/class)                                │   │
+│  │  • Skip comment handling (MIRROR_BRIDGE_SKIP)                    │   │
+│  │  • Binding code generation                                       │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Core Reflection Layer                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                   mirror_bridge_core.hpp                         │   │
+│  │                                                                   │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │   │
+│  │  │  Concepts   │  │  Member     │  │  Type Signature         │  │   │
+│  │  │  Arithmetic │  │  Caches     │  │  Generation             │  │   │
+│  │  │  StringLike │  │  (compile-  │  │  (change detection)     │  │   │
+│  │  │  Container  │  │   time)     │  │                         │  │   │
+│  │  │  SmartPtr   │  │             │  │                         │  │   │
+│  │  │  Bindable   │  │             │  │                         │  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+        ┌────────────────────────┼────────────────────────┐
+        │                        │                        │
+        ▼                        ▼                        ▼
+┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+│  Python Bindings  │  │   Lua Bindings    │  │   JS Bindings     │
+│  ───────────────  │  │   ─────────────   │  │   ───────────     │
+│                   │  │                   │  │                   │
+│  Python C API     │  │  Lua C API        │  │  Node.js N-API    │
+│  ─────────────    │  │  ──────────       │  │  ────────────     │
+│  • PyWrapper<T>   │  │  • LuaWrapper<T>  │  │  • JsWrapper<T>   │
+│  • to_python()    │  │  • to_lua()       │  │  • to_javascript()│
+│  • from_python()  │  │  • from_lua()     │  │  • from_js()      │
+│  • PyTypeObject   │  │  • Metatables     │  │  • napi_value     │
+│                   │  │                   │  │                   │
+└───────────────────┘  └───────────────────┘  └───────────────────┘
+        │                        │                        │
+        ▼                        ▼                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         C++26 Reflection (P2996)                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  std::meta::members_of(^^T, access_context) - Discover members   │   │
+│  │  std::meta::nonstatic_data_members_of(^^T, access_context)       │   │
+│  │  std::meta::identifier_of(member)  - Get member name             │   │
+│  │  std::meta::type_of(member)        - Get member type             │   │
+│  │  std::meta::parameters_of(func)    - Get function parameters     │   │
+│  │  std::meta::return_type_of(func)   - Get return type             │   │
+│  │  obj.[:member:]                    - Splicer (access member)     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Component Details
+
+### 1. Core Layer (`core/mirror_bridge_core.hpp`)
+
+The language-agnostic foundation providing:
+
+#### Type Concepts
+
+```cpp
+// Type classification at compile-time
+template<typename T> concept Arithmetic;   // int, float, double...
+template<typename T> concept StringLike;   // std::string, string_view...
+template<typename T> concept Container;    // vector, array, list...
+template<typename T> concept SmartPointer; // unique_ptr, shared_ptr
+template<typename T> concept EnumType;     // enum, enum class
+template<typename T> concept Bindable;     // Reflectable classes
+```
+
+#### Member Caches
+
+Compile-time caches for O(1) member access:
+
+```cpp
+template<typename T>
+struct MemberFunctionCache {
+    static consteval std::size_t compute_count();
+    static consteval auto get_at_index(std::size_t Index);
+    static constexpr std::size_t count = compute_count();
+};
+```
+
+This avoids repeated O(N) scans of `std::meta::members_of()` during binding generation.
+
+#### Registry
+
+Runtime registry for tracking bound classes:
+
+```cpp
+class Registry {
+    void register_class(name, signature, type_obj);
+    const ClassMetadata* get_class(name);
+    bool is_registered(name);
+};
+```
+
+### 2. Python Bindings (`python/mirror_bridge_python.hpp`)
+
+Python-specific implementation (~1,984 lines):
+
+#### PyWrapper<T>
+
+Template class wrapping C++ objects for Python:
+
+```cpp
+template<typename T>
+struct PyWrapper {
+    PyObject_HEAD
+    T* obj;
+    bool owned;
+};
+```
+
+#### Type Conversion
+
+Overloaded functions for bidirectional conversion:
+
+```cpp
+// C++ → Python
+template<Arithmetic T> PyObject* to_python(const T& value);
+template<Container T>  PyObject* to_python(const T& container);
+
+// Python → C++
+template<typename T> T from_python(PyObject* obj);
+```
+
+#### Binding Generation
+
+Compile-time generation of PyGetSetDef and PyMethodDef arrays:
+
+```cpp
+template<typename T>
+static consteval auto generate_getset_defs();
+
+template<typename T>
+static consteval auto generate_method_defs();
+```
+
+### 3. Lua Bindings (`lua/mirror_bridge_lua.hpp`)
+
+Lua-specific implementation (~667 lines):
+
+- Metatable-based property access (`__index`, `__newindex`)
+- Stack-based type conversion
+- Userdata with custom metatables
+
+### 4. JavaScript Bindings (`javascript/mirror_bridge_javascript.hpp`)
+
+Node.js N-API implementation (~646 lines):
+
+- N-API wrapper objects
+- Property descriptors via `napi_define_properties`
+- External data pointers for C++ object storage
+
+## Data Flow
+
+### Binding Generation Flow
+
+```
+1. User runs: mirror_bridge generate src/ --module my_mod --lang python
+
+2. Auto-Discovery:
+   ├── Scan *.hpp and *.h files in src/
+   ├── Parse for struct/class definitions
+   ├── Filter out MIRROR_BRIDGE_SKIP marked classes
+   └── Generate binding code
+
+3. Generated Code:
+   ┌────────────────────────────────────────┐
+   │ #include "mirror_bridge.hpp"           │
+   │ #include "my_class.hpp"                │
+   │                                        │
+   │ MIRROR_BRIDGE_MODULE(my_mod,           │
+   │     mirror_bridge::bind_class<MyClass> │
+   │         (m, "MyClass");                │
+   │ )                                      │
+   └────────────────────────────────────────┘
+
+4. Compilation:
+   clang++ -std=c++2c -freflection ... → my_mod.so
+
+5. At compile-time (inside bind_class<T>):
+   ├── std::meta::nonstatic_data_members_of(^^T, access_context)
+   │   → Discover data members
+   ├── std::meta::members_of(^^T, access_context)
+   │   → Discover methods
+   ├── Generate PyGetSetDef[] for properties
+   ├── Generate PyMethodDef[] for methods
+   └── Create PyTypeObject and register
+```
+
+### Runtime Flow
+
+```
+Python code: obj.value = 42
+
+1. Python calls setter (from PyGetSetDef)
+
+2. Setter function:
+   ├── Extract PyWrapper<T>* from Python object
+   ├── Get T* from wrapper
+   ├── Convert PyObject* (42) to C++ type
+   └── Assign: cpp_obj->value = from_python<int>(py_value)
+
+3. Return to Python
+```
+
+## Key Design Decisions
+
+### 1. Header-Only Library
+
+**Decision**: Single-header distribution for easy integration.
+
+**Rationale**:
+- Zero build system complexity for users
+- Works with any build system
+- Inspired by simdjson's approach
+
+**Trade-off**: Larger compile times (mitigated by PCH).
+
+### 2. Concept-Based Type System
+
+**Decision**: Use C++20 concepts for type classification.
+
+**Rationale**:
+- Clean, readable constraints
+- Better error messages than SFINAE
+- Extensible (users can add specializations)
+
+```cpp
+template<Arithmetic T>
+PyObject* to_python(const T& value) { ... }
+
+template<Container T>
+PyObject* to_python(const T& container) { ... }
+```
+
+### 3. Compile-Time Caching
+
+**Decision**: Cache reflection results in consteval functions.
+
+**Rationale**:
+- `std::meta::members_of()` is O(N)
+- Multiple passes would be O(N²)
+- Caching gives O(1) access after first computation
+
+### 4. Language-Specific Thin Layers
+
+**Decision**: Core reflection logic shared; only FFI code differs.
+
+**Rationale**:
+- ~77% code reuse across languages
+- Consistent behavior
+- Easier maintenance
+
+## Zero-Overhead Guarantee
+
+All binding code is resolved at compile-time:
+
+| Aspect | Implementation |
+|--------|---------------|
+| No vtables | Direct function pointers in PyMethodDef |
+| No RTTI | Type info from reflection metadata |
+| No indirection | Direct member offset access via splicers |
+| No runtime reflection | All via compile-time metaprogramming |
+
+## Extension Points
+
+### Adding a New Language
+
+1. Create `<lang>/mirror_bridge_<lang>.hpp`
+2. Implement `to_<lang>()` and `from_<lang>()` conversions
+3. Implement `Wrapper<T>` template
+4. Create `MIRROR_BRIDGE_<LANG>_MODULE` macro
+5. Add to amalgamation script
+
+### Adding a New Type Category
+
+1. Define new concept in `mirror_bridge_core.hpp`:
+   ```cpp
+   template<typename T>
+   concept MyNewType = /* constraints */;
+   ```
+
+2. Add conversion overloads in each language binding:
+   ```cpp
+   template<MyNewType T>
+   PyObject* to_python(const T& value);
+   ```
+
+## File Structure
+
+```
+mirror_bridge/
+├── core/
+│   └── mirror_bridge_core.hpp     # Language-agnostic core (476 lines)
+├── python/
+│   └── mirror_bridge_python.hpp   # Python bindings (1,984 lines)
+├── lua/
+│   └── mirror_bridge_lua.hpp      # Lua bindings (667 lines)
+├── javascript/
+│   └── mirror_bridge_javascript.hpp # JS bindings (646 lines)
+├── mirror_bridge.hpp              # Default include (Python)
+├── mirror_bridge_pch.hpp          # PCH wrapper
+├── tools/
+│   └── mirror_bridge              # Unified CLI
+├── single_header/                 # Amalgamated headers
+├── docs/                          # Documentation
+├── examples/                      # Progressive examples
+└── tests/                         # Test suite
+```
+
+## Performance Characteristics
+
+| Operation | Complexity | Notes |
+|-----------|------------|-------|
+| Member discovery | O(N) once | Cached at compile-time |
+| Member access | O(1) | Direct offset |
+| Method call | O(1) | Direct function pointer |
+| Type conversion | O(1) - O(N) | Depends on type (containers are O(N)) |
+| Module init | O(M) | M = number of bound classes |
+
+
+---
+# FILE: docs/internals/features.md
+---
+
+# Verified Features Matrix
+
+All features have been tested and verified across all supported languages.
+
+**Last Updated**: 2026-04-12
+**Environment**: Docker (Bloomberg clang-p2996)
+
+## Supported Languages
+
+| Language | Status | Auto-Discovery | Tests Passing |
+|----------|--------|---------------|---------------|
+| **Python** | Stable | `mirror_bridge generate --lang python` | 100% |
+| **Lua** | Stable | `mirror_bridge generate --lang lua` | 100% |
+| **JavaScript** | Stable | `mirror_bridge generate --lang js` | 100% |
+| **Rust** | Beta | Code generation via `generate_bindings<T>()` | 100% |
+
+## Feature Matrix
+
+| Feature | Python | Lua | JavaScript |
+|---------|--------|-----|------------|
+| **Default Constructors** | Yes | Yes | Yes |
+| **Parameterized Constructors** | Yes | Yes | Yes |
+| **Property Getters** | Yes | Yes | Yes |
+| **Property Setters** | Yes | Yes | Yes |
+| **Methods (0 params)** | Yes | Yes | Yes |
+| **Methods (1+ params)** | Yes | Yes | Yes |
+| **Methods (variadic)** | Yes | Yes | Yes |
+| **Void Methods** | Yes | Yes | Yes |
+| **Const Methods** | Yes | Yes | Yes |
+| **Return Values (numeric)** | Yes | Yes | Yes |
+| **Return Values (string)** | Yes | Yes | Yes |
+| **Containers (vector)** | Yes | Yes | Yes |
+| **Containers (array)** | Yes | Yes | Yes |
+| **Nested Objects** | Yes | Yes | Yes |
+| **Enums** | Yes | Yes | Yes |
+| **Method Overloading** | Yes | Partial | Partial |
+| **Smart Pointers** | Yes | Partial | Partial |
+| **Cross-Module Types** | Yes | No | No |
+| **Inheritance** | Yes | Yes | Yes |
+| **Exception Handling** | Yes | Yes | Yes |
+| **Auto-Discovery** | Yes | Yes | Yes |
+| **Async/Await (std::future)** | Yes | No | Yes |
+| **std::optional** | Yes | Yes | Yes |
+| **std::expected** | Yes | Yes | Yes |
+| **Bulk Array Transfer** | Yes (array.array) | No | No |
+| **Compile-Time Validation** | Yes | Yes | Yes |
+
+## Test Coverage
+
+### Python Tests
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Basic (Point2D, Vector3) | 3 | Passing |
+| Containers | 2 | Passing |
+| Nesting | 3 | Passing |
+| Methods (Calculator) | 4 | Passing |
+| Advanced (variadic) | 2 | Passing |
+| Advanced (constructors) | 2 | Passing |
+| Advanced (overloading) | 2 | Passing |
+| Advanced (smart_ptrs) | 2 | Passing |
+
+### Lua Tests
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Calculator | 12 | Passing |
+| Auto-Discovery | 3 | Passing |
+| Comprehensive Features | 4 | Passing |
+| **Total** | **19** | **100%** |
+
+### JavaScript Tests
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Calculator | 12 | Passing |
+| Auto-Discovery | 3 | Passing |
+| Comprehensive Features | 4 | Passing |
+| **Total** | **19** | **100%** |
+
+## Feature Details
+
+### Constructors
+
+```cpp
+struct Rectangle {
+    Rectangle() : width(0), height(0) {}
+    Rectangle(double w, double h) : width(w), height(h) {}
+    double width, height;
+};
+```
+
+All languages support:
+- Default constructors: `Rectangle()`
+- Parameterized constructors: `Rectangle(10.0, 5.0)`
+
+### Methods
+
+```cpp
+struct Calculator {
+    double value = 0.0;
+    double add(double x) { return value += x; }
+    void reset() { value = 0; }
+    double compute(double x, double y) { return (x + y) * 2; }
+    std::string to_string() const;
+};
+```
+
+Supported:
+- Any number of parameters (variadic)
+- Void return type
+- Const methods
+- String return values
+
+### Containers
+
+```cpp
+struct VectorTest {
+    std::vector<int> numbers;
+    std::vector<std::string> names;
+    std::array<double, 3> coords;
+};
+```
+
+Bidirectional conversion:
+- C++ `vector` <-> Python `list` / Lua `table` / JS `Array`
+- C++ `array` <-> Python `list` / Lua `table` / JS `Array`
+
+### Nested Objects
+
+```cpp
+struct Address { std::string city; int zip; };
+struct Person { std::string name; Address address; };
+```
+
+Nested structs convert to native dict/object/table types with full read/write access.
+
+### Enums
+
+```cpp
+enum class Color { Red = 0, Green = 1, Blue = 2 };
+struct Shape { Color color; };
+```
+
+Enums convert to integers in all languages.
+
+### Smart Pointers (Python Only)
+
+```cpp
+struct Manager {
+    std::unique_ptr<Resource> resource;
+    std::shared_ptr<Resource> shared_resource;
+};
+```
+
+Python fully supports smart pointer conversion. Lua and JavaScript have partial support.
+
+## Known Limitations
+
+### All Languages
+
+| Limitation | Status |
+|------------|--------|
+| Raw pointers (T*) | Not supported |
+| `std::optional` | Supported |
+| `std::variant` | Supported |
+| `std::tuple`/`std::pair` | Supported |
+| `std::map`/`std::unordered_map` | Supported |
+| `std::set`/`std::unordered_set` | Supported |
+| `std::function` | Python only (callbacks) |
+| Template classes | Must explicitly instantiate |
+
+### Lua & JavaScript
+
+| Limitation | Status |
+|------------|--------|
+| Smart pointers | Partial (basic only) |
+| Cross-module types | Not supported |
+| Method overloading | Limited |
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Compilation (simple) | <1 second |
+| Compilation (medium) | 1-5 seconds |
+| Runtime overhead | Zero (compile-time binding) |
+| Lines per class | 0 (auto-discovery) or 3 (manual) |
+
+## Running Tests
+
+```bash
+# All languages
+./tests/run_all_tests.sh
+
+# Python only
+./tests/run_all_tests.sh python
+
+# Lua only
+./tests/lua/run_lua_tests.sh
+
+# JavaScript only
+./tests/js/run_js_tests.sh
+```
+
+
+---
+# FILE: docs/MIGRATION_FROM_PYBIND11.md
+---
+
+# Migrating from pybind11 to Mirror Bridge
+
+This guide helps developers familiar with pybind11 transition to Mirror Bridge's reflection-based binding system.
+
+## Why Migrate?
+
+| Aspect | pybind11 | Mirror Bridge |
+|--------|----------|---------------|
+| Binding code | Manual per-member | Automatic reflection |
+| Code reduction | - | 5-10x less code |
+| Compile time | Baseline | 1.4-1.6x faster |
+| Runtime overhead | Baseline | Within 10% |
+| Multi-language | Python only | Python, Lua, JavaScript |
+| Maintenance | Update bindings manually | Auto-reflects changes |
+
+## Quick Comparison
+
+### Before: pybind11
+
+```cpp
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include "point.hpp"
+
+namespace py = pybind11;
+
+PYBIND11_MODULE(geometry, m) {
+    py::class_<Point2D>(m, "Point2D")
+        .def(py::init<>())
+        .def(py::init<double, double>())
+        .def_readwrite("x", &Point2D::x)
+        .def_readwrite("y", &Point2D::y)
+        .def("magnitude", &Point2D::magnitude)
+        .def("normalize", &Point2D::normalize)
+        .def("dot", &Point2D::dot)
+        .def("distance_to", &Point2D::distance_to)
+        .def("__repr__", [](const Point2D& p) {
+            return "Point2D(" + std::to_string(p.x) + ", " + std::to_string(p.y) + ")";
+        });
+
+    py::class_<Line2D>(m, "Line2D")
+        .def(py::init<Point2D, Point2D>())
+        .def_readwrite("start", &Line2D::start)
+        .def_readwrite("end", &Line2D::end)
+        .def("length", &Line2D::length)
+        .def("midpoint", &Line2D::midpoint);
+}
+```
+
+### After: Mirror Bridge
+
+```cpp
+#include "mirror_bridge.hpp"
+#include "point.hpp"
+
+MIRROR_BRIDGE_MODULE(geometry,
+    mirror_bridge::bind_class<Point2D>(m, "Point2D");
+    mirror_bridge::bind_class<Line2D>(m, "Line2D");
+)
+```
+
+That's it. All members, methods, and constructors are automatically discovered via C++26 reflection.
+
+## Step-by-Step Migration
+
+### Step 1: Update Include
+
+```diff
+- #include <pybind11/pybind11.h>
+- #include <pybind11/stl.h>
++ #include "mirror_bridge.hpp"
+```
+
+### Step 2: Replace Module Macro
+
+```diff
+- namespace py = pybind11;
+- PYBIND11_MODULE(mymodule, m) {
++ MIRROR_BRIDGE_MODULE(mymodule,
+```
+
+### Step 3: Replace Class Bindings
+
+```diff
+-     py::class_<MyClass>(m, "MyClass")
+-         .def(py::init<>())
+-         .def(py::init<int>())
+-         .def_readwrite("value", &MyClass::value)
+-         .def("get_value", &MyClass::get_value)
+-         .def("set_value", &MyClass::set_value);
++     mirror_bridge::bind_class<MyClass>(m, "MyClass");
+```
+
+### Step 4: Close Module
+
+```diff
+- }
++ )
+```
+
+## Feature Mapping
+
+### Constructors
+
+**pybind11:**
+```cpp
+py::class_<Widget>(m, "Widget")
+    .def(py::init<>())
+    .def(py::init<int>())
+    .def(py::init<std::string, int>());
+```
+
+**Mirror Bridge:**
+```cpp
+// All public constructors are automatically bound
+mirror_bridge::bind_class<Widget>(m, "Widget");
+```
+
+### Data Members
+
+**pybind11:**
+```cpp
+.def_readwrite("value", &Widget::value)      // Read-write
+.def_readonly("constant", &Widget::constant)  // Read-only
+```
+
+**Mirror Bridge:**
+```cpp
+// All public data members are automatically bound as read-write
+// For read-only, make the member const in C++:
+//   const int constant;
+mirror_bridge::bind_class<Widget>(m, "Widget");
+```
+
+### Methods
+
+**pybind11:**
+```cpp
+.def("process", &Widget::process)
+.def("calculate", &Widget::calculate)
+.def_static("create", &Widget::create)
+```
+
+**Mirror Bridge:**
+```cpp
+// All public methods (including static) are automatically bound
+mirror_bridge::bind_class<Widget>(m, "Widget");
+```
+
+### Method Overloading
+
+**pybind11:**
+```cpp
+.def("add", py::overload_cast<int>(&Calculator::add))
+.def("add", py::overload_cast<double>(&Calculator::add))
+.def("add", py::overload_cast<const std::string&>(&Calculator::add))
+```
+
+**Mirror Bridge:**
+```cpp
+// Overloads are automatically detected and dispatched
+mirror_bridge::bind_class<Calculator>(m, "Calculator");
+```
+
+Python usage remains the same - the correct overload is selected based on argument types.
+
+### Static Methods
+
+**pybind11:**
+```cpp
+.def_static("create", &Factory::create)
+.def_static("version", &Factory::version)
+```
+
+**Mirror Bridge:**
+```cpp
+// Static methods are automatically detected and bound
+mirror_bridge::bind_class<Factory>(m, "Factory");
+```
+
+### Static Constexpr Members
+
+**pybind11:**
+```cpp
+py::class_<Constants>(m, "Constants")
+    .def_readonly_static("PI", &Constants::PI)
+    .def_readonly_static("E", &Constants::E);
+```
+
+**Mirror Bridge:**
+```cpp
+// static constexpr members are automatically bound as class attributes
+mirror_bridge::bind_class<Constants>(m, "Constants");
+```
+
+### STL Containers
+
+**pybind11:**
+```cpp
+#include <pybind11/stl.h>  // Required for automatic conversion
+
+.def("get_items", &Container::get_items)  // Returns std::vector
+.def("set_items", &Container::set_items)  // Takes std::vector
+```
+
+**Mirror Bridge:**
+```cpp
+// STL containers are automatically converted
+// No additional includes needed
+mirror_bridge::bind_class<Container>(m, "Container");
+```
+
+Supported containers:
+- `std::vector<T>` ↔ Python `list`
+- `std::map<K, V>` ↔ Python `dict`
+- `std::set<T>` ↔ Python `set`
+- `std::optional<T>` ↔ Python `T | None`
+- `std::string` ↔ Python `str`
+
+### Smart Pointers
+
+**pybind11:**
+```cpp
+py::class_<Resource, std::shared_ptr<Resource>>(m, "Resource")
+    .def(py::init<>())
+    ...
+```
+
+**Mirror Bridge:**
+```cpp
+// Smart pointer semantics are automatically handled
+mirror_bridge::bind_class<Resource>(m, "Resource");
+
+// For factory methods returning shared_ptr:
+// std::shared_ptr<Resource> Factory::create();
+// Just works - returns the wrapped object to Python
+```
+
+### Callbacks (std::function)
+
+**pybind11:**
+```cpp
+.def("set_callback", &Widget::set_callback)  // Just works
+```
+
+**Mirror Bridge:**
+```cpp
+// std::function parameters accept Python callables
+mirror_bridge::bind_class<Widget>(m, "Widget");
+```
+
+Python usage:
+```python
+widget.set_callback(lambda x: x * 2)
+```
+
+### Enums
+
+**pybind11:**
+```cpp
+py::enum_<Color>(m, "Color")
+    .value("Red", Color::Red)
+    .value("Green", Color::Green)
+    .value("Blue", Color::Blue);
+```
+
+**Mirror Bridge:**
+```cpp
+// Enums are automatically bound when used by a bound class
+// Standalone enum binding:
+mirror_bridge::bind_enum<Color>(m, "Color");
+```
+
+### Free Functions
+
+**pybind11:**
+```cpp
+m.def("compute", &compute);
+m.def("transform", &transform);
+```
+
+**Mirror Bridge:**
+```cpp
+mirror_bridge::bind_function<&compute>(m, "compute");
+mirror_bridge::bind_function<&transform>(m, "transform");
+
+// Or use auto-discovery with mirror_bridge_auto which finds
+// all functions in namespaces that contain bound classes
+```
+
+### Custom __repr__
+
+**pybind11:**
+```cpp
+.def("__repr__", [](const Point& p) {
+    return "Point(" + std::to_string(p.x) + ", " + std::to_string(p.y) + ")";
+});
+```
+
+**Mirror Bridge:**
+```cpp
+// Add a to_string() or operator<< to your class:
+std::string Point::to_string() const {
+    return "Point(" + std::to_string(x) + ", " + std::to_string(y) + ")";
+}
+// It will be used for __repr__ automatically
+```
+
+## Excluding Members
+
+### Skip a Class
+
+```cpp
+// Add comment before class definition
+// MIRROR_BRIDGE_SKIP
+class InternalHelper {
+    // This class won't be bound
+};
+```
+
+### Skip a File
+
+```cpp
+// At the top of the file
+// MIRROR_BRIDGE_SKIP_FILE
+```
+
+## Build System Changes
+
+### CMake
+
+**Before (pybind11):**
+```cmake
+find_package(pybind11 REQUIRED)
+pybind11_add_module(mymodule src/bindings.cpp)
+```
+
+**After (Mirror Bridge):**
+```cmake
+# Use mirror_bridge_build script or:
+add_library(mymodule SHARED src/bindings.cpp)
+target_compile_options(mymodule PRIVATE
+    -std=c++2c -freflection -freflection-latest -stdlib=libc++
+)
+target_include_directories(mymodule PRIVATE
+    ${CMAKE_SOURCE_DIR}/path/to/mirror_bridge
+    ${Python3_INCLUDE_DIRS}
+)
+```
+
+### Command Line
+
+**Before:**
+```bash
+c++ -O3 -shared -std=c++17 -fPIC \
+    $(python3 -m pybind11 --includes) \
+    bindings.cpp -o mymodule$(python3-config --extension-suffix)
+```
+
+**After:**
+```bash
+./mirror_bridge_build bindings.cpp -o build/
+# Or use mirror_bridge_auto for auto-discovery:
+./mirror_bridge_auto src/ --module mymodule
+```
+
+## Common Migration Issues
+
+### Issue: Private Members Being Bound
+
+Mirror Bridge only binds public members. If you had pybind11 bindings for private members using friend declarations, you'll need to:
+1. Make the members public, or
+2. Add public accessor methods
+
+### Issue: Custom Type Converters
+
+If you had custom `type_caster` specializations in pybind11:
+
+```cpp
+namespace pybind11 { namespace detail {
+    template <> struct type_caster<MyType> { ... };
+}}
+```
+
+Mirror Bridge uses concepts for type handling. For custom types, ensure they satisfy one of the built-in concepts or add a specialization.
+
+### Issue: Keep-Alive Policies
+
+pybind11's `py::keep_alive<>()` doesn't have a direct equivalent. Mirror Bridge uses reference counting and shared_ptr semantics. If you need specific lifetime management, use `std::shared_ptr`.
+
+### Issue: Return Value Policies
+
+pybind11's return value policies (`return_value_policy::reference`, etc.) are not needed. Mirror Bridge automatically:
+- Copies value types
+- Wraps pointer/reference returns appropriately
+- Uses move semantics where applicable
+
+## Gradual Migration
+
+You can migrate incrementally:
+
+1. **Start with a single class**: Replace one pybind11 class binding with Mirror Bridge
+2. **Keep both systems**: Have separate binding files during transition
+3. **Verify behavior**: Run your existing tests
+4. **Expand gradually**: Migrate more classes as confidence grows
+
+## Getting Help
+
+- Check `examples/` for common patterns
+- Run `./mirror_bridge_doctor` to verify your setup
+- See `ARCHITECTURE.md` for system understanding
+- Review `benchmarks/FINAL_RESULTS.md` for performance expectations
+
+## Summary
+
+| pybind11 | Mirror Bridge |
+|----------|---------------|
+| `PYBIND11_MODULE(name, m)` | `MIRROR_BRIDGE_MODULE(name,` |
+| `py::class_<T>(m, "T")` | `mirror_bridge::bind_class<T>(m, "T");` |
+| `.def(py::init<...>())` | (automatic) |
+| `.def_readwrite("x", &T::x)` | (automatic) |
+| `.def("method", &T::method)` | (automatic) |
+| `.def_static(...)` | (automatic) |
+| `py::enum_<E>(m, "E")` | `mirror_bridge::bind_enum<E>(m, "E");` |
+| `m.def("func", &func)` | `mirror_bridge::bind_function<&func>(m, "func");` |
+| `}` | `)` |
+
+The key insight: **Mirror Bridge trades explicit bindings for automatic reflection.** You write less code, but you need C++26 reflection support (Bloomberg clang-p2996).
+
+
+---
+# FILE: examples/README.md
+---
+
+# Mirror Bridge Examples
+
+Progressive examples from beginner to production-ready scientific computing.
+
+## Quick Start
+
+```bash
+cd examples/01-hello-world
+../../tools/mirror_bridge generate src/ --module greeter --lang python
+python3 test_greeter.py
+```
+
+## Example Progression
+
+| Example | Focus | Complexity |
+|---------|-------|------------|
+| [01-hello-world](01-hello-world/) | Properties, simple methods | Beginner |
+| [02-calculator](02-calculator/) | Parameters, exceptions, const methods | Beginner |
+| [03-containers](03-containers/) | Vector/array conversion, STL containers | Intermediate |
+| [04-image-processing](04-image-processing/) | Real-world image processing library | Advanced |
+| [05-nbody-simulation](05-nbody-simulation/) | Scientific computing, physics simulation | Advanced |
+| [11-expected](11-expected/) | `std::expected` error handling | Intermediate |
+| [packaging](packaging/) | Distributable pip package | Intermediate |
+
+## Example Details
+
+### 01: Hello World
+**Difficulty**: Beginner
+
+A simple `Greeter` class demonstrating:
+- Properties (read/write)
+- Simple methods
+- Default values
+
+### 02: Calculator
+**Difficulty**: Beginner
+
+A calculator with various method signatures:
+- Methods with parameters
+- Multiple parameters
+- Const methods
+- Exception handling
+
+### 03: Containers
+**Difficulty**: Intermediate
+
+Working with C++ containers:
+- `std::vector<T>` to Python list
+- `std::array<T, N>` to Python list
+- Container methods
+
+### 04: Image Processing Library
+**Difficulty**: Advanced | **Lines**: ~1200
+
+A realistic image processing library demonstrating why C++ bindings matter:
+
+```
+src/
+├── color.hpp      # RGBA/HSV, blending, color math
+├── image.hpp      # Image buffer, transforms, compositing
+├── kernel.hpp     # Convolution (blur, sharpen, edge detect)
+└── histogram.hpp  # Analysis, equalization, thresholding
+```
+
+**Features**: Gaussian blur, Sobel edge detection, histogram equalization,
+bilinear resize, HSV color space, Otsu's method
+
+### 05: N-Body Gravitational Simulation
+**Difficulty**: Advanced | **Lines**: ~1400
+
+Production-quality gravitational simulation for astrophysics:
+
+```
+src/
+├── vec3.hpp         # Full 3D vector math
+├── body.hpp         # Celestial bodies, orbital elements
+├── integrator.hpp   # Euler, Verlet, RK4, Leapfrog
+├── simulation.hpp   # Force calculation, simulation driver
+└── statistics.hpp   # Conservation analysis, virial theorem
+```
+
+**Features**: Symplectic integration, energy conservation, Keplerian orbital
+elements, Lagrange points, cluster statistics, virial analysis
+
+## Running Examples
+
+Each example follows the same pattern:
+
+```bash
+cd examples/04-image-processing
+../../tools/mirror_bridge generate src/ --module imgproc --lang python
+python3 test_imgproc.py
+```
+
+### Run All Examples
+
+```bash
+# From the examples directory
+for dir in 01-* 02-* 03-* 04-* 05-*; do
+    name=$(echo $dir | cut -d'-' -f2-)
+    echo "=== $dir ==="
+    cd "$dir"
+    ../../tools/mirror_bridge generate src/ --module $name --lang python
+    python3 test_*.py
+    cd ..
+done
+```
+
+## Multi-Language Support
+
+Each example can be built for any supported language:
+
+```bash
+# Python
+../../tools/mirror_bridge generate src/ --module example --lang python
+
+# Lua
+../../tools/mirror_bridge generate src/ --module example --lang lua
+
+# JavaScript
+../../tools/mirror_bridge generate src/ --module example --lang js
+
+# All at once
+../../tools/mirror_bridge generate src/ --module example --lang all
+```
+
+## Why These Examples?
+
+**Examples 01-03** teach mirror_bridge concepts incrementally.
+
+**Examples 04-05** show realistic use cases where C++ bindings provide real value:
+- Image processing: Pixel-level operations at native speed
+- N-body simulation: Millions of floating-point operations per frame
+
+These mirror production libraries like OpenCV (image processing) and REBOUND
+(orbital mechanics) that use the same Python-calls-C++ pattern.
+
+## Documentation
+
+- [Getting Started](../docs/getting-started/quickstart.md)
+- [CLI Reference](../docs/reference/cli.md)
+- [Type Conversion](../docs/reference/type-conversion.md)
+
+
+---
+# FILE: CHANGELOG.md
+---
+
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- Rust FFI binding generation: `generate_bindings<T>()` produces extern "C" wrappers, C headers, and safe Rust wrapper types with Drop, Send, Sync, and idiomatic getters/setters
+- `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
+- `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
+- Bulk array transfer for numeric vectors: `vector<float>`, `vector<double>`, `vector<int>`, etc. are now returned as `array.array` objects via single memcpy (~10-50x faster than element-by-element list construction)
+- String interning for member names in Python dict conversion via `PyUnicode_InternFromString`
+- Exception handling for Lua (`luaL_error`) and JavaScript (`napi_throw_error`) bindings: C++ exceptions are now caught and propagated as native errors in all three languages
+- Compile-time binding validation: `bind_class<T>` now produces clear `static_assert` messages when a class contains unconvertible member types, instead of cryptic template errors
+- `MIRROR_BRIDGE_VALIDATE(T)` macro for explicit validation outside `bind_class`
+- `std::expected<T, E>` type conversion for Python (ValueError on error), Lua (idiomatic value, err multi-return), and JavaScript (throw Error on error)
+- GitHub Codespaces support (`.devcontainer/devcontainer.json`) for instant browser-based development
+- `std::optional<T>` type conversion for Python, Lua, and JavaScript
+- Async/await support: `std::future<T>` → Python awaitable, JavaScript Promise
+- GitHub issue and PR templates for better contribution experience
+- Feature matrix table in README showing per-language feature support
+
+### Changed
+- Improved devcontainer configuration with proper C++2c reflection flags
+
+## [0.2.0] - 2025-12-01
+
+### Added
+- P3394 annotation support for field-level binding control (`[[=exclude{}]]`, `[[=readonly{}]]`)
+- Zero-copy buffer protocol for NumPy integration (10M times faster for large data)
+- `.pyi` stub generation for Python IDE autocomplete
+- Multi-language Mandelbrot demo showcasing Python, Lua, and JavaScript bindings
+- `mirror_bridge_doctor` diagnostic tool
+- Examples 06-10: callbacks, static/constexpr, free functions, enums, smart pointers
+- Migration guide from pybind11
+- Comprehensive architecture documentation
+
+### Changed
+- Replaced method name mangling with pybind11-style overload dispatch
+- Improved method parameter forwarding for move-only and reference types
+
+### Fixed
+- GCC compatibility for P3394 annotations
+- V8 SetNativeDataProperty API compatibility
+- Fold expression empty pack handling
+
+## [0.1.0] - 2025-11-12
+
+### Added
+- Initial release with C++26 reflection-based binding generation
+- Python bindings via Python C API
+- Lua bindings via Lua C API
+- JavaScript bindings via Node.js N-API
+- Auto-discovery of classes for zero-boilerplate binding
+- Container support: `std::vector`, `std::array`
+- Smart pointer support: `std::unique_ptr`, `std::shared_ptr`
+- Enum support with automatic integer conversion
+- Nested object support with dict/table/object conversion
+- Method overloading with automatic dispatch
+- Static method and constexpr member binding
+- Free function binding
+- Precompiled header support for 3-6x faster builds
+- CLI tools: `mirror_bridge`, `mirror_bridge_auto`, `mirror_bridge_pch_build`
+- Docker environment with Bloomberg clang-p2996
+- Comprehensive test suite for all languages
+- Production-quality examples (image processing, n-body simulation)
+
+### Performance
+- 3-5x faster runtime than pybind11
+- Zero runtime overhead through compile-time binding generation
+- Batch processing API for avoiding Python/C++ boundary overhead
+
+[Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/FranciscoThiesen/mirror_bridge/releases/tag/v0.1.0
+
+
+

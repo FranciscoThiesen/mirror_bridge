@@ -1,0 +1,34 @@
+# mirror_bridge
+
+> mirror_bridge is a C++26 reflection-based binding generator: write your C++ once and get Python, Lua, and JavaScript bindings auto-generated with zero boilerplate. Classes and functions are discovered automatically via reflection, so there is no per-binding glue code to maintain. It requires the Bloomberg clang-p2996 reflection compiler, most easily used through the provided Docker image.
+
+## Docs
+- [README](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/README.md): Project overview, value proposition, and quick example
+- [Installation](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/getting-started/installation.md): Set up the C++26 reflection toolchain via Docker
+- [Quick Start](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/getting-started/quickstart.md): Get bindings working in five minutes
+- [Your First Binding](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/getting-started/first-binding.md): Step-by-step first C++ to Python binding
+- [Development Workflow](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/workflow.md): Recommended day-to-day workflow
+- [Multi-Language Support](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/multi-language.md): Generate Python, Lua, and JavaScript from one source
+- [Packaging](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/packaging.md): Distribute bindings as installable packages
+- [Single-Header](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/single-header.md): Integrate via amalgamated single-header builds
+- [PCH Optimization](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/pch-optimization.md): Cut compile times with precompiled headers
+
+## Reference
+- [API Reference](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/api.md): C++ binding functions, concepts, and macros
+- [CLI Reference](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/cli.md): The unified mirror_bridge command-line interface
+- [Configuration](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/configuration.md): Config files for explicit control over bindings
+- [Type Conversion](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/type-conversion.md): Supported C++ to target-language type mappings
+- [Errors](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/errors.md): Error messages and troubleshooting reference
+- [Architecture](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/architecture.md): How the reflection-driven generator works internally
+- [Feature Matrix](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/features.md): Verified features across all supported languages
+
+## Examples
+- [Examples](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/README.md): Progressive examples from beginner to production
+- [Migrating from pybind11](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/MIGRATION_FROM_PYBIND11.md): Transition guide for pybind11 users
+- [Zero-Copy Buffers](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/ZERO_COPY_BUFFERS.md): Zero-copy buffer protocol support for Python
+
+## Optional
+- [Benchmarks](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/benchmarks.md): Performance comparison vs traditional binding libraries
+- [Contributing](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/contributing.md): Develop, test, and contribute to mirror_bridge
+- [Playground](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/playground.md): Try mirror_bridge online with no local install
+- [Changelog](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/CHANGELOG.md): Notable changes per release
