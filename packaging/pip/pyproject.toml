@@ -25,9 +25,13 @@ Homepage = "https://github.com/FranciscoThiesen/mirror_bridge"
 Documentation = "https://github.com/FranciscoThiesen/mirror_bridge/tree/main/docs"
 Changelog = "https://github.com/FranciscoThiesen/mirror_bridge/blob/main/CHANGELOG.md"
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+
 [project.scripts]
 mirror_bridge = "mirror_bridge_cli:main"
 mirror-bridge = "mirror_bridge_cli:main"
+mirror-bridge-mcp = "mirror_bridge_cli.mcp_server:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

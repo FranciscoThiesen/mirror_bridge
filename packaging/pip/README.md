@@ -40,6 +40,22 @@ mirror_bridge diff src/ --check                     # CI gate for binding drift
 mirror_bridge shell                                 # interactive container
 ```
 
+## MCP server (for AI agents)
+
+The package ships an [MCP](https://modelcontextprotocol.io) server so AI
+coding agents can generate bindings as a native tool call:
+
+```bash
+pip install 'mirror-bridge[mcp]'
+
+# Register with Claude Code:
+claude mcp add mirror_bridge -- mirror-bridge-mcp
+```
+
+Exposed tools: `generate_bindings(src_dir, module, lang, ...)`, `doctor()`,
+and `check_binding_drift(src_dir)` — each returns the CLI's structured JSON
+result, including actionable suggestions on failure.
+
 ## Configuration
 
 | Environment variable | Effect |
