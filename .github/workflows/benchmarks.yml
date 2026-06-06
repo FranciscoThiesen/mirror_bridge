@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: benchmarks
@@ -43,14 +44,19 @@ jobs:
           ' docs/internals/benchmarks.md > /tmp/benchmarks.md
           mv /tmp/benchmarks.md docs/internals/benchmarks.md
 
-      - name: Commit updated page if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/internals/benchmarks.md
-          if git diff --cached --quiet; then
-            echo "Benchmarks page unchanged"
-            exit 0
-          fi
-          git commit -m "Regenerate runtime benchmarks page [skip ci]"
-          git push
+      # main is protected (PR-only), so the refresh lands as a PR for the
+      # maintainer to merge. The action is a no-op when the page is unchanged.
+      - name: Open PR with the regenerated page
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: docs/internals/benchmarks.md
+          commit-message: "Regenerate runtime benchmarks page"
+          title: "Regenerate runtime benchmarks page"
+          body: |
+            Automated benchmark refresh: the runtime suite was rerun on a
+            GitHub Actions runner and the table in
+            `docs/internals/benchmarks.md` regenerated from the results.
+            Compare the ratio columns against the previous page; absolute
+            times shift with runner hardware, ratios should be stable.
+          branch: bot/benchmarks-refresh
+          delete-branch: true

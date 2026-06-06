@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-05
+
 ### Added
 - `--json` machine-readable output for `generate`, `diff`, and `doctor`: stdout carries exactly one JSON object (status, discovered classes, built outputs, and per-language errors with actionable suggestions); human-readable progress goes to stderr
 - `mirror_bridge doctor` subcommand integrating the diagnostic tool into the unified CLI
@@ -16,10 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error catalog (`docs/reference/errors.md`): every known failure mode with exact symptom, cause, and fix
 - pip-installable `mirror-bridge` package (`packaging/pip/`): wraps the Docker toolchain so `pip install mirror-bridge` gives a working `mirror_bridge` CLI anywhere, plus `mirror_bridge shell` for an interactive container
 - MCP server (`pip install 'mirror-bridge[mcp]'`, run `mirror-bridge-mcp`): exposes `generate_bindings`, `doctor`, and `check_binding_drift` as native tool calls for AI agents
+- Claude Code integration (`integrations/claude-code/`): drop-in `bind-cpp` skill teaching the generate → fix → verify loop
+- Living benchmarks: a monthly CI workflow reruns the runtime suite and regenerates the table in `docs/internals/benchmarks.md`
+- API stability contract (`docs/reference/stability.md`): which surfaces are stable pre-1.0 and how versioning works
+- Smart pointer regression tests for Lua and JavaScript (members, params, returns, nil reset, abstract pointees)
 
 ### Fixed
+- Class-type smart pointers never compiled in the Lua and JavaScript backends (overload declaration order defeated two-phase lookup); they now work with the same deep-copy semantics as Python
+- `bool` returned/accepted as a number in Lua and JavaScript; it now maps to native booleans in both directions
+- Methods taking `std::unique_ptr<T>` by value failed to compile (parameter storage tried to copy a move-only type); smart pointer parameters now use value storage and are moved into the call
+- Test harness named modules after the source filename instead of the `MIRROR_BRIDGE_*MODULE` declaration, producing unloadable modules whenever the two differed (the root cause of the long-red Tests workflow)
 - `generate` no longer reports success when a stale `.so` from a previous run exists but the current compile failed
 - `generate --lang all` now attempts every language and reports all failures instead of aborting on the first one
+- Amalgamation stripped `#define MIRROR_BRIDGE_VALIDATE(T)` from the single headers, leaving a dangling macro body that broke every single-header consumer
 - Rust FFI binding generation: `generate_bindings<T>()` produces extern "C" wrappers, C headers, and safe Rust wrapper types with Drop, Send, Sync, and idiomatic getters/setters
 - `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
 - `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
@@ -85,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero runtime overhead through compile-time binding generation
 - Batch processing API for avoiding Python/C++ boundary overhead
 
-[Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/FranciscoThiesen/mirror_bridge/releases/tag/v0.1.0
 

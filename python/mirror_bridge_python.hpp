@@ -106,7 +106,7 @@
 // two headers from disagreeing at every user build).
 #ifndef MIRROR_BRIDGE_VERSION_MAJOR
   #define MIRROR_BRIDGE_VERSION_MAJOR 0
-  #define MIRROR_BRIDGE_VERSION_MINOR 2
+  #define MIRROR_BRIDGE_VERSION_MINOR 3
   #define MIRROR_BRIDGE_VERSION_PATCH 0
 #endif
 

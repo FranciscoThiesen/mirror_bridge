@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirror-bridge"
-version = "0.2.0"
+version = "0.3.0"
 description = "C++26 reflection-based binding generator: write C++ once, get Python, Lua, and JavaScript bindings with zero boilerplate"
 readme = "README.md"
 license = { text = "Apache-2.0" }
