@@ -34,7 +34,7 @@ All features have been tested and verified across all supported languages.
 | **Nested Objects** | Yes | Yes | Yes |
 | **Enums** | Yes | Yes | Yes |
 | **Method Overloading** | Yes | Partial | Partial |
-| **Smart Pointers** | Yes | Partial | Partial |
+| **Smart Pointers** | Yes | Yes | Yes |
 | **Cross-Module Types** | Yes | No | No |
 | **Inheritance** | Yes | Yes | Yes |
 | **Exception Handling** | Yes | Yes | Yes |
@@ -144,7 +144,7 @@ struct Shape { Color color; };
 
 Enums convert to integers in all languages.
 
-### Smart Pointers (Python Only)
+### Smart Pointers
 
 ```cpp
 struct Manager {
@@ -153,7 +153,11 @@ struct Manager {
 };
 ```
 
-Python fully supports smart pointer conversion. Lua and JavaScript have partial support.
+All three languages support smart pointers as members, parameters, and
+return values with deep-copy semantics (the target-language value is
+materialized into a fresh pointee). `None`/`nil`/`null` resets the pointer.
+Smart pointers to abstract types support only the reset round-trip; the
+pointee can't be materialized by value.
 
 ## Known Limitations
 
@@ -174,7 +178,6 @@ Python fully supports smart pointer conversion. Lua and JavaScript have partial 
 
 | Limitation | Status |
 |------------|--------|
-| Smart pointers | Partial (basic only) |
 | Cross-module types | Not supported |
 | Method overloading | Limited |
 
