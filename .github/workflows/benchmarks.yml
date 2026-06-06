@@ -1,0 +1,56 @@
+name: Benchmarks
+
+# Living benchmarks: regenerate the runtime table in
+# docs/internals/benchmarks.md from a fresh run so the published numbers
+# always reflect the current code. Monthly + on demand.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 1 * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/franciscothiesen/mirror_bridge-benchmark:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Run benchmark suite
+        run: ./benchmarks/run_all_benchmarks.sh
+
+      - name: Splice regenerated runtime table into the benchmarks page
+        run: |
+          python3 benchmarks/format_results.py \
+            benchmarks/runtime/python/runtime_results.json \
+            --commit "$GITHUB_SHA" \
+            --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
+            --fragment > /tmp/runtime_fragment.md
+          awk '
+            /<!-- RUNTIME:BEGIN/ { print; system("cat /tmp/runtime_fragment.md"); skip=1; next }
+            /<!-- RUNTIME:END/   { skip=0 }
+            !skip
+          ' docs/internals/benchmarks.md > /tmp/benchmarks.md
+          mv /tmp/benchmarks.md docs/internals/benchmarks.md
+
+      - name: Commit updated page if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/internals/benchmarks.md
+          if git diff --cached --quiet; then
+            echo "Benchmarks page unchanged"
+            exit 0
+          fi
+          git commit -m "Regenerate runtime benchmarks page [skip ci]"
+          git push
