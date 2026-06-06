@@ -23,13 +23,17 @@ mkdir -p "$OUTPUT_DIR"
 # Helper function to extract content between pragma once and end of file
 extract_content() {
     local file="$1"
-    # Skip the #pragma once line and include guards, extract everything else
-    # Also skip #include statements for mirror_bridge headers
+    # Skip the #pragma once line and include guards, extract everything else.
+    # Also skip #include statements for mirror_bridge headers.
+    # Guard patterns require the _HPP suffix: a bare MIRROR_BRIDGE match
+    # would also strip user-facing macro definitions like
+    # `#define MIRROR_BRIDGE_VALIDATE(T) \`, leaving its continuation
+    # body dangling in the output.
     awk '
         /^#pragma once/ { next }
-        /^#ifndef.*MIRROR_BRIDGE/ { next }
-        /^#define.*MIRROR_BRIDGE/ { next }
-        /^#endif.*MIRROR_BRIDGE/ { next }
+        /^#ifndef MIRROR_BRIDGE[A-Z_]*_HPP/ { next }
+        /^#define MIRROR_BRIDGE[A-Z_]*_HPP/ { next }
+        /^#endif.*MIRROR_BRIDGE[A-Z_]*_HPP/ { next }
         /^#include ".*mirror_bridge.*\.hpp"/ { next }
         /^#include "\.\.\/core\/mirror_bridge_core\.hpp"/ { next }
         { print }

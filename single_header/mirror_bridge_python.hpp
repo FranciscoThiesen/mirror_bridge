@@ -64,7 +64,13 @@
 #endif
 
 // Library version and capabilities
+#define MIRROR_BRIDGE_VERSION_MAJOR 0
+#define MIRROR_BRIDGE_VERSION_MINOR 2
+#define MIRROR_BRIDGE_VERSION_PATCH 0
 
+#define MIRROR_BRIDGE_HAS_REFLECTION 1
+#define MIRROR_BRIDGE_HAS_ENUMERATORS_OF 1
+#define MIRROR_BRIDGE_HAS_TYPE_SIGNATURES 1
 
 namespace mirror_bridge {
 namespace core {
@@ -783,6 +789,7 @@ consteval bool validate_bindable_members() {
 // On failure, produces:
 //   error: static assertion failed: "MyClass contains members with types that
 //   mirror_bridge cannot convert. Mark them with @exclude or add a custom converter."
+#define MIRROR_BRIDGE_VALIDATE(T) \
     static_assert(::mirror_bridge::core::validate_bindable_members<T>(), \
         #T " contains members with types that mirror_bridge cannot convert. " \
         "Mark unconvertible members with [[=exclude{}]] or add a custom type converter. " \
