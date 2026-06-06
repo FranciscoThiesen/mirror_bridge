@@ -46,7 +46,9 @@ struct LuaWrapper {
 // Arithmetic types
 template<Arithmetic T>
 void to_lua(lua_State* L, const T& value) {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        lua_pushboolean(L, value ? 1 : 0);
+    } else if constexpr (std::is_floating_point_v<T>) {
         lua_pushnumber(L, static_cast<lua_Number>(value));
     } else {
         lua_pushinteger(L, static_cast<lua_Integer>(value));
@@ -82,6 +84,16 @@ void to_lua(lua_State* L, const T& container) {
     }
 }
 
+// Forward declaration for Bindable types. Must precede the SmartPointer
+// overload: the pointee is typically a user class in the global namespace,
+// so the dependent to_lua(L, *ptr) call below finds this only through the
+// declaration context, never through ADL.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>
+>
+to_lua(lua_State* L, const T& obj);
+
 // Smart pointers
 template<SmartPointer T>
 void to_lua(lua_State* L, const T& ptr) {
@@ -89,16 +101,8 @@ void to_lua(lua_State* L, const T& ptr) {
         lua_pushnil(L);
         return;
     }
-    using ElementType = typename std::remove_cvref_t<T>::element_type;
     to_lua(L, *ptr);
 }
-
-// Forward declaration for Bindable types
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>
->
-to_lua(lua_State* L, const T& obj);
 
 // ============================================================================
 // Type Conversion: Lua → C++
@@ -107,7 +111,10 @@ to_lua(lua_State* L, const T& obj);
 // Arithmetic types
 template<Arithmetic T>
 bool from_lua(lua_State* L, int idx, T& out) {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        if (!lua_isboolean(L, idx)) return false;
+        out = lua_toboolean(L, idx) != 0;
+    } else if constexpr (std::is_floating_point_v<T>) {
         if (!lua_isnumber(L, idx)) return false;
         out = static_cast<T>(lua_tonumber(L, idx));
     } else {
@@ -182,6 +189,16 @@ bool from_lua(lua_State* L, int idx, T& container) {
     return true;
 }
 
+// Forward declaration for Bindable types. Must precede the SmartPointer
+// overload for the same lookup reason as to_lua above: the pointee class
+// lives in the global namespace, so ADL can't find a later declaration.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    bool
+>
+from_lua(lua_State* L, int idx, T& out);
+
 // Smart pointers from Lua
 template<SmartPointer T>
 bool from_lua(lua_State* L, int idx, T& out) {
@@ -192,15 +209,24 @@ bool from_lua(lua_State* L, int idx, T& out) {
         return true;
     }
 
-    ElementType value;
-    if (!from_lua(L, idx, value)) return false;
-
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
-        out = std::make_unique<ElementType>(std::move(value));
+    // Mirrors the Python backend: an abstract or non-default-constructible
+    // pointee can't be materialized from a Lua table by value, and trying
+    // would be a compile error. Only nil→reset is supported for those.
+    if constexpr (std::is_abstract_v<ElementType> ||
+                  !std::is_default_constructible_v<ElementType> ||
+                  !std::is_copy_assignable_v<ElementType>) {
+        return true;
     } else {
-        out = std::make_shared<ElementType>(std::move(value));
+        ElementType value;
+        if (!from_lua(L, idx, value)) return false;
+
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
+            out = std::make_unique<ElementType>(std::move(value));
+        } else {
+            out = std::make_shared<ElementType>(std::move(value));
+        }
+        return true;
     }
-    return true;
 }
 
 // ============================================================================
@@ -1151,25 +1177,33 @@ std::enable_if_t<
 to_lua(lua_State* L, const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Check if this type has been registered with bind_class
-    if (LuaTypeRegistry<CleanT>::metatable_name) {
-        // Create a new userdata wrapper
-        LuaWrapper<CleanT>* wrapper = static_cast<LuaWrapper<CleanT>*>(
-            lua_newuserdata(L, sizeof(LuaWrapper<CleanT>)));
+    // Abstract / non-copyable types can't be copied into a userdata
+    // wrapper. Mirror the Python backend's graceful fallback: emit a table
+    // snapshot of the members instead of failing to compile (reachable via
+    // e.g. shared_ptr<AbstractBase> members).
+    if constexpr (std::is_abstract_v<CleanT> || !std::is_copy_constructible_v<CleanT>) {
+        LuaConversionHelper<T>::to_lua_impl(L, obj);
+    } else {
+        // Check if this type has been registered with bind_class
+        if (LuaTypeRegistry<CleanT>::metatable_name) {
+            // Create a new userdata wrapper
+            LuaWrapper<CleanT>* wrapper = static_cast<LuaWrapper<CleanT>*>(
+                lua_newuserdata(L, sizeof(LuaWrapper<CleanT>)));
 
-        // Copy the C++ object
-        wrapper->cpp_object = new CleanT(obj);
-        wrapper->owns_memory = true;
+            // Copy the C++ object
+            wrapper->cpp_object = new CleanT(obj);
+            wrapper->owns_memory = true;
 
-        // Set the metatable
-        luaL_getmetatable(L, LuaTypeRegistry<CleanT>::metatable_name);
-        lua_setmetatable(L, -2);
+            // Set the metatable
+            luaL_getmetatable(L, LuaTypeRegistry<CleanT>::metatable_name);
+            lua_setmetatable(L, -2);
 
-        return;
+            return;
+        }
+
+        // Fall back to table conversion for unregistered types
+        LuaConversionHelper<T>::to_lua_impl(L, obj);
     }
-
-    // Fall back to table conversion for unregistered types
-    LuaConversionHelper<T>::to_lua_impl(L, obj);
 }
 
 template<typename T>

@@ -45,7 +45,9 @@ struct JsWrapper {
 template<Arithmetic T>
 napi_value to_javascript(napi_env env, const T& value) {
     napi_value result;
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        napi_get_boolean(env, value, &result);
+    } else if constexpr (std::is_floating_point_v<T>) {
         napi_create_double(env, static_cast<double>(value), &result);
     } else if constexpr (std::is_signed_v<T>) {
         napi_create_int64(env, static_cast<int64_t>(value), &result);
@@ -122,6 +124,17 @@ napi_value to_javascript(napi_env env, const T& container) {
     return array;
 }
 
+// Forward declaration for Bindable types. Must precede the SmartPointer
+// overload: the pointee is typically a user class in the global namespace,
+// so the dependent to_javascript(env, *ptr) call below finds this only
+// through the declaration context, never through ADL.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    napi_value
+>
+to_javascript(napi_env env, const T& obj);
+
 // Smart pointers
 template<SmartPointer T>
 napi_value to_javascript(napi_env env, const T& ptr) {
@@ -130,17 +143,8 @@ napi_value to_javascript(napi_env env, const T& ptr) {
         napi_get_null(env, &result);
         return result;
     }
-    using ElementType = typename std::remove_cvref_t<T>::element_type;
     return to_javascript(env, *ptr);
 }
-
-// Forward declaration for Bindable types
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
-    napi_value
->
-to_javascript(napi_env env, const T& obj);
 
 // ============================================================================
 // Type Conversion: JavaScript → C++
@@ -149,7 +153,11 @@ to_javascript(napi_env env, const T& obj);
 // Arithmetic types
 template<Arithmetic T>
 bool from_javascript(napi_env env, napi_value value, T& out) {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        bool temp;
+        if (napi_get_value_bool(env, value, &temp) != napi_ok) return false;
+        out = temp;
+    } else if constexpr (std::is_floating_point_v<T>) {
         double temp;
         if (napi_get_value_double(env, value, &temp) != napi_ok) return false;
         out = static_cast<T>(temp);
@@ -229,6 +237,16 @@ bool from_javascript(napi_env env, napi_value value, T& container) {
     return true;
 }
 
+// Forward declaration for Bindable types. Must precede the SmartPointer
+// overload for the same lookup reason as to_javascript above: the pointee
+// class lives in the global namespace, so ADL can't find a later declaration.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    bool
+>
+from_javascript(napi_env env, napi_value value, T& out);
+
 // Smart pointers from JavaScript
 template<SmartPointer T>
 bool from_javascript(napi_env env, napi_value value, T& out) {
@@ -242,15 +260,24 @@ bool from_javascript(napi_env env, napi_value value, T& out) {
         return true;
     }
 
-    ElementType cpp_value;
-    if (!from_javascript(env, value, cpp_value)) return false;
-
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
-        out = std::make_unique<ElementType>(std::move(cpp_value));
+    // Mirrors the Python backend: an abstract or non-default-constructible
+    // pointee can't be materialized from a JS object by value, and trying
+    // would be a compile error. Only null/undefined→reset is supported.
+    if constexpr (std::is_abstract_v<ElementType> ||
+                  !std::is_default_constructible_v<ElementType> ||
+                  !std::is_copy_assignable_v<ElementType>) {
+        return true;
     } else {
-        out = std::make_shared<ElementType>(std::move(cpp_value));
+        ElementType cpp_value;
+        if (!from_javascript(env, value, cpp_value)) return false;
+
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::unique_ptr<ElementType>>) {
+            out = std::make_unique<ElementType>(std::move(cpp_value));
+        } else {
+            out = std::make_shared<ElementType>(std::move(cpp_value));
+        }
+        return true;
     }
-    return true;
 }
 
 // ============================================================================
@@ -1325,28 +1352,36 @@ std::enable_if_t<
 to_javascript(napi_env env, const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Check if this type has been registered with bind_class
-    if (JsTypeRegistry<CleanT>::constructor_ref && JsTypeRegistry<CleanT>::cached_env == env) {
-        // Get the constructor from the reference
-        napi_value constructor;
-        napi_get_reference_value(env, JsTypeRegistry<CleanT>::constructor_ref, &constructor);
+    // Abstract / non-copy-assignable types can't be copied into a fresh
+    // wrapper instance. Mirror the Python backend's graceful fallback:
+    // emit an object snapshot of the members instead of failing to compile
+    // (reachable via e.g. shared_ptr<AbstractBase> members).
+    if constexpr (std::is_abstract_v<CleanT> || !std::is_copy_assignable_v<CleanT>) {
+        return JsConversionHelper<T>::to_javascript_impl(env, obj);
+    } else {
+        // Check if this type has been registered with bind_class
+        if (JsTypeRegistry<CleanT>::constructor_ref && JsTypeRegistry<CleanT>::cached_env == env) {
+            // Get the constructor from the reference
+            napi_value constructor;
+            napi_get_reference_value(env, JsTypeRegistry<CleanT>::constructor_ref, &constructor);
 
-        // Create a new instance
-        napi_value instance;
-        napi_new_instance(env, constructor, 0, nullptr, &instance);
+            // Create a new instance
+            napi_value instance;
+            napi_new_instance(env, constructor, 0, nullptr, &instance);
 
-        // Unwrap and copy the object
-        JsWrapper<CleanT>* wrapper;
-        napi_unwrap(env, instance, reinterpret_cast<void**>(&wrapper));
-        if (wrapper && wrapper->cpp_object) {
-            *wrapper->cpp_object = obj;
+            // Unwrap and copy the object
+            JsWrapper<CleanT>* wrapper;
+            napi_unwrap(env, instance, reinterpret_cast<void**>(&wrapper));
+            if (wrapper && wrapper->cpp_object) {
+                *wrapper->cpp_object = obj;
+            }
+
+            return instance;
         }
 
-        return instance;
+        // Fall back to object conversion for unregistered types
+        return JsConversionHelper<T>::to_javascript_impl(env, obj);
     }
-
-    // Fall back to object conversion for unregistered types
-    return JsConversionHelper<T>::to_javascript_impl(env, obj);
 }
 
 template<typename T>
