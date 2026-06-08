@@ -172,22 +172,17 @@ jobs:
           done
 
   # ============================================================================
-  # GCC-based tests (Marek Polacek's GCC reflection branch)
-  # This tests compatibility with GCC's P2996 implementation
-  # ============================================================================
-  # KNOWN ISSUE: GCC's P2996 implementation currently handles pack expansion
-  # with reflection splicers differently than Clang. Specifically, patterns like:
-  #   std::remove_cvref_t<typename [:get_param_type<T, Is>():]>...
-  # fail with "contains no parameter packs" because GCC doesn't recognize the
-  # pack parameter inside the splicer. This is a fundamental difference between
-  # the two experimental implementations. We expect this to be resolved as GCC's
-  # reflection support matures. See: python/mirror_bridge_python.hpp
+  # GCC-based tests (upstream GCC 16+ C++26 reflection)
+  # mirror_bridge supports stock GCC's P2996 implementation: the test runner
+  # auto-detects the compiler, splices are hoisted out of pack expansions so
+  # GCC accepts them, and the clang-only P3394 annotation tests are skipped.
+  # NOTE: not yet enforced (continue-on-error) until the published GCC image
+  # is rebuilt from the updated Dockerfile.gcc-reflection (adds Eigen et al.);
+  # validated locally as 53 built / 53 tests passed on that image + Eigen.
   # ============================================================================
   test-gcc-python:
     name: Python Bindings (GCC)
     runs-on: ubuntu-latest
-    # Allow this job to fail since GCC reflection is experimental and has
-    # known incompatibilities with our pack expansion patterns
     continue-on-error: true
     container:
       image: ghcr.io/franciscothiesen/mirror_bridge-gcc:latest
