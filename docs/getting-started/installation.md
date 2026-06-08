@@ -1,6 +1,15 @@
 # Installation Guide
 
-Mirror Bridge requires a C++26 compiler with reflection support. The easiest way to get started is using Docker.
+Mirror Bridge requires a C++26 compiler with reflection (P2996) support. Two compilers work today:
+
+- **Stock GCC 16+** — `g++ -std=c++26 -freflection`, no fork needed
+- **Bloomberg clang-p2996** — `clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++`
+
+The CLI auto-detects whichever is installed (force a choice with the `MB_CXX` environment variable).
+The easiest way to get a working toolchain is Docker.
+
+> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; on
+> GCC they are ignored (all members bound) until GCC ships P3394.
 
 ## Docker Setup (Recommended)
 
@@ -57,7 +66,17 @@ docker rmi mirror_bridge:latest
 
 ## Manual Installation
 
-If you need to build without Docker, you'll need Bloomberg's clang-p2996.
+If you need to build without Docker, you need a reflection-capable compiler. The simplest path is
+**GCC 16+**, which ships C++26 reflection upstream — no fork required:
+
+```bash
+# Once you have g++ 16 or newer on PATH:
+g++ --version          # confirm 16.x
+tools/mirror_bridge generate src/ --module my_module --lang python
+```
+
+If your distribution does not yet package GCC 16, install it from the toolchain PPA or build from
+source, or use Bloomberg's clang-p2996 as described below.
 
 ### Prerequisites
 
@@ -66,7 +85,7 @@ If you need to build without Docker, you'll need Bloomberg's clang-p2996.
 - Lua 5.4 development headers (optional)
 - Node.js 14+ with N-API (optional)
 
-### Build clang-p2996
+### Build clang-p2996 (alternative to GCC 16+)
 
 ```bash
 git clone https://github.com/bloomberg/clang-p2996
@@ -133,7 +152,7 @@ The Docker container and test scripts set this automatically.
 
 ### "error: no member named 'meta' in namespace 'std'"
 
-Your compiler doesn't have reflection support. Ensure you're using Bloomberg's clang-p2996.
+Your compiler doesn't have reflection support. Ensure you're using GCC 16+ (`-freflection`) or Bloomberg's clang-p2996.
 
 ### "reflection support is experimental"
 

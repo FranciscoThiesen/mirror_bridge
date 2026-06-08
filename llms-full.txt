@@ -13,7 +13,7 @@
 
 Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
-> **Experimental**: Requires C++26 reflection (P2996) via [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996).
+> **Experimental**: Requires a C++26 reflection (P2996) compiler. Works on **stock GCC 16+** (`g++ -std=c++26 -freflection`) or [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996). The CLI auto-detects whichever is present.
 
 ## One C++ Class, Three Languages
 
@@ -184,8 +184,10 @@ mirror_bridge/
 
 ## Requirements
 
-- **Compiler**: Bloomberg clang-p2996 (provided via Docker)
+- **Compiler**: a C++26 reflection compiler — stock **GCC 16+** (`-freflection`) or **Bloomberg clang-p2996**. Both are provided via Docker; the CLI auto-detects which is installed (override with `MB_CXX`).
 - **Python**: 3.7+ | **Lua**: 5.4 | **Node.js**: 14+
+
+> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; GCC builds ignore them (all members bound) until GCC ships P3394.
 
 ## Contributing
 
@@ -401,7 +403,16 @@ struct InternalHelper {
 
 # Installation Guide
 
-Mirror Bridge requires a C++26 compiler with reflection support. The easiest way to get started is using Docker.
+Mirror Bridge requires a C++26 compiler with reflection (P2996) support. Two compilers work today:
+
+- **Stock GCC 16+** — `g++ -std=c++26 -freflection`, no fork needed
+- **Bloomberg clang-p2996** — `clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++`
+
+The CLI auto-detects whichever is installed (force a choice with the `MB_CXX` environment variable).
+The easiest way to get a working toolchain is Docker.
+
+> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; on
+> GCC they are ignored (all members bound) until GCC ships P3394.
 
 ## Docker Setup (Recommended)
 
@@ -458,7 +469,17 @@ docker rmi mirror_bridge:latest
 
 ## Manual Installation
 
-If you need to build without Docker, you'll need Bloomberg's clang-p2996.
+If you need to build without Docker, you need a reflection-capable compiler. The simplest path is
+**GCC 16+**, which ships C++26 reflection upstream — no fork required:
+
+```bash
+# Once you have g++ 16 or newer on PATH:
+g++ --version          # confirm 16.x
+tools/mirror_bridge generate src/ --module my_module --lang python
+```
+
+If your distribution does not yet package GCC 16, install it from the toolchain PPA or build from
+source, or use Bloomberg's clang-p2996 as described below.
 
 ### Prerequisites
 
@@ -467,7 +488,7 @@ If you need to build without Docker, you'll need Bloomberg's clang-p2996.
 - Lua 5.4 development headers (optional)
 - Node.js 14+ with N-API (optional)
 
-### Build clang-p2996
+### Build clang-p2996 (alternative to GCC 16+)
 
 ```bash
 git clone https://github.com/bloomberg/clang-p2996
@@ -534,7 +555,7 @@ The Docker container and test scripts set this automatically.
 
 ### "error: no member named 'meta' in namespace 'std'"
 
-Your compiler doesn't have reflection support. Ensure you're using Bloomberg's clang-p2996.
+Your compiler doesn't have reflection support. Ensure you're using GCC 16+ (`-freflection`) or Bloomberg's clang-p2996.
 
 ### "reflection support is experimental"
 
@@ -2900,7 +2921,13 @@ fatal error: 'meta' file not found
 
 **Cause** The compiler does not implement C++26 reflection (P2996), so the `<meta>` header and `std::meta::` API are absent.
 
-**Fix** Build with Bloomberg's clang-p2996 and request reflection explicitly. Inside the container this is the default; manually:
+**Fix** Build with a reflection-capable compiler. Inside the container this is the default; manually, use stock GCC 16+:
+
+```bash
+g++ -std=c++26 -freflection binding.cpp ...
+```
+
+or Bloomberg's clang-p2996:
 
 ```bash
 clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ binding.cpp ...
@@ -4763,6 +4790,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Stock GCC 16+ support**: mirror_bridge now compiles with upstream GCC's C++26 reflection (`g++ -std=c++26 -freflection`), not just Bloomberg's clang-p2996 fork. The CLI, `mirror_bridge_build`, doctor, and test runner auto-detect the available reflection compiler (override with `MB_CXX`).
+
+### Changed
+- Pack expansions over reflected parameter types use alias templates (`method_param_t`, `static_method_param_t`, `*_constructor_param_t`, `virtual_param_t`) instead of inline splices, so the parameter pack is visible to both GCC and clang.
+- `PyTypeObject`/`BufferView` initializers designate `.ob_base` so GCC accepts them alongside the other designated fields.
+
+### Notes
+- P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) remain clang-p2996 only; under GCC they are ignored (all members bound) until GCC implements P3394. The annotation-specific tests are skipped on GCC.
+
+## [0.3.0] - 2026-06-05
+
+### Added
 - `--json` machine-readable output for `generate`, `diff`, and `doctor`: stdout carries exactly one JSON object (status, discovered classes, built outputs, and per-language errors with actionable suggestions); human-readable progress goes to stderr
 - `mirror_bridge doctor` subcommand integrating the diagnostic tool into the unified CLI
 - `mirror_bridge diff --check` CI gate: exits non-zero when the binding surface drifted from the committed snapshot, without ever modifying it
@@ -4771,10 +4810,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error catalog (`docs/reference/errors.md`): every known failure mode with exact symptom, cause, and fix
 - pip-installable `mirror-bridge` package (`packaging/pip/`): wraps the Docker toolchain so `pip install mirror-bridge` gives a working `mirror_bridge` CLI anywhere, plus `mirror_bridge shell` for an interactive container
 - MCP server (`pip install 'mirror-bridge[mcp]'`, run `mirror-bridge-mcp`): exposes `generate_bindings`, `doctor`, and `check_binding_drift` as native tool calls for AI agents
+- Claude Code integration (`integrations/claude-code/`): drop-in `bind-cpp` skill teaching the generate → fix → verify loop
+- Living benchmarks: a monthly CI workflow reruns the runtime suite and regenerates the table in `docs/internals/benchmarks.md`
+- API stability contract (`docs/reference/stability.md`): which surfaces are stable pre-1.0 and how versioning works
+- Smart pointer regression tests for Lua and JavaScript (members, params, returns, nil reset, abstract pointees)
 
 ### Fixed
+- Class-type smart pointers never compiled in the Lua and JavaScript backends (overload declaration order defeated two-phase lookup); they now work with the same deep-copy semantics as Python
+- `bool` returned/accepted as a number in Lua and JavaScript; it now maps to native booleans in both directions
+- Methods taking `std::unique_ptr<T>` by value failed to compile (parameter storage tried to copy a move-only type); smart pointer parameters now use value storage and are moved into the call
+- Test harness named modules after the source filename instead of the `MIRROR_BRIDGE_*MODULE` declaration, producing unloadable modules whenever the two differed (the root cause of the long-red Tests workflow)
 - `generate` no longer reports success when a stale `.so` from a previous run exists but the current compile failed
 - `generate --lang all` now attempts every language and reports all failures instead of aborting on the first one
+- Amalgamation stripped `#define MIRROR_BRIDGE_VALIDATE(T)` from the single headers, leaving a dangling macro body that broke every single-header consumer
 - Rust FFI binding generation: `generate_bindings<T>()` produces extern "C" wrappers, C headers, and safe Rust wrapper types with Drop, Send, Sync, and idiomatic getters/setters
 - `mirror_bridge watch` command for live reload during development: watches headers for changes and auto-recompiles bindings
 - `mirror_bridge diff` command to show binding surface changes since last build, catching accidental ABI breaks
@@ -4840,7 +4888,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero runtime overhead through compile-time binding generation
 - Batch processing API for avoiding Python/C++ boundary overhead
 
-[Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/FranciscoThiesen/mirror_bridge/releases/tag/v0.1.0
 

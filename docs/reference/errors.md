@@ -17,7 +17,13 @@ fatal error: 'meta' file not found
 
 **Cause** The compiler does not implement C++26 reflection (P2996), so the `<meta>` header and `std::meta::` API are absent.
 
-**Fix** Build with Bloomberg's clang-p2996 and request reflection explicitly. Inside the container this is the default; manually:
+**Fix** Build with a reflection-capable compiler. Inside the container this is the default; manually, use stock GCC 16+:
+
+```bash
+g++ -std=c++26 -freflection binding.cpp ...
+```
+
+or Bloomberg's clang-p2996:
 
 ```bash
 clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ binding.cpp ...

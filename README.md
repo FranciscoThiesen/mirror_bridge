@@ -9,7 +9,7 @@
 
 Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
-> **Experimental**: Requires C++26 reflection (P2996) via [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996).
+> **Experimental**: Requires a C++26 reflection (P2996) compiler. Works on **stock GCC 16+** (`g++ -std=c++26 -freflection`) or [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996). The CLI auto-detects whichever is present.
 
 ## One C++ Class, Three Languages
 
@@ -180,8 +180,10 @@ mirror_bridge/
 
 ## Requirements
 
-- **Compiler**: Bloomberg clang-p2996 (provided via Docker)
+- **Compiler**: a C++26 reflection compiler — stock **GCC 16+** (`-freflection`) or **Bloomberg clang-p2996**. Both are provided via Docker; the CLI auto-detects which is installed (override with `MB_CXX`).
 - **Python**: 3.7+ | **Lua**: 5.4 | **Node.js**: 14+
+
+> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; GCC builds ignore them (all members bound) until GCC ships P3394.
 
 ## Contributing
 

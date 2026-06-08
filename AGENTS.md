@@ -2,12 +2,16 @@
 
 `mirror_bridge` is a C++26 reflection-based binding generator: it inspects C++ structs/classes at
 compile time (via P2996 reflection) and emits zero-overhead Python, Lua, and JavaScript bindings —
-no hand-written binding code. **The one critical constraint: it requires Bloomberg's
-[clang-p2996](https://github.com/bloomberg/clang-p2996) with libc++ and the `<meta>` header. Nothing
-here compiles with a stock host compiler.** All binding compilation MUST happen inside the project's
-Docker container (or a GitHub Codespace). Never attempt to compile a binding with the host's
-`clang++`/`g++` — it will fail with "no member named 'meta'" or unknown `-freflection`. Editing,
-searching, and reading code on the host is fine; compiling is not.
+no hand-written binding code. **The one critical constraint: it requires a C++26 reflection
+compiler** — either stock **GCC 16+** (`g++ -std=c++26 -freflection`) or Bloomberg's
+[clang-p2996](https://github.com/bloomberg/clang-p2996) (with libc++ and the `<meta>` header).
+A pre-reflection distro compiler will fail with "no member named 'meta'" or an unknown
+`-freflection` flag. Unless your host already has GCC 16+ or clang-p2996, compile inside the
+project's Docker container (or a GitHub Codespace). The CLI auto-detects whichever compiler is
+present; override with `MB_CXX`. Editing, searching, and reading code on the host is always fine.
+
+Note: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) are currently clang-p2996 only.
+On GCC they are silently ignored (all members bound) until GCC implements P3394.
 
 ## Environment setup
 
