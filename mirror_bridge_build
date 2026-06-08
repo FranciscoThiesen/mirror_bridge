@@ -95,12 +95,29 @@ if [ ! -f "$BINDING_FILE" ]; then
     exit 1
 fi
 
-# Check for reflection compiler
-if ! command -v clang++ &> /dev/null; then
-    echo -e "${RED}Error: clang++ not found${NC}"
-    echo "Mirror Bridge requires the Bloomberg clang-p2996 reflection compiler."
+# Detect the reflection compiler: reflection-enabled clang preferred, else
+# stock GCC 16+ (-freflection). Override with $MB_CXX. Mirrors the
+# detection in tools/mirror_bridge.
+if [ -n "${MB_CXX:-}" ]; then
+    CXX_BIN="$MB_CXX"
+elif command -v clang++ &> /dev/null && clang++ --version 2>&1 | grep -qi "reflection\|p2996\|bloomberg"; then
+    CXX_BIN="clang++"
+elif command -v g++ &> /dev/null && g++ -std=c++26 -freflection -x c++ -fsyntax-only /dev/null &> /dev/null; then
+    CXX_BIN="g++"
+elif command -v clang++ &> /dev/null; then
+    CXX_BIN="clang++"
+elif command -v g++ &> /dev/null; then
+    CXX_BIN="g++"
+else
+    echo -e "${RED}Error: no reflection compiler found${NC}"
+    echo "Mirror Bridge requires Bloomberg's clang-p2996 or GCC 16+ with -freflection."
     exit 1
 fi
+
+case "$CXX_BIN" in
+    *clang*) CXX_REFLECT_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++" ;;
+    *)       CXX_REFLECT_FLAGS="-std=c++26 -freflection" ;;
+esac
 
 # Extract module name from file (remove _binding.cpp or .cpp)
 BASENAME=$(basename "$BINDING_FILE")
@@ -136,7 +153,7 @@ PYTHON_INCLUDES=$(python3-config --includes | tr '\n' ' ')
 PYTHON_LDFLAGS=$(python3-config --ldflags | tr '\n' ' ')
 
 # Construct compiler command (for display only)
-COMPILE_CMD="clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+COMPILE_CMD="$CXX_BIN $CXX_REFLECT_FLAGS \
     -I$PROJECT_ROOT -I$BINDING_DIR ${INCLUDE_DIRS[@]} -fPIC -shared \
     $PYTHON_INCLUDES $PYTHON_LDFLAGS \
     $BINDING_FILE -o $OUTPUT_DIR/${MODULE_NAME}.so"
@@ -150,13 +167,13 @@ fi
 # Compile
 echo -e "${YELLOW}Compiling...${NC}"
 if [ $VERBOSE -eq 1 ]; then
-    clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    $CXX_BIN $CXX_REFLECT_FLAGS \
         -I"$PROJECT_ROOT" -I"$BINDING_DIR" "${INCLUDE_DIRS[@]}" -fPIC -shared \
         $PYTHON_INCLUDES $PYTHON_LDFLAGS \
         "$BINDING_FILE" -o "$OUTPUT_DIR/${MODULE_NAME}.so" 2>&1
     compile_exit=$?
 else
-    compile_output=$(clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    compile_output=$($CXX_BIN $CXX_REFLECT_FLAGS \
         -I"$PROJECT_ROOT" -I"$BINDING_DIR" "${INCLUDE_DIRS[@]}" -fPIC -shared \
         $PYTHON_INCLUDES $PYTHON_LDFLAGS \
         "$BINDING_FILE" -o "$OUTPUT_DIR/${MODULE_NAME}.so" 2>&1)

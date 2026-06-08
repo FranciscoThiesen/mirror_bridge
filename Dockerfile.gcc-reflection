@@ -26,6 +26,13 @@ RUN apt-get update && apt-get install -y \
     libmpc-dev \
     libisl-dev \
     zlib1g-dev \
+    # C++ deps used by downstream binding targets, mirroring the clang
+    # image so the test suite (e.g. the Eigen-based inheritance example)
+    # builds identically under GCC.
+    libeigen3-dev \
+    libfmt-dev \
+    libjsoncpp-dev \
+    libnanoflann-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js native addon tools
