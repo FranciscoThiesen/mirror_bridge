@@ -85,6 +85,18 @@ echo ""
 
 cd "$TEST_DIR"
 
+# On GCC, exclude the P3394 annotation tests: P3394 (annotations,
+# std::meta::annotation_of_type) is a clang-p2996 extension not yet
+# implemented in GCC, so these tests can only pass on clang. This must be
+# computed BEFORE the loop: the find in the process substitution below is
+# evaluated once when the loop starts, not per iteration.
+P3394_EXCLUDE=()
+if [[ "$CXX_COMPILER" == "g++" ]]; then
+    P3394_EXCLUDE=(-not -name "test_p3394_type_check.cpp" -not -name "test_annotations_header.cpp")
+    echo -e "${YELLOW}Note: skipping P3394 annotation tests (not supported on GCC)${NC}"
+    echo ""
+fi
+
 # Find all binding .cpp files recursively
 while IFS= read -r -d '' binding_file; do
     [ -f "$binding_file" ] || continue
@@ -175,15 +187,7 @@ while IFS= read -r -d '' binding_file; do
 # Exclude v8/ directory - V8 tests are built separately in Step 2d.
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
-# On GCC, also exclude the P3394 annotation tests: P3394 (annotations,
-# std::meta::annotation_of_type) is a clang-p2996 extension not yet
-# implemented in GCC, so these tests can only pass on clang.
-P3394_EXCLUDE=()
-if [[ "$CXX_COMPILER" == "g++" ]]; then
-    P3394_EXCLUDE=(-not -name "test_p3394_type_check.cpp" -not -name "test_annotations_header.cpp")
-    echo -e "${YELLOW}Note: skipping P3394 annotation tests (not supported on GCC)${NC}"
-    echo ""
-fi
+# P3394_EXCLUDE drops the clang-only annotation tests when on GCC (set above).
 done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -name "test_validation.cpp" "${P3394_EXCLUDE[@]}" -print0)
 
 # Step 2: Run all Python tests
