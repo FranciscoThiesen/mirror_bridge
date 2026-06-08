@@ -11,8 +11,14 @@ echo "Testing Compile-Time Binding Validation"
 echo "=============================================="
 echo
 
-CXX="clang++"
-COMMON_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++ -fPIC -shared -O2"
+# Prefer reflection-enabled clang; fall back to GCC 16+ (-freflection).
+if command -v clang++ >/dev/null 2>&1 && clang++ --version 2>&1 | grep -qi "reflection\|p2996\|bloomberg"; then
+    CXX="clang++"
+    COMMON_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++ -fPIC -shared -O2"
+else
+    CXX="g++"
+    COMMON_FLAGS="-std=c++26 -freflection -fPIC -shared -O2"
+fi
 # Derive include paths from the script location: the repo isn't always
 # checked out at /workspace (CI uses /__w/mirror_bridge/mirror_bridge).
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

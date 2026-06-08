@@ -128,7 +128,9 @@ PyTypeObject* get_bufferview_type() {
     using ValueT = typename Container::value_type;
 
     static PyTypeObject type_object = {
-        PyVarObject_HEAD_INIT(nullptr, 0)
+        // Designated ob_base keeps every clause designated: GCC rejects
+        // mixing the positional HEAD_INIT macro with designated fields.
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = "mirror_bridge.BufferView",
         .tp_basicsize = sizeof(BufferViewObject<Container>),
         .tp_itemsize = 0,

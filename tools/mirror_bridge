@@ -41,6 +41,27 @@ USE_PCH=""
 PCH_PATH=""
 LANG="python"
 
+# Reflection compiler detection. clang-p2996 is preferred when present;
+# stock GCC 16+ with -freflection works as well (probed with a syntax-only
+# compile since plain distro g++ predates reflection). Override with
+# $MB_CXX when you need a specific binary.
+if [ -n "${MB_CXX:-}" ]; then
+    CXX_BIN="$MB_CXX"
+elif command -v clang++ >/dev/null 2>&1 && clang++ --version 2>&1 | grep -qi "reflection\|p2996\|bloomberg"; then
+    CXX_BIN="clang++"
+elif command -v g++ >/dev/null 2>&1 && g++ -std=c++26 -freflection -x c++ -fsyntax-only /dev/null >/dev/null 2>&1; then
+    CXX_BIN="g++"
+elif command -v clang++ >/dev/null 2>&1; then
+    CXX_BIN="clang++"
+else
+    CXX_BIN="g++"
+fi
+
+case "$CXX_BIN" in
+    *clang*) CXX_REFLECT_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++" ;;
+    *)       CXX_REFLECT_FLAGS="-std=c++26 -freflection" ;;
+esac
+
 # JSON output support (--json on generate/diff/doctor). Contract: in JSON
 # mode stdout carries exactly one JSON object and all human-readable
 # progress goes to stderr, so scripts and AI agents can parse results
@@ -559,7 +580,7 @@ compile_binding() {
 
     local output_file="$output_dir/${module_name}${output_ext}"
 
-    local cmd="clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
         -I. -I$src_dir -I$PROJECT_ROOT \
         -fPIC -shared -O3 -DNDEBUG \
         -Wno-deprecated-declarations"
@@ -581,7 +602,11 @@ compile_binding() {
     fi
 
     if [ -n "$pch_path" ] && [ -f "$pch_path" ]; then
-        cmd="$cmd -include-pch $pch_path"
+        case "$CXX_BIN" in
+            # -include-pch is clang-only; GCC picks up a .gch automatically
+            # when it sits next to the included header, so skip the flag.
+            *clang*) cmd="$cmd -include-pch $pch_path" ;;
+        esac
     fi
 
     cmd="$cmd $compile_flags $binding_file -o $output_file $link_flags"
@@ -815,8 +840,8 @@ cmd_pch() {
     echo -e "Output: ${YELLOW}$output_file${NC}"
     echo ""
 
-    local cmd="clang++ -std=c++2c -freflection -freflection-latest \
-        -fPIC -stdlib=libc++ \
+    local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
+        -fPIC \
         $(python3-config --includes) \
         $opt_flags \
         -x c++-header $pch_file \

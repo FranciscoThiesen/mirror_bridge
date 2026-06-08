@@ -676,7 +676,7 @@ PyTypeObject* get_future_awaitable_type() {
     };
 
     static PyTypeObject type_object = {
-        PyVarObject_HEAD_INIT(nullptr, 0)
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = "FutureAwaitable",
         .tp_basicsize = sizeof(PyFutureAwaitable<T>),
         .tp_itemsize = 0,
@@ -1603,7 +1603,7 @@ PyTypeObject* get_buffer_view_type() {
     };
 
     static PyTypeObject type_object = {
-        PyVarObject_HEAD_INIT(nullptr, 0)
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = "BufferView",
         .tp_basicsize = sizeof(BufferView<T>),
         .tp_itemsize = 0,
@@ -2416,6 +2416,15 @@ consteval auto get_static_method_return_type() {
     return std::meta::return_type_of(static_func);
 }
 
+// Alias-template form: pack expansions must use this instead of splicing
+// inline (GCC rejects packs that appear only inside a splice; see the note
+// in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using method_param_t = typename [:get_method_param_type<T, FuncIndex, ParamIndex>():];
+
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using static_method_param_t = typename [:get_static_method_param_type<T, FuncIndex, ParamIndex>():];
+
 // Helper to conditionally forward arguments based on parameter type.
 // For lvalue reference parameters (T&), pass as lvalue (no move).
 // For value or rvalue reference parameters (T or T&&), use std::move.
@@ -2680,6 +2689,12 @@ consteval auto get_constructor_param_type() {
     return std::meta::type_of(params[ParamIndex]);
 }
 
+// Alias-template form: pack expansions must use this instead of splicing
+// inline (GCC rejects packs that appear only inside a splice; see the note
+// in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+using constructor_param_t = typename [:get_constructor_param_type<T, CtorIndex, ParamIndex>():];
+
 // Check if all constructor params are bindable (value-bindable or pointer-holdable).
 // Constructors whose params are raw-pointer-to-user-type aren't safely bindable
 // (ambiguous ownership/output semantics) and are skipped.
@@ -2688,7 +2703,7 @@ consteval bool constructor_params_all_bindable() {
     constexpr std::size_t param_count = get_constructor_param_count<T, CtorIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
         return (mirror_bridge::core::is_param_bindable<
-            typename [:get_constructor_param_type<T, CtorIndex, Is>():]>() && ...);
+            constructor_param_t<T, CtorIndex, Is>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -2707,12 +2722,12 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
         // Parameter storage with pointer-holder for non-value-bindable types
         // (e.g., abstract base classes passed by const-ref).
         std::tuple<mirror_bridge::core::param_storage_t<
-            typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+            constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
         ([&] {
             if (!success) return;
-            if (!extract_param<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+            if (!extract_param<constructor_param_t<T, CtorIndex, Is>>(
                     PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
                 success = false;
             }
@@ -2724,7 +2739,7 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
 
         // Call constructor with unpacked arguments. forward_arg dereferences
         // pointer-stored params back into references.
-        return new T(forward_arg<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+        return new T(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
             std::get<Is>(cpp_args))...);
     }
 }
@@ -2741,12 +2756,12 @@ Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
         return nullptr;
     } else {
         std::tuple<mirror_bridge::core::param_storage_t<
-            typename [:get_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+            constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
         ([&] {
             if (!success) return;
-            if (!extract_param<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+            if (!extract_param<constructor_param_t<T, CtorIndex, Is>>(
                     PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
                 success = false;
             }
@@ -2754,7 +2769,7 @@ Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
 
         if (!success) return nullptr;
 
-        return new Alloc(forward_arg<typename [:get_constructor_param_type<T, CtorIndex, Is>():]>(
+        return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
             std::get<Is>(cpp_args))...);
     }
 }
@@ -3041,12 +3056,12 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     // wrapper's cpp_object (the object lives in the wrapper's heap memory,
     // we just hold a pointer to it). This is mirror_bridge's equivalent
     // of pybind11's shared_ptr holder, but inline and lightweight.
-    std::tuple<mirror_bridge::core::param_storage_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
         if (!success) return;
-        if (!extract_param<typename [:get_method_param_type<T, FuncIndex, Is>():]>(
+        if (!extract_param<method_param_t<T, FuncIndex, Is>>(
                 PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
             PyErr_Format(PyExc_TypeError, "Argument %zu type conversion failed", Is);
             success = false;
@@ -3060,12 +3075,12 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     // Call: forward_arg now handles pointer storage by dereferencing.
     if constexpr (std::is_void_v<ReturnType>) {
         ((*wrapper->cpp_object).[:member_func:])(
-            forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+            forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
         );
         Py_RETURN_NONE;
     } else {
         ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
-            forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+            forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
         );
         return to_python(result);
     }
@@ -3122,12 +3137,12 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<typename [:get_static_method_param_type<T, Index, Is>():]>...> cpp_args;
+    std::tuple<mirror_bridge::core::param_storage_t<static_method_param_t<T, Index, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
         if (!success) return;
-        if (!extract_param<typename [:get_static_method_param_type<T, Index, Is>():]>(
+        if (!extract_param<static_method_param_t<T, Index, Is>>(
                 PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
             PyErr_Format(PyExc_TypeError, "Argument %zu type conversion failed", Is);
             success = false;
@@ -3142,12 +3157,12 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     // Use forward_arg to conditionally move: move for value/rvalue params, no move for lvalue ref params
     if constexpr (std::is_void_v<ReturnType>) {
         [:static_func:](
-            forward_arg<typename [:get_static_method_param_type<T, Index, Is>():]>(std::get<Is>(cpp_args))...
+            forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
         );
         Py_RETURN_NONE;
     } else {
         ReturnType result = [:static_func:](
-            forward_arg<typename [:get_static_method_param_type<T, Index, Is>():]>(std::get<Is>(cpp_args))...
+            forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
         );
         return to_python(result);
     }
@@ -3226,11 +3241,12 @@ consteval bool is_canonical_method() {
     if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
         return false;
     } else {
-        constexpr auto& names = MethodNameCache<T>::names;
         return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
             // Canonical iff no EARLIER bindable method shares this name.
             // An earlier unbindable overload doesn't disqualify us.
-            return (... && (names[Earlier] != names[Index] ||
+            // The name cache is referenced directly: a named constexpr
+            // reference would be odr-used and need a capture under GCC.
+            return (... && (MethodNameCache<T>::names[Earlier] != MethodNameCache<T>::names[Index] ||
                             !mirror_bridge::core::method_params_all_bindable<T, Earlier>()));
         }(std::make_index_sequence<Index>{});
     }
@@ -3256,13 +3272,13 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool conversion_ok = true;
     ([&] {
         if (!conversion_ok) return;
         PyObject* py_arg = PyTuple_GET_ITEM(args, Is);
-        if (!extract_param<typename [:get_method_param_type<T, FuncIndex, Is>():]>(
+        if (!extract_param<method_param_t<T, FuncIndex, Is>>(
                 py_arg, std::get<Is>(cpp_args))) {
             conversion_ok = false;
         }
@@ -3278,12 +3294,12 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
     try {
         if constexpr (std::is_void_v<ReturnType>) {
             ((*wrapper->cpp_object).[:member_func:])(
-                forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
             );
             Py_RETURN_NONE;
         } else {
             ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
-                forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
             );
             return to_python(result);
         }
@@ -3347,12 +3363,12 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
 
     return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> PyObject* {
         std::tuple<mirror_bridge::core::param_storage_t<
-            typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+            method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
         bool conversion_ok = true;
         ([&] {
             if (!conversion_ok) return;
-            if (!extract_param<typename [:get_method_param_type<T, FuncIndex, Is>():]>(
+            if (!extract_param<method_param_t<T, FuncIndex, Is>>(
                     resolved[Is], std::get<Is>(cpp_args))) {
                 conversion_ok = false;
             }
@@ -3366,12 +3382,12 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
         try {
             if constexpr (std::is_void_v<ReturnType>) {
                 ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
-                    forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                    forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
                 );
                 Py_RETURN_NONE;
             } else {
                 ReturnType result = ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
-                    forward_arg<typename [:get_method_param_type<T, FuncIndex, Is>():]>(std::get<Is>(cpp_args))...
+                    forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
                 );
                 return to_python(result);
             }
@@ -4407,7 +4423,7 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     // Define the Python type structure
     // Note: Inheritance is implicitly supported - reflection sees all members including inherited ones
     static PyTypeObject type_object = {
-        PyVarObject_HEAD_INIT(nullptr, 0)
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = name,
         .tp_basicsize = sizeof(PyWrapper<T>),
         .tp_itemsize = 0,

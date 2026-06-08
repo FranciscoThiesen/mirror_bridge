@@ -105,6 +105,13 @@ consteval std::meta::info nth_virtual() {
     return auto_virtuals_of<T>()[I];
 }
 
+// Alias-template form of the virtual's parameter type. Pack expansions must
+// use this instead of splicing inline (GCC rejects packs that appear only
+// inside a splice; see the note in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t VIndex, std::size_t ParamIndex>
+using virtual_param_t =
+    typename [:std::meta::type_of(std::meta::parameters_of(nth_virtual<T, VIndex>())[ParamIndex]):];
+
 template<typename T>
 consteval std::size_t virtual_count() {
     return auto_virtuals_of<T>().size();
@@ -121,7 +128,7 @@ constexpr void* make_auto_dispatcher() {
     return []<std::size_t... Is>(std::index_sequence<Is...>) -> void* {
         using Ret = typename [:std::meta::return_type_of(nth_virtual<T, VIndex>()):];
         using SlotFn = Ret(*)(const T*,
-            typename [:std::meta::type_of(std::meta::parameters_of(nth_virtual<T, VIndex>())[Is]):]...);
+            virtual_param_t<T, VIndex, Is>...);
 
         // Method name for Python lookup (stable pointer from reflection).
         constexpr auto name_sv = std::meta::identifier_of(nth_virtual<T, VIndex>());
@@ -132,7 +139,7 @@ constexpr void* make_auto_dispatcher() {
         constexpr std::size_t orig_slot = dtor_slots + VIndex;
 
         return reinterpret_cast<void*>(+[](const T* self,
-                typename [:std::meta::type_of(std::meta::parameters_of(nth_virtual<T, VIndex>())[Is]):]... args) -> Ret {
+                virtual_param_t<T, VIndex, Is>... args) -> Ret {
             auto* entry = AutoTrampolineRegistry<T>::lookup(self);
             if (entry && entry->py_self &&
                     mirror_bridge::has_python_override(entry->py_self, name)) {

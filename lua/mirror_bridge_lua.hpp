@@ -826,7 +826,7 @@ int call_method_impl(lua_State* L, LuaWrapper<T>* wrapper, std::index_sequence<I
     constexpr auto return_type = get_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -892,7 +892,7 @@ int call_static_method_impl(lua_State* L, std::index_sequence<Is...>) {
     constexpr auto return_type = get_static_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -1014,14 +1014,20 @@ consteval auto get_lua_constructor_param_type() {
     return std::meta::type_of(params[ParamIndex]);
 }
 
+// Alias-template form: pack expansions must use this instead of splicing
+// inline (GCC rejects packs that appear only inside a splice; see the note
+// in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+using lua_constructor_param_t = typename [:get_lua_constructor_param_type<T, CtorIndex, ParamIndex>():];
+
 // Call constructor with Lua arguments
 template<typename T, std::size_t CtorIndex, std::size_t... Is>
 T* call_lua_constructor_impl(lua_State* L, int arg_offset, std::index_sequence<Is...>) {
     using ParamTypes = std::tuple<
-        std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...
+        std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...
     >;
 
-    std::tuple<std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {

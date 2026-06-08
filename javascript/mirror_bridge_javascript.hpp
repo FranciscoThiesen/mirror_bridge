@@ -1002,7 +1002,7 @@ napi_value call_method_impl(napi_env env, JsWrapper<T>* wrapper, napi_value* arg
     constexpr auto return_type = get_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -1071,7 +1071,7 @@ napi_value call_static_method_impl(napi_env env, napi_value* args, std::index_se
     constexpr auto return_type = get_static_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -1195,10 +1195,16 @@ consteval auto get_js_constructor_param_type() {
     return std::meta::type_of(params[ParamIndex]);
 }
 
+// Alias-template form: pack expansions must use this instead of splicing
+// inline (GCC rejects packs that appear only inside a splice; see the note
+// in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+using js_constructor_param_t = typename [:get_js_constructor_param_type<T, CtorIndex, ParamIndex>():];
+
 // Call constructor with JS arguments
 template<typename T, std::size_t CtorIndex, std::size_t... Is>
 T* call_js_constructor_impl(napi_env env, napi_value* args, std::index_sequence<Is...>, bool& success) {
-    std::tuple<std::remove_cvref_t<typename [:get_js_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<js_constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
     success = true;
     ([&] {

@@ -440,6 +440,18 @@ consteval auto get_method_return_type() {
     return std::meta::return_type_of(func);
 }
 
+// Alias-template forms of the parameter-type getters. Pack expansions must
+// use these instead of splicing inline: GCC's reflection implementation
+// does not treat a pack as expandable when it appears only inside a splice
+// ("expansion pattern contains no parameter packs" / "operand of fold
+// expression has no unexpanded parameter packs"), while an alias template
+// makes the pack an ordinary template argument that both compilers accept.
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using method_param_t = typename [:get_method_param_type<T, FuncIndex, ParamIndex>():];
+
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using static_method_param_t = typename [:get_static_method_param_type<T, FuncIndex, ParamIndex>():];
+
 // ============================================================================
 // Method Bindability — Physical Feasibility Check
 // ============================================================================
@@ -518,7 +530,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool method_params_are_value_bindable() {
     constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_value_bindable<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+        return (is_value_bindable<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -526,7 +538,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool static_method_params_are_value_bindable() {
     constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_value_bindable<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+        return (is_value_bindable<std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -583,7 +595,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool method_params_all_bindable() {
     constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_param_bindable<typename [:get_method_param_type<T, FuncIndex, Is>():]>() && ...);
+        return (is_param_bindable<method_param_t<T, FuncIndex, Is>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -591,7 +603,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool static_method_params_all_bindable() {
     constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_param_bindable<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>() && ...);
+        return (is_param_bindable<static_method_param_t<T, FuncIndex, Is>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -1629,7 +1641,7 @@ int call_method_impl(lua_State* L, LuaWrapper<T>* wrapper, std::index_sequence<I
     constexpr auto return_type = get_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -1695,7 +1707,7 @@ int call_static_method_impl(lua_State* L, std::index_sequence<Is...>) {
     constexpr auto return_type = get_static_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
-    std::tuple<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -1817,14 +1829,20 @@ consteval auto get_lua_constructor_param_type() {
     return std::meta::type_of(params[ParamIndex]);
 }
 
+// Alias-template form: pack expansions must use this instead of splicing
+// inline (GCC rejects packs that appear only inside a splice; see the note
+// in core/mirror_bridge_core.hpp).
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+using lua_constructor_param_t = typename [:get_lua_constructor_param_type<T, CtorIndex, ParamIndex>():];
+
 // Call constructor with Lua arguments
 template<typename T, std::size_t CtorIndex, std::size_t... Is>
 T* call_lua_constructor_impl(lua_State* L, int arg_offset, std::index_sequence<Is...>) {
     using ParamTypes = std::tuple<
-        std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...
+        std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...
     >;
 
-    std::tuple<std::remove_cvref_t<typename [:get_lua_constructor_param_type<T, CtorIndex, Is>():]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {

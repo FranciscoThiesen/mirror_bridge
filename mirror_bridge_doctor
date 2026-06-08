@@ -155,7 +155,10 @@ section() {
 # ============================================================================
 section "C++ Compiler"
 
-# Check for clang++
+# Pick the reflection compiler the same way the CLI does: prefer
+# reflection-enabled clang, fall back to GCC 16+ with -freflection.
+DOCTOR_CXX=""
+DOCTOR_FLAGS=""
 if command -v clang++ &> /dev/null; then
     CLANG_VERSION=$(clang++ --version 2>&1 | head -1)
     check_pass "clang++ found"
@@ -164,19 +167,30 @@ if command -v clang++ &> /dev/null; then
     # Check if it's the Bloomberg reflection fork
     if clang++ --version 2>&1 | grep -qi "reflection\|p2996\|bloomberg"; then
         check_pass "Reflection-enabled clang detected"
+        DOCTOR_CXX="clang++"
+        DOCTOR_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++"
     else
         check_warn "Standard clang detected (may not support reflection)" \
-            "Mirror Bridge requires Bloomberg's clang-p2996 fork"
+            "Use Bloomberg's clang-p2996 fork or stock GCC 16+"
     fi
-else
-    check_fail "clang++ not found" \
-        "Install Bloomberg's clang-p2996 or run inside Docker container"
 fi
 
-# Check for g++ (alternative)
 if command -v g++ &> /dev/null; then
     GCC_VERSION=$(g++ --version 2>&1 | head -1)
-    verbose "g++ also available: $GCC_VERSION"
+    verbose "g++ available: $GCC_VERSION"
+    if [ -z "$DOCTOR_CXX" ] && g++ -std=c++26 -freflection -x c++ -fsyntax-only /dev/null &> /dev/null; then
+        check_pass "Reflection-enabled GCC detected"
+        DOCTOR_CXX="g++"
+        DOCTOR_FLAGS="-std=c++26 -freflection"
+    fi
+fi
+
+if [ -z "$DOCTOR_CXX" ]; then
+    check_fail "No reflection-enabled compiler found" \
+        "Install Bloomberg's clang-p2996 or GCC 16+, or run inside the Docker container"
+    # Keep the legacy default so the remaining checks still report something
+    DOCTOR_CXX="clang++"
+    DOCTOR_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++"
 fi
 
 # Test reflection support
@@ -197,13 +211,13 @@ int main() {
 TESTCODE
 
 REFLECTION_OUTPUT=$(mktemp /tmp/mirror_bridge_test_out.XXXXXX)
-if clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ "$REFLECTION_TEST" -o "$REFLECTION_OUTPUT" 2>/dev/null; then
-    check_pass "C++26 reflection compiles successfully"
+if $DOCTOR_CXX $DOCTOR_FLAGS "$REFLECTION_TEST" -o "$REFLECTION_OUTPUT" 2>/dev/null; then
+    check_pass "C++26 reflection compiles successfully ($DOCTOR_CXX)"
 else
     check_fail "Reflection test failed to compile" \
-        "Ensure you're using Bloomberg's clang-p2996 with -freflection flag"
+        "Ensure you're using Bloomberg's clang-p2996 or GCC 16+ with -freflection"
     if [ $VERBOSE -eq 1 ]; then
-        echo -e "  ${BLUE}Test command: clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ test.cpp${NC}"
+        echo -e "  ${BLUE}Test command: $DOCTOR_CXX $DOCTOR_FLAGS test.cpp${NC}"
     fi
 fi
 rm -f "$REFLECTION_TEST" "$REFLECTION_OUTPUT"
@@ -433,7 +447,7 @@ MIRROR_BRIDGE_MODULE(quick_test,
 TESTBINDING
 
 if [ -f "$SCRIPT_DIR/mirror_bridge.hpp" ]; then
-    COMPILE_CMD="clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ -fPIC -shared"
+    COMPILE_CMD="$DOCTOR_CXX $DOCTOR_FLAGS -fPIC -shared"
     COMPILE_CMD="$COMPILE_CMD -I$SCRIPT_DIR -I$QUICK_TEST_DIR"
     COMPILE_CMD="$COMPILE_CMD $(python3-config --includes 2>/dev/null)"
     COMPILE_CMD="$COMPILE_CMD $QUICK_TEST_DIR/test_binding.cpp"

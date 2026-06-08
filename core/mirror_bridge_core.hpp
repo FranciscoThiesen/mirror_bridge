@@ -416,6 +416,18 @@ consteval auto get_method_return_type() {
     return std::meta::return_type_of(func);
 }
 
+// Alias-template forms of the parameter-type getters. Pack expansions must
+// use these instead of splicing inline: GCC's reflection implementation
+// does not treat a pack as expandable when it appears only inside a splice
+// ("expansion pattern contains no parameter packs" / "operand of fold
+// expression has no unexpanded parameter packs"), while an alias template
+// makes the pack an ordinary template argument that both compilers accept.
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using method_param_t = typename [:get_method_param_type<T, FuncIndex, ParamIndex>():];
+
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+using static_method_param_t = typename [:get_static_method_param_type<T, FuncIndex, ParamIndex>():];
+
 // ============================================================================
 // Method Bindability — Physical Feasibility Check
 // ============================================================================
@@ -494,7 +506,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool method_params_are_value_bindable() {
     constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_value_bindable<std::remove_cvref_t<typename [:get_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+        return (is_value_bindable<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -502,7 +514,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool static_method_params_are_value_bindable() {
     constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_value_bindable<std::remove_cvref_t<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>>() && ...);
+        return (is_value_bindable<std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -559,7 +571,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool method_params_all_bindable() {
     constexpr std::size_t param_count = get_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_param_bindable<typename [:get_method_param_type<T, FuncIndex, Is>():]>() && ...);
+        return (is_param_bindable<method_param_t<T, FuncIndex, Is>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -567,7 +579,7 @@ template<typename T, std::size_t FuncIndex>
 consteval bool static_method_params_all_bindable() {
     constexpr std::size_t param_count = get_static_method_param_count<T, FuncIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return (is_param_bindable<typename [:get_static_method_param_type<T, FuncIndex, Is>():]>() && ...);
+        return (is_param_bindable<static_method_param_t<T, FuncIndex, Is>>() && ...);
     }(std::make_index_sequence<param_count>{});
 }
 
