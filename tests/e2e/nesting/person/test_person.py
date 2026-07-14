@@ -8,7 +8,7 @@ import sys
 import os
 
 # Add build directory to path (4 levels up from tests/e2e/nesting/person)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'build'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'build'))
 
 try:
     import person

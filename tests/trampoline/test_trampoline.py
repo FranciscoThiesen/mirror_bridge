@@ -1,7 +1,7 @@
 """Python subclasses override C++ virtual methods, and the override is
 called when C++ code invokes the virtual (the 'trampoline' path)."""
 import sys
-sys.path.insert(0, "build")
+sys.path.append("build")
 
 import trampoline_test
 

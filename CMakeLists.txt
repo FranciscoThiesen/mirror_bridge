@@ -57,21 +57,24 @@ option(MIRROR_BRIDGE_USE_PCH "Use precompiled headers for faster builds" OFF)
 # Compiler Configuration (C++26 with Reflection)
 # ============================================================================
 
-# Check for clang with reflection support
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(WARNING "Mirror Bridge requires clang-p2996 with reflection support. "
-                    "Current compiler: ${CMAKE_CXX_COMPILER_ID}")
+# Two reflection compilers are supported: Bloomberg clang-p2996 and stock
+# GCC 16+. Flags differ (clang-p2996 needs its bundled libc++; GCC uses
+# plain -std=c++26 -freflection with libstdc++).
+# Note: -std flags are passed directly instead of CMAKE_CXX_STANDARD
+# because CMake versions < 3.25 don't recognize C++26.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set(MIRROR_BRIDGE_CXX_FLAGS -std=c++2c -freflection -freflection-latest -stdlib=libc++)
+    set(MIRROR_BRIDGE_LINK_FLAGS -stdlib=libc++)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    set(MIRROR_BRIDGE_CXX_FLAGS -std=c++26 -freflection)
+    set(MIRROR_BRIDGE_LINK_FLAGS "")
+else()
+    message(WARNING "Mirror Bridge requires a C++26 reflection compiler: "
+                    "Bloomberg clang-p2996 or stock GCC 16+. "
+                    "Current compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+    set(MIRROR_BRIDGE_CXX_FLAGS -std=c++2c -freflection -freflection-latest -stdlib=libc++)
+    set(MIRROR_BRIDGE_LINK_FLAGS -stdlib=libc++)
 endif()
-
-# C++26 reflection flags for clang-p2996
-# Note: We use -std=c++2c directly instead of CMAKE_CXX_STANDARD because
-# CMake versions < 3.25 don't recognize C++26
-set(MIRROR_BRIDGE_CXX_FLAGS
-    -std=c++2c
-    -freflection
-    -freflection-latest
-    -stdlib=libc++
-)
 
 # Add C++26 and reflection flags globally — but only when building
 # mirror_bridge itself. As a dependency (FetchContent/add_subdirectory)
@@ -79,7 +82,7 @@ set(MIRROR_BRIDGE_CXX_FLAGS
 # parent project's own targets are untouched.
 if(MIRROR_BRIDGE_IS_TOP_LEVEL)
     add_compile_options(${MIRROR_BRIDGE_CXX_FLAGS})
-    add_link_options(-stdlib=libc++)
+    add_link_options(${MIRROR_BRIDGE_LINK_FLAGS})
 endif()
 
 # Set up library paths for libc++
@@ -108,11 +111,14 @@ target_include_directories(mirror_bridge INTERFACE
 
 # Usage requirements for consumers (find_package / FetchContent): linking
 # mirror_bridge::mirror_bridge is enough to get the reflection flags.
-# Restricted to Clang since only clang-p2996 understands -freflection.
-# Quoted so the ;-separated flag list stays inside one generator
+# Both compiler branches are spelled out literally (not via
+# MIRROR_BRIDGE_CXX_FLAGS) because the genex evaluates against the
+# CONSUMER's compiler, which need not match the one configuring this
+# project. Quoted so the ;-separated flag list stays inside one generator
 # expression instead of splitting into broken arguments.
 target_compile_options(mirror_bridge INTERFACE
-    "$<$<COMPILE_LANG_AND_ID:CXX,Clang>:${MIRROR_BRIDGE_CXX_FLAGS}>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,Clang>:-std=c++2c;-freflection;-freflection-latest;-stdlib=libc++>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-std=c++26;-freflection>"
 )
 target_link_options(mirror_bridge INTERFACE
     "$<$<LINK_LANG_AND_ID:CXX,Clang>:-stdlib=libc++>"
@@ -214,101 +220,11 @@ endif()
 # Helper Functions for Creating Bindings
 # ============================================================================
 
-# Function to create a Python binding module
-# Usage: mirror_bridge_python_module(module_name source.cpp [HEADERS header1.hpp ...])
-function(mirror_bridge_python_module TARGET_NAME)
-    cmake_parse_arguments(ARG "" "" "SOURCES;HEADERS;INCLUDE_DIRS" ${ARGN})
-
-    if(NOT ARG_SOURCES)
-        set(ARG_SOURCES ${ARGN})
-        list(FILTER ARG_SOURCES EXCLUDE REGEX "^(HEADERS|INCLUDE_DIRS)$")
-    endif()
-
-    Python3_add_library(${TARGET_NAME} MODULE ${ARG_SOURCES})
-
-    target_link_libraries(${TARGET_NAME} PRIVATE mirror_bridge)
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${ARG_INCLUDE_DIRS}
-    )
-
-    # Use PCH if enabled (3-4x faster builds)
-    if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_python)
-        target_precompile_headers(${TARGET_NAME} REUSE_FROM mirror_bridge_pch_python)
-    endif()
-
-    # Set output name without lib prefix
-    set_target_properties(${TARGET_NAME} PROPERTIES
-        PREFIX ""
-        OUTPUT_NAME ${TARGET_NAME}
-    )
-endfunction()
-
-# Function to create a Lua binding module
-# Usage: mirror_bridge_lua_module(module_name source.cpp [HEADERS header1.hpp ...])
-function(mirror_bridge_lua_module TARGET_NAME)
-    cmake_parse_arguments(ARG "" "" "SOURCES;HEADERS;INCLUDE_DIRS" ${ARGN})
-
-    if(NOT ARG_SOURCES)
-        set(ARG_SOURCES ${ARGN})
-        list(FILTER ARG_SOURCES EXCLUDE REGEX "^(HEADERS|INCLUDE_DIRS)$")
-    endif()
-
-    add_library(${TARGET_NAME} MODULE ${ARG_SOURCES})
-
-    target_link_libraries(${TARGET_NAME} PRIVATE mirror_bridge ${LUA_LIBRARIES})
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${LUA_INCLUDE_DIRS}
-        ${ARG_INCLUDE_DIRS}
-    )
-
-    # Use PCH if enabled (3-4x faster builds)
-    if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_lua)
-        target_precompile_headers(${TARGET_NAME} REUSE_FROM mirror_bridge_pch_lua)
-    endif()
-
-    # Set output name without lib prefix, with .so extension
-    # Output to lua/ subdirectory to avoid conflicts with Python modules
-    set_target_properties(${TARGET_NAME} PROPERTIES
-        PREFIX ""
-        SUFFIX ".so"
-        OUTPUT_NAME ${TARGET_NAME}
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/lua"
-    )
-endfunction()
-
-# Function to create a JavaScript/Node.js binding module
-# Usage: mirror_bridge_js_module(module_name source.cpp [HEADERS header1.hpp ...])
-function(mirror_bridge_js_module TARGET_NAME)
-    cmake_parse_arguments(ARG "" "" "SOURCES;HEADERS;INCLUDE_DIRS" ${ARGN})
-
-    if(NOT ARG_SOURCES)
-        set(ARG_SOURCES ${ARGN})
-        list(FILTER ARG_SOURCES EXCLUDE REGEX "^(HEADERS|INCLUDE_DIRS)$")
-    endif()
-
-    add_library(${TARGET_NAME} MODULE ${ARG_SOURCES})
-
-    target_link_libraries(${TARGET_NAME} PRIVATE mirror_bridge)
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${NAPI_INCLUDE_DIR}
-        ${ARG_INCLUDE_DIRS}
-    )
-
-    # Use PCH if enabled (3-4x faster builds)
-    if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_js)
-        target_precompile_headers(${TARGET_NAME} REUSE_FROM mirror_bridge_pch_js)
-    endif()
-
-    # Set output as .node file
-    set_target_properties(${TARGET_NAME} PROPERTIES
-        PREFIX ""
-        SUFFIX ".node"
-        OUTPUT_NAME ${TARGET_NAME}
-    )
-endfunction()
+# mirror_bridge_python_module() / mirror_bridge_lua_module() /
+# mirror_bridge_js_module() live in a separate file because they are also
+# installed with the package, so find_package consumers get the exact same
+# helper API as add_subdirectory/FetchContent consumers.
+include(cmake/MirrorBridgeModules.cmake)
 
 # ============================================================================
 # Build Tests
@@ -340,21 +256,33 @@ install(FILES mirror_bridge.hpp mirror_bridge_pch.hpp
 )
 
 install(EXPORT mirror_bridge-targets
-    FILE mirror_bridge-config.cmake
+    FILE mirror_bridge-targets.cmake
     NAMESPACE mirror_bridge::
     DESTINATION lib/cmake/mirror_bridge
 )
 
-# Version file so `find_package(mirror_bridge 0.2 REQUIRED)` can check
-# compatibility. ARCH_INDEPENDENT because the library is header-only.
+# The config file chains the exported target with the module helper
+# functions, so find_package delivers the same API as add_subdirectory.
 include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    cmake/mirror_bridge-config.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config.cmake"
+    INSTALL_DESTINATION lib/cmake/mirror_bridge
+)
+
+# Version file so `find_package(mirror_bridge 0.3 REQUIRED)` can check
+# compatibility. ARCH_INDEPENDENT because the library is header-only.
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config-version.cmake"
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMinorVersion
     ARCH_INDEPENDENT
 )
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config-version.cmake"
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror_bridge-config-version.cmake"
+    cmake/MirrorBridgeModules.cmake
     DESTINATION lib/cmake/mirror_bridge
 )
 

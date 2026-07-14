@@ -2,12 +2,17 @@
 // 1. Static methods (hot_loop, add_vectors)
 // 2. Methods with const reference parameters (dot)
 
-// Try node-gyp build path first (for standalone tests), then project-wide build
+// Resolution order: NODE_PATH (set by ctest to the CMake build tree),
+// then the node-gyp build path (standalone runs), then the bash harness output
 let vec3;
 try {
-    vec3 = require('./build/Release/vec3.node');
-} catch (e) {
-    vec3 = require('../../../build/vec3_js.node');
+    vec3 = require('vec3_js');
+} catch (e0) {
+    try {
+        vec3 = require('./build/Release/vec3.node');
+    } catch (e) {
+        vec3 = require('../../../build/vec3_js.node');
+    }
 }
 
 console.log("============================================================");

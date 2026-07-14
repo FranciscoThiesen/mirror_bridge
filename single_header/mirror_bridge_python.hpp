@@ -888,7 +888,210 @@ consteval bool validate_bindable_members() {
 
 // Include P3394 annotations support for field-level binding control
 // Requires -freflection-latest with Bloomberg's clang-p2996
-#include "python/mirror_bridge_annotations.hpp"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mirror Bridge Annotations - P3394 Field Annotations for Binding Control
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This header provides annotation types for controlling binding behavior using
+// C++26 P3394 (Annotations for Reflection), accepted at the Sofia meeting.
+//
+// Usage (recommended - import annotation types for clean syntax):
+//
+//   using mirror_bridge::exclude;
+//   using mirror_bridge::readonly;
+//
+//   struct UserProfile {
+//       int user_id;                              // Bound normally
+//       [[=exclude{}]] std::string password_hash; // Not bound to Python
+//       [[=readonly{}]] std::string created_at;   // Read-only in Python
+//   };
+//
+// Requires: -freflection-latest with Bloomberg's clang-p2996
+//
+// For compilers without P3394 support, annotations are ignored and all
+// members are bound normally.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include <meta>
+
+// ============================================================================
+// P3394 Feature Detection
+// ============================================================================
+//
+// P3394 (Annotations for Reflection) adds std::meta::annotation_of_type<T>().
+// Currently only Bloomberg's clang-p2996 with -freflection-latest supports it.
+// GCC's reflection implementation does not yet support P3394.
+//
+// We detect P3394 by checking if annotation_of_type is available via SFINAE.
+
+namespace mirror_bridge {
+namespace detail {
+
+// Helper to detect P3394 support at compile time
+template<typename T, typename = void>
+struct has_p3394_support : std::false_type {};
+
+// This specialization will only be valid if annotation_of_type exists
+// We use a simple struct for testing
+struct p3394_test_marker {
+    constexpr bool operator==(const p3394_test_marker&) const = default;
+};
+
+#if defined(__clang__) && __has_builtin(__builtin_reflection)
+// Clang with reflection support - check if annotation_of_type exists
+// by attempting to use it in a requires clause
+template<typename T>
+struct has_p3394_support<T, std::void_t<
+    decltype(std::meta::annotation_of_type<p3394_test_marker>(std::meta::info{}))
+>> : std::true_type {};
+#endif
+
+// For simplicity, we use a compile-time constant based on compiler detection
+// Bloomberg's clang-p2996 with -freflection-latest supports P3394
+#if defined(__clang__) && defined(__has_feature)
+  #if __has_feature(reflection)
+    // Check if this is clang-p2996 with P3394 support
+    // The annotation_of_type function is only available with -freflection-latest
+    // We detect this by checking if the function exists in std::meta
+    inline constexpr bool p3394_available = requires {
+        std::meta::annotation_of_type<p3394_test_marker>(std::meta::info{});
+    };
+  #else
+    inline constexpr bool p3394_available = false;
+  #endif
+#else
+    inline constexpr bool p3394_available = false;
+#endif
+
+} // namespace detail
+
+// ============================================================================
+// Annotation Types
+// ============================================================================
+
+// Exclude a field from the binding entirely
+// The field will not appear in the Python/Lua/JavaScript binding
+struct exclude {
+    constexpr bool operator==(const exclude&) const = default;
+};
+
+// Make a field read-only in the binding
+// The field will have a getter but no setter
+struct readonly {
+    constexpr bool operator==(const readonly&) const = default;
+};
+
+// ============================================================================
+// Annotation Detection Helpers
+// ============================================================================
+
+namespace annotations {
+
+#if defined(__clang__)
+// Clang with P3394 support - use annotation_of_type
+
+// Check if a member has the 'exclude' annotation
+template<std::meta::info Member>
+consteval bool is_excluded() {
+    return std::meta::annotation_of_type<exclude>(Member).has_value();
+}
+
+// Check if a member has the 'readonly' annotation
+template<std::meta::info Member>
+consteval bool is_readonly() {
+    return std::meta::annotation_of_type<readonly>(Member).has_value();
+}
+
+// Count the number of non-excluded data members for a type
+template<typename T>
+consteval std::size_t count_visible_members() {
+    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    std::size_t count = 0;
+    for (auto member : members) {
+        if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Get the Nth visible (non-excluded) member
+template<typename T>
+consteval std::meta::info get_visible_member(std::size_t visible_index) {
+    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    std::size_t visible_count = 0;
+    for (auto member : members) {
+        if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
+            if (visible_count == visible_index) {
+                return member;
+            }
+            ++visible_count;
+        }
+    }
+    // Should not reach here if visible_index is valid
+    return members[0];
+}
+
+// Check if the Nth visible member is readonly
+template<typename T, std::size_t VisibleIndex>
+consteval bool is_visible_member_readonly() {
+    constexpr auto member = get_visible_member<T>(VisibleIndex);
+    return std::meta::annotation_of_type<readonly>(member).has_value();
+}
+
+// Get the name of the Nth visible member
+template<typename T, std::size_t VisibleIndex>
+consteval const char* get_visible_member_name() {
+    constexpr auto member = get_visible_member<T>(VisibleIndex);
+    return std::meta::identifier_of(member).data();
+}
+
+#else
+// GCC or other compilers without P3394 - all members are visible, none readonly
+
+// Check if a member has the 'exclude' annotation - always false without P3394
+template<std::meta::info Member>
+consteval bool is_excluded() {
+    return false;  // No P3394 support, can't check annotations
+}
+
+// Check if a member has the 'readonly' annotation - always false without P3394
+template<std::meta::info Member>
+consteval bool is_readonly() {
+    return false;  // No P3394 support, can't check annotations
+}
+
+// Count the number of non-excluded data members - all members are visible
+template<typename T>
+consteval std::size_t count_visible_members() {
+    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+}
+
+// Get the Nth visible member - just return the Nth member directly
+template<typename T>
+consteval std::meta::info get_visible_member(std::size_t index) {
+    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())[index];
+}
+
+// Check if the Nth visible member is readonly - always false without P3394
+template<typename T, std::size_t VisibleIndex>
+consteval bool is_visible_member_readonly() {
+    return false;  // No P3394 support, can't check annotations
+}
+
+// Get the name of the Nth visible member
+template<typename T, std::size_t VisibleIndex>
+consteval const char* get_visible_member_name() {
+    constexpr auto member = get_visible_member<T>(VisibleIndex);
+    return std::meta::identifier_of(member).data();
+}
+
+#endif // __clang__
+
+} // namespace annotations
+} // namespace mirror_bridge
 
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
@@ -1065,7 +1268,185 @@ bool from_python(PyObject* obj, T& container);
 // this, two-phase lookup inside these templates can't find the Eigen
 // overloads because ADL looks in Eigen's namespace (no to_python there)
 // and non-ADL looks at definition point.
-#include "mirror_bridge_eigen.hpp"
+
+// ============================================================================
+// Mirror Bridge — Built-in Eigen Type Converters
+// ============================================================================
+//
+// Automatically included when Eigen types are detected in bound classes.
+// Provides to_python/from_python overloads for common Eigen vector and
+// matrix types, enabling zero-effort binding of classes that use Eigen.
+//
+// Supported types:
+//   Eigen::Vector2d, Vector2f, Vector2i
+//   Eigen::Vector3d, Vector3f, Vector3i
+//   Eigen::Vector4d, Vector4f, Vector4i
+//   Eigen::Matrix3d, Matrix3f
+//   Eigen::Matrix4d, Matrix4f
+//
+// Vectors convert to/from Python lists: [x, y, z]
+// Matrices convert to/from nested lists: [[r0c0, r0c1, ...], ...]
+//
+// ============================================================================
+
+#ifdef __has_include
+#if __has_include(<Eigen/Dense>)
+#define MIRROR_BRIDGE_HAS_EIGEN 1
+#endif
+#if __has_include(<Eigen/Core>)
+#ifndef MIRROR_BRIDGE_HAS_EIGEN
+#define MIRROR_BRIDGE_HAS_EIGEN 1
+#endif
+#endif
+#endif
+
+#ifdef MIRROR_BRIDGE_HAS_EIGEN
+
+#include <Eigen/Core>
+#include <Python.h>
+
+namespace mirror_bridge {
+
+// ============================================================================
+// Helper: fixed-size Eigen vector <-> Python list
+// ============================================================================
+
+template<typename Scalar, int N>
+inline PyObject* eigen_vector_to_python(const Eigen::Matrix<Scalar, N, 1>& v) {
+    PyObject* list = PyList_New(N);
+    if (!list) return nullptr;
+    for (int i = 0; i < N; i++) {
+        if constexpr (std::is_floating_point_v<Scalar>) {
+            PyList_SET_ITEM(list, i, PyFloat_FromDouble(static_cast<double>(v[i])));
+        } else {
+            PyList_SET_ITEM(list, i, PyLong_FromLong(static_cast<long>(v[i])));
+        }
+    }
+    return list;
+}
+
+template<typename Scalar, int N>
+inline bool eigen_vector_from_python(PyObject* obj, Eigen::Matrix<Scalar, N, 1>& out) {
+    if (!PySequence_Check(obj) || PySequence_Size(obj) != N) return false;
+    for (int i = 0; i < N; i++) {
+        PyObject* item = PySequence_GetItem(obj, i);
+        if (!item) return false;
+        if constexpr (std::is_floating_point_v<Scalar>) {
+            double val = PyFloat_AsDouble(item);
+            Py_DECREF(item);
+            if (val == -1.0 && PyErr_Occurred()) return false;
+            out[i] = static_cast<Scalar>(val);
+        } else {
+            long val = PyLong_AsLong(item);
+            Py_DECREF(item);
+            if (val == -1 && PyErr_Occurred()) return false;
+            out[i] = static_cast<Scalar>(val);
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Helper: fixed-size Eigen matrix <-> Python nested list
+// ============================================================================
+
+template<typename Scalar, int Rows, int Cols>
+inline PyObject* eigen_matrix_to_python(const Eigen::Matrix<Scalar, Rows, Cols>& m) {
+    PyObject* outer = PyList_New(Rows);
+    if (!outer) return nullptr;
+    for (int r = 0; r < Rows; r++) {
+        PyObject* row = PyList_New(Cols);
+        if (!row) { Py_DECREF(outer); return nullptr; }
+        for (int c = 0; c < Cols; c++) {
+            if constexpr (std::is_floating_point_v<Scalar>) {
+                PyList_SET_ITEM(row, c, PyFloat_FromDouble(static_cast<double>(m(r, c))));
+            } else {
+                PyList_SET_ITEM(row, c, PyLong_FromLong(static_cast<long>(m(r, c))));
+            }
+        }
+        PyList_SET_ITEM(outer, r, row);
+    }
+    return outer;
+}
+
+template<typename Scalar, int Rows, int Cols>
+inline bool eigen_matrix_from_python(PyObject* obj, Eigen::Matrix<Scalar, Rows, Cols>& out) {
+    if (!PySequence_Check(obj) || PySequence_Size(obj) != Rows) return false;
+    for (int r = 0; r < Rows; r++) {
+        PyObject* row = PySequence_GetItem(obj, r);
+        if (!row || !PySequence_Check(row) || PySequence_Size(row) != Cols) {
+            Py_XDECREF(row);
+            return false;
+        }
+        for (int c = 0; c < Cols; c++) {
+            PyObject* item = PySequence_GetItem(row, c);
+            if (!item) { Py_DECREF(row); return false; }
+            if constexpr (std::is_floating_point_v<Scalar>) {
+                out(r, c) = static_cast<Scalar>(PyFloat_AsDouble(item));
+            } else {
+                out(r, c) = static_cast<Scalar>(PyLong_AsLong(item));
+            }
+            Py_DECREF(item);
+        }
+        Py_DECREF(row);
+    }
+    return true;
+}
+
+// ============================================================================
+// Vector2
+// ============================================================================
+
+inline PyObject* to_python(const Eigen::Vector2d& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector2f& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector2i& v) { return eigen_vector_to_python(v); }
+inline bool from_python(PyObject* o, Eigen::Vector2d& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector2f& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector2i& v) { return eigen_vector_from_python(o, v); }
+
+// ============================================================================
+// Vector3
+// ============================================================================
+
+inline PyObject* to_python(const Eigen::Vector3d& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector3f& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector3i& v) { return eigen_vector_to_python(v); }
+inline bool from_python(PyObject* o, Eigen::Vector3d& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector3f& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector3i& v) { return eigen_vector_from_python(o, v); }
+
+// ============================================================================
+// Vector4
+// ============================================================================
+
+inline PyObject* to_python(const Eigen::Vector4d& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector4f& v) { return eigen_vector_to_python(v); }
+inline PyObject* to_python(const Eigen::Vector4i& v) { return eigen_vector_to_python(v); }
+inline bool from_python(PyObject* o, Eigen::Vector4d& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector4f& v) { return eigen_vector_from_python(o, v); }
+inline bool from_python(PyObject* o, Eigen::Vector4i& v) { return eigen_vector_from_python(o, v); }
+
+// ============================================================================
+// Matrix3
+// ============================================================================
+
+inline PyObject* to_python(const Eigen::Matrix3d& m) { return eigen_matrix_to_python(m); }
+inline PyObject* to_python(const Eigen::Matrix3f& m) { return eigen_matrix_to_python(m); }
+inline bool from_python(PyObject* o, Eigen::Matrix3d& m) { return eigen_matrix_from_python(o, m); }
+inline bool from_python(PyObject* o, Eigen::Matrix3f& m) { return eigen_matrix_from_python(o, m); }
+
+// ============================================================================
+// Matrix4
+// ============================================================================
+
+inline PyObject* to_python(const Eigen::Matrix4d& m) { return eigen_matrix_to_python(m); }
+inline PyObject* to_python(const Eigen::Matrix4f& m) { return eigen_matrix_to_python(m); }
+inline bool from_python(PyObject* o, Eigen::Matrix4d& m) { return eigen_matrix_from_python(o, m); }
+inline bool from_python(PyObject* o, Eigen::Matrix4f& m) { return eigen_matrix_from_python(o, m); }
+
+} // namespace mirror_bridge
+
+#endif // MIRROR_BRIDGE_HAS_EIGEN
 
 namespace mirror_bridge {
 

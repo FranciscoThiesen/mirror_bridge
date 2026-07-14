@@ -1,0 +1,22 @@
+# mirror_bridge-config.cmake
+# ===========================
+#
+# find_package(mirror_bridge) entry point.
+#
+#   find_package(mirror_bridge REQUIRED)
+#
+#   mirror_bridge_python_module(mymodule my_binding.cpp)
+#   mirror_bridge_lua_module(mymodule_lua my_binding_lua.cpp)
+#   mirror_bridge_js_module(mymodule_js my_binding_js.cpp)
+#
+# Imported target:
+#   mirror_bridge::mirror_bridge - header-only interface library carrying
+#   the C++26 reflection flags (clang-p2996 or GCC 16+) as usage
+#   requirements; linking it is all a hand-rolled target needs.
+
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/mirror_bridge-targets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/MirrorBridgeModules.cmake")
+
+check_required_components(mirror_bridge)

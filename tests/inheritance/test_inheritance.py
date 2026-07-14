@@ -1,7 +1,7 @@
 """Runtime test: inherited methods from non-virtual, virtual, and overridden
 base-class methods are all exposed via auto-discovery + bases_of walking."""
 import sys
-sys.path.insert(0, "build")
+sys.path.append("build")
 
 import inherit_mod
 

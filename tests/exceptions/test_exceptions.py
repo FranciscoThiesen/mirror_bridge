@@ -1,6 +1,6 @@
 """C++ std:: exceptions map to the most specific Python exception type."""
 import sys
-sys.path.insert(0, "build")
+sys.path.append("build")
 import exceptions_test as mod
 
 fail = 0

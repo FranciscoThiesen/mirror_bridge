@@ -5,7 +5,7 @@ import sys
 import os
 
 # Add build directory to path (2 levels up from tests/single_header_test)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'build'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'build'))
 
 import robot_py
 

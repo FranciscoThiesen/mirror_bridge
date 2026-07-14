@@ -146,11 +146,17 @@ endif()
 
 if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
 
+    # Lua modules go to their own subdirectory: several share an OUTPUT_NAME
+    # with a Python module (e.g. point2d) and would clobber it in tests/.
+    # The Lua test runner's LUA_CPATH points here.
+    set(LUA_TEST_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/lua")
+
     # Static method test (Vec3) - output as vec3.so to match test expectations
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/static_method_test)
         mirror_bridge_lua_module(vec3_lua
             lua/static_method_test/vec3_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/static_method_test
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
         )
         # Test expects 'vec3' not 'vec3_lua'
         set_target_properties(vec3_lua PROPERTIES OUTPUT_NAME vec3)
@@ -161,6 +167,7 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         mirror_bridge_lua_module(point2d_lua
             lua/basic/point2d/point2d_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/basic/point2d
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
         )
         set_target_properties(point2d_lua PROPERTIES OUTPUT_NAME point2d)
     endif()
@@ -170,6 +177,7 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         mirror_bridge_lua_module(calculator_lua
             lua/comprehensive/calculator/calculator_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/comprehensive/calculator
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
         )
         set_target_properties(calculator_lua PROPERTIES OUTPUT_NAME calculator)
     endif()
@@ -179,6 +187,7 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         mirror_bridge_lua_module(features_lua
             comprehensive_features/features_binding_lua.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/comprehensive_features
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
         )
     endif()
 
@@ -187,6 +196,7 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         mirror_bridge_lua_module(robot_lua
             single_header_test/robot_lua.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/single_header_test
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
         )
     endif()
 
@@ -220,6 +230,16 @@ endif()
 # Python Test Runner
 # ============================================================================
 
+# CTest contract: only tests whose binding modules are built by THIS CMake
+# run are registered. Tests whose modules come from the bash harness
+# (tests/run_all_tests.sh, per-directory build scripts, or the CLI) are
+# excluded here — they are still exercised by CI's bash jobs. To promote
+# one into ctest, add its module via mirror_bridge_python_module() above
+# and remove its directory from this pattern.
+set(MB_PYTHON_BASH_ONLY_PATTERN
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features"
+)
+
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")
 
@@ -229,6 +249,11 @@ foreach(TEST_FILE ${PYTHON_TESTS})
 
     # Create unique test name by including relative path
     file(RELATIVE_PATH REL_PATH ${CMAKE_CURRENT_SOURCE_DIR} ${TEST_DIR})
+
+    if(REL_PATH MATCHES "${MB_PYTHON_BASH_ONLY_PATTERN}")
+        continue()
+    endif()
+
     string(REPLACE "/" "_" REL_PATH_SAFE "${REL_PATH}")
     set(UNIQUE_TEST_NAME "python_${REL_PATH_SAFE}_${TEST_NAME}")
 
@@ -263,8 +288,9 @@ if(LUA_FOUND)
             string(REPLACE "/" "_" REL_PATH_SAFE "${REL_PATH}")
             set(UNIQUE_TEST_NAME "lua_${REL_PATH_SAFE}_${TEST_NAME}")
 
-            # Skip auto_discovery tests (use bash scripts to generate bindings)
-            if(REL_PATH MATCHES "auto_discovery")
+            # Skip tests whose modules the bash harness builds, not CMake
+            # (same contract as the Python runner above)
+            if(REL_PATH MATCHES "auto_discovery|custom_converter|smart_ptr_test|exception_test")
                 continue()
             endif()
 
@@ -301,9 +327,9 @@ if(NAPI_FOUND)
             string(REPLACE "/" "_" REL_PATH_SAFE "${REL_PATH}")
             set(UNIQUE_TEST_NAME "js_${REL_PATH_SAFE}_${TEST_NAME}")
 
-            # Skip tests for modules not built by CMake
-            # (auto_discovery uses bash scripts)
-            if(REL_PATH MATCHES "auto_discovery")
+            # Skip tests whose modules the bash harness builds, not CMake
+            # (same contract as the Python runner above)
+            if(REL_PATH MATCHES "auto_discovery|custom_converter|smart_ptr_test|basic|comprehensive")
                 continue()
             endif()
 

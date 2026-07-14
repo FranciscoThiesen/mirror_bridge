@@ -6,7 +6,7 @@ import os
 
 # Add build directory to Python path (use absolute path for CI compatibility)
 # Build output is at repo_root/build, which is 3 levels up from tests/e2e/callbacks
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', 'build'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'build'))
 
 import callbacks
 

@@ -84,10 +84,31 @@ echo "// PYTHON - Python C API Bindings" >> "$OUTPUT_DIR/mirror_bridge_python.hp
 echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 
-# Extract Python content but skip the core include
-awk '
+# The Python backend pulls in two satellite headers that must be inlined
+# AT THEIR INCLUDE SITE (position matters: the eigen include sits at a
+# point where namespace mirror_bridge is deliberately closed so the Eigen
+# overloads land in the right scope). Leaving the raw #include lines in
+# place shipped a single header that could not compile standalone.
+TMP_ANNOTATIONS=$(mktemp)
+TMP_EIGEN=$(mktemp)
+trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_EIGEN"' EXIT
+extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
+
+# Extract Python content: skip the core include, splice satellites inline
+awk -v annotations="$TMP_ANNOTATIONS" -v eigen="$TMP_EIGEN" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
+    /^#include "python\/mirror_bridge_annotations\.hpp"/ {
+        while ((getline line < annotations) > 0) print line
+        close(annotations)
+        next
+    }
+    /^#include "mirror_bridge_eigen\.hpp"/ {
+        while ((getline line < eigen) > 0) print line
+        close(eigen)
+        next
+    }
     { print }
 ' "$SCRIPT_DIR/python/mirror_bridge_python.hpp" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 

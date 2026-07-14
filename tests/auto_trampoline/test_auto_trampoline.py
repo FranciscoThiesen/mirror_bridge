@@ -1,7 +1,7 @@
 """Auto-trampoline: vtable-swap driven by reflection lets Python subclasses
 override C++ virtuals without any hand-written trampoline class."""
 import sys
-sys.path.insert(0, "build")
+sys.path.append("build")
 
 import auto_trampoline_test as mod
 

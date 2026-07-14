@@ -22,7 +22,7 @@ import os
 # Ensure build directory is in path
 build_dir = os.path.join(os.path.dirname(__file__), '../../build')
 if build_dir not in sys.path:
-    sys.path.insert(0, build_dir)
+    sys.path.append(build_dir)
 
 def test_cross_module_type_sharing():
     """Test that types are properly shared across modules."""

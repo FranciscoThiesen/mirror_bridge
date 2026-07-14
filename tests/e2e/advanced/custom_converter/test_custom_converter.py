@@ -9,7 +9,7 @@ import sys
 import os
 
 # Add build directory to Python path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "build"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "..", "build"))
 
 try:
     import pixel

@@ -2,7 +2,7 @@
 """Test auto-discovered free functions."""
 
 import sys
-sys.path.insert(0, 'build')
+sys.path.append('build')
 
 import math_funcs
 

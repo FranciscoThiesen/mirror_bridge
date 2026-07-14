@@ -1,7 +1,15 @@
 // Test single-header JavaScript binding
 const path = require('path');
-const robot = require(path.join(__dirname, '..', '..', 'build', 'robot_js'));
 const assert = require('assert');
+
+// Resolution order: NODE_PATH (set by ctest to the CMake build tree),
+// then the bash harness output in <repo>/build
+let robot;
+try {
+    robot = require('robot_js');
+} catch (e) {
+    robot = require(path.join(__dirname, '..', '..', 'build', 'robot_js'));
+}
 
 console.log('=== JavaScript Single-Header Test ===\n');
 

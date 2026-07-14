@@ -2,7 +2,7 @@
 reflection (has_default_argument + identifier_of on parameters). No hand-
 written binding annotations needed."""
 import sys
-sys.path.insert(0, "build")
+sys.path.append("build")
 
 import kwargs_defaults_test as mod
 
