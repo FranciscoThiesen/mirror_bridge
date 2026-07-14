@@ -2525,9 +2525,13 @@ decltype(auto) forward_arg(StoredType& arg) {
 // so we can read the cpp_object pointer generically and cast to the target
 // pointer type. The cast is safe as long as the user passes a Python wrapper
 // whose underlying C++ object is a T* or T-derived*.
+//
+// None is rejected (returns false): pointer storage is always dereferenced
+// by forward_arg before the call — bindable parameters are never raw
+// pointers — so accepting None as nullptr would guarantee a null deref.
 template<typename T>
 inline bool from_python_pointer(PyObject* obj, T*& out) {
-    if (!obj || obj == Py_None) { out = nullptr; return obj == Py_None; }
+    if (!obj || obj == Py_None) { out = nullptr; return false; }
     // Generic layout shared by every PyWrapper<X>
     struct GenericPyWrapper {
         PyObject_HEAD
@@ -2539,6 +2543,70 @@ inline bool from_python_pointer(PyObject* obj, T*& out) {
     out = static_cast<T*>(wrapper->cpp_object);
     return true;
 }
+
+// ============================================================================
+// Python-level parameter storage policy
+// ============================================================================
+//
+// core::param_storage_t only uses pointer storage when value storage is
+// impossible (abstract or non-copyable types). That leaves a copy on every
+// call for lvalue-reference parameters of ordinary bound classes: a method
+// taking `const BigMesh&` copied the whole mesh per call, and a `T&`
+// parameter mutated the copy, silently dropping the mutation.
+//
+// This policy widens pointer storage to every lvalue-reference parameter
+// whose type is "wrapper-backed" — converted by reading the PyWrapper's
+// held object rather than by building a value from Python data. The held
+// object is passed by pointer: zero copies, and T& mutations land on the
+// Python-visible object (matching pybind11 semantics).
+//
+// wrapper-backed must mirror overload resolution over from_python exactly:
+// a type with a value-converting overload (containers, strings, optional,
+// pair/tuple/variant, expected, function, futures, Eigen, user custom
+// converters) must keep value storage, because its Python representation
+// is not a PyWrapper.
+
+template<typename T> struct is_std_tuple_like : std::false_type {};
+template<typename... Ts> struct is_std_tuple_like<std::tuple<Ts...>> : std::true_type {};
+template<typename A, typename B> struct is_std_tuple_like<std::pair<A, B>> : std::true_type {};
+template<typename T> struct is_std_variant : std::false_type {};
+template<typename... Ts> struct is_std_variant<std::variant<Ts...>> : std::true_type {};
+
+template<typename Clean>
+consteval bool is_wrapper_backed_class() {
+    if constexpr (!std::is_class_v<Clean> ||
+                  Arithmetic<Clean> || StringLike<Clean> ||
+                  SmartPointer<Clean> || Container<Clean> ||
+                  is_std_optional<Clean>::value ||
+                  is_std_expected<Clean>::value ||
+                  is_std_function<Clean>::value ||
+                  is_std_future<Clean>::value ||
+                  is_std_tuple_like<Clean>::value ||
+                  is_std_variant<Clean>::value ||
+                  HasCustomConverter<Clean>) {
+        return false;
+    }
+#ifdef MIRROR_BRIDGE_HAS_EIGEN
+    else if constexpr (std::is_base_of_v<Eigen::EigenBase<Clean>, Clean>) {
+        return false;  // Eigen types convert by value from lists/tuples
+    }
+#endif
+    else {
+        return true;
+    }
+}
+
+template<typename ParamType>
+struct py_param_storage {
+    using Clean = std::remove_cvref_t<ParamType>;
+    using type = std::conditional_t<
+        std::is_lvalue_reference_v<ParamType> && is_wrapper_backed_class<Clean>(),
+        Clean*,                                        // zero-copy: alias the wrapper's object
+        mirror_bridge::core::param_storage_t<ParamType>>;
+};
+
+template<typename ParamType>
+using py_param_storage_t = typename py_param_storage<ParamType>::type;
 
 // Dispatcher: value storage vs pointer storage.
 // Called in method dispatch to populate the tuple of stored args.
@@ -2795,7 +2863,7 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
     } else {
         // Parameter storage with pointer-holder for non-value-bindable types
         // (e.g., abstract base classes passed by const-ref).
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
@@ -2829,7 +2897,7 @@ Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
         return nullptr;
     } else {
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
@@ -3130,7 +3198,7 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     // wrapper's cpp_object (the object lives in the wrapper's heap memory,
     // we just hold a pointer to it). This is mirror_bridge's equivalent
     // of pybind11's shared_ptr holder, but inline and lightweight.
-    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -3211,7 +3279,7 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<static_method_param_t<T, Index, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<static_method_param_t<T, Index, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -3346,7 +3414,7 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool conversion_ok = true;
     ([&] {
@@ -3436,7 +3504,7 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
     using ReturnType = typename [:get_method_return_type<T, FuncIndex>():];
 
     return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> PyObject* {
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
         bool conversion_ok = true;
@@ -3842,7 +3910,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
         // Convert `other` Python arg. If conversion fails (e.g., Vec3 + int),
         // return NotImplemented so Python tries the reverse operand's
         // __radd__ and eventually raises TypeError if no handler accepts.
-        mirror_bridge::core::param_storage_t<OtherParam> storage;
+        py_param_storage_t<OtherParam> storage;
         if (!extract_param<OtherParam>(other, storage)) {
             PyErr_Clear();
             Py_RETURN_NOTIMPLEMENTED;

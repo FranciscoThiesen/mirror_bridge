@@ -138,6 +138,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # By-reference argument semantics (zero-copy const T&, visible T& mutation)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
+        mirror_bridge_python_module(byref
+            byref_args/byref_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args
+        )
+    endif()
+
 endif()
 
 # ============================================================================
