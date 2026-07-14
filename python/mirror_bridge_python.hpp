@@ -66,6 +66,7 @@
 #include <functional>
 #include <cstdint>  // For uint8_t, int32_t, etc.
 #include <cstdio>   // For snprintf in simple repr functions
+#include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
 
 // Include core header for GlobalTypeRegistry
@@ -1887,20 +1888,90 @@ inline bool from_python(PyObject* obj, T& out) {
     return true;
 }
 
+// Does a Py_buffer's element format match the given C++ arithmetic type
+// category? `kind` is 'i' (signed int), 'u' (unsigned int), or 'f' (float).
+// Size is matched via itemsize rather than exact format char so that e.g.
+// 'l' and 'q' both satisfy int64_t on LP64 platforms.
+inline bool buffer_format_matches(const Py_buffer& view, char kind, std::size_t item_size) {
+    if (view.itemsize != static_cast<Py_ssize_t>(item_size)) return false;
+    const char* f = view.format ? view.format : "B";
+    if (*f == '@' || *f == '=') ++f;          // native byte order prefixes
+    else if (*f == '<' || *f == '>' || *f == '!') return false;  // explicit order: skip fast path
+    if (f[0] == '\0' || f[1] != '\0') return false;
+    switch (f[0]) {
+        case 'b': case 'h': case 'i': case 'l': case 'q': case 'n':
+            return kind == 'i';
+        case 'B': case 'H': case 'I': case 'L': case 'Q': case 'N':
+            return kind == 'u';
+        case 'f': case 'd':
+            return kind == 'f';
+        default:
+            return false;
+    }
+}
+
 // Convert Python sequences to C++ containers.
 // Accepts list, tuple, array.array, and any type supporting the sequence protocol.
 // This ensures round-trip compatibility: to_python returns array.array for numeric
 // vectors, and from_python accepts it back.
+//
+// Three tiers, fastest first:
+//   1. Buffer protocol (array.array, numpy arrays, memoryview): one memcpy.
+//   2. Exact list/tuple: borrowed-reference macro access — skips one
+//      sequence-protocol dispatch and a refcount round-trip per element.
+//   3. Generic sequence protocol.
 template<Container T>
 bool from_python(PyObject* obj, T& container) {
     if (!PySequence_Check(obj) || PyUnicode_Check(obj) || PyBytes_Check(obj)) {
         return false;
     }
 
-    Py_ssize_t size = PySequence_Size(obj);
-    if (size < 0) return false;
-
     using ValueType = typename std::remove_cvref_t<T>::value_type;
+
+    // Tier 1: bulk transfer from any contiguous buffer of matching element
+    // type. This is the ingest mirror of to_python's array.array memcpy
+    // path, and makes numpy float64 arrays land in vector<double> with a
+    // single copy instead of per-element boxing.
+    if constexpr (std::is_arithmetic_v<ValueType> && !std::is_same_v<ValueType, bool> &&
+                  requires(std::size_t n) { container.resize(n); container.data(); }) {
+        if (PyObject_CheckBuffer(obj)) {
+            Py_buffer view;
+            if (PyObject_GetBuffer(obj, &view, PyBUF_CONTIG_RO | PyBUF_FORMAT) == 0) {
+                constexpr char kind = std::is_floating_point_v<ValueType> ? 'f'
+                                    : std::is_signed_v<ValueType>         ? 'i' : 'u';
+                bool copied = false;
+                if (buffer_format_matches(view, kind, sizeof(ValueType))) {
+                    const std::size_t n = static_cast<std::size_t>(view.len) / sizeof(ValueType);
+                    container.resize(n);
+                    if (n > 0) {
+                        std::memcpy(container.data(), view.buf, static_cast<std::size_t>(view.len));
+                    }
+                    copied = true;
+                }
+                PyBuffer_Release(&view);
+                if (copied) return true;
+                // Format mismatch (e.g. list of ints into vector<double>
+                // never gets here, but array('i') into vector<double>
+                // does): fall through to the element-wise tiers, which
+                // convert value-by-value.
+            } else {
+                PyErr_Clear();
+            }
+        }
+    }
+
+    // Tier 2/3 share one loop; list/tuple hits resolve to borrowed-ref
+    // macros. Element conversion can run arbitrary Python code (__float__,
+    // nested containers), which may mutate the sequence — the borrowed
+    // path therefore re-reads the current size every iteration and never
+    // holds a borrowed pointer across iterations.
+    const bool is_list  = PyList_CheckExact(obj);
+    const bool is_tuple = !is_list && PyTuple_CheckExact(obj);
+
+    Py_ssize_t size = is_list  ? PyList_GET_SIZE(obj)
+                    : is_tuple ? PyTuple_GET_SIZE(obj)
+                    : PySequence_Size(obj);
+    if (size < 0) return false;
 
     if constexpr (requires { container.clear(); }) {
         container.clear();
@@ -1909,16 +1980,25 @@ bool from_python(PyObject* obj, T& container) {
         container.reserve(size);
     }
 
+    auto convert_at = [&](Py_ssize_t idx, ValueType& cpp_item) -> bool {
+        if (is_list) {
+            if (idx >= PyList_GET_SIZE(obj)) return false;  // shrunk mid-loop
+            return from_python(PyList_GET_ITEM(obj, idx), cpp_item);
+        }
+        if (is_tuple) {
+            return from_python(PyTuple_GET_ITEM(obj, idx), cpp_item);
+        }
+        PyObject* py_item = PySequence_GetItem(obj, idx);  // New reference
+        if (!py_item) return false;
+        const bool ok = from_python(py_item, cpp_item);
+        Py_DECREF(py_item);
+        return ok;
+    };
+
     Py_ssize_t i = 0;
     for (; i < size && i < static_cast<Py_ssize_t>(container.size()); ++i) {
-        PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
-        if (!py_item) return false;
         ValueType cpp_item;
-        if (!from_python(py_item, cpp_item)) {
-            Py_DECREF(py_item);
-            return false;
-        }
-        Py_DECREF(py_item);
+        if (!convert_at(i, cpp_item)) return false;
 
         if constexpr (requires { container[i]; }) {
             container[i] = std::move(cpp_item);
@@ -1934,14 +2014,8 @@ bool from_python(PyObject* obj, T& container) {
 
     if constexpr (requires { container.push_back(ValueType{}); }) {
         for (; i < size; ++i) {
-            PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
-            if (!py_item) return false;
             ValueType cpp_item;
-            if (!from_python(py_item, cpp_item)) {
-                Py_DECREF(py_item);
-                return false;
-            }
-            Py_DECREF(py_item);
+            if (!convert_at(i, cpp_item)) return false;
             container.push_back(std::move(cpp_item));
         }
     }

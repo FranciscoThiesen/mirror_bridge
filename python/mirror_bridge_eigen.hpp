@@ -58,6 +58,34 @@ inline PyObject* eigen_vector_to_python(const Eigen::Matrix<Scalar, N, 1>& v) {
 
 template<typename Scalar, int N>
 inline bool eigen_vector_from_python(PyObject* obj, Eigen::Matrix<Scalar, N, 1>& out) {
+    // Fast path for exact list/tuple: borrowed-reference macro access plus
+    // PyFloat_AS_DOUBLE for exact floats. This is the hot inner conversion
+    // when ingesting point clouds (vector<Vector3d> from list of [x,y,z]),
+    // where the per-element PySequence_GetItem/Py_DECREF pair and the
+    // PyFloat_AsDouble type dispatch dominate the profile.
+    const bool is_list  = PyList_CheckExact(obj);
+    const bool is_tuple = !is_list && PyTuple_CheckExact(obj);
+    if (is_list || is_tuple) {
+        if ((is_list ? PyList_GET_SIZE(obj) : PyTuple_GET_SIZE(obj)) != N) return false;
+        for (int i = 0; i < N; i++) {
+            PyObject* item = is_list ? PyList_GET_ITEM(obj, i) : PyTuple_GET_ITEM(obj, i);
+            if constexpr (std::is_floating_point_v<Scalar>) {
+                if (PyFloat_CheckExact(item)) {
+                    out[i] = static_cast<Scalar>(PyFloat_AS_DOUBLE(item));
+                } else {
+                    double val = PyFloat_AsDouble(item);
+                    if (val == -1.0 && PyErr_Occurred()) return false;
+                    out[i] = static_cast<Scalar>(val);
+                }
+            } else {
+                long val = PyLong_AsLong(item);
+                if (val == -1 && PyErr_Occurred()) return false;
+                out[i] = static_cast<Scalar>(val);
+            }
+        }
+        return true;
+    }
+
     if (!PySequence_Check(obj) || PySequence_Size(obj) != N) return false;
     for (int i = 0; i < N; i++) {
         PyObject* item = PySequence_GetItem(obj, i);
