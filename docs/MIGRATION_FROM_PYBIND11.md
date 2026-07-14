@@ -409,7 +409,7 @@ You can migrate incrementally:
 - Check `examples/` for common patterns
 - Run `./mirror_bridge_doctor` to verify your setup
 - See `ARCHITECTURE.md` for system understanding
-- Review `benchmarks/FINAL_RESULTS.md` for performance expectations
+- Review `docs/internals/benchmarks.md` for performance expectations (regenerated monthly by CI)
 
 ## Summary
 

@@ -1,17 +1,22 @@
 # Zero-Copy Buffer Protocol Support
 
-Mirror Bridge provides zero-copy buffer protocol support for efficient data sharing between C++ and Python. This eliminates the overhead of copying large data buffers, achieving **10 million times faster** transfers for large arrays compared to element-by-element copying.
+Mirror Bridge provides zero-copy buffer protocol support for efficient data sharing between C++ and Python. Instead of copying a buffer across the boundary, Python gets a `memoryview` over the C++ memory itself — so the cost of "transferring" data is constant regardless of size.
 
 ## Performance
 
-| Buffer Size | Element-by-Element | Bulk memcpy | Zero-Copy | Speedup vs Copy |
-|-------------|-------------------|-------------|-----------|-----------------|
-| 1 KB        | 0.0008 ms         | 0.0001 ms   | 0.000001 ms | 955x |
-| 100 KB      | 0.08 ms           | 0.002 ms    | 0.000001 ms | 96,000x |
-| 10 MB       | 8.2 ms            | 0.25 ms     | 0.000008 ms | 970,000x |
-| 100 MB      | 260 ms            | 2.6 ms      | 0.00003 ms  | **10,000,000x** |
+Exposing a view is O(1); any form of copying is O(n). The table below is
+illustrative of what that difference means at various sizes (the "speedup"
+column compares doing no per-byte work against element-by-element copying —
+that is the point of zero-copy, not a like-for-like benchmark):
 
-For real-time applications (60 fps = 16.6ms budget), zero-copy is essentially free while copying would consume the entire frame budget.
+| Buffer Size | Element-by-Element | Bulk memcpy | Zero-Copy view |
+|-------------|-------------------|-------------|-----------|
+| 1 KB        | 0.0008 ms         | 0.0001 ms   | ~0.000001 ms |
+| 100 KB      | 0.08 ms           | 0.002 ms    | ~0.000001 ms |
+| 10 MB       | 8.2 ms            | 0.25 ms     | ~0.000008 ms |
+| 100 MB      | 260 ms            | 2.6 ms      | ~0.00003 ms  |
+
+For real-time applications (60 fps = 16.6ms budget), zero-copy access to a 100 MB buffer is essentially free, while element-by-element copying would blow the entire frame budget many times over.
 
 ## Usage
 

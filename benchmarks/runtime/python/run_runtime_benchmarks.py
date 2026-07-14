@@ -179,13 +179,13 @@ def print_results(results_mb, results_pb, results_nb, results_swig, results_bp):
         mb = results_mb[key]
         pb = results_pb[key]
         nb = results_nb[key]
-        sw = results_swig[key]
-        bp = results_bp[key]
+        sw = results_swig[key] if results_swig else None
+        bp = results_bp[key] if results_bp else None
         ratio_pb = mb / pb if pb > 0 else 0
         marker = "✓" if ratio_pb <= 1.1 else ("⚠" if ratio_pb <= 1.5 else "✗")
 
-        swig_str = format_time(sw) if sw > 0 else "N/A"
-        bp_str = format_time(bp) if bp > 0 else "N/A"
+        swig_str = format_time(sw) if sw else "N/A"
+        bp_str = format_time(bp) if bp else "N/A"
 
         print(f"{name:<20} {format_time(mb):<12} {format_time(pb):<12} {format_time(nb):<12} {swig_str:<12} {bp_str:<12} {ratio_pb:.2f}x {marker}")
 
@@ -228,34 +228,37 @@ if __name__ == '__main__':
         print("Running nanobind benchmarks...")
         results_nb = run_benchmarks('bench_nb', bench_nb.BenchmarkClass)
 
-        # Try SWIG
+        # Optional frameworks: record only what actually ran. Writing
+        # zero-filled placeholders would masquerade as measurements in the
+        # saved JSON, so absent frameworks are omitted entirely.
         try:
             import bench_swig
             print("Running SWIG benchmarks...")
             results_swig = run_benchmarks('bench_swig', bench_swig.BenchmarkClass)
         except ImportError:
             print("SWIG module not available, skipping...")
-            results_swig = {k: 0.0 for k in results_mb.keys()}
+            results_swig = None
 
-        # Try Boost.Python
         try:
             import bench_bp
             print("Running Boost.Python benchmarks...")
             results_bp = run_benchmarks('bench_bp', bench_bp.BenchmarkClass)
         except ImportError:
             print("Boost.Python module not available, skipping...")
-            results_bp = {k: 0.0 for k in results_mb.keys()}
+            results_bp = None
 
         print_results(results_mb, results_pb, results_nb, results_swig, results_bp)
 
         # Save results
         import json
+        all_results = {
+            'mirror_bridge': results_mb,
+            'pybind11': results_pb,
+            'nanobind': results_nb,
+            'swig': results_swig,
+            'boost_python': results_bp
+        }
         with open('runtime_results.json', 'w') as f:
-            json.dump({
-                'mirror_bridge': results_mb,
-                'pybind11': results_pb,
-                'nanobind': results_nb,
-                'swig': results_swig,
-                'boost_python': results_bp
-            }, f, indent=2)
+            json.dump({k: v for k, v in all_results.items() if v is not None},
+                      f, indent=2)
         print("\nResults saved to runtime_results.json")

@@ -7,9 +7,14 @@ Comprehensive performance benchmarks comparing Mirror Bridge against:
 
 ## Quick Links
 
-- **[Results Summary](docs/RESULTS.md)** - Complete benchmark results for all languages
-- **[Lua/JS Detailed Results](docs/LUA_JS_RESULTS.md)** - In-depth Lua and JavaScript analysis
+- **[Current Results](../docs/internals/benchmarks.md)** - The canonical numbers, regenerated monthly by CI from a fresh run
+- **[Lua/JS Detailed Results](docs/LUA_JS_RESULTS.md)** - One-off manual Lua and JavaScript analysis
 - **[Quick Start Guide](docs/QUICKSTART.md)** - Fast introduction to running benchmarks
+
+> **Which numbers to trust:** `docs/internals/benchmarks.md` at the repo root
+> is the only self-updating results page — CI reruns the suite and regenerates
+> it, so it can't drift from the code. Everything else in this directory is
+> either methodology documentation or a dated manual run.
 
 ## Directory Structure
 
@@ -17,8 +22,7 @@ Comprehensive performance benchmarks comparing Mirror Bridge against:
 benchmarks/
 ├── README.md                    # This file
 ├── docs/                        # Documentation and results
-│   ├── RESULTS.md              # Complete results (all languages)
-│   ├── LUA_JS_RESULTS.md       # Lua/JS detailed analysis
+│   ├── LUA_JS_RESULTS.md       # Lua/JS detailed analysis (manual run)
 │   └── QUICKSTART.md           # Quick start guide
 ├── compile_time/               # Compile-time benchmarks
 │   ├── simple/                 # 1 class, ~10 methods
@@ -146,39 +150,40 @@ The benchmark suite will:
 Example output:
 ```
 Simple Project (1 class, ~10 methods)
-  Mirror Bridge...  850ms  (245 KB)
-  pybind11...       1200ms (312 KB)
-  Boost.Python...   3500ms (1200 KB)
-
-  Speedup: Mirror Bridge vs pybind11:     1.41x
-  Speedup: Mirror Bridge vs Boost.Python: 4.12x
+  Mirror Bridge...  567ms  (no PCH) / 194ms (with PCH)
+  pybind11...       1938ms
+  nanobind...       165ms
 ```
 
 **What to look for:**
 - **Compilation time**: Lower is better (faster developer iteration)
 - **Binary size**: Lower is better (smaller deployment footprint)
-- **Speedup ratio**: Higher is better (Mirror Bridge should be faster)
+- Mirror Bridge compiles ~2-3x faster than pybind11; nanobind compiles
+  faster still because it has no reflection machinery — Mirror Bridge
+  only matches it when the precompiled header is used (see
+  `docs/guides/pch.md`)
 
 ### Runtime Results
 
-Example output:
+Example output (see `docs/internals/benchmarks.md` for current numbers):
 ```
-Benchmark            Mirror Bridge   pybind11        Boost.Python    vs pb11
+Benchmark            Mirror Bridge   pybind11        nanobind        vs pb11
 --------------------------------------------------------------------------------
-Null call            45 ns           42 ns           78 ns           1.07x ✓
-Add int              48 ns           45 ns           82 ns           1.07x ✓
-String concat        125 ns          118 ns          205 ns          1.06x ✓
+Null call            73 ns           190 ns          70 ns           2.59x
+Add int              98 ns           218 ns          84 ns           2.24x
+Vector return        316 ns          914 ns          2650 ns         2.89x
 ```
 
-**Legend:**
-- ✓ within 10% of pybind11 (acceptable overhead)
-- ⚠ within 50% of pybind11 (noticeable overhead)
-- ✗ slower than 50% of pybind11 (significant overhead)
+**Legend (console output):**
+- ✓ within 10% of pybind11
+- ⚠ within 50% of pybind11
+- ✗ more than 50% slower than pybind11
 
 **What to look for:**
-- Mirror Bridge should be **within 10%** of pybind11 for most operations
-- Both should significantly outperform Boost.Python
-- The "zero overhead" claim is validated if ratios are near 1.0x
+- Mirror Bridge is typically **2-4x faster than pybind11** on dispatch-bound
+  operations and at rough **parity with nanobind** (faster on `std::vector`
+  returns, slightly slower on some scalar ops)
+- Absolute nanoseconds shift with hardware; compare the ratio columns
 
 ### Developer Experience Results
 
@@ -292,12 +297,12 @@ This reduces variance from:
 
 Mirror Bridge is considered successful if:
 
-1. **Compile-time**: 1.2x-2x faster than pybind11 for medium projects
-2. **Runtime**: Within 10% of pybind11 for most operations
-3. **Developer Experience**: 5-10x less binding code for medium projects
+1. **Compile-time**: 2x+ faster than pybind11 (nanobind-competitive with PCH)
+2. **Runtime**: Faster than pybind11 across the board, parity with nanobind
+3. **Developer Experience**: zero hand-written binding code
 
 The key value proposition is:
-> **"Compile faster, write less code, run at the same speed"**
+> **"Write no binding code, compile faster than pybind11, run as fast as the best hand-tuned binding."**
 
 ## Output Files
 
