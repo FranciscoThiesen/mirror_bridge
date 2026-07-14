@@ -440,6 +440,8 @@ The Docker container includes:
 - Node.js with N-API headers
 - All your changes preserved between sessions
 
+(A GCC 16 reflection image is also available: `ghcr.io/franciscothiesen/mirror_bridge-gcc`.)
+
 ### Container Management
 
 ```bash
@@ -519,24 +521,21 @@ cd mirror_bridge
 
 ## CMake Integration
 
-For projects using CMake, Mirror Bridge provides helper functions:
+For projects using CMake, Mirror Bridge provides helper functions
+(available via `add_subdirectory`, `FetchContent`, and `find_package` alike):
 
 ```cmake
-cmake_minimum_required(VERSION 3.16)
-project(my_project)
+cmake_minimum_required(VERSION 3.20)
+project(my_project CXX)
 
-# Add Mirror Bridge
+# Option A: vendored checkout
 add_subdirectory(mirror_bridge)
+# Option B: installed package
+# find_package(mirror_bridge REQUIRED)
 
-# Create a Python module
-mirror_bridge_python_module(my_module
-    SOURCES src/my_class.hpp
-)
-
-# Create a Lua module
-mirror_bridge_lua_module(my_module_lua
-    SOURCES src/my_class.hpp
-)
+# my_binding.cpp contains the MIRROR_BRIDGE_MODULE(...) declaration
+mirror_bridge_python_module(my_module my_binding.cpp)
+mirror_bridge_lua_module(my_module_lua my_binding_lua.cpp)
 ```
 
 See the [CMake Integration Guide](../guides/cmake.md) for full details.
@@ -665,6 +664,125 @@ mirror_bridge generate src/ --module my_module --lang all
 ```
 
 See the [Multi-Language Guide](../guides/multi-language.md) for details.
+
+
+---
+# FILE: docs/guides/cmake.md
+---
+
+# CMake Integration Guide
+
+Mirror Bridge is a header-only library with first-class CMake support. There
+are three ways to consume it, and all three deliver the same API: the
+`mirror_bridge::mirror_bridge` target plus the `mirror_bridge_<lang>_module()`
+helper functions.
+
+## Consuming Mirror Bridge
+
+### Option 1: add_subdirectory (vendored checkout)
+
+```cmake
+add_subdirectory(third_party/mirror_bridge)
+```
+
+### Option 2: FetchContent
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(mirror_bridge
+    GIT_REPOSITORY https://github.com/FranciscoThiesen/mirror_bridge
+    GIT_TAG main
+)
+FetchContent_MakeAvailable(mirror_bridge)
+```
+
+### Option 3: find_package (installed)
+
+```bash
+# One-time install of the package
+cmake -S mirror_bridge -B build
+cmake --install build --prefix /opt/mirror_bridge
+```
+
+```cmake
+find_package(mirror_bridge REQUIRED)
+# if installed to a custom prefix:
+#   cmake -Dmirror_bridge_DIR=/opt/mirror_bridge/lib/cmake/mirror_bridge ...
+```
+
+As a dependency, Mirror Bridge never pushes compile flags into your own
+targets — the reflection flags travel only on the `mirror_bridge::mirror_bridge`
+interface target and whatever you build with the helpers below.
+
+## Creating binding modules
+
+Write a small binding translation unit:
+
+```cpp
+// my_binding.cpp
+#include "mirror_bridge.hpp"
+#include "my_class.hpp"
+
+MIRROR_BRIDGE_MODULE(my_module,
+    mirror_bridge::bind_class<MyClass>(m, "MyClass");
+)
+```
+
+Then declare one target per language:
+
+```cmake
+mirror_bridge_python_module(my_module my_binding.cpp)      # -> my_module.so
+mirror_bridge_lua_module(my_module_lua my_binding_lua.cpp) # -> my_module_lua.so
+mirror_bridge_js_module(my_module_js my_binding_js.cpp)    # -> my_module_js.node
+```
+
+All three helpers accept the same keyword arguments:
+
+| Argument | Meaning |
+|---|---|
+| positional / `SOURCES` | The binding `.cpp` file(s) |
+| `INCLUDE_DIRS` | Extra include directories (your library headers) |
+| `OUTPUT_DIRECTORY` | Where to place the built module (default: current binary dir) |
+
+Dependencies are found lazily: the Python helper runs `find_package(Python3)`
+on first use, the Lua helper locates Lua via pkg-config or manual search, and
+the JS helper looks for `node_api.h`. Missing dependencies are a configure
+error only for the languages you actually request.
+
+## Hand-rolled targets
+
+If you prefer not to use the helpers, linking the interface target is all
+that's required — it carries the reflection flags as usage requirements:
+
+```cmake
+Python3_add_library(my_module MODULE my_binding.cpp)
+target_link_libraries(my_module PRIVATE mirror_bridge::mirror_bridge)
+set_target_properties(my_module PROPERTIES PREFIX "")
+```
+
+## Compiler support
+
+The flags are chosen per consumer compiler via generator expressions:
+
+| Compiler | Flags applied |
+|---|---|
+| clang-p2996 | `-std=c++2c -freflection -freflection-latest -stdlib=libc++` |
+| GCC 16+ | `-std=c++26 -freflection` |
+
+Any other compiler gets a configure-time warning: there is no way to build
+reflection-based bindings without one of these two.
+
+## Precompiled headers
+
+When building inside the Mirror Bridge repo (tests, examples), configure with
+`-DMIRROR_BRIDGE_USE_PCH=ON` to cut binding compile times roughly 3-4x. The
+helpers pick up the PCH automatically when it's enabled.
+
+## See also
+
+- [Installation](../getting-started/installation.md) — toolchain setup
+- [Packaging guide](packaging.md) — shipping the generated modules
+- [PCH guide](pch.md) — precompiled header details
 
 
 ---
@@ -953,6 +1071,8 @@ print(c.to_string())  # "Calculator(value=7.000000)"
 
 **Lua:**
 ```lua
+-- Lua modules are emitted to build/lua/ (Python owns build/<name>.so)
+package.cpath = "build/lua/?.so;" .. package.cpath
 local calc = require("calc")
 local c = calc.Calculator()
 c:add(10.0)
@@ -4609,7 +4729,7 @@ You can migrate incrementally:
 - Check `examples/` for common patterns
 - Run `./mirror_bridge_doctor` to verify your setup
 - See `ARCHITECTURE.md` for system understanding
-- Review `benchmarks/FINAL_RESULTS.md` for performance expectations
+- Review `docs/internals/benchmarks.md` for performance expectations (regenerated monthly by CI)
 
 ## Summary
 
@@ -4653,8 +4773,17 @@ python3 test_greeter.py
 | [03-containers](03-containers/) | Vector/array conversion, STL containers | Intermediate |
 | [04-image-processing](04-image-processing/) | Real-world image processing library | Advanced |
 | [05-nbody-simulation](05-nbody-simulation/) | Scientific computing, physics simulation | Advanced |
+| [06-callbacks](06-callbacks/) | `std::function`, Python callables, event systems | Intermediate |
+| [07-static-constexpr](07-static-constexpr/) | Static methods, constexpr members, factories | Intermediate |
+| [08-free-functions](08-free-functions/) | Binding standalone namespace functions | Beginner |
+| [09-enums](09-enums/) | Scoped enums and classes using them | Beginner |
+| [10-smart-pointers](10-smart-pointers/) | `shared_ptr`, `unique_ptr`, `weak_ptr` patterns | Intermediate |
 | [11-expected](11-expected/) | `std::expected` error handling | Intermediate |
+| [mandelbrot-demo](mandelbrot-demo/) | Same fractal from Python, Lua, and JS | Intermediate |
 | [packaging](packaging/) | Distributable pip package | Intermediate |
+| [open3d-port](open3d-port/) | Auto-discovery on an Open3D geometry subset | Advanced |
+| [open3d-comprehensive](open3d-comprehensive/) | Open3D subset + three-way benchmark | Advanced |
+| [open3d-runtime](open3d-runtime/) | Binding against the real installed Open3D | Advanced |
 
 ## Example Details
 

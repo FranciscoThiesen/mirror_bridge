@@ -125,53 +125,6 @@ template<typename T>
 concept NestedBindable = Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>;
 
 // ============================================================================
-// Class Metadata and Registry
-// ============================================================================
-
-struct ClassMetadata {
-    std::string name;
-    std::string type_signature;
-    size_t hash;
-    void* language_type_object;  // Language-specific type object (PyTypeObject*, etc.)
-
-    void compute_hash() {
-        std::hash<std::string> hasher;
-        hash = hasher(type_signature);
-    }
-
-    bool needs_recompilation(const std::string& new_signature) const {
-        return type_signature != new_signature;
-    }
-};
-
-class Registry {
-private:
-    std::unordered_map<std::string, ClassMetadata> classes;
-    Registry() = default;
-
-public:
-    static Registry& instance() {
-        static Registry reg;
-        return reg;
-    }
-
-    void register_class(const std::string& name, const std::string& signature, void* type_obj = nullptr) {
-        ClassMetadata meta{name, signature, 0, type_obj};
-        meta.compute_hash();
-        classes[name] = meta;
-    }
-
-    const ClassMetadata* get_class(const std::string& name) const {
-        auto it = classes.find(name);
-        return (it != classes.end()) ? &it->second : nullptr;
-    }
-
-    bool is_registered(const std::string& name) const {
-        return classes.find(name) != classes.end();
-    }
-};
-
-// ============================================================================
 // Global Type Registry - Cross-Module Type Sharing (RTTI Required)
 // ============================================================================
 //
@@ -882,6 +835,7 @@ consteval bool validate_bindable_members() {
 #include <functional>
 #include <cstdint>  // For uint8_t, int32_t, etc.
 #include <cstdio>   // For snprintf in simple repr functions
+#include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
 
 // Include core header for GlobalTypeRegistry
@@ -1327,6 +1281,34 @@ inline PyObject* eigen_vector_to_python(const Eigen::Matrix<Scalar, N, 1>& v) {
 
 template<typename Scalar, int N>
 inline bool eigen_vector_from_python(PyObject* obj, Eigen::Matrix<Scalar, N, 1>& out) {
+    // Fast path for exact list/tuple: borrowed-reference macro access plus
+    // PyFloat_AS_DOUBLE for exact floats. This is the hot inner conversion
+    // when ingesting point clouds (vector<Vector3d> from list of [x,y,z]),
+    // where the per-element PySequence_GetItem/Py_DECREF pair and the
+    // PyFloat_AsDouble type dispatch dominate the profile.
+    const bool is_list  = PyList_CheckExact(obj);
+    const bool is_tuple = !is_list && PyTuple_CheckExact(obj);
+    if (is_list || is_tuple) {
+        if ((is_list ? PyList_GET_SIZE(obj) : PyTuple_GET_SIZE(obj)) != N) return false;
+        for (int i = 0; i < N; i++) {
+            PyObject* item = is_list ? PyList_GET_ITEM(obj, i) : PyTuple_GET_ITEM(obj, i);
+            if constexpr (std::is_floating_point_v<Scalar>) {
+                if (PyFloat_CheckExact(item)) {
+                    out[i] = static_cast<Scalar>(PyFloat_AS_DOUBLE(item));
+                } else {
+                    double val = PyFloat_AsDouble(item);
+                    if (val == -1.0 && PyErr_Occurred()) return false;
+                    out[i] = static_cast<Scalar>(val);
+                }
+            } else {
+                long val = PyLong_AsLong(item);
+                if (val == -1 && PyErr_Occurred()) return false;
+                out[i] = static_cast<Scalar>(val);
+            }
+        }
+        return true;
+    }
+
     if (!PySequence_Check(obj) || PySequence_Size(obj) != N) return false;
     for (int i = 0; i < N; i++) {
         PyObject* item = PySequence_GetItem(obj, i);
@@ -3083,20 +3065,90 @@ inline bool from_python(PyObject* obj, T& out) {
     return true;
 }
 
+// Does a Py_buffer's element format match the given C++ arithmetic type
+// category? `kind` is 'i' (signed int), 'u' (unsigned int), or 'f' (float).
+// Size is matched via itemsize rather than exact format char so that e.g.
+// 'l' and 'q' both satisfy int64_t on LP64 platforms.
+inline bool buffer_format_matches(const Py_buffer& view, char kind, std::size_t item_size) {
+    if (view.itemsize != static_cast<Py_ssize_t>(item_size)) return false;
+    const char* f = view.format ? view.format : "B";
+    if (*f == '@' || *f == '=') ++f;          // native byte order prefixes
+    else if (*f == '<' || *f == '>' || *f == '!') return false;  // explicit order: skip fast path
+    if (f[0] == '\0' || f[1] != '\0') return false;
+    switch (f[0]) {
+        case 'b': case 'h': case 'i': case 'l': case 'q': case 'n':
+            return kind == 'i';
+        case 'B': case 'H': case 'I': case 'L': case 'Q': case 'N':
+            return kind == 'u';
+        case 'f': case 'd':
+            return kind == 'f';
+        default:
+            return false;
+    }
+}
+
 // Convert Python sequences to C++ containers.
 // Accepts list, tuple, array.array, and any type supporting the sequence protocol.
 // This ensures round-trip compatibility: to_python returns array.array for numeric
 // vectors, and from_python accepts it back.
+//
+// Three tiers, fastest first:
+//   1. Buffer protocol (array.array, numpy arrays, memoryview): one memcpy.
+//   2. Exact list/tuple: borrowed-reference macro access — skips one
+//      sequence-protocol dispatch and a refcount round-trip per element.
+//   3. Generic sequence protocol.
 template<Container T>
 bool from_python(PyObject* obj, T& container) {
     if (!PySequence_Check(obj) || PyUnicode_Check(obj) || PyBytes_Check(obj)) {
         return false;
     }
 
-    Py_ssize_t size = PySequence_Size(obj);
-    if (size < 0) return false;
-
     using ValueType = typename std::remove_cvref_t<T>::value_type;
+
+    // Tier 1: bulk transfer from any contiguous buffer of matching element
+    // type. This is the ingest mirror of to_python's array.array memcpy
+    // path, and makes numpy float64 arrays land in vector<double> with a
+    // single copy instead of per-element boxing.
+    if constexpr (std::is_arithmetic_v<ValueType> && !std::is_same_v<ValueType, bool> &&
+                  requires(std::size_t n) { container.resize(n); container.data(); }) {
+        if (PyObject_CheckBuffer(obj)) {
+            Py_buffer view;
+            if (PyObject_GetBuffer(obj, &view, PyBUF_CONTIG_RO | PyBUF_FORMAT) == 0) {
+                constexpr char kind = std::is_floating_point_v<ValueType> ? 'f'
+                                    : std::is_signed_v<ValueType>         ? 'i' : 'u';
+                bool copied = false;
+                if (buffer_format_matches(view, kind, sizeof(ValueType))) {
+                    const std::size_t n = static_cast<std::size_t>(view.len) / sizeof(ValueType);
+                    container.resize(n);
+                    if (n > 0) {
+                        std::memcpy(container.data(), view.buf, static_cast<std::size_t>(view.len));
+                    }
+                    copied = true;
+                }
+                PyBuffer_Release(&view);
+                if (copied) return true;
+                // Format mismatch (e.g. list of ints into vector<double>
+                // never gets here, but array('i') into vector<double>
+                // does): fall through to the element-wise tiers, which
+                // convert value-by-value.
+            } else {
+                PyErr_Clear();
+            }
+        }
+    }
+
+    // Tier 2/3 share one loop; list/tuple hits resolve to borrowed-ref
+    // macros. Element conversion can run arbitrary Python code (__float__,
+    // nested containers), which may mutate the sequence — the borrowed
+    // path therefore re-reads the current size every iteration and never
+    // holds a borrowed pointer across iterations.
+    const bool is_list  = PyList_CheckExact(obj);
+    const bool is_tuple = !is_list && PyTuple_CheckExact(obj);
+
+    Py_ssize_t size = is_list  ? PyList_GET_SIZE(obj)
+                    : is_tuple ? PyTuple_GET_SIZE(obj)
+                    : PySequence_Size(obj);
+    if (size < 0) return false;
 
     if constexpr (requires { container.clear(); }) {
         container.clear();
@@ -3105,16 +3157,25 @@ bool from_python(PyObject* obj, T& container) {
         container.reserve(size);
     }
 
+    auto convert_at = [&](Py_ssize_t idx, ValueType& cpp_item) -> bool {
+        if (is_list) {
+            if (idx >= PyList_GET_SIZE(obj)) return false;  // shrunk mid-loop
+            return from_python(PyList_GET_ITEM(obj, idx), cpp_item);
+        }
+        if (is_tuple) {
+            return from_python(PyTuple_GET_ITEM(obj, idx), cpp_item);
+        }
+        PyObject* py_item = PySequence_GetItem(obj, idx);  // New reference
+        if (!py_item) return false;
+        const bool ok = from_python(py_item, cpp_item);
+        Py_DECREF(py_item);
+        return ok;
+    };
+
     Py_ssize_t i = 0;
     for (; i < size && i < static_cast<Py_ssize_t>(container.size()); ++i) {
-        PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
-        if (!py_item) return false;
         ValueType cpp_item;
-        if (!from_python(py_item, cpp_item)) {
-            Py_DECREF(py_item);
-            return false;
-        }
-        Py_DECREF(py_item);
+        if (!convert_at(i, cpp_item)) return false;
 
         if constexpr (requires { container[i]; }) {
             container[i] = std::move(cpp_item);
@@ -3130,14 +3191,8 @@ bool from_python(PyObject* obj, T& container) {
 
     if constexpr (requires { container.push_back(ValueType{}); }) {
         for (; i < size; ++i) {
-            PyObject* py_item = PySequence_GetItem(obj, i);  // New reference
-            if (!py_item) return false;
             ValueType cpp_item;
-            if (!from_python(py_item, cpp_item)) {
-                Py_DECREF(py_item);
-                return false;
-            }
-            Py_DECREF(py_item);
+            if (!convert_at(i, cpp_item)) return false;
             container.push_back(std::move(cpp_item));
         }
     }
@@ -3647,9 +3702,13 @@ decltype(auto) forward_arg(StoredType& arg) {
 // so we can read the cpp_object pointer generically and cast to the target
 // pointer type. The cast is safe as long as the user passes a Python wrapper
 // whose underlying C++ object is a T* or T-derived*.
+//
+// None is rejected (returns false): pointer storage is always dereferenced
+// by forward_arg before the call — bindable parameters are never raw
+// pointers — so accepting None as nullptr would guarantee a null deref.
 template<typename T>
 inline bool from_python_pointer(PyObject* obj, T*& out) {
-    if (!obj || obj == Py_None) { out = nullptr; return obj == Py_None; }
+    if (!obj || obj == Py_None) { out = nullptr; return false; }
     // Generic layout shared by every PyWrapper<X>
     struct GenericPyWrapper {
         PyObject_HEAD
@@ -3661,6 +3720,70 @@ inline bool from_python_pointer(PyObject* obj, T*& out) {
     out = static_cast<T*>(wrapper->cpp_object);
     return true;
 }
+
+// ============================================================================
+// Python-level parameter storage policy
+// ============================================================================
+//
+// core::param_storage_t only uses pointer storage when value storage is
+// impossible (abstract or non-copyable types). That leaves a copy on every
+// call for lvalue-reference parameters of ordinary bound classes: a method
+// taking `const BigMesh&` copied the whole mesh per call, and a `T&`
+// parameter mutated the copy, silently dropping the mutation.
+//
+// This policy widens pointer storage to every lvalue-reference parameter
+// whose type is "wrapper-backed" — converted by reading the PyWrapper's
+// held object rather than by building a value from Python data. The held
+// object is passed by pointer: zero copies, and T& mutations land on the
+// Python-visible object (matching pybind11 semantics).
+//
+// wrapper-backed must mirror overload resolution over from_python exactly:
+// a type with a value-converting overload (containers, strings, optional,
+// pair/tuple/variant, expected, function, futures, Eigen, user custom
+// converters) must keep value storage, because its Python representation
+// is not a PyWrapper.
+
+template<typename T> struct is_std_tuple_like : std::false_type {};
+template<typename... Ts> struct is_std_tuple_like<std::tuple<Ts...>> : std::true_type {};
+template<typename A, typename B> struct is_std_tuple_like<std::pair<A, B>> : std::true_type {};
+template<typename T> struct is_std_variant : std::false_type {};
+template<typename... Ts> struct is_std_variant<std::variant<Ts...>> : std::true_type {};
+
+template<typename Clean>
+consteval bool is_wrapper_backed_class() {
+    if constexpr (!std::is_class_v<Clean> ||
+                  Arithmetic<Clean> || StringLike<Clean> ||
+                  SmartPointer<Clean> || Container<Clean> ||
+                  is_std_optional<Clean>::value ||
+                  is_std_expected<Clean>::value ||
+                  is_std_function<Clean>::value ||
+                  is_std_future<Clean>::value ||
+                  is_std_tuple_like<Clean>::value ||
+                  is_std_variant<Clean>::value ||
+                  HasCustomConverter<Clean>) {
+        return false;
+    }
+#ifdef MIRROR_BRIDGE_HAS_EIGEN
+    else if constexpr (std::is_base_of_v<Eigen::EigenBase<Clean>, Clean>) {
+        return false;  // Eigen types convert by value from lists/tuples
+    }
+#endif
+    else {
+        return true;
+    }
+}
+
+template<typename ParamType>
+struct py_param_storage {
+    using Clean = std::remove_cvref_t<ParamType>;
+    using type = std::conditional_t<
+        std::is_lvalue_reference_v<ParamType> && is_wrapper_backed_class<Clean>(),
+        Clean*,                                        // zero-copy: alias the wrapper's object
+        mirror_bridge::core::param_storage_t<ParamType>>;
+};
+
+template<typename ParamType>
+using py_param_storage_t = typename py_param_storage<ParamType>::type;
 
 // Dispatcher: value storage vs pointer storage.
 // Called in method dispatch to populate the tuple of stored args.
@@ -3917,7 +4040,7 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
     } else {
         // Parameter storage with pointer-holder for non-value-bindable types
         // (e.g., abstract base classes passed by const-ref).
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
@@ -3951,7 +4074,7 @@ Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
         return nullptr;
     } else {
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
 
         bool success = true;
@@ -4252,7 +4375,7 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     // wrapper's cpp_object (the object lives in the wrapper's heap memory,
     // we just hold a pointer to it). This is mirror_bridge's equivalent
     // of pybind11's shared_ptr holder, but inline and lightweight.
-    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -4333,7 +4456,7 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<static_method_param_t<T, Index, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<static_method_param_t<T, Index, Is>>...> cpp_args;
 
     bool success = true;
     ([&] {
@@ -4468,7 +4591,7 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
     using ReturnType = typename [:return_type:];
 
     // Parameter storage with pointer-holder for abstract/non-copyable types
-    std::tuple<mirror_bridge::core::param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
+    std::tuple<py_param_storage_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
     bool conversion_ok = true;
     ([&] {
@@ -4558,7 +4681,7 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
     using ReturnType = typename [:get_method_return_type<T, FuncIndex>():];
 
     return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> PyObject* {
-        std::tuple<mirror_bridge::core::param_storage_t<
+        std::tuple<py_param_storage_t<
             method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
         bool conversion_ok = true;
@@ -4964,7 +5087,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
         // Convert `other` Python arg. If conversion fails (e.g., Vec3 + int),
         // return NotImplemented so Python tries the reverse operand's
         // __radd__ and eventually raises TypeError if no handler accepts.
-        mirror_bridge::core::param_storage_t<OtherParam> storage;
+        py_param_storage_t<OtherParam> storage;
         if (!extract_param<OtherParam>(other, storage)) {
             PyErr_Clear();
             Py_RETURN_NOTIMPLEMENTED;

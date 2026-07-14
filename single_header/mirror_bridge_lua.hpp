@@ -125,53 +125,6 @@ template<typename T>
 concept NestedBindable = Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>;
 
 // ============================================================================
-// Class Metadata and Registry
-// ============================================================================
-
-struct ClassMetadata {
-    std::string name;
-    std::string type_signature;
-    size_t hash;
-    void* language_type_object;  // Language-specific type object (PyTypeObject*, etc.)
-
-    void compute_hash() {
-        std::hash<std::string> hasher;
-        hash = hasher(type_signature);
-    }
-
-    bool needs_recompilation(const std::string& new_signature) const {
-        return type_signature != new_signature;
-    }
-};
-
-class Registry {
-private:
-    std::unordered_map<std::string, ClassMetadata> classes;
-    Registry() = default;
-
-public:
-    static Registry& instance() {
-        static Registry reg;
-        return reg;
-    }
-
-    void register_class(const std::string& name, const std::string& signature, void* type_obj = nullptr) {
-        ClassMetadata meta{name, signature, 0, type_obj};
-        meta.compute_hash();
-        classes[name] = meta;
-    }
-
-    const ClassMetadata* get_class(const std::string& name) const {
-        auto it = classes.find(name);
-        return (it != classes.end()) ? &it->second : nullptr;
-    }
-
-    bool is_registered(const std::string& name) const {
-        return classes.find(name) != classes.end();
-    }
-};
-
-// ============================================================================
 // Global Type Registry - Cross-Module Type Sharing (RTTI Required)
 // ============================================================================
 //
