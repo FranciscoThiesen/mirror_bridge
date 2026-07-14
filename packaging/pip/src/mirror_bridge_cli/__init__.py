@@ -1,14 +1,16 @@
 """mirror-bridge: pip-installable front end for the mirror_bridge binding generator.
 
-C++26 reflection requires Bloomberg's clang-p2996 fork, which is impractical
-to install natively today. This wrapper runs the real CLI inside the official
-Docker image instead: the user's working directory is mounted at /workspace
-and the bundled mirror_bridge runtime (headers + CLI scripts) is mounted
-read-only, so generated artifacts land in the caller's directory exactly as
-if the CLI ran natively.
+C++26 reflection requires Bloomberg's clang-p2996 fork or stock GCC 16+,
+which most systems don't have natively yet. This wrapper runs the real CLI
+inside the official Docker image instead: the user's working directory is
+mounted at /workspace and the bundled mirror_bridge runtime (headers + CLI
+scripts) is mounted read-only, so generated artifacts land in the caller's
+directory exactly as if the CLI ran natively.
 
-When stock compilers ship P2996 reflection this package will switch to native
-invocation with no user-facing change.
+If you already have a reflection compiler (GCC 16+ or a clang-p2996 build),
+you don't need this wrapper — the repo's tools/mirror_bridge CLI runs
+natively and auto-detects both. As reflection compilers become common this
+package will switch to native invocation with no user-facing change.
 """
 
 import os

@@ -19,8 +19,17 @@ python3 test_greeter.py
 | [03-containers](03-containers/) | Vector/array conversion, STL containers | Intermediate |
 | [04-image-processing](04-image-processing/) | Real-world image processing library | Advanced |
 | [05-nbody-simulation](05-nbody-simulation/) | Scientific computing, physics simulation | Advanced |
+| [06-callbacks](06-callbacks/) | `std::function`, Python callables, event systems | Intermediate |
+| [07-static-constexpr](07-static-constexpr/) | Static methods, constexpr members, factories | Intermediate |
+| [08-free-functions](08-free-functions/) | Binding standalone namespace functions | Beginner |
+| [09-enums](09-enums/) | Scoped enums and classes using them | Beginner |
+| [10-smart-pointers](10-smart-pointers/) | `shared_ptr`, `unique_ptr`, `weak_ptr` patterns | Intermediate |
 | [11-expected](11-expected/) | `std::expected` error handling | Intermediate |
+| [mandelbrot-demo](mandelbrot-demo/) | Same fractal from Python, Lua, and JS | Intermediate |
 | [packaging](packaging/) | Distributable pip package | Intermediate |
+| [open3d-port](open3d-port/) | Auto-discovery on an Open3D geometry subset | Advanced |
+| [open3d-comprehensive](open3d-comprehensive/) | Open3D subset + three-way benchmark | Advanced |
+| [open3d-runtime](open3d-runtime/) | Binding against the real installed Open3D | Advanced |
 
 ## Example Details
 

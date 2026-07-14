@@ -56,6 +56,8 @@ print(c.to_string())  # "Calculator(value=7.000000)"
 
 **Lua:**
 ```lua
+-- Lua modules are emitted to build/lua/ (Python owns build/<name>.so)
+package.cpath = "build/lua/?.so;" .. package.cpath
 local calc = require("calc")
 local c = calc.Calculator()
 c:add(10.0)

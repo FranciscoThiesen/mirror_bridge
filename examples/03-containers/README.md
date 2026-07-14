@@ -80,4 +80,4 @@ print(dp.volume())  # 24
 
 ## Next Steps
 
-- [04-game-engine](../04-game-engine/) - Nested objects and inheritance
+- [04-image-processing](../04-image-processing/) - A realistic image processing library

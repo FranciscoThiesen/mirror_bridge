@@ -18,15 +18,18 @@ python3 -c "import my_module"   # done
 ## How it works
 
 C++26 reflection currently requires Bloomberg's
-[clang-p2996](https://github.com/bloomberg/clang-p2996) fork, so this package
-runs the toolchain inside the official Docker image. Your working directory is
-mounted into the container; generated `.so`/`.node` files land right where you
-ran the command. The first invocation pulls the image (one-time, several GB).
+[clang-p2996](https://github.com/bloomberg/clang-p2996) fork or stock GCC 16+,
+which most systems don't ship yet, so this package runs the toolchain inside
+the official Docker image. Your working directory is mounted into the
+container; generated `.so`/`.node` files land right where you ran the command.
+The first invocation pulls the image (one-time, several GB).
 
 **Requirements:** Python ≥ 3.9 and Docker (or podman).
 
-When stock clang ships P2996 reflection, this package will switch to native
-invocation — same commands, no Docker.
+Already have GCC 16+ or a clang-p2996 build? Skip this wrapper — the repo's
+`tools/mirror_bridge` CLI runs natively and auto-detects both compilers. As
+reflection support reaches stock toolchains, this package will switch to
+native invocation — same commands, no Docker.
 
 ## Commands
 

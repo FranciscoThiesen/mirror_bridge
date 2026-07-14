@@ -578,7 +578,17 @@ compile_binding() {
             ;;
     esac
 
-    local output_file="$output_dir/${module_name}${output_ext}"
+    # Lua modules go to a lua/ subdirectory: Python and Lua would otherwise
+    # both emit <module>.so and --lang all would silently clobber one with
+    # the other. The file name itself must stay <module>.so because Lua's
+    # require("module") derives the luaopen_<module> symbol from it.
+    local output_file
+    if [ "$lang" = "lua" ]; then
+        mkdir -p "$output_dir/lua"
+        output_file="$output_dir/lua/${module_name}${output_ext}"
+    else
+        output_file="$output_dir/${module_name}${output_ext}"
+    fi
 
     local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
         -I. -I$src_dir -I$PROJECT_ROOT \
@@ -1227,13 +1237,232 @@ ${YELLOW}Example:${NC}
 EOF
 }
 
+show_init_help() {
+    cat << EOF
+${CYAN}mirror_bridge init${NC} - Scaffold a new Mirror Bridge project
+
+${YELLOW}Usage:${NC}
+  mirror_bridge init <project_name> [options]
+
+Creates <project_name>/ with an example C++ header, a smoke test per
+target language, a README with build instructions, and a GitHub Actions
+workflow that builds and tests the bindings in the reflection container.
+
+${YELLOW}Options:${NC}
+  --lang, -l <lang>   Target language: python, lua, js, or all [default: python]
+  --no-ci             Skip the GitHub Actions workflow
+  -h, --help          Show this help
+
+${YELLOW}Example:${NC}
+  mirror_bridge init my_lib --lang python
+  cd my_lib
+  mirror_bridge generate src/ --module my_lib --lang python
+  python3 test_my_lib.py
+EOF
+}
+
+# Command: init - scaffold a ready-to-build project
+cmd_init() {
+    local project_name=""
+    local lang="python"
+    local with_ci=1
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --lang|-l) lang="$2"; shift 2 ;;
+            --no-ci) with_ci=0; shift ;;
+            -h|--help) show_init_help; exit 0 ;;
+            -*)
+                echo -e "${RED}Error: Unknown option '$1'${NC}"; show_init_help; exit 1 ;;
+            *)
+                if [ -z "$project_name" ]; then project_name="$1"; shift
+                else echo -e "${RED}Error: Unexpected argument '$1'${NC}"; exit 1; fi ;;
+        esac
+    done
+
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Project name required${NC}"
+        show_init_help
+        exit 1
+    fi
+    case "$lang" in python|lua|js|all) ;; *)
+        echo -e "${RED}Error: Invalid language '$lang' (python|lua|js|all)${NC}"; exit 1 ;;
+    esac
+
+    # Module names become C identifiers (module init symbol) — enforce here
+    # rather than letting the user discover it as a compile error later.
+    local module_name
+    module_name=$(echo "$project_name" | tr '-' '_' | tr '[:upper:]' '[:lower:]')
+    if ! echo "$module_name" | grep -qE '^[a-z_][a-z0-9_]*$'; then
+        echo -e "${RED}Error: '$project_name' cannot be turned into a valid module name${NC}"
+        exit 1
+    fi
+
+    if [ -e "$project_name" ]; then
+        echo -e "${RED}Error: '$project_name' already exists${NC}"
+        exit 1
+    fi
+
+    echo -e "${CYAN}Creating project '$project_name' (module: $module_name, lang: $lang)${NC}"
+    mkdir -p "$project_name/src"
+
+    cat > "$project_name/src/greeter.hpp" << 'HEADER_EOF'
+#pragma once
+
+#include <string>
+#include <vector>
+
+// Every struct/class in src/ is bound automatically — no registration
+// needed. Replace this example with your own classes.
+// To keep a class out of the bindings, put // MIRROR_BRIDGE_SKIP on the
+// line directly above it.
+struct Greeter {
+    std::string name = "world";
+    int greet_count = 0;
+
+    std::string greet() {
+        ++greet_count;
+        return "Hello, " + name + "!";
+    }
+
+    std::vector<int> counts_up_to(int n) const {
+        std::vector<int> out;
+        for (int i = 0; i < n; ++i) out.push_back(i);
+        return out;
+    }
+};
+HEADER_EOF
+
+    if [ "$lang" = "python" ] || [ "$lang" = "all" ]; then
+        cat > "$project_name/test_${module_name}.py" << PY_EOF
+#!/usr/bin/env python3
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), "build"))
+
+import ${module_name}
+
+g = ${module_name}.Greeter()
+assert g.greet() == "Hello, world!"
+g.name = "mirror_bridge"
+assert g.greet() == "Hello, mirror_bridge!"
+assert g.greet_count == 2
+# Numeric vectors come back as array.array (zero-copy friendly) — compare as list
+assert list(g.counts_up_to(4)) == [0, 1, 2, 3]
+print("all checks passed")
+PY_EOF
+    fi
+
+    if [ "$lang" = "lua" ] || [ "$lang" = "all" ]; then
+        cat > "$project_name/test_${module_name}.lua" << LUA_EOF
+package.cpath = "build/lua/?.so;" .. package.cpath
+local m = require("${module_name}")
+
+local g = m.Greeter()
+assert(g:greet() == "Hello, world!")
+g.name = "mirror_bridge"
+assert(g:greet() == "Hello, mirror_bridge!")
+assert(g.greet_count == 2)
+print("all checks passed")
+LUA_EOF
+    fi
+
+    if [ "$lang" = "js" ] || [ "$lang" = "all" ]; then
+        cat > "$project_name/test_${module_name}.js" << JS_EOF
+const assert = require('assert');
+const m = require('./build/${module_name}.node');
+
+const g = new m.Greeter();
+assert.strictEqual(g.greet(), 'Hello, world!');
+g.name = 'mirror_bridge';
+assert.strictEqual(g.greet(), 'Hello, mirror_bridge!');
+assert.strictEqual(g.greet_count, 2);
+console.log('all checks passed');
+JS_EOF
+    fi
+
+    local gen_lang="$lang"
+    local test_cmd=""
+    case "$lang" in
+        python) test_cmd="python3 test_${module_name}.py" ;;
+        lua)    test_cmd="lua5.4 test_${module_name}.lua" ;;
+        js)     test_cmd="node test_${module_name}.js" ;;
+        all)    test_cmd="python3 test_${module_name}.py" ;;
+    esac
+
+    cat > "$project_name/README.md" << README_EOF
+# ${project_name}
+
+C++ bindings generated by [Mirror Bridge](https://github.com/FranciscoThiesen/mirror_bridge)
+— every class in \`src/\` is discovered and bound automatically.
+
+## Build & test
+
+Requires a C++26 reflection compiler (Bloomberg clang-p2996 or GCC 16+).
+The easiest way is the Mirror Bridge dev container:
+
+\`\`\`bash
+mirror_bridge generate src/ --module ${module_name} --lang ${gen_lang}
+${test_cmd}
+\`\`\`
+
+## Iterating
+
+\`\`\`bash
+# Rebuild automatically whenever a header changes
+mirror_bridge watch src/ --module ${module_name} --lang ${gen_lang}
+
+# See what the binding surface looks like after a change
+mirror_bridge diff src/ --module ${module_name}
+\`\`\`
+README_EOF
+
+    cat > "$project_name/.gitignore" << 'GI_EOF'
+build/
+*.so
+*.node
+__pycache__/
+GI_EOF
+
+    if [ $with_ci -eq 1 ]; then
+        mkdir -p "$project_name/.github/workflows"
+        cat > "$project_name/.github/workflows/bindings.yml" << CI_EOF
+name: Bindings
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/franciscothiesen/mirror_bridge:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate bindings
+        run: mirror_bridge generate src/ --module ${module_name} --lang ${gen_lang}
+      - name: Run tests
+        run: |
+          export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH
+          ${test_cmd}
+CI_EOF
+    fi
+
+    echo -e "${GREEN}✓ Created:${NC}"
+    find "$project_name" -type f | sed 's/^/    /'
+    echo ""
+    echo -e "${YELLOW}Next steps:${NC}"
+    echo "  cd $project_name"
+    echo "  mirror_bridge generate src/ --module ${module_name} --lang ${gen_lang}"
+    echo "  ${test_cmd}"
+}
+
 # Command: version
 cmd_version() {
     echo "Mirror Bridge v$VERSION"
     echo "C++26 Reflection-based binding generator"
     echo ""
     echo "Supported languages: Python, Lua, JavaScript"
-    echo "Compiler required: Bloomberg clang-p2996"
+    echo "Supported compilers: Bloomberg clang-p2996, stock GCC 16+"
+    echo "Selected compiler: $CXX_BIN (override with MB_CXX)"
 }
 
 # Main entry point
@@ -1256,7 +1485,7 @@ main() {
         # Invoked via bash so the doctor script works even when the
         # executable bit was lost (e.g. mounted from a pip install).
         doctor) exec bash "$PROJECT_ROOT/mirror_bridge_doctor" "$@" ;;
-        init) echo "Not yet implemented"; exit 1 ;;
+        init) cmd_init "$@" ;;
         version|--version|-v) cmd_version ;;
         help|--help|-h) show_help ;;
         *)

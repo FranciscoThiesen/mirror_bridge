@@ -37,6 +37,8 @@ The Docker container includes:
 - Node.js with N-API headers
 - All your changes preserved between sessions
 
+(A GCC 16 reflection image is also available: `ghcr.io/franciscothiesen/mirror_bridge-gcc`.)
+
 ### Container Management
 
 ```bash
@@ -116,24 +118,21 @@ cd mirror_bridge
 
 ## CMake Integration
 
-For projects using CMake, Mirror Bridge provides helper functions:
+For projects using CMake, Mirror Bridge provides helper functions
+(available via `add_subdirectory`, `FetchContent`, and `find_package` alike):
 
 ```cmake
-cmake_minimum_required(VERSION 3.16)
-project(my_project)
+cmake_minimum_required(VERSION 3.20)
+project(my_project CXX)
 
-# Add Mirror Bridge
+# Option A: vendored checkout
 add_subdirectory(mirror_bridge)
+# Option B: installed package
+# find_package(mirror_bridge REQUIRED)
 
-# Create a Python module
-mirror_bridge_python_module(my_module
-    SOURCES src/my_class.hpp
-)
-
-# Create a Lua module
-mirror_bridge_lua_module(my_module_lua
-    SOURCES src/my_class.hpp
-)
+# my_binding.cpp contains the MIRROR_BRIDGE_MODULE(...) declaration
+mirror_bridge_python_module(my_module my_binding.cpp)
+mirror_bridge_lua_module(my_module_lua my_binding_lua.cpp)
 ```
 
 See the [CMake Integration Guide](../guides/cmake.md) for full details.
