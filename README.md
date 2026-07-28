@@ -5,11 +5,12 @@
 [![Tests](https://github.com/FranciscoThiesen/mirror_bridge/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/FranciscoThiesen/mirror_bridge/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/FranciscoThiesen/mirror_bridge)](https://github.com/FranciscoThiesen/mirror_bridge/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespaces-Open-blue?logo=github)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
 
 Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
-> **Experimental**: Requires a C++26 reflection (P2996) compiler. Works on **stock GCC 16+** (`g++ -std=c++26 -freflection`) or [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996). The CLI auto-detects whichever is present.
+![mirror_bridge demo: one command generates Python, Lua and JavaScript modules](docs/assets/mirror_bridge_demo.svg)
+
+> C++26 reflection ships in **stock GCC 16.1+** (`g++ -std=c++26 -freflection`); [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996) also works. The CLI auto-detects whichever is present. Reflection was voted into C++26 in June 2025 — this is standard C++, not a fork-only experiment.
 
 ## One C++ Class, Three Languages
 
@@ -25,13 +26,43 @@ struct Calculator {
 mirror_bridge generate src/ --module calc --lang all
 ```
 
-**Python** | **Lua** | **JavaScript**
+That command is the entire binding process — no `.def()`, no macros in your class, no wrapper files. The same `Calculator` is now native in all three languages:
+
+**Python**
 ```python
 import calc
 c = calc.Calculator()
 c.add(10)
-print(c.value)  # 10.0
+print(c.value)   # 10.0
 ```
+
+**Lua**
+```lua
+package.cpath = "build/lua/?.so;" .. package.cpath
+local calc = require("calc")
+local c = calc.Calculator()
+c:add(10)
+print(c.value)   -- 10.0
+```
+
+**JavaScript (Node.js)**
+```javascript
+const calc = require('./build/calc.node');
+const c = new calc.Calculator();
+c.add(10);
+console.log(c.value);   // 10.0
+```
+
+## Proof on a Real Library: Open3D
+
+We ported [Open3D](https://github.com/isl-org/Open3D)'s geometry module — the same API surface that takes **25,262 lines of hand-written pybind11** upstream — with **71 generated lines and one command** ([full case study](https://chico.dev/Mirror-Bridge-Open3D-71-Lines/), [runnable example](examples/open3d-port/)):
+
+```bash
+cd examples/open3d-port
+mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/eigen3
+```
+
+And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
 
 ## Try It Now
 
@@ -162,7 +193,7 @@ mirror_bridge is built to be driven by coding agents as well as humans:
 
 - **[AGENTS.md](AGENTS.md)**: operating manual for agents working in this repo
 - **`--json` everywhere**: `generate`, `diff`, and `doctor` emit exactly one JSON object on stdout, with actionable suggestions on failure
-- **MCP server**: `pip install 'mirror-bridge[mcp]'` → `claude mcp add mirror_bridge -- mirror-bridge-mcp` gives any MCP-capable agent `generate_bindings`, `doctor`, and `check_binding_drift` as tool calls
+- **MCP server**: gives any MCP-capable agent `generate_bindings`, `doctor`, and `check_binding_drift` as tool calls. Until the PyPI release lands, build it locally (`cd packaging/pip && ./build_wheel.sh`, then `pip install "$(ls dist/*.whl)[mcp]"` and `claude mcp add mirror_bridge -- mirror-bridge-mcp`)
 - **[Claude Code skill](integrations/claude-code/)**: drop-in `bind-cpp` skill teaching the full generate → fix → verify loop
 - **[llms.txt](llms.txt)** / **[llms-full.txt](llms-full.txt)**: docs index and full corpus for LLM consumption
 
