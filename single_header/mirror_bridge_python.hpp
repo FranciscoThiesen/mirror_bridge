@@ -4170,6 +4170,23 @@ PyObject* py_new_with_init(PyTypeObject* type, PyObject* args, PyObject* kwds) {
 // can dispatch to Python.
 template<typename T, typename Trampoline = T>
 PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+    // This class has no bindable parameterized constructors, so arguments
+    // cannot be consumed here. Silently ignoring them constructed a default
+    // object while the caller believed their data was used. Mirror
+    // object.__new__ semantics: excess arguments are an error unless a
+    // Python-level __init__ override (e.g. on a trampoline subclass) will
+    // receive them.
+    const bool has_args = (args && PyTuple_GET_SIZE(args) > 0) ||
+                          (kwds && PyDict_GET_SIZE(kwds) > 0);
+    if (has_args && type->tp_init == PyBaseObject_Type.tp_init) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s() takes no constructor arguments (no bindable "
+                     "parameterized constructor was found; construct with no "
+                     "arguments and assign members instead)",
+                     type->tp_name);
+        return nullptr;
+    }
+
     auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
     if (self) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {

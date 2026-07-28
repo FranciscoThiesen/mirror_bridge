@@ -40,4 +40,11 @@ try:
 except TypeError:
     print("  ✓ TypeError raised")
 
+print("Test 5: constructor args to a class without bindable constructors raise...")
+try:
+    byref.Mutator(123)
+    raise AssertionError("expected TypeError, got a silently default-constructed object")
+except TypeError:
+    print("  ✓ TypeError raised instead of silent default-construction")
+
 print("\nAll by-reference argument tests passed!")

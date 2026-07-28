@@ -55,6 +55,9 @@ struct PointCloud {
     std::vector<Eigen::Vector3d> colors;
 
     PointCloud() = default;
+    // Same constructor real Open3D exposes; from Python this ingests a
+    // list of [x, y, z] (or a NumPy array) via the bulk conversion path.
+    explicit PointCloud(std::vector<Eigen::Vector3d> pts) : points(std::move(pts)) {}
 
     bool has_points() const { return !points.empty(); }
     bool has_normals() const { return normals.size() == points.size() && !normals.empty(); }
