@@ -104,8 +104,6 @@ jobs:
   test-v8:
     name: JavaScript Bindings - V8 Direct (Clang)
     runs-on: ubuntu-latest
-    # Allow failure until Docker image is rebuilt with libv8-dev
-    continue-on-error: true
     container:
       image: ghcr.io/franciscothiesen/mirror_bridge:latest
       credentials:
@@ -176,14 +174,11 @@ jobs:
   # mirror_bridge supports stock GCC's P2996 implementation: the test runner
   # auto-detects the compiler, splices are hoisted out of pack expansions so
   # GCC accepts them, and the clang-only P3394 annotation tests are skipped.
-  # NOTE: not yet enforced (continue-on-error) until the published GCC image
-  # is rebuilt from the updated Dockerfile.gcc-reflection (adds Eigen et al.);
-  # validated locally as 53 built / 53 tests passed on that image + Eigen.
+  # Enforced: a red GCC job fails the workflow, same as the Clang jobs.
   # ============================================================================
   test-gcc-python:
     name: Python Bindings (GCC)
     runs-on: ubuntu-latest
-    continue-on-error: true
     container:
       image: ghcr.io/franciscothiesen/mirror_bridge-gcc:latest
       credentials:
