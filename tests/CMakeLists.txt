@@ -146,6 +146,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # GIL release policy (release_gil(): native calls overlap across threads)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gil_release)
+        mirror_bridge_python_module(gil_worker
+            gil_release/gil_release_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/gil_release
+        )
+    endif()
+
 endif()
 
 # ============================================================================

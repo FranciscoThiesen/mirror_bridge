@@ -2697,8 +2697,73 @@ struct PyWrapper {
 //   A getattr on the instance returns either a Python bound method (when the
 //   subclass shadows the name) or a PyCFunction object (our C++ binding).
 //   PyMethod_Check is true only for the former.
+inline bool has_python_override(PyObject* py_self, const char* name);
+
+// ============================================================================
+// GIL policy: optional release around bound C++ calls
+// ============================================================================
+//
+// When enabled for a class (bind_class<T>(...).release_gil(), or the CLI's
+// --release-gil flag), the GIL is dropped while the C++ method body runs:
+// argument conversion happens with the GIL held, then the interpreter is
+// released for the duration of the native call, then re-acquired before the
+// result converts back. Long-running C++ work stops blocking other Python
+// threads.
+//
+// This is safe by construction rather than by signature analysis: every
+// path that re-enters Python from C++ re-acquires the GIL itself — the
+// std::function callback wrapper uses PyGILState_Ensure, and dispatch_python
+// (virtual overrides) carries a gil_acquire_guard. What remains the user's
+// responsibility is the same thing pybind11 documents for
+// gil_scoped_release: concurrent calls INTO THE SAME C++ OBJECT from
+// multiple Python threads race on that object unless the C++ side is
+// thread-safe.
+
+template<typename T>
+struct GilPolicy {
+    static inline bool release = false;
+};
+
+// RAII: release the GIL (PyEval_SaveThread) and restore on scope exit,
+// including exception unwinding — the surrounding catch blocks call into
+// the Python C API and must run with the GIL held again.
+class gil_release_guard {
+public:
+    gil_release_guard() noexcept : state_(PyEval_SaveThread()) {}
+    ~gil_release_guard() { PyEval_RestoreThread(state_); }
+    gil_release_guard(const gil_release_guard&) = delete;
+    gil_release_guard& operator=(const gil_release_guard&) = delete;
+private:
+    PyThreadState* state_;
+};
+
+// RAII: ensure the GIL is held (safe to nest, safe from any thread).
+class gil_acquire_guard {
+public:
+    gil_acquire_guard() noexcept : state_(PyGILState_Ensure()) {}
+    ~gil_acquire_guard() { PyGILState_Release(state_); }
+    gil_acquire_guard(const gil_acquire_guard&) = delete;
+    gil_acquire_guard& operator=(const gil_acquire_guard&) = delete;
+private:
+    PyGILState_STATE state_;
+};
+
+// Run the actual C++ call with or without the GIL according to T's policy.
+// The policy check is a single static bool load — zero cost when disabled.
+template<typename T, typename F>
+decltype(auto) call_gil_aware(F&& f) {
+    if (GilPolicy<T>::release) {
+        gil_release_guard released;
+        return f();
+    }
+    return f();
+}
+
+// GIL-safe: callable from the vtable dispatcher on a thread that released
+// (or never held) the GIL.
 inline bool has_python_override(PyObject* py_self, const char* name) {
     if (!py_self) return false;
+    gil_acquire_guard gil;
     PyObject* method = PyObject_GetAttrString(py_self, name);
     if (!method) { PyErr_Clear(); return false; }
     bool is_py = PyMethod_Check(method) || PyFunction_Check(method);
@@ -2718,8 +2783,14 @@ public:
     // Invoke a Python-side override by name, marshalling args and result.
     // The trampoline's generated override body calls this when
     // has_python_override returns true.
+    //
+    // Acquires the GIL for its whole body: virtual calls can arrive from
+    // a bound method running under a released GIL (GilPolicy), or from a
+    // pure C++ thread that never held it. PyGILState_Ensure nests cheaply
+    // when the GIL is already held.
     template<typename Ret, typename... Args>
     Ret dispatch_python(const char* name, Args&&... args) const {
+        gil_acquire_guard gil;
         if (!py_self_) {
             throw std::runtime_error(std::string("TrampolineBase: no py_self for ") + name);
         }
@@ -3232,15 +3303,22 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
     }
 
     // Call: forward_arg now handles pointer storage by dereferencing.
+    // Splices are expanded inside the lambda (not via the outer constexpr
+    // member_func) because std::meta::info can't be referenced through a
+    // runtime lambda; call_gil_aware may drop the GIL for the call itself.
     if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(
-            forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
-        );
+        call_gil_aware<T>([&] {
+            ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
+            );
+        });
         Py_RETURN_NONE;
     } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
-            forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
-        );
+        ReturnType result = call_gil_aware<T>([&]() -> ReturnType {
+            return ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
+            );
+        });
         return to_python(result);
     }
 }
@@ -3314,15 +3392,21 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
 
     // Call the static C++ method using reflection splicer
     // Use forward_arg to conditionally move: move for value/rvalue params, no move for lvalue ref params
+    // (splices expand inside the lambda — meta::info can't cross a runtime
+    // lambda boundary; call_gil_aware may drop the GIL for the call)
     if constexpr (std::is_void_v<ReturnType>) {
-        [:static_func:](
-            forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
-        );
+        call_gil_aware<T>([&] {
+            [:get_static_member_function<T, Index>():](
+                forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
+            );
+        });
         Py_RETURN_NONE;
     } else {
-        ReturnType result = [:static_func:](
-            forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
-        );
+        ReturnType result = call_gil_aware<T>([&]() -> ReturnType {
+            return [:get_static_member_function<T, Index>():](
+                forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
+            );
+        });
         return to_python(result);
     }
 }
@@ -3540,14 +3624,18 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
 
         try {
             if constexpr (std::is_void_v<ReturnType>) {
-                ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
-                    forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
-                );
+                call_gil_aware<T>([&] {
+                    ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                        forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
+                    );
+                });
                 Py_RETURN_NONE;
             } else {
-                ReturnType result = ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
-                    forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
-                );
+                ReturnType result = call_gil_aware<T>([&]() -> ReturnType {
+                    return ((*wrapper->cpp_object).[:get_member_function<T, FuncIndex>():])(
+                        forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
+                    );
+                });
                 return to_python(result);
             }
         } catch (const std::exception& e) {
@@ -3935,8 +4023,10 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
 
         try {
             if constexpr (InPlace) {
-                ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
-                    forward_arg<OtherParam>(storage));
+                call_gil_aware<T>([&] {
+                    ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                        forward_arg<OtherParam>(storage));
+                });
                 Py_INCREF(self);
                 return self;
             } else {
@@ -3945,8 +4035,10 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
                 if constexpr (std::is_void_v<Ret>) {
                     Py_RETURN_NONE;
                 } else {
-                    Ret result = ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
-                        forward_arg<OtherParam>(storage));
+                    Ret result = call_gil_aware<T>([&]() -> Ret {
+                        return ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                            forward_arg<OtherParam>(storage));
+                    });
                     return to_python(result);
                 }
             }
@@ -4475,6 +4567,26 @@ from_python(PyObject* obj, T& out) {
     return ConversionOverloadGenerator<T>::from_python_impl(obj, out);
 }
 
+// Fluent handle returned by bind_class. Converts implicitly to
+// PyTypeObject* so existing callers are unaffected; chaining lets binding
+// code opt into per-class behavior:
+//
+//     mirror_bridge::bind_class<Engine>(m, "Engine").release_gil();
+//
+template<typename T>
+struct BoundClass {
+    PyTypeObject* type;
+
+    // Drop the GIL while this class's C++ method bodies run (see GilPolicy).
+    BoundClass& release_gil(bool enabled = true) {
+        GilPolicy<T>::release = enabled;
+        return *this;
+    }
+
+    operator PyTypeObject*() const { return type; }
+    explicit operator bool() const { return type != nullptr; }
+};
+
 // Main binding function — generates Python type object for a C++ class.
 //
 // Takes an optional `Trampoline` template parameter (defaulting to T). When
@@ -4483,7 +4595,7 @@ from_python(PyObject* obj, T& out) {
 // forwards each virtual call to the Python override if one exists.
 // The `mirror_bridge generate --trampolines` tool emits the trampoline class.
 template<Bindable T, typename Trampoline = T>
-PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_hash = nullptr) {
+BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_hash = nullptr) {
     static_assert(std::is_base_of_v<T, Trampoline> || std::is_same_v<T, Trampoline>,
         "Trampoline must derive from T (or be T itself)");
     // Compile-time validation: ensure all member types are convertible
@@ -4602,7 +4714,7 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
 
     // Initialize and register the type with Python
     if (PyType_Ready(&type_object) < 0) {
-        return nullptr;
+        return {nullptr};
     }
 
     // Add static methods to the type dictionary
@@ -4652,7 +4764,7 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     Py_INCREF(&type_object);
     if (PyModule_AddObject(module, name, reinterpret_cast<PyObject*>(&type_object)) < 0) {
         Py_DECREF(&type_object);
-        return nullptr;
+        return {nullptr};
     }
 
     // Update registry with the Python type object
@@ -4666,7 +4778,7 @@ PyTypeObject* bind_class(PyObject* module, const char* name, const char* file_ha
     // from methods in another .so file (C++ static variables are per-.so)
     register_type_in_python<T>(&type_object);
 
-    return &type_object;
+    return {&type_object};
 }
 
 // ============================================================================
@@ -4829,6 +4941,19 @@ bool bind_function(PyObject* module, const char* name) {
 // Module Definition Macro
 // ============================================================================
 
+// On free-threaded CPython (3.13+ built with --disable-gil), a module that
+// doesn't declare a GIL policy silently re-enables the GIL for the whole
+// process. Compiling with -DMB_FREE_THREADED declares this module safe to
+// run without it (opt-in, mirroring nanobind's FREE_THREADED flag: the
+// binding layer's own entry points are GIL/thread-state correct, but your
+// C++ objects must tolerate concurrent access from Python threads).
+#if defined(MB_FREE_THREADED) && defined(Py_GIL_DISABLED)
+#define MIRROR_BRIDGE_DECLARE_GIL_POLICY(m) \
+        PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#else
+#define MIRROR_BRIDGE_DECLARE_GIL_POLICY(m)
+#endif
+
 // Create a Python module with registered classes
 #define MIRROR_BRIDGE_MODULE(module_name, ...) \
     static PyModuleDef module_name##_def = { \
@@ -4841,6 +4966,7 @@ bool bind_function(PyObject* module, const char* name) {
     PyMODINIT_FUNC PyInit_##module_name() { \
         PyObject* m = PyModule_Create(&module_name##_def); \
         if (!m) return nullptr; \
+        MIRROR_BRIDGE_DECLARE_GIL_POLICY(m) \
         __VA_ARGS__ \
         return m; \
     }

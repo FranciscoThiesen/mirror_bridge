@@ -40,6 +40,7 @@ FORCE_REBUILD=0
 USE_PCH=""
 PCH_PATH=""
 LANG="python"
+RELEASE_GIL=0
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -166,6 +167,10 @@ ${YELLOW}Options:${NC}
   -f, --force         Force rebuild even if sources haven't changed
   -I DIR              Add include directory
   --json              Emit one JSON result object on stdout (progress -> stderr)
+  --release-gil       Python: drop the GIL while C++ method bodies run, so
+                      long-running native calls stop blocking other threads
+                      (argument/result conversion still holds the GIL; safe
+                      with callbacks and virtual overrides, which re-acquire)
   -h, --help          Show this help
 
 ${YELLOW}Auto-Discovery:${NC}
@@ -539,7 +544,13 @@ PYSCRIPT
         elif [ "$lang" = "lua" ]; then
             echo "    $bind_func<$class_name>(L, \"$simple_name\");" >> "$output_file"
         else
-            echo "    $bind_func<$class_name>(m, \"$simple_name\");" >> "$output_file"
+            # --release-gil: drop the GIL while C++ method bodies run
+            # (Python backend only; Lua/JS have no GIL equivalent)
+            if [ "${RELEASE_GIL:-0}" -eq 1 ]; then
+                echo "    $bind_func<$class_name>(m, \"$simple_name\").release_gil();" >> "$output_file"
+            else
+                echo "    $bind_func<$class_name>(m, \"$simple_name\");" >> "$output_file"
+            fi
         fi
     done
 
@@ -663,6 +674,7 @@ cmd_generate() {
             -v|--verbose) VERBOSE=1; shift ;;
             -f|--force) FORCE_REBUILD=1; shift ;;
             --json) JSON_MODE=1; shift ;;
+            --release-gil) RELEASE_GIL=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
             --pch)
                 USE_PCH="1"
