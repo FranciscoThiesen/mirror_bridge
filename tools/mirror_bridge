@@ -41,6 +41,7 @@ USE_PCH=""
 PCH_PATH=""
 LANG="python"
 RELEASE_GIL=0
+GEN_STUBS=0
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -171,6 +172,9 @@ ${YELLOW}Options:${NC}
                       long-running native calls stop blocking other threads
                       (argument/result conversion still holds the GIL; safe
                       with callbacks and virtual overrides, which re-acquire)
+  --stubs             Python: write <module>.pyi next to the built module —
+                      reflection-exact signatures with real C++ parameter
+                      names (no runtime parsing; stubs can't drift)
   -h, --help          Show this help
 
 ${YELLOW}Auto-Discovery:${NC}
@@ -657,6 +661,31 @@ compile_binding() {
     fi
 }
 
+# Write <module>.pyi next to the built Python module. The module itself is
+# the source of truth: importing it and calling __mirror_bridge_stubs__()
+# returns reflection-exact stub content collected during bind_class — no
+# parsing of the compiled artifact involved.
+emit_stubs() {
+    local module_name="$1"
+    local output_dir="$2"
+    local stub_file="$output_dir/${module_name}.pyi"
+
+    if LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}" python3 - "$output_dir" "$module_name" "$stub_file" << 'PYEOF'
+import importlib, sys
+out_dir, mod_name, stub_file = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, out_dir)
+mod = importlib.import_module(mod_name)
+content = mod.__mirror_bridge_stubs__()
+with open(stub_file, "w") as f:
+    f.write(content)
+PYEOF
+    then
+        echo -e "${GREEN}✓ Stubs: $stub_file${NC}"
+    else
+        echo -e "${YELLOW}⚠ Stub generation skipped (importing the module failed)${NC}"
+    fi
+}
+
 # Command: generate
 cmd_generate() {
     local src_dir=""
@@ -675,6 +704,7 @@ cmd_generate() {
             -f|--force) FORCE_REBUILD=1; shift ;;
             --json) JSON_MODE=1; shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
+            --stubs) GEN_STUBS=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
             --pch)
                 USE_PCH="1"
@@ -783,6 +813,9 @@ cmd_generate() {
         echo -e "${YELLOW}Compiling $lang module...${NC}"
         if compile_binding "$lang" "$module_name" "$binding_file" "$OUTPUT_DIR" "$src_dir" "$PCH_PATH" "${include_dirs[@]:-}"; then
             built_outputs+=("$LAST_OUTPUT_FILE")
+            if [ "$GEN_STUBS" -eq 1 ] && [ "$lang" = "python" ]; then
+                emit_stubs "$module_name" "$OUTPUT_DIR"
+            fi
         else
             failed_langs+=("$lang")
             local first_err

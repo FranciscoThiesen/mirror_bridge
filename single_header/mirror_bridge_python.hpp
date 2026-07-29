@@ -1046,6 +1046,7 @@ consteval const char* get_visible_member_name() {
 
 } // namespace annotations
 } // namespace mirror_bridge
+#include "python/mirror_bridge_stubgen.hpp"
 
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
@@ -5744,6 +5745,128 @@ from_python(PyObject* obj, T& out) {
     return ConversionOverloadGenerator<T>::from_python_impl(obj, out);
 }
 
+// ============================================================================
+// Automatic stub collection (reflection-exact .pyi metadata)
+// ============================================================================
+//
+// bind_class feeds the stubgen registry from the same reflection data the
+// binding itself is generated from: exact member types, method signatures,
+// real C++ parameter names, constructor overloads. No runtime parsing of
+// the finished module is involved — the stubs can't drift from the binding.
+// Every module exposes the result via __mirror_bridge_stubs__() (see the
+// MIRROR_BRIDGE_MODULE macro); the CLI's `generate --stubs` writes it to a
+// .pyi next to the built module.
+
+template<typename T, std::size_t FuncIndex, std::size_t ParamIndex>
+consteval std::string_view static_param_name() {
+    constexpr auto func = get_static_member_function<T, FuncIndex>();
+    auto p = std::meta::parameters_of(func)[ParamIndex];
+    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
+    return {};
+}
+
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+consteval std::string_view constructor_param_name() {
+    constexpr auto ctor = get_constructor<T, CtorIndex>();
+    auto p = std::meta::parameters_of(ctor)[ParamIndex];
+    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
+    return {};
+}
+
+// Per-index collectors: each takes the outer index as a scalar template
+// parameter so the inner Ps... expansion contains exactly one pack (nesting
+// an outer fold's pack element inside another expansion trips the
+// equal-length rule on both GCC and clang).
+
+template<typename T, std::size_t CtorIndex>
+void collect_ctor_stub(const char* class_name) {
+    if constexpr (constructor_params_all_bindable<T, CtorIndex>()) {
+        constexpr std::size_t pc = get_constructor_param_count<T, CtorIndex>();
+        [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
+            std::vector<std::string> names = {
+                std::string(constructor_param_name<T, CtorIndex, Ps>())...};
+            stubgen::register_constructor_stub<
+                constructor_param_t<T, CtorIndex, Ps>...>(class_name, names);
+        }(std::make_index_sequence<pc>{});
+    }
+}
+
+template<typename T, std::size_t FuncIndex>
+void collect_method_stub(const char* class_name) {
+    if constexpr (mirror_bridge::core::method_params_all_bindable<T, FuncIndex>()) {
+        constexpr auto mname = get_member_function_name<T, FuncIndex>();
+        // Operators surface through Python's protocol slots, not named defs
+        if (std::string_view(mname).starts_with("operator")) return;
+        using Ret = typename [:get_method_return_type<T, FuncIndex>():];
+        constexpr std::size_t pc = get_method_param_count<T, FuncIndex>();
+        [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
+            std::vector<std::string> names = {
+                std::string(param_name<T, FuncIndex, Ps>())...};
+            stubgen::register_method_stub<Ret, method_param_t<T, FuncIndex, Ps>...>(
+                class_name, mname, names, /*is_static=*/false);
+        }(std::make_index_sequence<pc>{});
+    }
+}
+
+template<typename T, std::size_t FuncIndex>
+void collect_static_method_stub(const char* class_name) {
+    if constexpr (mirror_bridge::core::static_method_params_all_bindable<T, FuncIndex>()) {
+        using Ret = typename [:get_static_method_return_type<T, FuncIndex>():];
+        constexpr std::size_t pc = get_method_param_count_static<T, FuncIndex>();
+        [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
+            std::vector<std::string> names = {
+                std::string(static_param_name<T, FuncIndex, Ps>())...};
+            stubgen::register_method_stub<Ret, static_method_param_t<T, FuncIndex, Ps>...>(
+                class_name, get_static_member_function_name<T, FuncIndex>(),
+                names, /*is_static=*/true);
+        }(std::make_index_sequence<pc>{});
+    }
+}
+
+template<typename T>
+void collect_stub_info(const char* class_name) {
+    stubgen::register_class_stub<T>(class_name);
+
+    // Data members -> annotated attributes
+    constexpr std::size_t member_count = get_data_member_count<T>();
+    if constexpr (member_count > 0) {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                using MemberType = typename [:std::meta::type_of(get_data_member<T, Is>()):];
+                stubgen::register_property_stub<T, MemberType>(
+                    class_name, get_data_member_name<T, Is>());
+            }(), ...);
+        }(std::make_index_sequence<member_count>{});
+    }
+
+    // Constructors (bindable overloads only — what Python can actually call)
+    constexpr std::size_t ctor_count = get_constructor_count<T>();
+    if constexpr (ctor_count > 0) {
+        [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+            (collect_ctor_stub<T, Cs>(class_name), ...);
+        }(std::make_index_sequence<ctor_count>{});
+    }
+    if constexpr (std::is_default_constructible_v<T>) {
+        stubgen::register_default_constructor_if_missing(class_name);
+    }
+
+    // Methods: every bindable overload
+    constexpr std::size_t method_count = get_member_function_count<T>();
+    if constexpr (method_count > 0) {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            (collect_method_stub<T, Is>(class_name), ...);
+        }(std::make_index_sequence<method_count>{});
+    }
+
+    // Static methods
+    constexpr std::size_t static_count = get_static_member_function_count<T>();
+    if constexpr (static_count > 0) {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            (collect_static_method_stub<T, Is>(class_name), ...);
+        }(std::make_index_sequence<static_count>{});
+    }
+}
+
 // Fluent handle returned by bind_class. Converts implicitly to
 // PyTypeObject* so existing callers are unaffected; chaining lets binding
 // code opt into per-class behavior:
@@ -5955,6 +6078,10 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // from methods in another .so file (C++ static variables are per-.so)
     register_type_in_python<T>(&type_object);
 
+    // Feed the stub registry from the same reflection data this binding was
+    // generated from; __mirror_bridge_stubs__() serves it per module.
+    collect_stub_info<T>(name);
+
     return {&type_object};
 }
 
@@ -6131,8 +6258,18 @@ bool bind_function(PyObject* module, const char* name) {
 #define MIRROR_BRIDGE_DECLARE_GIL_POLICY(m)
 #endif
 
-// Create a Python module with registered classes
+// Create a Python module with registered classes.
+// Every module exposes __mirror_bridge_stubs__(), returning reflection-exact
+// .pyi content for everything bound in it (used by `generate --stubs`).
 #define MIRROR_BRIDGE_MODULE(module_name, ...) \
+    static PyObject* module_name##_mb_stubs(PyObject*, PyObject*) { \
+        return PyUnicode_FromString( \
+            mirror_bridge::stubgen::generate_stubs(#module_name).c_str()); \
+    } \
+    static PyMethodDef module_name##_mb_stub_def = { \
+        "__mirror_bridge_stubs__", module_name##_mb_stubs, METH_NOARGS, \
+        "Return reflection-generated .pyi content for this module" \
+    }; \
     static PyModuleDef module_name##_def = { \
         PyModuleDef_HEAD_INIT, \
         #module_name, \
@@ -6145,5 +6282,9 @@ bool bind_function(PyObject* module, const char* name) {
         if (!m) return nullptr; \
         MIRROR_BRIDGE_DECLARE_GIL_POLICY(m) \
         __VA_ARGS__ \
+        PyObject* mb_stub_fn = PyCFunction_New(&module_name##_mb_stub_def, nullptr); \
+        if (mb_stub_fn) { \
+            PyModule_AddObject(m, "__mirror_bridge_stubs__", mb_stub_fn); \
+        } \
         return m; \
     }

@@ -168,8 +168,16 @@ private:
             }
         }
 
-        // Methods
+        // Methods. Overloaded names need @overload or type checkers reject
+        // the duplicate definitions.
+        std::map<std::string, int> name_counts;
         for (const auto& method : info.methods) {
+            ++name_counts[method.name];
+        }
+        for (const auto& method : info.methods) {
+            if (name_counts[method.name] > 1) {
+                ss << "    @overload\n";
+            }
             if (method.is_static) {
                 ss << "    @staticmethod\n";
                 ss << "    def " << method.name << "(";
@@ -233,6 +241,31 @@ std::string type_hint() {
         return "str";
     } else if constexpr (std::is_void_v<CleanT>) {
         return "None";
+    }
+
+    // Eigen fixed-size vectors/matrices convert to (nested) Python lists.
+    // Detected structurally so this header stays Eigen-independent.
+    if constexpr (requires { CleanT::RowsAtCompileTime; CleanT::ColsAtCompileTime;
+                             typename CleanT::Scalar; }) {
+        std::string scalar =
+            std::is_floating_point_v<typename CleanT::Scalar> ? "float" : "int";
+        if constexpr (CleanT::ColsAtCompileTime == 1 || CleanT::RowsAtCompileTime == 1) {
+            return "list[" + scalar + "]";
+        } else {
+            return "list[list[" + scalar + "]]";
+        }
+    }
+
+    // Maps -> dict[K, V] (checked before generic containers: maps iterate too)
+    if constexpr (requires { typename CleanT::key_type; typename CleanT::mapped_type; }) {
+        return "dict[" + type_hint<typename CleanT::key_type>() + ", " +
+               type_hint<typename CleanT::mapped_type>() + "]";
+    }
+
+    // Sets -> set[T]
+    if constexpr (requires { typename CleanT::key_type; } &&
+                  !requires { typename CleanT::mapped_type; }) {
+        return "set[" + type_hint<typename CleanT::key_type>() + "]";
     }
 
     // Byte containers -> bytes
@@ -303,24 +336,40 @@ void register_property_stub(const char* class_name, const char* prop_name, bool 
     info.properties.push_back({prop_name, type_hint<MemberT>(), readonly});
 }
 
-// Register a method
+// Register a method. Parameter names may be empty strings (unnamed params
+// in the C++ declaration) — those fall back to argN.
 template<typename ReturnT, typename... Args>
 void register_method_stub(const char* class_name, const char* method_name,
-                          const std::vector<std::string>& param_names = {}) {
+                          const std::vector<std::string>& param_names = {},
+                          bool is_static = false) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
 
     MethodInfo method;
     method.name = method_name;
     method.return_type = type_hint<ReturnT>();
+    method.is_static = is_static;
 
     // Generate parameters
     std::vector<std::string> type_hints = {type_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
-        std::string pname = (i < param_names.size()) ? param_names[i] : "arg" + std::to_string(i);
+        std::string pname = (i < param_names.size() && !param_names[i].empty())
+                                ? param_names[i]
+                                : "arg" + std::to_string(i);
         method.parameters.push_back({pname, type_hints[i]});
     }
 
     info.methods.push_back(method);
+}
+
+// The runtime always permits zero-arg construction of default-constructible
+// classes (py_init's nargs==0 branch), whether or not a default constructor
+// was reflected — keep the stub in agreement.
+inline void register_default_constructor_if_missing(const char* class_name) {
+    ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
+    for (const auto& ctor : info.constructors) {
+        if (ctor.parameters.empty()) return;
+    }
+    info.constructors.push_back({});
 }
 
 // Register a constructor
@@ -332,7 +381,9 @@ void register_constructor_stub(const char* class_name,
     ConstructorInfo ctor;
     std::vector<std::string> type_hints = {type_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
-        std::string pname = (i < param_names.size()) ? param_names[i] : "arg" + std::to_string(i);
+        std::string pname = (i < param_names.size() && !param_names[i].empty())
+                                ? param_names[i]
+                                : "arg" + std::to_string(i);
         ctor.parameters.push_back({pname, type_hints[i]});
     }
 
