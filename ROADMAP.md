@@ -6,20 +6,14 @@ this is a small project and the fastest way to move something up is to
 
 ## Now (active)
 
-- **Free-threaded Python, safe by default.** Free-threading is officially
-  supported since Python 3.14, and one unported extension silently re-enables
-  the GIL for the whole process. Reflection lets us do what runtime binding
-  libraries cannot: classify each bound method (const vs mutating) at compile
-  time, release the GIL around eligible C++ calls automatically, and declare
-  `Py_MOD_GIL_NOT_USED` on free-threaded builds.
-- **Exact `.pyi` stubs from reflection.** Stub generators that parse runtime
-  objects are fragile by their own maintainers' admission. Reflection knows
-  every signature, type, and default — stubs should be complete and
-  mypy-clean with zero parsing.
-- **Header-to-wheel scaffolding.** `mirror_bridge init --wheel`: from bare
-  C++ headers to a pip-installable, cibuildwheel-ready repository
-  (pyproject.toml + scikit-build-core + CI matrix) in one command.
 - **PyPI release** of the `mirror-bridge` CLI wrapper and MCP server.
+- **Free-threading, next steps.** v1 shipped (see below: GIL release policy +
+  `-DMB_FREE_THREADED` declaration). Next: per-method thread-safety report
+  derived from constness reflection, free-threaded wheels in CI, and a
+  manylinux image with a reflection compiler so scaffolded wheel workflows
+  can target PyPI's manylinux tags.
+- **Stub polish.** Defaults rendered as `= ...` values, free-function stubs,
+  and a `diff`-style check that fails CI when committed stubs drift.
 
 ## Next
 
@@ -53,5 +47,7 @@ this is a small project and the fastest way to move something up is to
 
 See [CHANGELOG.md](CHANGELOG.md). Highlights: stock GCC 16.1 support,
 by-reference argument passing, buffer-protocol bulk ingest (42x pybind11 on
-point-cloud ingest), `mirror_bridge init`, installable CMake helper API,
-`ctest` as a trustworthy signal.
+point-cloud ingest), `mirror_bridge init` (+`--wheel` header-to-wheel
+scaffolding), GIL release policy (`release_gil()` / `--release-gil`) with
+`-DMB_FREE_THREADED` declaration support, reflection-exact `.pyi` stubs
+(`--stubs`), installable CMake helper API, `ctest` as a trustworthy signal.
