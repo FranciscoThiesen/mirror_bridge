@@ -175,6 +175,8 @@ ${YELLOW}Options:${NC}
   --stubs             Python: write <module>.pyi next to the built module —
                       reflection-exact signatures with real C++ parameter
                       names (no runtime parsing; stubs can't drift)
+  --link-args ARGS    Extra link inputs for non-header-only libraries
+                      (e.g. --link-args "/path/to/libFoo.a -lz")
   -h, --help          Show this help
 
 ${YELLOW}Auto-Discovery:${NC}
@@ -276,23 +278,26 @@ content = re.sub(r'//[^\n]*', '', content)
 content = re.sub(r'"(?:[^"\\]|\\.)*"', '""', content)
 content = re.sub(r"'(?:[^'\\]|\\.)*'", "''", content)
 
-# Tokenize to {, }, ;, class NAME, struct NAME, and 'template' (for
-# template-parameter skipping). This is much simpler than hand-walking chars.
+# Tokenize to {, }, ;, class NAME, struct NAME, access labels, and
+# 'template' (for template-parameter skipping).
 token_re = re.compile(
-    r'\b(class|struct)\b\s+([A-Za-z_]\w*)'  # 1,2: class/struct keyword + name
-    r'|\btemplate\b'                        # 3: template keyword
-    r'|([{};])'                             # 4: punctuation we care about
+    r'\b(class|struct)\b\s+([A-Za-z_]\w*)'      # 1,2: keyword + name
+    r'|\b(public|private|protected)\s*:'        # 3: access label
+    r'|\btemplate\b'                            # template keyword
+    r'|([{};])'                                 # 4: punctuation we care about
 )
 
 tokens = []
 for m in token_re.finditer(content):
     line_no = content.count('\n', 0, m.start()) + 1
     if m.group(1):   # class/struct declaration
-        tokens.append(('decl', m.group(2), line_no, m.end()))
+        tokens.append(('decl', (m.group(1), m.group(2)), line_no, m.end()))
+    elif m.group(3):
+        tokens.append(('access', m.group(3), line_no, m.end()))
     elif m.group(0) == 'template':
         tokens.append(('template', None, line_no, m.end()))
     else:            # {, }, ;
-        tokens.append((m.group(3), None, line_no, m.end()))
+        tokens.append((m.group(4), None, line_no, m.end()))
 
 # Walk tokens. A 'decl' followed (eventually) by '{' at depth D pushes the name
 # onto the class stack at depth D. A 'decl' followed by ';' is a forward
@@ -300,8 +305,13 @@ for m in token_re.finditer(content):
 # a matching <...> block — we handle that by scanning the raw text between the
 # template token and its balanced '>'.
 depth = 0
-class_stack = []     # list of (name, opened_at_depth)
-pending = None       # (name, line_no) awaiting a '{'
+# Stack entries: [name, opened_at_depth, cur_access, visible]
+# cur_access starts 'private' for class, 'public' for struct, and tracks
+# access labels so private nested classes are never emitted (binding an
+# inaccessible type is ill-formed — Clipper2's ClipperOffset::Group taught
+# us this). `visible` is the AND of the enclosing chain's accessibility.
+class_stack = []
+pending = None       # ((keyword, name), line_no) awaiting a '{'
 skip_until_pos = 0   # positions up to here were eaten by a template<...>
 skip_next_decl = False  # True after a template<...> block — next decl is a template
 results = []
@@ -321,7 +331,7 @@ def skip_template_params(start):
         i += 1
     return i
 
-for kind, name, line_no, end_pos in tokens:
+for kind, payload, line_no, end_pos in tokens:
     if end_pos <= skip_until_pos:
         continue
     if kind == 'template':
@@ -333,17 +343,27 @@ for kind, name, line_no, end_pos in tokens:
             # Template class — can't be bound directly (needs instantiation).
             # Still push a placeholder so the brace matching stays consistent;
             # we just never emit it.
-            pending = ('__mb_template__', line_no)
+            pending = (('class', '__mb_template__'), line_no)
             skip_next_decl = False
         else:
-            pending = (name, line_no)
+            pending = (payload, line_no)
+    elif kind == 'access':
+        # Attribute the label to the innermost open class whose body we're in
+        if class_stack and depth == class_stack[-1][1] + 1:
+            class_stack[-1][2] = payload
     elif kind == '{':
         if pending is not None:
-            class_stack.append((pending[0], depth))
-            if pending[0] != '__mb_template__' and \
-               not any(n == '__mb_template__' for n, _ in class_stack[:-1]):
-                qual = '::'.join(n for n, _ in class_stack)
-                results.append((qual, pending[1]))
+            (kw, name), decl_line = pending
+            # Nested classes are only bindable when every enclosing class
+            # section is public at the point of declaration.
+            parent_public = (not class_stack) or (
+                class_stack[-1][3] and class_stack[-1][2] == 'public')
+            default_access = 'private' if kw == 'class' else 'public'
+            class_stack.append([name, depth, default_access, parent_public])
+            if name != '__mb_template__' and parent_public and \
+               not any(entry[0] == '__mb_template__' for entry in class_stack[:-1]):
+                qual = '::'.join(entry[0] for entry in class_stack)
+                results.append((qual, decl_line))
             pending = None
         depth += 1
     elif kind == '}':
@@ -428,7 +448,9 @@ generate_binding_file() {
         python)
             include_header="mirror_bridge.hpp"
             module_macro="MIRROR_BRIDGE_MODULE"
-            bind_func="mirror_bridge::bind_class"
+            # when_bindable: on real-world headers, skip (with a warning)
+            # classes that can't be bound instead of failing the module
+            bind_func="mirror_bridge::bind_class_when_bindable"
             ;;
         lua)
             include_header="lua/mirror_bridge_lua.hpp"
@@ -634,7 +656,9 @@ compile_binding() {
         esac
     fi
 
-    cmd="$cmd $compile_flags $binding_file -o $output_file $link_flags"
+    # LINK_ARGS: extra objects/archives/flags for libraries that aren't
+    # header-only (e.g. --link-args "/path/libClipper2.a")
+    cmd="$cmd $compile_flags $binding_file -o $output_file $link_flags ${LINK_ARGS:-}"
 
     # Capture the full compiler output so failures can be reported with
     # context (and machine-readably in --json mode via LAST_COMPILE_LOG).
@@ -705,6 +729,7 @@ cmd_generate() {
             --json) JSON_MODE=1; shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
+            --link-args) LINK_ARGS="$2"; shift 2 ;;
             -I) include_dirs+=("$2"); shift 2 ;;
             --pch)
                 USE_PCH="1"

@@ -30,7 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CMake compiler check and package config understand GCC 16+ (previously warned that only clang was supported)
 - Removed the unused `ClassMetadata`/`Registry` pair from `core/` — the Python backend's registry (the only one ever used) is the single implementation
 
+### Added (real-world header hardening — found by binding Clipper2 cold)
+- **const data members bind as read-only attributes** (readable, assignment raises `AttributeError`, `@property` in stubs) instead of failing to compile
+- **CLI-generated bindings skip unbindable classes with a per-class reason** (`bind_class_when_bindable`) instead of failing the whole module: "31 discovered, 12 bound, 15 skipped (reasons)" — hand-written `bind_class` keeps the hard `static_assert`
+- **Methods/operators with unconvertible return types (raw pointers, iterators) are skipped** like param-unbindable ones, for named methods, static methods, number slots, rich-compare, and subscript
+- **Constructors reflection can see but Python can't call (protected/private) are filtered** via `is_constructible_v`
+- **Auto-discovery tracks access specifiers**: private/protected nested classes are no longer emitted (binding them is ill-formed)
+- `--link-args` on `generate` for libraries that aren't header-only (`--link-args "/path/libFoo.a"`)
+
 ### Fixed
+- `const char*` constructor/method parameters were dereferenced as if they were pointer-holder storage, producing garbage or failing to compile — pointer-typed *values* are now distinguished from pointer-holder storage
 - Virtual-override dispatch (`dispatch_python`/`has_python_override`) now acquires the GIL itself, making overridden virtuals safe to call from pure C++ threads that never held the GIL (previously undefined behavior)
 - Constructor calls with arguments no constructor accepts now raise `TypeError` instead of silently returning a default-constructed object
 - The Python single header shipped raw `#include` lines for `mirror_bridge_annotations.hpp` and `mirror_bridge_eigen.hpp`, so it could not compile standalone; the amalgamation now inlines both at their include site

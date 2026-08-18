@@ -3685,11 +3685,13 @@ using static_method_param_t = typename [:get_static_method_param_type<T, FuncInd
 // and abstract-class parameters (const Base&).
 template<typename OriginalParamType, typename StoredType>
 decltype(auto) forward_arg(StoredType& arg) {
-    if constexpr (std::is_pointer_v<StoredType>) {
-        // Pointer storage: dereference back to the underlying object.
-        // This is used when the parameter type can't be held by value
-        // (e.g., abstract class) and we stored a pointer into a Python
-        // wrapper's cpp_object instead.
+    if constexpr (std::is_pointer_v<StoredType> &&
+                  !std::is_pointer_v<std::remove_cvref_t<OriginalParamType>>) {
+        // Pointer-HOLDER storage: dereference back to the underlying object.
+        // Used when the parameter can't be held by value (abstract class) or
+        // is an lvalue reference to a wrapper-backed class (zero-copy).
+        // Genuinely pointer-typed parameters (const char*) are VALUE storage
+        // that happens to be a pointer — they must not be dereferenced.
         return *arg;
     } else if constexpr (std::is_lvalue_reference_v<OriginalParamType>) {
         return arg;  // Pass as lvalue for T& parameters
@@ -3790,7 +3792,12 @@ using py_param_storage_t = typename py_param_storage<ParamType>::type;
 // Called in method dispatch to populate the tuple of stored args.
 template<typename ParamType, typename Storage>
 inline bool extract_param(PyObject* obj, Storage& out) {
-    if constexpr (std::is_pointer_v<Storage>) {
+    // Pointer STORAGE means pointer-holder (aliasing a wrapper's object) —
+    // but only when the parameter itself isn't a pointer type. A
+    // `const char*` parameter has pointer-typed VALUE storage and must go
+    // through from_python (Clipper2's exception ctor taught us this).
+    if constexpr (std::is_pointer_v<Storage> &&
+                  !std::is_pointer_v<std::remove_cvref_t<ParamType>>) {
         return from_python_pointer(obj, out);
     } else {
         return from_python(obj, out);
@@ -4093,8 +4100,11 @@ template<typename T, std::size_t CtorIndex>
 consteval bool constructor_params_all_bindable() {
     constexpr std::size_t param_count = get_constructor_param_count<T, CtorIndex>();
     return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        // is_constructible_v filters constructors reflection can see but
+        // Python can't call: protected/private ctors on real-world classes.
         return (mirror_bridge::core::is_param_bindable<
-            constructor_param_t<T, CtorIndex, Is>>() && ...);
+                    constructor_param_t<T, CtorIndex, Is>>() && ...) &&
+               std::is_constructible_v<T, constructor_param_t<T, CtorIndex, Is>...>;
     }(std::make_index_sequence<param_count>{});
 }
 
@@ -4346,7 +4356,13 @@ int py_setter(PyObject* self, PyObject* value, void* closure) {
     constexpr auto member = get_member_info<T, Index>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    if constexpr (std::is_array_v<MemberType>) {
+    if constexpr (std::is_const_v<MemberType>) {
+        // const data members are readable but never assignable; registration
+        // points them at py_readonly_setter, this branch keeps the template
+        // instantiable for any member type.
+        PyErr_SetString(PyExc_AttributeError, "Attribute is const in C++");
+        return -1;
+    } else if constexpr (std::is_array_v<MemberType>) {
         // C-style arrays can't be whole-assigned. Fill in-place.
         if (!from_python(value, (*wrapper->cpp_object).[:member:])) {
             PyErr_SetString(PyExc_TypeError, "Type conversion failed");
@@ -4413,7 +4429,13 @@ int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     constexpr auto member = get_visible_member_info<T, VisibleIndex>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    if constexpr (std::is_array_v<MemberType>) {
+    if constexpr (std::is_const_v<MemberType>) {
+        // const data members (e.g. `const uint64_t seed;`) are readable but
+        // never assignable. Registration uses py_readonly_setter for them;
+        // this branch keeps the template instantiable no matter what.
+        PyErr_SetString(PyExc_AttributeError, "Attribute is const in C++");
+        return -1;
+    } else if constexpr (std::is_array_v<MemberType>) {
         // Array: fill in-place. from_python<T[N]> writes directly into the array.
         if (!from_python(value, (*wrapper->cpp_object).[:member:])) {
             PyErr_SetString(PyExc_TypeError, "Type conversion failed");
@@ -4651,6 +4673,50 @@ struct MethodNameCache {
     static constexpr auto names = compute_names();
 };
 
+// Can this return type cross into Python? Methods whose returns can't
+// (raw pointers, iterators, unconverted exotic types) are skipped the same
+// way param-unbindable methods are — real-world headers are full of them.
+template<typename Ret>
+consteval bool return_type_convertible() {
+    if constexpr (std::is_void_v<Ret>) {
+        return true;
+    } else {
+        using Clean = std::remove_cvref_t<Ret>;
+        if constexpr (std::is_pointer_v<Clean>) {
+            return false;
+        } else if constexpr (is_std_optional<Clean>::value || is_std_expected<Clean>::value ||
+                             is_std_future<Clean>::value || is_std_function<Clean>::value ||
+                             is_std_tuple_like<Clean>::value || is_std_variant<Clean>::value) {
+            return true;
+        } else if constexpr (HasCustomConverter<Clean>) {
+            return true;
+        } else if constexpr (requires { Clean::RowsAtCompileTime; typename Clean::Scalar; }) {
+            return true;  // Eigen fixed matrices/vectors have built-in converters
+        } else {
+            return mirror_bridge::core::is_convertible_type<Clean>();
+        }
+    }
+}
+
+// Bindable = every parameter storable AND the return convertible.
+template<typename T, std::size_t Index>
+consteval bool method_fully_bindable() {
+    if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+        return false;
+    } else {
+        return return_type_convertible<typename [:get_method_return_type<T, Index>():]>();
+    }
+}
+
+template<typename T, std::size_t Index>
+consteval bool static_method_fully_bindable() {
+    if constexpr (!mirror_bridge::core::static_method_params_all_bindable<T, Index>()) {
+        return false;
+    } else {
+        return return_type_convertible<typename [:get_static_method_return_type<T, Index>():]>();
+    }
+}
+
 // Check if method at Index is the first BINDABLE method with its name.
 // Methods whose params can't be stored either by value or via pointer-holder
 // (e.g., raw pointer to a user container — ambiguous ownership) are excluded,
@@ -4659,7 +4725,7 @@ struct MethodNameCache {
 // to avoid redundant reflection work.
 template<typename T, std::size_t Index>
 consteval bool is_canonical_method() {
-    if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+    if constexpr (!method_fully_bindable<T, Index>()) {
         return false;
     } else {
         return []<std::size_t... Earlier>(std::index_sequence<Earlier...>) {
@@ -4668,7 +4734,7 @@ consteval bool is_canonical_method() {
             // The name cache is referenced directly: a named constexpr
             // reference would be odr-used and need a capture under GCC.
             return (... && (MethodNameCache<T>::names[Earlier] != MethodNameCache<T>::names[Index] ||
-                            !mirror_bridge::core::method_params_all_bindable<T, Earlier>()));
+                            !method_fully_bindable<T, Earlier>()));
         }(std::make_index_sequence<Index>{});
     }
 }
@@ -4916,7 +4982,7 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, PyObject* kwds
 
         constexpr auto this_name = get_member_function_name<T, AllIndices>();
         if constexpr (std::string_view(this_name) == std::string_view(target_name) &&
-                      mirror_bridge::core::method_params_all_bindable<T, AllIndices>()) {
+                      method_fully_bindable<T, AllIndices>()) {
             result = try_overload<T, AllIndices>(wrapper, args, kwds);
         }
     }(), ...);
@@ -4951,6 +5017,19 @@ consteval const char* get_member_name() {
     return std::meta::identifier_of(get_data_member<T, Index>()).data();
 }
 
+// const-qualified data members get the read-only setter: Python can read
+// them, assignment raises AttributeError instead of failing to compile.
+template<typename T, std::size_t Index>
+consteval bool is_member_const() {
+    return std::is_const_v<typename [:std::meta::type_of(get_data_member<T, Index>()):]>;
+}
+
+template<typename T, std::size_t VisibleIndex>
+consteval bool is_visible_member_const() {
+    return std::is_const_v<
+        typename [:std::meta::type_of(get_visible_member_info<T, VisibleIndex>()):]>;
+}
+
 // Generate Python getters/setters for all members of a class
 template<typename T, std::size_t... Indices>
 consteval auto generate_getsetters(std::index_sequence<Indices...>) {
@@ -4963,7 +5042,9 @@ consteval auto generate_getsetters(std::index_sequence<Indices...>) {
     ((getsets[Indices] = PyGetSetDef{
         .name = get_member_name<T, Indices>(),
         .get = py_getter<T, Indices>,
-        .set = py_setter<T, Indices>,
+        .set = is_member_const<T, Indices>()
+            ? py_readonly_setter<T, Indices>
+            : py_setter<T, Indices>,
         .doc = nullptr,
         .closure = nullptr
     }), ...);
@@ -4986,8 +5067,9 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
     ((getsets[VisibleIndices] = PyGetSetDef{
         .name = annotations::get_visible_member_name<T, VisibleIndices>(),
         .get = py_visible_getter<T, VisibleIndices>,
-        // Use readonly setter if member has [[=readonly{}]] annotation
-        .set = annotations::is_visible_member_readonly<T, VisibleIndices>()
+        // Read-only when annotated [[=readonly{}]] or const-qualified in C++
+        .set = (annotations::is_visible_member_readonly<T, VisibleIndices>() ||
+                is_visible_member_const<T, VisibleIndices>())
             ? py_readonly_setter<T, VisibleIndices>
             : py_visible_setter<T, VisibleIndices>,
         .doc = nullptr,
@@ -5052,7 +5134,7 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
 
     // Populate entries only for methods whose params are all bindable.
     ([&] {
-        if constexpr (mirror_bridge::core::static_method_params_all_bindable<T, Indices>()) {
+        if constexpr (static_method_fully_bindable<T, Indices>()) {
             constexpr auto func_name = get_static_member_function_name<T, Indices>();
             methods[Indices] = PyMethodDef{
                 .ml_name = func_name,
@@ -5171,6 +5253,28 @@ consteval std::size_t find_op(Slot target) {
 template<typename T, std::size_t OpIndex>
 consteval std::size_t op_param_count() {
     return std::meta::parameters_of(OperatorCache<T>::at(OpIndex)).size();
+}
+
+// Operator slots get the same fully-bindable gating as named methods:
+// registration is skipped when the operand can't be stored or the result
+// can't convert (real-world headers bind iterators' operator* et al.).
+// Safely false for OpIndex == count (the find_op "not found" sentinel).
+template<typename T, std::size_t OpIndex>
+consteval bool op_bindable() {
+    if constexpr (OpIndex >= OperatorCache<T>::count) {
+        return false;
+    } else {
+        using Ret = typename [:std::meta::return_type_of(OperatorCache<T>::at(OpIndex)):];
+        if constexpr (!return_type_convertible<Ret>()) {
+            return false;
+        } else if constexpr (op_param_count<T, OpIndex>() == 1) {
+            return mirror_bridge::core::is_param_bindable<
+                typename [:std::meta::type_of(
+                    std::meta::parameters_of(OperatorCache<T>::at(OpIndex))[0]):]>();
+        } else {
+            return true;
+        }
+    }
 }
 
 // Wrapper for a binary operator: `(a OP b) -> result`. When `InPlace` is true,
@@ -5300,7 +5404,7 @@ PyObject* richcompare_wrapper(PyObject* self, PyObject* other, int op) {
     auto try_slot = [&]<Slot S, int PyOpCode>() -> PyObject* {
         if (op != PyOpCode) return OVERLOAD_TRY_NEXT;
         constexpr std::size_t idx = find_op<T>(S);
-        if constexpr (idx == OperatorCache<T>::count) {
+        if constexpr (!op_bindable<T, idx>()) {
             return OVERLOAD_TRY_NEXT;
         } else {
             return normalize_bool(
@@ -5337,18 +5441,18 @@ PyNumberMethods* build_number_methods() {
     constexpr std::size_t pos_idx = find_op<T>(Slot::Positive);
     constexpr std::size_t N = OperatorCache<T>::count;
 
-    if constexpr (add_idx < N)  nm.nb_add = binary_op_wrapper<T, add_idx, false>;
-    if constexpr (sub_idx < N)  nm.nb_subtract = binary_op_wrapper<T, sub_idx, false>;
-    if constexpr (mul_idx < N)  nm.nb_multiply = binary_op_wrapper<T, mul_idx, false>;
-    if constexpr (div_idx < N)  nm.nb_true_divide = binary_op_wrapper<T, div_idx, false>;
-    if constexpr (mod_idx < N)  nm.nb_remainder = binary_op_wrapper<T, mod_idx, false>;
-    if constexpr (iadd_idx < N) nm.nb_inplace_add = binary_op_wrapper<T, iadd_idx, true>;
-    if constexpr (isub_idx < N) nm.nb_inplace_subtract = binary_op_wrapper<T, isub_idx, true>;
-    if constexpr (imul_idx < N) nm.nb_inplace_multiply = binary_op_wrapper<T, imul_idx, true>;
-    if constexpr (idiv_idx < N) nm.nb_inplace_true_divide = binary_op_wrapper<T, idiv_idx, true>;
-    if constexpr (imod_idx < N) nm.nb_inplace_remainder = binary_op_wrapper<T, imod_idx, true>;
-    if constexpr (neg_idx < N)  nm.nb_negative = unary_op_wrapper<T, neg_idx>;
-    if constexpr (pos_idx < N)  nm.nb_positive = unary_op_wrapper<T, pos_idx>;
+    if constexpr (op_bindable<T, add_idx>())  nm.nb_add = binary_op_wrapper<T, add_idx, false>;
+    if constexpr (op_bindable<T, sub_idx>())  nm.nb_subtract = binary_op_wrapper<T, sub_idx, false>;
+    if constexpr (op_bindable<T, mul_idx>())  nm.nb_multiply = binary_op_wrapper<T, mul_idx, false>;
+    if constexpr (op_bindable<T, div_idx>())  nm.nb_true_divide = binary_op_wrapper<T, div_idx, false>;
+    if constexpr (op_bindable<T, mod_idx>())  nm.nb_remainder = binary_op_wrapper<T, mod_idx, false>;
+    if constexpr (op_bindable<T, iadd_idx>()) nm.nb_inplace_add = binary_op_wrapper<T, iadd_idx, true>;
+    if constexpr (op_bindable<T, isub_idx>()) nm.nb_inplace_subtract = binary_op_wrapper<T, isub_idx, true>;
+    if constexpr (op_bindable<T, imul_idx>()) nm.nb_inplace_multiply = binary_op_wrapper<T, imul_idx, true>;
+    if constexpr (op_bindable<T, idiv_idx>()) nm.nb_inplace_true_divide = binary_op_wrapper<T, idiv_idx, true>;
+    if constexpr (op_bindable<T, imod_idx>()) nm.nb_inplace_remainder = binary_op_wrapper<T, imod_idx, true>;
+    if constexpr (op_bindable<T, neg_idx>())  nm.nb_negative = unary_op_wrapper<T, neg_idx>;
+    if constexpr (op_bindable<T, pos_idx>())  nm.nb_positive = unary_op_wrapper<T, pos_idx>;
 
     // Return null if nothing was populated, so tp_as_number stays null.
     if constexpr (add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
@@ -5364,7 +5468,7 @@ template<typename T>
 PyMappingMethods* build_mapping_methods() {
     static PyMappingMethods mm{};
     constexpr std::size_t sub_idx = find_op<T>(Slot::Subscript);
-    if constexpr (sub_idx < OperatorCache<T>::count) {
+    if constexpr (op_bindable<T, sub_idx>()) {
         mm.mp_subscript = subscript_wrapper<T, sub_idx>;
         return &mm;
     }
@@ -5793,7 +5897,7 @@ void collect_ctor_stub(const char* class_name) {
 
 template<typename T, std::size_t FuncIndex>
 void collect_method_stub(const char* class_name) {
-    if constexpr (mirror_bridge::core::method_params_all_bindable<T, FuncIndex>()) {
+    if constexpr (method_fully_bindable<T, FuncIndex>()) {
         constexpr auto mname = get_member_function_name<T, FuncIndex>();
         // Operators surface through Python's protocol slots, not named defs
         if (std::string_view(mname).starts_with("operator")) return;
@@ -5810,7 +5914,7 @@ void collect_method_stub(const char* class_name) {
 
 template<typename T, std::size_t FuncIndex>
 void collect_static_method_stub(const char* class_name) {
-    if constexpr (mirror_bridge::core::static_method_params_all_bindable<T, FuncIndex>()) {
+    if constexpr (static_method_fully_bindable<T, FuncIndex>()) {
         using Ret = typename [:get_static_method_return_type<T, FuncIndex>():];
         constexpr std::size_t pc = get_method_param_count_static<T, FuncIndex>();
         [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
@@ -5834,7 +5938,8 @@ void collect_stub_info(const char* class_name) {
             ([&] {
                 using MemberType = typename [:std::meta::type_of(get_data_member<T, Is>()):];
                 stubgen::register_property_stub<T, MemberType>(
-                    class_name, get_data_member_name<T, Is>());
+                    class_name, get_data_member_name<T, Is>(),
+                    /*readonly=*/std::is_const_v<MemberType>);
             }(), ...);
         }(std::make_index_sequence<member_count>{});
     }
@@ -6083,6 +6188,29 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     collect_stub_info<T>(name);
 
     return {&type_object};
+}
+
+// Auto-discovery-friendly binder. The CLI points mirror_bridge at arbitrary
+// real-world headers, where some discovered classes legitimately can't be
+// bound (unconvertible member types, nothing reflectable). Hand-written
+// bindings keep bind_class's hard static_assert; CLI-generated bindings use
+// this variant, which binds what it can and reports what it skipped instead
+// of failing the entire module on the first awkward class.
+template<typename T, typename Trampoline = T>
+BoundClass<T> bind_class_when_bindable(PyObject* module, const char* name) {
+    if constexpr (!Bindable<std::remove_cvref_t<T>>) {
+        std::fprintf(stderr,
+            "mirror_bridge: skipped '%s' (not bindable: no reflectable "
+            "members/methods)\n", name);
+        return {nullptr};
+    } else if constexpr (!core::validate_bindable_members<T>()) {
+        std::fprintf(stderr,
+            "mirror_bridge: skipped '%s' (a member type has no converter; "
+            "mark it [[=exclude{}]] or add a custom converter)\n", name);
+        return {nullptr};
+    } else {
+        return bind_class<T, Trampoline>(module, name);
+    }
 }
 
 // ============================================================================

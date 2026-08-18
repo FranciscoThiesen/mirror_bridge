@@ -154,6 +154,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # const data members bind as read-only attributes
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/const_members)
+        mirror_bridge_python_module(const_members
+            const_members/const_members_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/const_members
+        )
+    endif()
+
 endif()
 
 # ============================================================================
