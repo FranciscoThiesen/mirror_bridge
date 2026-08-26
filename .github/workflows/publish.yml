@@ -1,0 +1,46 @@
+# Publish the mirror-bridge wheel to PyPI via Trusted Publishing (OIDC).
+# No API token is stored anywhere: PyPI is configured to trust this exact
+# workflow (repo FranciscoThiesen/mirror_bridge, file publish.yml,
+# environment "pypi"). Runs on version tags and on demand.
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          bash packaging/pip/build_wheel.sh
+      - name: Smoke-test the wheel
+        run: |
+          python -m pip install packaging/pip/dist/*.whl
+          mirror_bridge --help | head -3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: packaging/pip/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # the OIDC token PyPI verifies
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
