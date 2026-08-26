@@ -84,24 +84,31 @@ echo "// PYTHON - Python C API Bindings" >> "$OUTPUT_DIR/mirror_bridge_python.hp
 echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 
-# The Python backend pulls in two satellite headers that must be inlined
+# The Python backend pulls in three satellite headers that must be inlined
 # AT THEIR INCLUDE SITE (position matters: the eigen include sits at a
 # point where namespace mirror_bridge is deliberately closed so the Eigen
 # overloads land in the right scope). Leaving the raw #include lines in
 # place shipped a single header that could not compile standalone.
 TMP_ANNOTATIONS=$(mktemp)
+TMP_STUBGEN=$(mktemp)
 TMP_EIGEN=$(mktemp)
-trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_EIGEN"' EXIT
+trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN"' EXIT
 extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_stubgen.hpp" > "$TMP_STUBGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
 
 # Extract Python content: skip the core include, splice satellites inline
-awk -v annotations="$TMP_ANNOTATIONS" -v eigen="$TMP_EIGEN" '
+awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" -v eigen="$TMP_EIGEN" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
     /^#include "python\/mirror_bridge_annotations\.hpp"/ {
         while ((getline line < annotations) > 0) print line
         close(annotations)
+        next
+    }
+    /^#include "python\/mirror_bridge_stubgen\.hpp"/ {
+        while ((getline line < stubgen) > 0) print line
+        close(stubgen)
         next
     }
     /^#include "mirror_bridge_eigen\.hpp"/ {
@@ -219,6 +226,19 @@ awk '
 ' "$SCRIPT_DIR/javascript/mirror_bridge_javascript.hpp" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
 
 echo -e "${GREEN}✓ Created: $OUTPUT_DIR/mirror_bridge_javascript.hpp${NC}"
+
+# ============================================================================
+# Self-check: a "single" header must not reference any other local header.
+# This is exactly the regression that shipped in 0.3.0 (issue #12), when a
+# new satellite header was added without a splice rule above.
+# ============================================================================
+for file in "$OUTPUT_DIR"/*.hpp; do
+    if grep -nE '^[[:space:]]*#include[[:space:]]*"' "$file"; then
+        echo -e "${YELLOW}ERROR: $(basename "$file") still includes a local header (see above)."
+        echo -e "Add a splice rule for it in amalgamate.sh.${NC}"
+        exit 1
+    fi
+done
 
 # ============================================================================
 # Summary

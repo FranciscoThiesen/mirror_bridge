@@ -138,6 +138,15 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # The single header must also compile with no repo include path at all
+    # (issue #12). Runs the compiler directly against a copy in a temp dir.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/single_header_test)
+        add_test(NAME single_header_standalone
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/single_header_test/check_standalone.sh
+                    ${CMAKE_CXX_COMPILER} ${Python3_INCLUDE_DIRS}
+        )
+    endif()
+
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref

@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--link-args` on `generate` for libraries that aren't header-only (`--link-args "/path/libFoo.a"`)
 
 ### Fixed
+- Single-header `mirror_bridge_python.hpp` could not compile standalone: it still `#include`d `python/mirror_bridge_stubgen.hpp`, which the amalgamation never inlined. The stubgen header is now spliced in, `amalgamate.sh` fails if any local include survives, and a new `single_header_standalone` ctest compiles the header with no repo include path (#12).
 - `const char*` constructor/method parameters were dereferenced as if they were pointer-holder storage, producing garbage or failing to compile — pointer-typed *values* are now distinguished from pointer-holder storage
 - Virtual-override dispatch (`dispatch_python`/`has_python_override`) now acquires the GIL itself, making overridden virtuals safe to call from pure C++ threads that never held the GIL (previously undefined behavior)
 - Constructor calls with arguments no constructor accepts now raise `TypeError` instead of silently returning a default-constructed object
