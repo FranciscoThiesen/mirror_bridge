@@ -23,6 +23,9 @@ def data_handler(value):
 
 emitter.on_data(data_handler)
 assert emitter.has_data_callback(), "Callback should be set"
+# A C++ bool must arrive as a real bool, not as 1/0.
+assert emitter.has_data_callback() is True, "bool return should be True, not 1"
+assert callbacks.EventEmitter().has_data_callback() is False, "bool return should be False, not 0"
 
 emitter.emit_data(42)
 emitter.emit_data(100)

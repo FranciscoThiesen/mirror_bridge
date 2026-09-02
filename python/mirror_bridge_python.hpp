@@ -291,7 +291,11 @@ inline void set_py_error_from_cpp_exception(const std::exception& e) {
 // Convert C++ types to Python objects
 template<Arithmetic T>
 PyObject* to_python(const T& value) {
-    if constexpr (std::is_floating_point_v<T>) {
+    // bool is arithmetic and unsigned; without this branch a C++ bool return
+    // or field reaches Python as 1/0 instead of True/False.
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        return PyBool_FromLong(value);
+    } else if constexpr (std::is_floating_point_v<T>) {
         return PyFloat_FromDouble(static_cast<double>(value));
     } else if constexpr (std::is_signed_v<T>) {
         return PyLong_FromLong(static_cast<long>(value));
