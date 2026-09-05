@@ -145,6 +145,7 @@ python3 test_greeter.py
 
 - **Precompiled headers**: 3-6x faster builds
 - **Auto-discovery**: Zero binding code required
+- **Templates without hints** (Python): `generate` binds every specialization the headers name (`using Vec3f = Vector3<float>;` is the declaration), instantiates function templates over the types the headers use, and lets the compiler reject what does not exist. Python sees families: `geom.Vector3[float]`, `geom.Vector3(1.0, 2.0, 3.0)`, `geom.clamp(1.5, 0.0, 1.0)`, `v.cast[int]()`. The plan is written next to the module — [details](docs/reference/cli.md#templates-and-free-functions-python)
 - **Type stubs**: `.pyi` generation for Python IDE support
 
 ## Documentation

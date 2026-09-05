@@ -37,6 +37,9 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `-f, --force` | Force rebuild even if sources haven't changed |
 | `-I DIR` | Add include directory |
 | `--json` | Emit one JSON result object on stdout (see [Machine-readable output](#machine-readable-output)) |
+| `--instantiate SPEC` | Python: also bind this template specialization, e.g. `"geom::Vector3<short>"` or `"geom::clamp<float>"` (repeatable) |
+| `--template-cap N` | Python: max argument combinations tried per function template before falling back to Python scalars (default 64) |
+| `--no-templates` | Python: skip template and free-function planning, bind classes only |
 
 **Examples:**
 
@@ -348,6 +351,48 @@ Skip entire files:
 // At the top of a header file
 ```
 
+### Templates and Free Functions (Python)
+
+A template is not a type until it is instantiated, and headers rarely say
+which instantiations a binding should contain. For Python modules, `generate`
+works it out from the headers themselves and lets the compiler settle what it
+cannot:
+
+- **Aliases are declarations.** `using Vec3f = Vector3<float>;` binds
+  `Vector3<float>` as `Vec3f`. Specializations that only appear in signatures
+  or members (`Vector3<long> ticks;`) are bound under a synthesized name
+  (`Vector3_long`, `Matrix_float_3`).
+- **Function and member templates** are instantiated over the *universe* —
+  Python's scalars (`bool`, `long`, `double`, `std::string`) plus every type
+  the headers *accept*: template arguments, parameter and member types
+  (a `size_t` that only appears as a return type does not count) — and each
+  candidate is compiled in a probe; the ones that fail (unsatisfied
+  constraints, no `operator+` for that type, ...) are dropped with the
+  compiler's reason. A class template nobody mentions gets the scalar
+  baseline.
+- **Free functions** are bound when every parameter and the return type
+  convert. Overload sets are skipped for now.
+
+In Python every template is a *family* that behaves like a generic type:
+
+```python
+geom.Vec3f(1.0, 2.0, 3.0)          # the alias
+geom.Vector3[float]                # == geom.Vec3d (Python float is a double)
+geom.Vector3["int"]                # a C++ spelling names the exact instantiation
+geom.Vector3[np.float32]           # numpy dtypes work as keys
+geom.Vector3(1.0, 2.0, 3.0)        # CTAD-like: the best constructor across instantiations
+geom.Vector3.instantiations        # ['float', 'double', 'int', 'long', 'bool']
+geom.clamp(1.5, 0.0, 1.0)          # dispatches on the arguments
+geom.twice[np.int16](7)            # or pick the instantiation explicitly
+v.cast[int]()                      # member templates too
+```
+
+The full plan — what was bound, what the compiler rejected and why, what
+compiles but cannot be bound (a `T*` parameter), and every note — is written
+to `<output>/<module>_plan.txt`. To bind an instantiation the headers never
+mention, pass `--instantiate "geom::Vector3<short>"`; to keep the old
+classes-only behaviour, pass `--no-templates`.
+
 ## Change Detection
 
 By default, `generate` tracks source file changes and only recompiles when header files have been modified since the last build. Use `--force` to bypass this check.
@@ -368,9 +413,22 @@ scraping log text.
   "languages": ["python"],
   "classes": [{"name": "Greeter", "header": "greeter.hpp"}],
   "outputs": ["/path/to/build/my_module.so"],
+  "templates": {
+    "functions": ["dot3", "answer"],
+    "instantiations": [{"kind": "class", "template": "geom::Vector3", "args": "float",
+                        "cpp": "geom::Vector3<float>", "python": "Vec3f", "origin": "alias Vec3f"}],
+    "rejected": [{"cpp": "geom::twice<geom::Robot>", "reason": "invalid operands to binary expression ..."}],
+    "unbindable": [{"cpp": "geom::deref<long>", "reason": "parameter 'long*' is a raw pointer (only const char* converts)"}],
+    "skipped_functions": [],
+    "notes": [],
+    "rounds": 4,
+    "report": "/path/to/build/my_module_plan.txt"
+  },
   "errors": []
 }
 ```
+
+`templates` is `null` for non-Python modules and with `--no-templates`.
 
 On failure, each entry in `errors` carries the first compiler error plus an
 actionable suggestion:
