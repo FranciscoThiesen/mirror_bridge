@@ -184,7 +184,10 @@ def write_inputs(work, headers, hints, approved, namespaces, cap, requested):
     if requested:
         lines += ["#define MIRROR_BRIDGE_PLAN_HAS_REQUESTED 1", "namespace mirror_bridge::plan::requested {"]
         lines += [f"using namespace {ns};" for ns in namespaces if ns != "::"]
-        lines += [f"inline constexpr std::meta::info r{i} = {expr};" for i, expr in enumerate(requested)]
+        # Not `inline`: the planner reads these with extract<info>, which the
+        # GCC 16 prerelease refuses on inline variables ("odr-used inline
+        # variable is not defined"); a plain namespace-scope constexpr is fine.
+        lines += [f"constexpr std::meta::info r{i} = {expr};" for i, expr in enumerate(requested)]
         lines += ["}"]
     lines += ["#define MIRROR_BRIDGE_PLAN_NAMESPACES " + ", ".join("^^" + ns for ns in namespaces), ""]
     (work / "plan_inputs.hpp").write_text("\n".join(lines))

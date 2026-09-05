@@ -260,15 +260,22 @@ consteval std::meta::info find_member_template() {
     throw "no such member template";
 }
 
+// Alias-template form of "type of the I-th parameter of Fn": pack expansions
+// must use this instead of splicing inline (GCC rejects packs that appear
+// only inside a splice; see the note in core/mirror_bridge_core.hpp).
+template <std::meta::info Fn, std::size_t I>
+consteval std::meta::info param_type_of() { return std::meta::type_of(std::meta::parameters_of(Fn)[I]); }
+template <std::meta::info Fn, std::size_t I>
+using param_t = typename[:param_type_of<Fn, I>():];
+
 template <typename T, std::meta::info Inst, std::size_t... Is>
 PyObject* call_member_impl(T& obj, PyObject* args, std::index_sequence<Is...>) {
-    constexpr auto params = define_static_array(std::meta::parameters_of(Inst));
     if (PyTuple_Size(args) != static_cast<Py_ssize_t>(sizeof...(Is))) {
         PyErr_Format(PyExc_TypeError, "%s takes %zu argument(s) but %zd were given",
                      c_function<Inst>(), sizeof...(Is), PyTuple_Size(args));
         return nullptr;
     }
-    std::tuple<std::remove_cvref_t<typename[:std::meta::type_of(params[Is]):]>...> cpp_args;
+    std::tuple<std::remove_cvref_t<param_t<Inst, Is>>...> cpp_args;
     bool ok = true;
     ([&] {
         if (!ok) return;
@@ -298,8 +305,7 @@ PyObject* call_member(PyObject* self, PyObject* args) {
 
 template <std::meta::info Inst, std::size_t... Is>
 int score_member_impl(PyObject* args, std::index_sequence<Is...>) {
-    constexpr auto params = define_static_array(std::meta::parameters_of(Inst));
-    return score_args<typename[:std::meta::type_of(params[Is]):]...>(args);
+    return score_args<param_t<Inst, Is>...>(args);
 }
 
 template <std::meta::info Inst>
@@ -520,8 +526,7 @@ inline Family* family_for(PyObject* dict_owner, bool is_type, const char* name, 
 // with a message beats failing the whole module.
 template <std::meta::info Fn, std::size_t... Is>
 consteval bool signature_bindable_impl(std::index_sequence<Is...>) {
-    constexpr auto params = define_static_array(std::meta::parameters_of(Fn));
-    return (free_param_bindable<typename[:std::meta::type_of(params[Is]):]>() && ...)
+    return (free_param_bindable<param_t<Fn, Is>>() && ...)
         && return_type_convertible<typename[:std::meta::return_type_of(Fn):]>();
 }
 
