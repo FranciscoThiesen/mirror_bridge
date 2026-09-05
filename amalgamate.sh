@@ -84,23 +84,34 @@ echo "// PYTHON - Python C API Bindings" >> "$OUTPUT_DIR/mirror_bridge_python.hp
 echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 
-# The Python backend pulls in three satellite headers that must be inlined
-# AT THEIR INCLUDE SITE (position matters: the eigen include sits at a
-# point where namespace mirror_bridge is deliberately closed so the Eigen
-# overloads land in the right scope). Leaving the raw #include lines in
-# place shipped a single header that could not compile standalone.
+# The Python backend pulls in satellite headers that must be inlined AT
+# THEIR INCLUDE SITE (position matters: the eigen include sits at a point
+# where namespace mirror_bridge is deliberately closed so the Eigen
+# overloads land in the right scope, and the templates header comes last
+# because it builds on everything before it). Leaving the raw #include
+# lines in place shipped a single header that could not compile standalone.
+TMP_SPELLING=$(mktemp)
 TMP_ANNOTATIONS=$(mktemp)
 TMP_STUBGEN=$(mktemp)
 TMP_EIGEN=$(mktemp)
-trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN"' EXIT
+TMP_TEMPLATES=$(mktemp)
+trap 'rm -f "$TMP_SPELLING" "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES"' EXIT
+extract_content "$SCRIPT_DIR/core/mirror_bridge_spelling.hpp" > "$TMP_SPELLING"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_stubgen.hpp" > "$TMP_STUBGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_templates.hpp" > "$TMP_TEMPLATES"
 
 # Extract Python content: skip the core include, splice satellites inline
-awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" -v eigen="$TMP_EIGEN" '
+awk -v spelling="$TMP_SPELLING" -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
+    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
+    /^#include "core\/mirror_bridge_spelling\.hpp"/ {
+        while ((getline line < spelling) > 0) print line
+        close(spelling)
+        next
+    }
     /^#include "python\/mirror_bridge_annotations\.hpp"/ {
         while ((getline line < annotations) > 0) print line
         close(annotations)
@@ -114,6 +125,11 @@ awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" -v eigen="$TMP_E
     /^#include "mirror_bridge_eigen\.hpp"/ {
         while ((getline line < eigen) > 0) print line
         close(eigen)
+        next
+    }
+    /^#include "python\/mirror_bridge_templates\.hpp"/ {
+        while ((getline line < templates) > 0) print line
+        close(templates)
         next
     }
     { print }

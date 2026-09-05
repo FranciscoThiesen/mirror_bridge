@@ -71,6 +71,9 @@
 
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
+// Compiler-independent spelling of types and template arguments (shared with
+// the CLI's template planner and used by the template family runtime)
+#include "core/mirror_bridge_spelling.hpp"
 
 // Include P3394 annotations support for field-level binding control
 // Requires -freflection-latest with Bloomberg's clang-p2996
@@ -1005,13 +1008,18 @@ bool from_python(PyObject* obj, T (&arr)[N]) {
     for (std::size_t i = 0; i < N; ++i) {
         PyObject* item = PySequence_GetItem(obj, i);
         if (!item) return false;
-        T val;
-        if (!from_python(item, val)) {
-            Py_DECREF(item);
-            return false;
+        bool ok;
+        if constexpr (std::is_array_v<T>) {
+            // Nested array (float m[3][3]): rows can't be copied by assignment,
+            // so convert straight into the row in place.
+            ok = from_python(item, arr[i]);
+        } else {
+            T val;
+            ok = from_python(item, val);
+            if (ok) arr[i] = val;
         }
-        arr[i] = val;
         Py_DECREF(item);
+        if (!ok) return false;
     }
     return true;
 }
@@ -5127,6 +5135,27 @@ PyObject* call_free_function(PyObject* /*self*/, PyObject* args) {
     return call_free_function_impl<FuncPtr>(args, std::make_index_sequence<Traits::arity>{});
 }
 
+template<auto FuncPtr, std::size_t ParamIndex>
+consteval std::string_view free_param_name() {
+    constexpr auto fn = std::meta::reflect_function(*FuncPtr);
+    auto p = std::meta::parameters_of(fn)[ParamIndex];
+    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
+    return {};
+}
+
+// Free functions reach the .pyi through the same registry as methods, with
+// their real parameter names (reflect_function recovers the declaration
+// behind the pointer, template specializations included).
+template<auto FuncPtr>
+void register_function_stub(const char* name) {
+    using Traits = FunctionTraits<decltype(FuncPtr)>;
+    [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
+        std::vector<std::string> names = {std::string(free_param_name<FuncPtr, Ps>())...};
+        stubgen::register_function_stub<typename Traits::ReturnType,
+                                        std::tuple_element_t<Ps, typename Traits::ArgsTuple>...>(name, names);
+    }(std::make_index_sequence<Traits::arity>{});
+}
+
 // Bind a free function to a Python module
 // FuncPtr is a non-type template parameter (the actual function pointer)
 template<auto FuncPtr>
@@ -5150,10 +5179,62 @@ bool bind_function(PyObject* module, const char* name) {
         return false;
     }
 
+    register_function_stub<FuncPtr>(name);
     return true;
 }
 
+// Can call_free_function_impl handle every parameter? Each argument lands in
+// value storage (CleanArgType value; from_python(py_arg, value)), so the type
+// must be value-bindable and have a from_python overload; the only pointers
+// with one are the C strings.
+template<typename Arg>
+consteval bool free_param_bindable() {
+    using Clean = std::remove_cvref_t<Arg>;
+    if constexpr (std::is_pointer_v<Clean>) {
+        return StringLike<Clean>;
+    } else if constexpr (!mirror_bridge::core::is_value_bindable<Clean>()) {
+        return false;
+    } else {
+        return return_type_convertible<Clean>();
+    }
+}
+
+template<typename Tuple>
+struct FreeParamsBindable;
+
+template<typename... Args>
+struct FreeParamsBindable<std::tuple<Args...>> {
+    static constexpr bool value = (free_param_bindable<Args>() && ...);
+};
+
+template<auto FuncPtr>
+consteval bool free_function_bindable() {
+    using Traits = FunctionTraits<decltype(FuncPtr)>;
+    return FreeParamsBindable<typename Traits::ArgsTuple>::value &&
+           return_type_convertible<typename Traits::ReturnType>();
+}
+
+// The free-function counterpart of bind_class_when_bindable: CLI-generated
+// bindings use it so one function with an unconvertible parameter (a raw
+// pointer, an iterator, a type with no converter) is reported and skipped
+// instead of failing the whole module.
+template<auto FuncPtr>
+bool bind_function_when_bindable(PyObject* module, const char* name) {
+    if constexpr (free_function_bindable<FuncPtr>()) {
+        return bind_function<FuncPtr>(module, name);
+    } else {
+        std::fprintf(stderr,
+            "mirror_bridge: skipped function '%s' (a parameter or the return "
+            "type has no converter)\n", name);
+        return false;
+    }
+}
+
 } // namespace mirror_bridge
+
+// Template families (mirror_bridge::templates::bind_instance & co.) build on
+// everything above, so they live in their own header included last.
+#include "python/mirror_bridge_templates.hpp"
 
 // ============================================================================
 // Convenience Macros

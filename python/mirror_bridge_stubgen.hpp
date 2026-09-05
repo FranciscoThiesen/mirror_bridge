@@ -85,7 +85,41 @@ public:
         functions_.push_back(info);
     }
 
+    // A bound class is known to the stub by its Python name; type_hint<T>()
+    // refers to classes through a typeid placeholder (see type_hint) that
+    // generate() resolves against this table, so the hint is right no matter
+    // whether the class was bound before or after the method mentioning it.
+    void register_type_name(const char* typeid_name, const std::string& py_name) {
+        type_names_[typeid_name] = py_name;
+    }
+
+    static std::string type_placeholder(const char* typeid_name) {
+        return std::string("\x01") + typeid_name + "\x02";
+    }
+
     std::string generate(const std::string& module_name) const {
+        return resolve_placeholders(generate_raw(module_name));
+    }
+
+    bool write_to_file(const std::string& module_name, const std::string& filename) const {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            return false;
+        }
+        file << generate(module_name);
+        return file.good();
+    }
+
+    void clear() {
+        classes_.clear();
+        functions_.clear();
+        type_names_.clear();
+    }
+
+private:
+    StubRegistry() = default;
+
+    std::string generate_raw(const std::string& module_name) const {
         std::ostringstream ss;
 
         // Module docstring
@@ -115,22 +149,30 @@ public:
         return ss.str();
     }
 
-    bool write_to_file(const std::string& module_name, const std::string& filename) const {
-        std::ofstream file(filename);
-        if (!file.is_open()) {
-            return false;
+    // Replace every "\x01<typeid name>\x02" with the Python name of that class.
+    // Unbound classes keep the old heuristic: their own simple name when it
+    // looks like a class, Any otherwise; a template specialization that was
+    // never bound has no Python name at all.
+    std::string resolve_placeholders(std::string text) const {
+        std::string::size_type start = 0;
+        while ((start = text.find('\x01', start)) != std::string::npos) {
+            auto end = text.find('\x02', start);
+            if (end == std::string::npos) break;
+            std::string typeid_name = text.substr(start + 1, end - start - 1);
+            std::string replacement;
+            auto it = type_names_.find(typeid_name);
+            if (it != type_names_.end()) {
+                replacement = it->second;
+            } else {
+                replacement = fallback_class_name(typeid_name);
+            }
+            text.replace(start, end - start + 1, replacement);
+            start += replacement.size();
         }
-        file << generate(module_name);
-        return file.good();
+        return text;
     }
 
-    void clear() {
-        classes_.clear();
-        functions_.clear();
-    }
-
-private:
-    StubRegistry() = default;
+    static std::string fallback_class_name(const std::string& typeid_name);
 
     std::string generate_class_stub(const ClassInfo& info) const {
         std::ostringstream ss;
@@ -203,6 +245,7 @@ private:
 
     std::map<std::string, ClassInfo> classes_;
     std::vector<MethodInfo> functions_;
+    std::map<std::string, std::string> type_names_;
 };
 
 // ============================================================================
@@ -298,21 +341,22 @@ std::string type_hint() {
         }
     }
 
-    // Default: extract class name
-    std::string name = demangle(typeid(CleanT).name());
-    // Remove namespace prefix
+    // Default: a class. Its Python name is whatever bind_class registered it
+    // as (Vec3f for Vector3<float>), which may not be known yet, so leave a
+    // placeholder for generate() to resolve.
+    return StubRegistry::type_placeholder(typeid(CleanT).name());
+}
+
+inline std::string StubRegistry::fallback_class_name(const std::string& typeid_name) {
+    std::string name = demangle(typeid_name.c_str());
+    if (name.find('<') != std::string::npos) {
+        return "Any";
+    }
     auto pos = name.rfind("::");
     if (pos != std::string::npos) {
         name = name.substr(pos + 2);
     }
-    // Remove template parameters
-    pos = name.find('<');
-    if (pos != std::string::npos) {
-        name = name.substr(0, pos);
-    }
-
-    // If it looks like a bound class, return the name; otherwise Any
-    if (!name.empty() && std::isupper(name[0])) {
+    if (!name.empty() && std::isupper(static_cast<unsigned char>(name[0]))) {
         return name;
     }
     return "Any";
@@ -327,6 +371,25 @@ template<typename T>
 void register_class_stub(const char* name) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(name);
     info.name = name;
+    StubRegistry::instance().register_type_name(typeid(std::remove_cvref_t<T>).name(), name);
+}
+
+// Register a module-level function
+template<typename ReturnT, typename... Args>
+void register_function_stub(const char* name, const std::vector<std::string>& param_names = {}) {
+    MethodInfo func;
+    func.name = name;
+    func.return_type = type_hint<ReturnT>();
+
+    std::vector<std::string> type_hints = {type_hint<Args>()...};
+    for (size_t i = 0; i < type_hints.size(); ++i) {
+        std::string pname = (i < param_names.size() && !param_names[i].empty())
+                                ? param_names[i]
+                                : "arg" + std::to_string(i);
+        func.parameters.push_back({pname, type_hints[i]});
+    }
+
+    StubRegistry::instance().add_function(func);
 }
 
 // Register a property
