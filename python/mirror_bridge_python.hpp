@@ -5185,13 +5185,14 @@ bool bind_function(PyObject* module, const char* name) {
 
 // Can call_free_function_impl handle every parameter? Each argument lands in
 // value storage (CleanArgType value; from_python(py_arg, value)), so the type
-// must be value-bindable and have a from_python overload; the only pointers
-// with one are the C strings.
+// must be value-bindable and have a from_python overload; the only pointer
+// with one is `const char*` (PyUnicode_AsUTF8 hands out const storage, so a
+// mutable `char*` parameter has nothing safe to receive).
 template<typename Arg>
 consteval bool free_param_bindable() {
     using Clean = std::remove_cvref_t<Arg>;
     if constexpr (std::is_pointer_v<Clean>) {
-        return StringLike<Clean>;
+        return std::is_same_v<Clean, const char*>;
     } else if constexpr (!mirror_bridge::core::is_value_bindable<Clean>()) {
         return false;
     } else {

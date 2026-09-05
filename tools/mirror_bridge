@@ -42,6 +42,9 @@ PCH_PATH=""
 LANG="python"
 RELEASE_GIL=0
 GEN_STUBS=0
+NO_TEMPLATES=0
+TEMPLATE_CAP=64
+INSTANTIATE=()
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -177,11 +180,25 @@ ${YELLOW}Options:${NC}
                       names (no runtime parsing; stubs can't drift)
   --link-args ARGS    Extra link inputs for non-header-only libraries
                       (e.g. --link-args "/path/to/libFoo.a -lz")
+  --instantiate SPEC  Python: also bind this template specialization, e.g.
+                      --instantiate "geom::Vector3<short>" or
+                      --instantiate "geom::clamp<float>" (repeatable)
+  --template-cap N    Python: max argument combinations tried per function
+                      template before falling back to Python scalars (64)
+  --no-templates      Python: skip template/free-function planning and bind
+                      classes only
   -h, --help          Show this help
 
 ${YELLOW}Auto-Discovery:${NC}
   Scans all .hpp/.h files in src_dir and automatically binds all
   struct/class definitions found.
+
+  Python modules also get free functions and template instantiations:
+  every specialization the headers name (aliases, signatures, members)
+  is bound under its alias or a synthesized name (Vector3<long> ->
+  Vector3_long); function templates are instantiated over the types the
+  headers use and the compiler decides which instantiations exist.
+  The full plan is written to <output>/<module>_plan.txt.
 
   Opt-out: Add comment "MIRROR_BRIDGE_SKIP" before class to skip it.
 
@@ -228,6 +245,50 @@ ${YELLOW}Performance:${NC}
   Without PCH: ~500-1700ms compilation
   With PCH:    ~200-250ms compilation (3-6x faster!)
 EOF
+}
+
+# Include spelling for a header: relative to src_dir, or — when the user
+# passed -I directories — relative to the broadest include root containing
+# it, so the #include matches what the library's own headers use
+# ("open3d/geometry/Foo.h" rather than "Foo.h").
+header_include_spelling() {
+    local header_file="$1"
+    local src_dir="$2"
+    local rel_path
+    rel_path=$(realpath --relative-to="$src_dir" "$header_file")
+    local abs_header
+    abs_header=$(realpath "$header_file" 2>/dev/null || echo "$header_file")
+    local best=""
+    local inc
+    for inc in "${_INCLUDE_DIRS[@]:-}"; do
+        [ -z "$inc" ] && continue
+        local abs_inc
+        abs_inc=$(realpath "$inc" 2>/dev/null || echo "$inc")
+        if [[ "$abs_header" == "$abs_inc"/* ]]; then
+            local candidate="${abs_header#$abs_inc/}"
+            # Prefer the path with more directory components (broader root)
+            if [ -z "$best" ] || [ "${#candidate}" -gt "${#best}" ]; then
+                best="$candidate"
+            fi
+        fi
+    done
+    echo "${best:-$rel_path}"
+}
+
+# Eigen ships as headers only; find the usual install location so users
+# don't have to pass -I for it.
+detect_eigen_dir() {
+    local src_dir="$1"
+    if grep -rq "Eigen/" "$src_dir" 2>/dev/null; then
+        local eigen_path
+        for eigen_path in /usr/include/eigen3 /usr/local/include/eigen3 /opt/homebrew/include/eigen3; do
+            if [ -d "$eigen_path" ]; then
+                echo "$eigen_path"
+                return 0
+            fi
+        done
+    fi
+    return 0
 }
 
 # Discover classes in source directory.
@@ -381,29 +442,7 @@ PYSCRIPT
 
     while IFS= read -r header_file; do
         local rel_path
-        rel_path=$(realpath --relative-to="$src_dir" "$header_file")
-
-        # If user passed -I directories, prefer a path relative to the
-        # broadest include root (so #include matches what internal headers
-        # use, e.g. "open3d/geometry/Foo.h" rather than just "Foo.h").
-        local abs_header
-        abs_header=$(realpath "$header_file" 2>/dev/null || echo "$header_file")
-        for inc in "${_INCLUDE_DIRS[@]:-}"; do
-            [ -z "$inc" ] && continue
-            local abs_inc
-            abs_inc=$(realpath "$inc" 2>/dev/null || echo "$inc")
-            if [[ "$abs_header" == "$abs_inc"/* ]]; then
-                local candidate="${abs_header#$abs_inc/}"
-                # Prefer the path with more directory components (broader root)
-                if [ -z "$rel_path_from_inc" ] || [ "${#candidate}" -gt "${#rel_path_from_inc}" ]; then
-                    rel_path_from_inc="$candidate"
-                fi
-            fi
-        done
-        if [ -n "${rel_path_from_inc:-}" ]; then
-            rel_path="$rel_path_from_inc"
-            unset rel_path_from_inc
-        fi
+        rel_path=$(header_include_spelling "$header_file" "$src_dir")
 
         # Skip files marked with MIRROR_BRIDGE_SKIP_FILE
         if grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null; then
@@ -481,6 +520,16 @@ EOF
             included["$header"]=1
         fi
     done
+    # Headers without classes that the template planner found functions or
+    # templates in
+    if [ -n "$TEMPLATE_INCLUDES_FILE" ] && [ -s "$TEMPLATE_INCLUDES_FILE" ]; then
+        while IFS= read -r header; do
+            if [ -n "$header" ] && [ -z "${included["$header"]}" ]; then
+                echo "#include \"$header\"" >> "$output_file"
+                included["$header"]=1
+            fi
+        done < "$TEMPLATE_INCLUDES_FILE"
+    fi
 
     echo "" >> "$output_file"
 
@@ -580,7 +629,83 @@ PYSCRIPT
         fi
     done
 
+    # Free functions and template instantiations the planner approved
+    # (Python only; see plan_templates)
+    if [ "$lang" = "python" ] && [ -n "$TEMPLATE_LINES_FILE" ] && [ -s "$TEMPLATE_LINES_FILE" ]; then
+        cat "$TEMPLATE_LINES_FILE" >> "$output_file"
+    fi
+
     echo ")" >> "$output_file"
+}
+
+# Template instantiation planning (Python backend). Nothing in a header says
+# which instantiations of its templates to bind, so tools/mirror_bridge_templates.py
+# derives candidates from the API surface through reflection and lets the
+# compiler decide which ones exist (discover/probe rounds). It also binds
+# non-overloaded free functions. On success the binding lines wait in
+# TEMPLATE_LINES_FILE (plus TEMPLATE_INCLUDES_FILE for headers the class scan
+# had no reason to include); on failure the module degrades to classes only.
+TEMPLATE_LINES_FILE=""
+TEMPLATE_INCLUDES_FILE=""
+TEMPLATE_JSON_FILE=""
+plan_templates() {
+    local module_name="$1"
+    local src_dir="$2"
+    local -n classes_ref=$3
+    local -n headers_ref=$4
+    shift 4
+    local extra_includes=("$@")
+
+    TEMPLATE_LINES_FILE=""
+    TEMPLATE_INCLUDES_FILE=""
+    TEMPLATE_JSON_FILE=""
+    local work="$OUTPUT_DIR/.mirror_bridge/plan/$module_name"
+    mkdir -p "$work"
+
+    # Every header in src_dir, flagged when the class scan already includes it
+    declare -A already
+    local h
+    for h in "${headers_ref[@]}"; do already["$h"]=1; done
+    : > "$work/headers.txt"
+    local header_file
+    while IFS= read -r header_file; do
+        [ -z "$header_file" ] && continue
+        grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null && continue
+        local rel
+        rel=$(header_include_spelling "$header_file" "$src_dir")
+        printf '%s\t%s\n' "$rel" "${already["$rel"]:-0}" >> "$work/headers.txt"
+    done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
+    printf '%s\n' "${classes_ref[@]}" > "$work/classes.txt"
+
+    local -a args=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS" --project-root "$PROJECT_ROOT"
+                   --src-dir "$src_dir" --module "$module_name" --work "$work"
+                   --headers-file "$work/headers.txt" --classes-file "$work/classes.txt"
+                   --emit "$work/bindings.inc" --includes-out "$work/includes.txt"
+                   --report "$OUTPUT_DIR/${module_name}_plan.txt" --json-out "$work/plan.json"
+                   --template-cap "$TEMPLATE_CAP")
+    local inc
+    for inc in "${extra_includes[@]}"; do
+        [ -n "$inc" ] && args+=(-I "$inc")
+    done
+    local eigen_path
+    eigen_path=$(detect_eigen_dir "$src_dir")
+    [ -n "$eigen_path" ] && args+=(--eigen-dir "$eigen_path")
+    [ "$RELEASE_GIL" -eq 1 ] && args+=(--release-gil)
+    [ "$VERBOSE" -eq 1 ] && args+=(--verbose)
+    local spec
+    for spec in "${INSTANTIATE[@]}"; do
+        [ -n "$spec" ] && args+=(--instantiate "$spec")
+    done
+
+    echo -e "${YELLOW}Planning template instantiations...${NC}"
+    if python3 "$PROJECT_ROOT/tools/mirror_bridge_templates.py" "${args[@]}"; then
+        TEMPLATE_LINES_FILE="$work/bindings.inc"
+        TEMPLATE_INCLUDES_FILE="$work/includes.txt"
+        TEMPLATE_JSON_FILE="$work/plan.json"
+        return 0
+    fi
+    echo -e "${YELLOW}  Templates and free functions not bound (see $work/planner.log); binding classes only.${NC}"
+    return 1
 }
 
 # Compile binding for a specific language
@@ -637,15 +762,11 @@ compile_binding() {
         [ -n "$inc" ] && cmd="$cmd -I$inc"
     done
 
-    # Auto-detect Eigen and add include path
-    if grep -rq "Eigen/" "$src_dir" 2>/dev/null; then
-        for eigen_path in /usr/include/eigen3 /usr/local/include/eigen3 /opt/homebrew/include/eigen3; do
-            if [ -d "$eigen_path" ]; then
-                cmd="$cmd -I$eigen_path"
-                [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Auto-detected Eigen at $eigen_path${NC}"
-                break
-            fi
-        done
+    local eigen_path
+    eigen_path=$(detect_eigen_dir "$src_dir")
+    if [ -n "$eigen_path" ]; then
+        cmd="$cmd -I$eigen_path"
+        [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Auto-detected Eigen at $eigen_path${NC}"
     fi
 
     if [ -n "$pch_path" ] && [ -f "$pch_path" ]; then
@@ -730,6 +851,9 @@ cmd_generate() {
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
             --link-args) LINK_ARGS="$2"; shift 2 ;;
+            --instantiate) INSTANTIATE+=("$2"); shift 2 ;;
+            --template-cap) TEMPLATE_CAP="$2"; shift 2 ;;
+            --no-templates) NO_TEMPLATES=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
             --pch)
                 USE_PCH="1"
@@ -784,7 +908,24 @@ cmd_generate() {
     _INCLUDE_DIRS=("${include_dirs[@]}")
     discover_classes "$src_dir" CLASSES HEADERS
 
-    if [ ${#CLASSES[@]} -eq 0 ]; then
+    # Determine languages to generate
+    local languages=()
+    case "$LANG" in
+        all) languages=("python" "lua" "js") ;;
+        python|lua|js|javascript) languages=("$LANG") ;;
+        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, all" ;;
+    esac
+
+    # Python modules also get free functions and template instantiations,
+    # so a header with no plain classes can still produce a module.
+    local plans_templates=0
+    if [ $NO_TEMPLATES -eq 0 ]; then
+        for lang in "${languages[@]}"; do
+            [ "$lang" = "python" ] && plans_templates=1
+        done
+    fi
+
+    if [ ${#CLASSES[@]} -eq 0 ] && [ $plans_templates -eq 0 ]; then
         echo -e "${RED}Error: No classes found in $src_dir${NC}"
         json_fail "discover" "No classes found in $src_dir" \
             "Check that headers contain struct/class definitions and are not all marked MIRROR_BRIDGE_SKIP_FILE"
@@ -793,6 +934,16 @@ cmd_generate() {
     echo ""
     echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC}"
     echo ""
+
+    if [ $plans_templates -eq 1 ]; then
+        plan_templates "$module_name" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}" || true
+        if [ ${#CLASSES[@]} -eq 0 ] && { [ -z "$TEMPLATE_LINES_FILE" ] || [ ! -s "$TEMPLATE_LINES_FILE" ]; }; then
+            echo -e "${RED}Error: Nothing to bind in $src_dir${NC}"
+            json_fail "discover" "No classes, functions or template instantiations found in $src_dir" \
+                "Check that headers contain struct/class/function definitions and are not all marked MIRROR_BRIDGE_SKIP_FILE"
+        fi
+        echo ""
+    fi
 
     # Auto-detect PCH if requested
     if [ "$PCH_PATH" = "auto" ]; then
@@ -813,14 +964,6 @@ cmd_generate() {
             PCH_PATH=""
         fi
     fi
-
-    # Determine languages to generate
-    local languages=()
-    case "$LANG" in
-        all) languages=("python" "lua" "js") ;;
-        python|lua|js|javascript) languages=("$LANG") ;;
-        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, all" ;;
-    esac
 
     # Generate and compile for each language. A failed language no longer
     # aborts the whole run (previously set -e killed the script on the first
@@ -866,9 +1009,15 @@ cmd_generate() {
         done
         local status="ok"
         [ ${#failed_langs[@]} -gt 0 ] && status="error"
-        printf '{"status":"%s","module":"%s","languages":[%s],"classes":[%s],"outputs":[%s],"errors":[%s]}\n' \
+        # "templates": what the planner bound (functions, instantiations,
+        # rejections with the compiler's reason); null when it did not run
+        local templates_json="null"
+        if [ -n "$TEMPLATE_JSON_FILE" ] && [ -s "$TEMPLATE_JSON_FILE" ]; then
+            templates_json=$(cat "$TEMPLATE_JSON_FILE")
+        fi
+        printf '{"status":"%s","module":"%s","languages":[%s],"classes":[%s],"outputs":[%s],"errors":[%s],"templates":%s}\n' \
             "$status" "$(json_escape "$module_name")" "${langs_json%,}" \
-            "${classes_json%,}" "${outputs_json%,}" "${errors_json%,}" >&3
+            "${classes_json%,}" "${outputs_json%,}" "${errors_json%,}" "$templates_json" >&3
     fi
 
     echo ""

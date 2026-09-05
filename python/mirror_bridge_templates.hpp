@@ -125,7 +125,9 @@ inline const char* short_type_name(PyTypeObject* t) {
     return dot ? dot + 1 : t->tp_name;
 }
 
-// 2 = exact, 1 = same category (int vs int32), 0 = no match
+// 3 = the C++ spelling itself ("int" names Vector3<int> even though Python's
+// int is a long), 2 = same category and width (int is a long, np.float32 is a
+// float), 1 = same category (int vs int32), 0 = no match
 inline int match_key(PyObject* key, const ArgKey& k) {
     auto by_scalar = [&](const char* name) {
         Cat cat; unsigned size;
@@ -134,20 +136,20 @@ inline int match_key(PyObject* key, const ArgKey& k) {
         return (size == 0 || k.size == 0 || size == k.size) ? 2 : 1;
     };
     if (PyType_Check(key)) {
-        if (k.cat == Cat::Class && k.resolve && reinterpret_cast<PyTypeObject*>(key) == k.resolve()) return 2;
+        if (k.cat == Cat::Class && k.resolve && reinterpret_cast<PyTypeObject*>(key) == k.resolve()) return 3;
         return by_scalar(short_type_name(reinterpret_cast<PyTypeObject*>(key)));
     }
     if (PyUnicode_Check(key)) {
         const char* s = PyUnicode_AsUTF8(key);
         if (!s) { PyErr_Clear(); return 0; }
-        if (std::strcmp(s, k.spelling) == 0 || std::strcmp(s, k.pretty) == 0) return 2;
+        if (std::strcmp(s, k.spelling) == 0 || std::strcmp(s, k.pretty) == 0) return 3;
         return by_scalar(s);
     }
     if (PyLong_Check(key) && !PyBool_Check(key)) {
         if (k.cat != Cat::Value) return 0;
         long long v = PyLong_AsLongLong(key);
         if (v == -1 && PyErr_Occurred()) { PyErr_Clear(); return 0; }
-        return v == std::atoll(k.spelling) ? 2 : 0;
+        return v == std::atoll(k.spelling) ? 3 : 0;
     }
     // numpy dtype instances: np.dtype("float32").name == "float32"
     if (PyObject* name = PyObject_GetAttrString(key, "name")) {
@@ -357,7 +359,7 @@ inline Instance* pick_by_key(Family* f, PyObject* key) {
     int best_score = 0;
     for (auto& inst : *f->instances) {
         if (static_cast<Py_ssize_t>(inst.keys.size()) != n) continue;
-        int score = 2;
+        int score = 3;
         for (Py_ssize_t i = 0; i < n && score; ++i)
             score = std::min(score, match_key(PyTuple_GET_ITEM(tup, i), inst.keys[i]));
         if (score > best_score) { best_score = score; best = &inst; }
@@ -513,6 +515,21 @@ inline Family* family_for(PyObject* dict_owner, bool is_type, const char* name, 
 
 // -------------------------------------------------------------- binding API --
 
+// The planner's probe proves an instantiation compiles; whether Python can
+// call it is a separate question (a T* parameter has no converter). Skipping
+// with a message beats failing the whole module.
+template <std::meta::info Fn, std::size_t... Is>
+consteval bool signature_bindable_impl(std::index_sequence<Is...>) {
+    constexpr auto params = define_static_array(std::meta::parameters_of(Fn));
+    return (free_param_bindable<typename[:std::meta::type_of(params[Is]):]>() && ...)
+        && return_type_convertible<typename[:std::meta::return_type_of(Fn):]>();
+}
+
+template <std::meta::info Fn>
+consteval bool signature_bindable() {
+    return signature_bindable_impl<Fn>(std::make_index_sequence<std::meta::parameters_of(Fn).size()>{});
+}
+
 // One instantiation of T's member template N, added to the family that hangs
 // off T's Python type as a descriptor.
 template <typename T, Name N, typename... Args>
@@ -520,16 +537,21 @@ bool add_member_instance(PyTypeObject* type) {
     if (!type) return false;
     constexpr auto mt = find_member_template<T, N>();
     constexpr auto inst = std::meta::substitute(mt, {^^Args...});
-    static PyMethodDef def = { N.data, reinterpret_cast<PyCFunction>(call_member<T, inst>), METH_VARARGS, nullptr };
-    Family* f = family_for(reinterpret_cast<PyObject*>(type), true, N.data, c_qualified<mt>(), Kind::Member, type);
-    if (!f) return false;
-    // GCC 16 rejects `push_back(Instance{...})` here ("consteval-only
-    // expressions are only allowed in a constant-evaluated context") because
-    // the braced temporary spells a template-id with an info argument; the bare
-    // braced-init-list form is accepted by both compilers.
-    f->instances->push_back({keys_of<inst>(), c_function<inst>(), c_args<inst>(),
-                                     nullptr, &def, &score_member<inst>});
-    return true;
+    if constexpr (!signature_bindable<inst>()) {
+        std::fprintf(stderr, "mirror_bridge: skipped %s (a parameter or the return type has no converter)\n", c_function<inst>());
+        return false;
+    } else {
+        static PyMethodDef def = { N.data, reinterpret_cast<PyCFunction>(call_member<T, inst>), METH_VARARGS, nullptr };
+        Family* f = family_for(reinterpret_cast<PyObject*>(type), true, N.data, c_qualified<mt>(), Kind::Member, type);
+        if (!f) return false;
+        // GCC 16 rejects `push_back(Instance{...})` here ("consteval-only
+        // expressions are only allowed in a constant-evaluated context") because
+        // the braced temporary spells a template-id with an info argument; the bare
+        // braced-init-list form is accepted by both compilers.
+        f->instances->push_back({keys_of<inst>(), c_function<inst>(), c_args<inst>(),
+                                         nullptr, &def, &score_member<inst>});
+        return true;
+    }
 }
 
 template <typename T>
@@ -573,14 +595,19 @@ bool bind_instance(PyObject* m) {
     static_assert(std::meta::has_template_arguments(fn), "bind_instance<&f>: f must be a function template specialization");
     constexpr auto tmpl = std::meta::template_of(fn);
     constexpr const char* name = c_ident<tmpl>();
-    static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_VARARGS, nullptr };
-    PyObject* func = PyCFunction_New(&def, nullptr);
-    if (!func) return false;
-    Family* f = family_for(m, false, name, c_qualified<tmpl>(), Kind::Function, nullptr);
-    if (!f) { Py_DECREF(func); return false; }
-    f->instances->push_back({keys_of<fn>(), c_function<fn>(), c_args<fn>(),
-                                     func, &def, &score_function<FuncPtr>});
-    return true;
+    if constexpr (!free_function_bindable<FuncPtr>()) {
+        std::fprintf(stderr, "mirror_bridge: skipped %s (a parameter or the return type has no converter)\n", c_function<fn>());
+        return false;
+    } else {
+        static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_VARARGS, nullptr };
+        PyObject* func = PyCFunction_New(&def, nullptr);
+        if (!func) return false;
+        Family* f = family_for(m, false, name, c_qualified<tmpl>(), Kind::Function, nullptr);
+        if (!f) { Py_DECREF(func); return false; }
+        f->instances->push_back({keys_of<fn>(), c_function<fn>(), c_args<fn>(),
+                                         func, &def, &score_function<FuncPtr>});
+        return true;
+    }
 }
 
 // A member template of a class bound earlier with bind_class (plain classes:
