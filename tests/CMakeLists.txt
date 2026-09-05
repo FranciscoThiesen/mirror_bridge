@@ -270,8 +270,20 @@ endif()
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
 set(MB_PYTHON_BASH_ONLY_PATTERN
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features"
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation"
 )
+
+# Template instantiation planning is a CLI feature (discover/probe rounds
+# driven by tools/mirror_bridge_templates.py), so its test runs the CLI
+# end to end with this build's compiler.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/template_instantiation)
+    add_test(NAME cli_template_instantiation
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/template_instantiation/build_and_test.sh
+    )
+    set_tests_properties(cli_template_instantiation PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
 
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")

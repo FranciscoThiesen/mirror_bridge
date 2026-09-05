@@ -205,6 +205,8 @@ SKIP_TESTS=(
     # inheritance's module is produced by the CLI generator, not a checked-in
     # binding .cpp, so the generic build step never creates inherit_mod.so
     "inheritance/test_inheritance.py:Run via test_inheritance_cli.sh (module built by CLI generate)"
+    # template_instantiation's module comes from the CLI's template planner
+    "template_instantiation/test_template_instantiation.py:Run via test_template_instantiation_cli.sh (module built by CLI generate)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)
