@@ -274,8 +274,8 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-benchmark:${{ steps.meta.outputs.version }}
 
-  # Build the GCC reflection image (experimental GCC with P2996 support)
-  # This builds GCC from Marek Polacek's reflection branch
+  # Build the GCC image: stock GCC 16 (reflection shipped in 16.1) plus the
+  # test suite's dependencies. Nothing is compiled from source any more.
   build-gcc-reflection:
     strategy:
       fail-fast: false
@@ -283,9 +283,8 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-          # Note: ARM64 build disabled for now as GCC build is very slow
-          # - platform: linux/arm64
-          #   runner: ubuntu-24.04-arm
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -293,23 +292,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Free disk space
-        run: |
-          echo "Before cleanup:"
-          df -h
-          # Remove unnecessary large packages (need extra space for GCC build)
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/go
-          sudo rm -rf /opt/hostedtoolcache
-          sudo docker image prune -af
-          echo "After cleanup:"
-          df -h
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -358,7 +340,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Merge GCC reflection image manifests
+  # Merge GCC image manifests
   merge-gcc:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
