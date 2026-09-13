@@ -56,12 +56,23 @@
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
 
-#ifndef __cpp_reflection
-  #warning "Compiler does not define __cpp_reflection feature-test macro. " \
+// P2996 as adopted defines __cpp_impl_reflection (the library half is
+// __cpp_lib_reflection); earlier drafts and some experimental builds used
+// __cpp_reflection. clang-p2996 defines neither, so the warning is expected
+// there (docs/reference/errors.md).
+#ifndef MIRROR_BRIDGE_REFLECTION_CHECKED
+#define MIRROR_BRIDGE_REFLECTION_CHECKED 1
+#if defined(__cpp_impl_reflection)
+  // adopted P2996: nothing more to check
+#elif defined(__cpp_reflection)
+  #if __cpp_reflection < 202306L
+    #error "This library requires C++26 reflection (P2996) from 2023-06 or later"
+  #endif
+#else
+  #warning "Compiler defines neither __cpp_impl_reflection nor __cpp_reflection. " \
            "Reflection support is experimental and may be incomplete."
-#elif __cpp_reflection < 202306L
-  #error "This library requires C++26 reflection (P2996) from 2023-06 or later"
 #endif
+#endif  // MIRROR_BRIDGE_REFLECTION_CHECKED
 
 // Library version and capabilities
 #define MIRROR_BRIDGE_VERSION_MAJOR 0

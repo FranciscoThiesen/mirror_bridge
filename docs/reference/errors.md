@@ -37,7 +37,7 @@ clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ binding.cpp .
 error: "This library requires C++26 reflection (P2996) from 2023-06 or later"
 ```
 
-**Cause** `__cpp_reflection` is defined but reports a value below `202306L`, meaning the compiler implements a pre-P2996-revision of reflection that mirror_bridge does not support.
+**Cause** The compiler defines the pre-adoption `__cpp_reflection` macro with a value below `202306L`, meaning it implements a pre-P2996-revision of reflection that mirror_bridge does not support. Compilers that define the standard `__cpp_impl_reflection` (stock GCC 16+) never hit this.
 
 **Fix** Update clang-p2996 to a current `p2996` branch build (the container ships one). Rebuild the image with `docker rmi mirror_bridge:latest && ./start_dev_container.sh` if you are on an old image.
 
@@ -46,12 +46,12 @@ error: "This library requires C++26 reflection (P2996) from 2023-06 or later"
 **Symptom**
 
 ```
-warning: "Compiler does not define __cpp_reflection feature-test macro. Reflection support is experimental and may be incomplete."
+warning: "Compiler defines neither __cpp_impl_reflection nor __cpp_reflection. Reflection support is experimental and may be incomplete."
 ```
 
-**Cause** The experimental clang-p2996 build does not always set `__cpp_reflection`. This is expected and harmless — mirror_bridge falls back to detecting reflection via the `<meta>` header.
+**Cause** The experimental clang-p2996 build sets neither the standard `__cpp_impl_reflection` macro nor the older `__cpp_reflection`. This is expected and harmless — if `<meta>` compiled, reflection works. Stock GCC 16+ defines `__cpp_impl_reflection` and does not warn.
 
-**Fix** None needed. If `<meta>` compiles, reflection works. Suppress with `-Wno-#warnings` only if the warning is noisy in your build logs.
+**Fix** None needed. Suppress with `-Wno-#warnings` (clang) only if the warning is noisy in your build logs.
 
 ### Unconvertible member type (`bind_class` / `MIRROR_BRIDGE_VALIDATE`)
 
