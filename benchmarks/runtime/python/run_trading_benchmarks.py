@@ -35,9 +35,11 @@ host project:
 Writes trading_results.json next to runtime_results.json.
 """
 import gc
+import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 
@@ -53,8 +55,19 @@ try:
 except ImportError:
     lfilter = None
 
+MODULES = (("trade_mb", "mirror_bridge"), ("trade_pb", "pybind11"), ("trade_nb", "nanobind"))
+
+# One framework per process. Importing all three into one interpreter made the
+# batched rows depend on which ran first: by the time the third was timed, the
+# heap held millions of boxed objects from the first two, and a row that
+# allocates a 320 KB vector per call measured up to 30% slow. The parent
+# process below runs each framework in its own interpreter and merges.
+ONLY = os.environ.get("MB_BENCH_ONLY", "")
+
 FRAMEWORKS = {}
-for mod_name, label in (("trade_mb", "mirror_bridge"), ("trade_pb", "pybind11"), ("trade_nb", "nanobind")):
+for mod_name, label in MODULES:
+    if ONLY and label != ONLY:
+        continue
     try:
         FRAMEWORKS[label] = __import__(mod_name)
     except ImportError:
@@ -399,11 +412,62 @@ def run():
     return results
 
 
+def merge(into, part):
+    """Fold one child's results in. Baseline rows (python, numpy) are computed
+    by every child; the first one to report wins, and the spread between them
+    is reported as the run-to-run noise floor."""
+    for workload, block in part.items():
+        if workload.startswith("_"):
+            continue
+        dest = into.setdefault(workload, {"unit": block["unit"], "note": block["note"], "rows": {}})
+        if workload == "signal_sweep":
+            for chunk, row in block["rows"].items():
+                dest["rows"].setdefault(chunk, {}).update(row)
+        else:
+            dest["rows"].update(block["rows"])
+
+
 def main():
-    if not FRAMEWORKS:
+    # Child: time one framework and print its JSON on stdout.
+    if os.environ.get("MB_BENCH_ONLY"):
+        json.dump(run(), sys.stdout)
+        return 0
+
+    present = [label for mod, label in MODULES
+               if importlib.util.find_spec(mod) is not None]
+    if not present:
         print("no trading benchmark modules importable; build them first", file=sys.stderr)
         return 1
-    results = run()
+
+    results, baselines = {}, {}
+    for label in present:
+        env = dict(os.environ, MB_BENCH_ONLY=label)
+        print(f"  timing {label} in its own process...", file=sys.stderr)
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__)],
+                              capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            print(proc.stderr[-2000:], file=sys.stderr)
+            raise SystemExit(f"{label} run failed")
+        part = json.loads(proc.stdout)
+        for workload, block in part.items():
+            if workload.startswith("_"):
+                continue
+            rows = block["rows"] if workload != "signal_sweep" else block["rows"].get("1", {})
+            for impl, v in rows.items():
+                if impl in ("python", "numpy", "numpy+scipy"):
+                    baselines.setdefault(f"{workload}:{impl}", []).append(v)
+        merge(results, part)
+        results["_meta"] = part.get("_meta", {})
+
+    # How much the identical baseline moved between processes: the floor below
+    # which no difference in this table means anything.
+    spreads = [max(v) / min(v) for v in baselines.values() if len(v) > 1 and min(v) > 0]
+    results.setdefault("_meta", {})["baseline_spread"] = round(max(spreads), 3) if spreads else None
+    results["_meta"]["processes"] = len(present)
+    # Each child reports only the framework it imported, so the last
+    # child's list would otherwise be the whole record of the run.
+    results["_meta"]["frameworks"] = present
+
     out = os.path.join(HERE, "trading_results.json")
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
