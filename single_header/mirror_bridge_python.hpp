@@ -1510,6 +1510,13 @@ std::string type_hint() {
         return "str";
     } else if constexpr (std::is_integral_v<CleanT>) {
         return "int";
+    } else if constexpr (std::is_enum_v<CleanT>) {
+        // std::is_integral is false for enums, so without this an enum fell
+        // through to the "it must be a class" path and the stub annotated it
+        // with the C++ enum's own name — a name the module never defines,
+        // which makes the whole .pyi unusable to a type checker. The values
+        // really do cross as plain int (PyLong_FromLong / PyLong_Check).
+        return "int";
     } else if constexpr (std::is_floating_point_v<CleanT>) {
         return "float";
     } else if constexpr (std::is_same_v<CleanT, std::string> ||
