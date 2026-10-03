@@ -43,7 +43,8 @@ def render(data, commit, env):
                "[same header](../../benchmarks/runtime/shared/trading_bench.hpp) and every "
                "batched method delegates to the same kernel the per-element method uses, "
                "so no framework is measured against a different implementation. "
-               "Reproduce with `./run_benchmarks.sh`.")
+               "Each framework is timed in its own interpreter, fastest of nine runs with "
+               "the collector off. Reproduce with `./run_benchmarks.sh`.")
     out.append("")
 
     # ---- 1. order book
@@ -64,12 +65,26 @@ def render(data, commit, env):
     out.append("")
     py = book.get("python")
     worst = max((book[k], k) for k in book if not k.endswith(" (one call)") and k != "python")
+    batched = book.get(mb + " (one call)")
     if py and worst[0] > py:
         out.append(f"At one crossing per event **{worst[1]} is slower than pure Python** "
                    f"({fmt(worst[0])} vs {fmt(py)} ns): the binding overhead exceeds what "
                    "the C++ saves. Batching the same work into one call is what changes "
-                   f"the picture — {fmt(book[mb + ' (one call)'])} ns/event for "
-                   f"{mb}, {ratio(py, book[mb + ' (one call)']):.1f}x pure Python.")
+                   f"the picture — {fmt(batched)} ns/event for "
+                   f"{mb}, {ratio(py, batched):.1f}x pure Python.")
+        out.append("")
+    elif py and batched:
+        # Nothing was slower than pure Python this run, but the point of the
+        # two columns is the same either way: it is the batching that pays.
+        best_per_event = min(book[k] for k in book
+                             if not k.endswith(" (one call)") and k != "python")
+        out.append(f"At one crossing per event the fastest binding buys only "
+                   f"{ratio(py, best_per_event):.1f}x over pure Python ({fmt(best_per_event)} "
+                   f"vs {fmt(py)} ns): the crossing costs most of what the C++ saves. "
+                   f"Batching the same work into one call is what changes the picture — "
+                   f"{fmt(batched)} ns/event for {mb}, "
+                   f"{ratio(py, batched):.1f}x pure Python and "
+                   f"{ratio(book[mb], batched):.1f}x the same binding called per event.")
         out.append("")
 
     # ---- 2. pricing
@@ -90,8 +105,11 @@ def render(data, commit, env):
     if "numpy" in bs and mb in bs:
         rel = ratio(bs["numpy"], bs[mb])
         verdict = (f"{rel:.2f}x numpy" if rel >= 1 else f"{1/rel:.2f}x slower than numpy")
+        # The gap to pure Python differs per binder, so quote the range. A
+        # single ratio here would be whichever binder happened to be indexed.
+        gaps = [ratio(bs["python"], bs[k]) for k in (mb, "pybind11", "nanobind") if k in bs]
         out.append(f"Arithmetic dominates, so the binders bunch up: {mb} is {verdict}, and "
-                   f"pure Python is {ratio(bs['python'], bs[mb]):.0f}x slower than any of them. "
+                   f"every binder is {min(gaps):.0f}x to {max(gaps):.0f}x pure Python. "
                    "This is the half of a trading stack where the binding layer does not matter.")
         out.append("")
 
@@ -164,23 +182,29 @@ def render(data, commit, env):
     # ---- the unflattering half, computed
     out.append("### Where mirror_bridge loses")
     out.append("")
+    # Only count a gap wider than the measured noise floor. baseline_spread is
+    # how far an identical baseline moved between processes in this very run,
+    # so anything inside it is the harness, not the framework.
+    floor = data.get("_meta", {}).get("baseline_spread") or 1.0
     losses = []
     for label, rows, unit in (("order book, per event", book, "ns/event"),
                               ("Black-Scholes", bs, "ns/contract")):
         for other in ("nanobind", "pybind11", "numpy"):
-            if other in rows and mb in rows and rows[other] < rows[mb]:
+            if other in rows and mb in rows and rows[mb] / rows[other] > floor:
                 losses.append(f"- **{other}** is faster on {label}: "
                               f"{fmt(rows[other])} vs {fmt(rows[mb])} {unit} "
                               f"({ratio(rows[mb], rows[other]):.2f}x).")
     beaten_everywhere = [k for k in ("nanobind", "pybind11")
-                         if k in first and all(sweep[c].get(k, 1e9) < sweep[c].get(mb, 0) for c in chunks)]
+                         if k in first and all(sweep[c].get(mb, 0) / sweep[c].get(k, 1e9) > floor
+                                               for c in chunks)]
     for k in beaten_everywhere:
         worst_ratio = max(sweep[c][mb] / sweep[c][k] for c in chunks)
         losses.append(f"- **{k}** is faster at every point of the crossing-frequency sweep, "
                       f"by up to {worst_ratio:.2f}x.")
     if "numpy+scipy" in last and mb in last and last["numpy+scipy"] < last[mb]:
         losses.append("- **numpy+scipy** wins the full-array signal case.")
-    out.extend(losses or ["- Nothing in this run."])
+    out.extend(losses or [f"- Nothing in this run, counting only gaps wider than the "
+                          f"{(floor - 1) * 100:.1f}% the identical baselines moved between processes."])
     out.append("")
 
     nb_lines = data.get("_meta", {}).get("binding_lines", {})
