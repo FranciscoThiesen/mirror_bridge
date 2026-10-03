@@ -203,6 +203,18 @@ def test_conversion_operator_does_not_break_the_build():
     print("✓ a class with a conversion operator still binds")
 
 
+def test_polymorphic_return_is_not_mislabelled():
+    # as_shape() returns const Shape&, and the wrapper copies a Shape. It
+    # used to be labelled with the dynamic type (Square) while holding that
+    # smaller copy, so reading a Square member ran off the end of it.
+    h = ts.Holder()
+    assert type(h.as_square()).__name__ == "Square"
+    assert h.as_square().side == 3.0
+    shape_view = h.as_shape()
+    assert type(shape_view).__name__ != "Square", "a Shape-sized copy must not claim to be a Square"
+    print("✓ a sliced polymorphic return is not labelled with the derived type")
+
+
 def test_python_subclass_is_still_accepted():
     # A Python subclass extends the wrapper at the tail, so the C++ object is
     # still where it was. This is the trampoline case and must keep working.

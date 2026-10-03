@@ -18,6 +18,7 @@ MIRROR_BRIDGE_MODULE(type_safety,
     mirror_bridge::bind_class<Ticks>(m, "Ticks");
     mirror_bridge::bind_class<VBase>(m, "VBase");
     mirror_bridge::bind_class<VDiamond>(m, "VDiamond");
+    mirror_bridge::bind_class<Holder>(m, "Holder");
 
     mirror_bridge::bind_function<&take_curve_cref>(m, "take_curve_cref");
     mirror_bridge::bind_function<&take_curve_value>(m, "take_curve_value");
