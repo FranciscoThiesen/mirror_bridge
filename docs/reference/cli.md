@@ -229,6 +229,55 @@ mirror_bridge diff src/ --check
 mirror_bridge diff src/ --output build/
 ```
 
+### `api` - API Surface Gate
+
+Gate a module's Python surface on a committed `.pyi` baseline.
+
+```bash
+mirror_bridge api <src_dir> --module <name> [options]
+```
+
+Builds the module, extracts its reflection-derived stub, and compares it
+with a committed baseline. The stub is produced from the same reflection
+data as the binding, is byte-identical between runs, and is the same under
+clang-p2996 and GCC 16, so it is safe to commit and to compare in CI.
+
+| Option | Meaning |
+|---|---|
+| `--module, -m` | Module name (required) |
+| `--baseline, -b` | Stub to compare against (default: `api/<module>.pyi`) |
+| `--include, -I` | Extra include directory (repeatable) |
+| `--update, -u` | Write the baseline instead of comparing |
+| `--check` | Exit 1 if anything breaking changed (use in CI) |
+| `--json` | One JSON object on stdout, progress to stderr |
+
+A removed name or a changed signature is breaking. An added name is not:
+nobody's import breaks because a method appeared.
+
+| Exit | Meaning |
+|---|---|
+| 0 | unchanged, or additive only |
+| 1 | a name was removed or re-signed (with `--check`) |
+| 2 | no baseline exists yet |
+
+```
+API surface of 'quotes' changed (baseline api/quotes.pyi):
+
+  removed — importers raise AttributeError:
+      Book.best
+
+  changed — importers may pass the wrong type:
+      Book.add
+          was: (self, q: Quote) -> None
+          now: (self, q: Quote, qty: int) -> None
+
+  2 breaking changes, 0 additive.
+  Accept with: mirror_bridge api src/ --module quotes --update
+```
+
+See [Independent Teams](../guides/independent-teams.md) for the workflow
+this is built for.
+
 ### `watch` - Live Reload
 
 Watch header files for changes and automatically recompile bindings.
