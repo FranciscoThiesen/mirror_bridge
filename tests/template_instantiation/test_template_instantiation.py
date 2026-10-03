@@ -99,6 +99,19 @@ def test_free_functions_and_skips():
     print("✓ free functions bound, unbindable ones skipped")
 
 
+def test_survives_operators_and_noexcept():
+    # algo.hpp declares a namespace-scope operator+. It used to end the
+    # planner's consteval evaluation, which cost the module every free
+    # function and every template instantiation while still reporting
+    # success, so answer() is the canary here.
+    assert geom.answer() == 42, "a free operator dropped every free function"
+    assert hasattr(geom, "twice"), "a free operator dropped every template instantiation"
+    # noexcept is part of the function type and needs its own traits
+    # specialization; without one the module did not compile.
+    assert geom.half(5.0) == 2.5
+    print("✓ a free operator and a noexcept free function are survivable")
+
+
 def test_baseline_and_containers():
     s = geom.Stack[str]()
     s.push("a")

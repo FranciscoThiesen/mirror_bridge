@@ -147,6 +147,15 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # Class-typed arguments are identity-checked at the Python boundary
+    # (wrong type -> TypeError, derived -> base lands on the right subobject)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/type_safety)
+        mirror_bridge_python_module(type_safety
+            type_safety/type_safety_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_safety
+        )
+    endif()
+
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref
