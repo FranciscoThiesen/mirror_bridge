@@ -10,6 +10,7 @@
 #   build       Compile a manually-written binding file
 #   config      Generate bindings from a configuration file
 #   diff        Show binding surface changes since last build
+#   api         Gate the Python surface on a committed .pyi baseline
 #   watch       Watch headers and auto-recompile bindings on change
 #   doctor      Diagnose environment and setup issues
 #   init        Initialize a new Mirror Bridge project
@@ -135,6 +136,7 @@ ${YELLOW}Commands:${NC}
   build       Compile a manually-written binding file
   config      Generate bindings from a configuration file
   diff        Show binding surface changes since last build
+  api         Gate the Python surface on a committed .pyi baseline
   watch       Watch headers and auto-recompile bindings on change
   doctor      Diagnose environment and setup issues
   init        Initialize a new Mirror Bridge project
@@ -1177,6 +1179,146 @@ cmd_generate() {
     report_unbound "$module_name"
 }
 
+# Command: api — gate the module's Python surface on a committed stub.
+#
+# The stub is the only artifact that cannot drift from the binding: it is
+# filled in during bind_class from the same reflection data the binding is
+# generated from. Two runs produce byte-identical output, and clang-p2996
+# and GCC 16 produce the same bytes as each other, so it can be committed
+# and compared in CI the way a lockfile is.
+#
+# That is what lets a C++ team and a Python team work apart: the C++ team's
+# pull request shows, in its own diff, exactly which names the Python team
+# is about to lose.
+cmd_api() {
+    local src_dir="" module_name="" baseline="" update=0 check=0
+    local -a include_dirs=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h) show_api_help; exit 0 ;;
+            --module|-m) module_name="$2"; shift 2 ;;
+            --baseline|-b) baseline="$2"; shift 2 ;;
+            --output|-o) OUTPUT_DIR="$2"; shift 2 ;;
+            --include|-I) include_dirs+=("$2"); shift 2 ;;
+            --update|-u) update=1; shift ;;
+            --check) check=1; shift ;;
+            --json) JSON_MODE=1; shift ;;
+            -*)
+                echo -e "${RED}Error: unknown option '$1' for 'api'${NC}"
+                show_api_help
+                exit 1 ;;
+            *) src_dir="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$src_dir" ] && { echo -e "${RED}Error: Source directory required${NC}"; exit 1; }
+    [ -z "$module_name" ] && { echo -e "${RED}Error: --module is required${NC}"; exit 1; }
+    [ -z "$baseline" ] && baseline="api/${module_name}.pyi"
+
+    if [ $JSON_MODE -eq 1 ]; then
+        exec 3>&1 1>&2
+    fi
+
+    # Build into a scratch directory so the comparison never sees a stale
+    # stub from an earlier run.
+    local work
+    work=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" RETURN
+
+    local -a gen_args=("$src_dir" --module "$module_name" --lang python
+                       --output "$work" --stubs --force)
+    local inc
+    for inc in "${include_dirs[@]:-}"; do
+        [ -n "$inc" ] && gen_args+=(--include "$inc")
+    done
+
+    echo -e "${YELLOW}Generating the current surface...${NC}"
+    if ! "$0" generate "${gen_args[@]}" > "$work/generate.log" 2>&1; then
+        echo -e "${RED}Error: could not build '$module_name' from $src_dir${NC}"
+        tail -20 "$work/generate.log"
+        exit 1
+    fi
+
+    local current="$work/${module_name}.pyi"
+    if [ ! -f "$current" ]; then
+        echo -e "${RED}Error: the build produced no stub at $current${NC}"
+        echo -e "${YELLOW}  The module must import for its stub to be extracted; see $work/generate.log${NC}"
+        exit 1
+    fi
+
+    if [ $update -eq 1 ]; then
+        mkdir -p "$(dirname "$baseline")"
+        cp "$current" "$baseline"
+        echo -e "${GREEN}Baseline written to $baseline${NC}"
+        echo -e "${YELLOW}Commit it: the Python team depends on this file, not on the build.${NC}"
+        [ $JSON_MODE -eq 1 ] && printf '{"status":"ok","action":"update","baseline":"%s"}\n' "$(json_escape "$baseline")" >&3
+        return 0
+    fi
+
+    if [ ! -f "$baseline" ]; then
+        echo -e "${RED}Error: no baseline at $baseline${NC}"
+        echo -e "${YELLOW}  Create one and commit it:${NC}"
+        echo -e "${YELLOW}      mirror_bridge api $src_dir --module $module_name --update${NC}"
+        [ $JSON_MODE -eq 1 ] && printf '{"status":"error","reason":"no baseline","baseline":"%s"}\n' "$(json_escape "$baseline")" >&3
+        exit 2
+    fi
+
+    local -a cmp_args=(--baseline "$baseline" --current "$current" --module "$module_name"
+                       --update-hint "mirror_bridge api $src_dir --module $module_name --update")
+    [ $JSON_MODE -eq 1 ] && cmp_args+=(--json)
+
+    local rc=0
+    if [ $JSON_MODE -eq 1 ]; then
+        python3 "$PROJECT_ROOT/tools/mirror_bridge_api.py" "${cmp_args[@]}" >&3 || rc=$?
+    else
+        python3 "$PROJECT_ROOT/tools/mirror_bridge_api.py" "${cmp_args[@]}" || rc=$?
+    fi
+
+    # Breaking changes fail only under --check, so the command is also usable
+    # as a plain "what would this change" locally.
+    if [ "$rc" -ne 0 ] && [ $check -eq 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
+show_api_help() {
+    cat <<EOF
+${BLUE}mirror_bridge api${NC} - gate a module's Python surface on a committed stub
+
+${YELLOW}Usage:${NC}
+  mirror_bridge api <src_dir> --module <name> [options]
+
+Builds the module, extracts its reflection-derived .pyi, and compares it
+with a committed baseline. Names that disappeared or changed signature are
+reported as breaking; new names are additive.
+
+The stub is produced from the same reflection data as the binding itself,
+is byte-identical between runs, and is the same under clang-p2996 and
+GCC 16 — so it is safe to commit and to compare in CI.
+
+${YELLOW}Options:${NC}
+  --module, -m    Module name (required)
+  --baseline, -b  Committed stub to compare against (default: api/<module>.pyi)
+  --output, -o    Unused; the build goes to a temporary directory
+  --include, -I   Extra include directory (repeatable)
+  --update, -u    Write the baseline instead of comparing, then commit it
+  --check         Exit 1 if anything breaking changed (use this in CI)
+  --json          Emit one JSON result object on stdout (progress -> stderr)
+
+${YELLOW}Exit codes:${NC}
+  0   unchanged, or additive only
+  1   a name was removed or its signature changed (only with --check)
+  2   no baseline exists yet
+
+${YELLOW}Example:${NC}
+  mirror_bridge api src/ --module quotes --update     # accept the surface
+  mirror_bridge api src/ --module quotes --check      # CI gate
+EOF
+}
+
 # Command: pch
 cmd_pch() {
     local output_dir=""
@@ -1989,6 +2131,7 @@ main() {
         build) cmd_build "$@" ;;
         config) cmd_config "$@" ;;
         diff) cmd_diff "$@" ;;
+        api) cmd_api "$@" ;;
         watch) cmd_watch "$@" ;;
         # Invoked via bash so the doctor script works even when the
         # executable bit was lost (e.g. mounted from a pip install).
