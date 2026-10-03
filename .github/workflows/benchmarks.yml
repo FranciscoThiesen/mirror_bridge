@@ -44,6 +44,19 @@ jobs:
           ' docs/internals/benchmarks.md > /tmp/benchmarks.md
           mv /tmp/benchmarks.md docs/internals/benchmarks.md
 
+      - name: Splice regenerated trading table into the benchmarks page
+        run: |
+          python3 benchmarks/format_trading_results.py \
+            --commit "$GITHUB_SHA" \
+            --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
+            --fragment > /tmp/trading_fragment.md
+          awk '
+            /<!-- TRADING:BEGIN/ { print; system("cat /tmp/trading_fragment.md"); skip=1; next }
+            /<!-- TRADING:END/   { skip=0 }
+            !skip
+          ' docs/internals/benchmarks.md > /tmp/benchmarks.md
+          mv /tmp/benchmarks.md docs/internals/benchmarks.md
+
       # main is protected (PR-only), so the refresh lands as a PR for the
       # maintainer to merge. The action is a no-op when the page is unchanged.
       - name: Open PR with the regenerated page

@@ -492,6 +492,61 @@ echo "Running runtime benchmarks (this may take a few minutes)..."
 export LD_LIBRARY_PATH=/usr/local/lib/aarch64-unknown-linux-gnu:/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH
 python3 run_runtime_benchmarks.py run
 
+# ============================================================================
+# PART 3: Trading Workloads
+# ============================================================================
+# Three shapes of real work rather than one operation at a time, so the page
+# can say where the binding layer decides the result and where it does not.
+echo ""
+echo -e "${BLUE}========================================${NC}"
+echo -e "${BLUE}  PART 3: Trading Workloads${NC}"
+echo -e "${BLUE}========================================${NC}"
+echo ""
+
+TRADE_PYINC=$(python3-config --includes)
+TRADE_OK=0
+
+echo -n "  Building mirror_bridge module... "
+if clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ -O3 -DNDEBUG -fPIC -shared \
+    -I"$PROJECT_ROOT" -I"$BENCHMARK_DIR/runtime/python" $TRADE_PYINC \
+    "$BENCHMARK_DIR/runtime/python/trading_mirror_bridge_binding.cpp" \
+    -o "$BUILD_DIR/trade_mb.so" > /dev/null 2>&1; then
+    echo "ok"; TRADE_OK=1
+else
+    echo -e "${YELLOW}failed${NC}"
+fi
+
+PB_INC=$(python3 -c "import pybind11; print(pybind11.get_include())" 2>/dev/null || echo "")
+if [ -n "$PB_INC" ]; then
+    echo -n "  Building pybind11 module...      "
+    clang++ -std=c++17 -O3 -DNDEBUG -fPIC -shared -I"$PB_INC" \
+        -I"$BENCHMARK_DIR/runtime/python" $TRADE_PYINC \
+        "$BENCHMARK_DIR/runtime/python/trading_pybind11_binding.cpp" \
+        -o "$BUILD_DIR/trade_pb.so" > /dev/null 2>&1 && echo "ok" || echo -e "${YELLOW}failed${NC}"
+fi
+
+NB_ROOT=$(python3 -c "import nanobind, os; print(os.path.dirname(nanobind.__file__))" 2>/dev/null || echo "")
+[ -d "/usr/local/nanobind" ] && NB_ROOT=/usr/local/nanobind
+if [ -n "$NB_ROOT" ] && [ -d "$NB_ROOT/include" ]; then
+    echo -n "  Building nanobind module...      "
+    if [ ! -f "$BUILD_DIR/nb_stub_trade.o" ]; then
+        clang++ -std=c++17 -O3 -DNDEBUG -fPIC -c -I"$NB_ROOT/include" \
+            -I"$NB_ROOT/ext/robin_map/include" $TRADE_PYINC \
+            "$NB_ROOT/src/nb_combined.cpp" -o "$BUILD_DIR/nb_stub_trade.o" > /dev/null 2>&1 || true
+    fi
+    clang++ -std=c++17 -O3 -DNDEBUG -fPIC -shared -I"$NB_ROOT/include" \
+        -I"$NB_ROOT/ext/robin_map/include" -I"$BENCHMARK_DIR/runtime/python" $TRADE_PYINC \
+        "$BENCHMARK_DIR/runtime/python/trading_nanobind_binding.cpp" "$BUILD_DIR/nb_stub_trade.o" \
+        -o "$BUILD_DIR/trade_nb.so" > /dev/null 2>&1 && echo "ok" || echo -e "${YELLOW}failed${NC}"
+fi
+
+if [ "$TRADE_OK" -eq 1 ]; then
+    echo ""
+    MB_BENCH_BUILD="$BUILD_DIR" python3 "$BENCHMARK_DIR/runtime/python/run_trading_benchmarks.py" || true
+else
+    echo -e "${YELLOW}  Trading workloads skipped (no module built)${NC}"
+fi
+
 # Summary
 echo ""
 echo -e "${GREEN}========================================${NC}"
@@ -502,4 +557,5 @@ echo "Results summary:"
 echo "  - Compile-time results: See above"
 echo "  - Runtime results: See above table"
 echo "  - Detailed runtime data: benchmarks/runtime/runtime_results.json"
+echo "  - Trading workloads:     benchmarks/runtime/python/trading_results.json"
 echo ""

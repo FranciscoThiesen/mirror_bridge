@@ -332,3 +332,13 @@ When adding benchmarks:
 2. Document what the benchmark measures
 3. Choose appropriate iteration counts (balance accuracy vs runtime)
 4. Include results in PR description
+
+### Trading Workloads
+
+`runtime/shared/trading_bench.hpp` — an order book, Black-Scholes pricing and
+an EWMA signal engine, bound by mirror_bridge, pybind11 and nanobind and
+measured against pure Python and numpy/scipy. The point is not a ranking but
+a boundary: the binding layer decides the result when you cross per event,
+and is close to irrelevant when you cross per batch. Results, including the
+ones that go against mirror_bridge, are rendered into
+`docs/internals/benchmarks.md` by `format_trading_results.py`.
