@@ -420,6 +420,13 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log):
 
 # --------------------------------------------------------------------- emit --
 
+# A name the user wrote that is absent from the finished module, as
+# (reason key, C++ spelling). The CLI turns these into the one report a user
+# sees after the build banner, so a dropped function stops being a line that
+# scrolls past mid-run.
+UNBOUND = []
+
+
 def free_functions_to_bind(result, notes):
     """Plain free functions with a unique address: not overloaded, not sharing
     a name with a function template (both need an overload set, phase C)."""
@@ -435,8 +442,10 @@ def free_functions_to_bind(result, notes):
         if counts[e["spelling"]] > 1:
             notes.append(f"skip {e['spelling']}: overloaded ({counts[e['spelling']]} overloads); "
                          "overload sets are not bound yet")
+            UNBOUND.append(("overloaded", e["spelling"]))
         elif e["spelling"] in template_names:
             notes.append(f"skip plain {e['spelling']}: shares its name with a function template")
+            UNBOUND.append(("shares_template_name", e["spelling"]))
         else:
             out.append(e)
     return out
@@ -543,6 +552,8 @@ def parse_args():
     ap.add_argument("--includes-out", required=True, help="write extra headers the binding lines need here")
     ap.add_argument("--report", required=True, help="human-readable plan")
     ap.add_argument("--json-out", default="")
+    ap.add_argument("--unbound-out", default="",
+                    help="tab-separated reason<TAB>C++ name, one per name absent from the module")
     ap.add_argument("--verbose", action="store_true")
     return ap.parse_args()
 
@@ -604,6 +615,12 @@ def main():
     pathlib.Path(args.includes_out).write_text("".join(h + "\n" for h in extra_headers) if lines else "")
     write_report(args.report, args, cc, result, frees, notes, log, extra_headers if lines else [])
 
+    # The CLI renders these after its build banner. Written even when empty so
+    # a stale file from a previous run cannot be mistaken for this one's.
+    if args.unbound_out:
+        pathlib.Path(args.unbound_out).write_text(
+            "".join(f"{reason}\t{name}\n" for reason, name in UNBOUND))
+
     approved = [c for c, _ in result["approved"]]
     families = sorted({c["owner"] for c in approved})
     if args.json_out:
@@ -615,6 +632,7 @@ def main():
             "unbindable": [{"cpp": c["spelling"], "reason": why} for c, why in result["unbindable"]],
             "skipped_functions": [{"cpp": e["spelling"], "needs": specs} for e, specs in result["dropped"]],
             "notes": notes,
+            "unbound": [{"reason": reason, "cpp": name} for reason, name in UNBOUND],
             "rounds": len(result["rounds"]),
             "report": args.report,
         }, open(args.json_out, "w"))   # one line: the CLI splices it into its own JSON object

@@ -43,6 +43,13 @@ LANG="python"
 RELEASE_GIL=0
 GEN_STUBS=0
 NO_TEMPLATES=0
+# Enum types found while scanning. They are not bound (Python has no object
+# for them and their values cross as plain int), so they are reported at the
+# end of a generate run rather than disappearing.
+DISCOVERED_ENUMS=()
+# Declaration site of each discovered class, parallel to the class list, so a
+# name collision can be reported as header:line rather than just a name.
+DISCOVERED_LINES=()
 TEMPLATE_CAP=64
 INSTANTIATE=()
 
@@ -346,12 +353,22 @@ token_re = re.compile(
     r'|\b(public|private|protected)\s*:'        # 3: access label
     r'|\btemplate\b'                            # template keyword
     r'|([{};])'                                 # 4: punctuation we care about
+    # `enum class Side` contains the token `class`, so without this the
+    # alternative above reported every scoped enum as a class to bind — and a
+    # plain `enum Color` was invisible at every stage. Matched at the `enum`,
+    # which comes first, so the `class` inside it never starts its own match.
+    # The name is captured for reporting; the body's braces still pair, and
+    # nothing is pending when they do, so no enum reaches the class stack.
+    # Appended last and named, so groups 1-4 keep their indices.
+    r'|\benum\b(?:\s+(?:class|struct))?\s*(?P<enum>[A-Za-z_]\w*)?'
 )
 
 tokens = []
 for m in token_re.finditer(content):
     line_no = content.count('\n', 0, m.start()) + 1
-    if m.group(1):   # class/struct declaration
+    if m.group(0).startswith('enum'):
+        tokens.append(('enum', m.group('enum'), line_no, m.end()))
+    elif m.group(1):   # class/struct declaration
         tokens.append(('decl', (m.group(1), m.group(2)), line_no, m.end()))
     elif m.group(3):
         tokens.append(('access', m.group(3), line_no, m.end()))
@@ -376,6 +393,7 @@ pending = None       # ((keyword, name), line_no) awaiting a '{'
 skip_until_pos = 0   # positions up to here were eaten by a template<...>
 skip_next_decl = False  # True after a template<...> block — next decl is a template
 results = []
+enums = []        # (qualified name, line) — reported, never bound
 
 def skip_template_params(start):
     # Find the matching '>' for a '<' that follows 'template'.
@@ -398,6 +416,11 @@ for kind, payload, line_no, end_pos in tokens:
     if kind == 'template':
         skip_until_pos = skip_template_params(end_pos)
         skip_next_decl = True
+        continue
+    if kind == 'enum':
+        if payload:
+            scope = [e[0] for e in class_stack]
+            enums.append(('::'.join(scope + [payload]), line_no))
         continue
     if kind == 'decl':
         if skip_next_decl:
@@ -435,8 +458,11 @@ for kind, payload, line_no, end_pos in tokens:
         pending = None  # forward declaration — discard
         skip_next_decl = False
 
+# Kind is the THIRD field so a two-field reader keeps working.
 for name, lineno in results:
-    print(f"{name}\t{lineno}")
+    print(f"{name}\t{lineno}\tclass")
+for name, lineno in enums:
+    print(f"{name}\t{lineno}\tenum")
 PYSCRIPT
     )
 
@@ -451,8 +477,15 @@ PYSCRIPT
         fi
 
         # Run the Python parser on this header.
-        while IFS=$'\t' read -r class_name line_num; do
+        while IFS=$'\t' read -r class_name line_num kind; do
             [ -z "$class_name" ] && continue
+
+            # Enums are discovered so they can be reported, never bound: there
+            # is no Python enum type yet, and their values cross as plain int.
+            if [ "$kind" = "enum" ]; then
+                DISCOVERED_ENUMS+=("$class_name")
+                continue
+            fi
 
             # Honor MIRROR_BRIDGE_SKIP annotation on the line before the declaration.
             if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
@@ -465,6 +498,7 @@ PYSCRIPT
 
             classes_ref+=("$class_name")
             headers_ref+=("$rel_path")
+            DISCOVERED_LINES+=("$line_num")
             echo -e "  ${GREEN}✓${NC} Found: $class_name in $rel_path"
         done < <(python3 -c "$parser_script" "$header_file" 2>/dev/null)
     done <<< "$header_files"
@@ -638,6 +672,114 @@ PYSCRIPT
     echo ")" >> "$output_file"
 }
 
+# Names the user wrote that are absent from the finished module. These facts
+# already existed — a dropped overload set was one stderr line printed eight
+# lines before a green success banner, and an enum said nothing at all — so
+# this is about placement, not detection: one block, after the banner, where
+# the reader is already looking.
+#
+# Grouped by reason and capped, so twelve dropped overloads cost four lines.
+report_unbound() {
+    local module_name="$1"
+    local -a overloaded=() shares_name=()
+    local reason name
+
+    if [ -n "$TEMPLATE_UNBOUND_FILE" ] && [ -f "$TEMPLATE_UNBOUND_FILE" ]; then
+        while IFS=$'\t' read -r reason name; do
+            [ -z "$name" ] && continue
+            case "$reason" in
+                overloaded)           overloaded+=("$name") ;;
+                shares_template_name) shares_name+=("$name") ;;
+            esac
+        done < "$TEMPLATE_UNBOUND_FILE"
+    fi
+
+    local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#DISCOVERED_ENUMS[@]} ))
+    [ "$total" -eq 0 ] && return 0
+
+    local noun="names were" ; local pronoun="them"
+    if [ "$total" -eq 1 ]; then noun="name was"; pronoun="it"; fi
+
+    echo ""
+    echo -e "${YELLOW}⚠ $total $noun not bound into '$module_name' — Python raises AttributeError on $pronoun:${NC}"
+
+    # Print at most 8 names of a group, then a count.
+    print_group() {
+        local -n items=$1
+        local line="      " shown=0 item
+        for item in "${items[@]}"; do
+            if [ "$shown" -ge 8 ]; then
+                line="$line... (+$(( ${#items[@]} - 8 )) more)"
+                break
+            fi
+            [ "$shown" -gt 0 ] && line="$line, "
+            line="$line$item"
+            shown=$(( shown + 1 ))
+        done
+        echo "$line" | fold -s -w 78
+    }
+
+    if [ ${#DISCOVERED_ENUMS[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#DISCOVERED_ENUMS[@]} enum type(s) — values still cross as plain int, unchecked"
+        print_group DISCOVERED_ENUMS
+        echo "      Fix: mirror each enum as a Python enum.IntEnum; stubs annotate these as int"
+    fi
+    if [ ${#overloaded[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#overloaded[@]} free function(s) overloaded in C++ — overload sets are not bound yet"
+        print_group overloaded
+        echo "      Fix: give one overload a distinct name, or bind a single non-overloaded wrapper"
+    fi
+    if [ ${#shares_name[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#shares_name[@]} free function(s) sharing a name with a function template (no unique address)"
+        print_group shares_name
+        echo "      Fix: rename the plain function, or call it through the bound template of that name"
+    fi
+    echo ""
+    echo "  See docs/reference/errors.md#names-missing-from-the-module"
+}
+
+# A module refers to every class by its UNQUALIFIED name and recovers scope
+# with one `using namespace` per namespace found, so two discovered classes
+# that share a simple name cannot share a module. The compiler says so, but
+# it says it about a generated .cpp the CLI then deletes, so the user is left
+# with "reference to 'Config' is ambiguous" and nothing to act on. Said here
+# instead, before a line of code is generated, in terms of their own headers.
+warn_duplicate_binding_names() {
+    local -n names_ref=$1
+    local -n files_ref=$2
+    local i j name
+
+    local -a reported=()
+    for (( i = 0; i < ${#names_ref[@]}; i++ )); do
+        name="${names_ref[$i]}"
+        local already=0 r
+        for r in "${reported[@]:-}"; do [ "$r" = "$name" ] && already=1; done
+        [ "$already" -eq 1 ] && continue
+
+        local -a where=()
+        for (( j = 0; j < ${#names_ref[@]}; j++ )); do
+            [ "${names_ref[$j]}" = "$name" ] && \
+                where+=("${files_ref[$j]}:${DISCOVERED_LINES[$j]:-?}")
+        done
+        [ ${#where[@]} -lt 2 ] && continue
+
+        reported+=("$name")
+        echo ""
+        echo -e "${YELLOW}⚠ '$name' is the binding name of ${#where[@]} classes:${NC}"
+        local f
+        for f in "${where[@]}"; do echo "      $f"; done
+        echo "  A module binds every class under its unqualified name, so the C++"
+        echo "  compiler will reject this module as ambiguous or as a redefinition."
+        echo "  Fix: bind one of them in a module of its own, or rename one class."
+        echo "  // MIRROR_BRIDGE_SKIP on one is not enough: the using-directive for"
+        echo "  its namespace is still emitted."
+        echo "  See docs/reference/errors.md#two-bound-classes-with-the-same-unqualified-name"
+    done
+}
+
 # Template instantiation planning (Python backend). Nothing in a header says
 # which instantiations of its templates to bind, so tools/mirror_bridge_templates.py
 # derives candidates from the API surface through reflection and lets the
@@ -648,6 +790,7 @@ PYSCRIPT
 TEMPLATE_LINES_FILE=""
 TEMPLATE_INCLUDES_FILE=""
 TEMPLATE_JSON_FILE=""
+TEMPLATE_UNBOUND_FILE=""
 plan_templates() {
     local module_name="$1"
     local src_dir="$2"
@@ -659,6 +802,7 @@ plan_templates() {
     TEMPLATE_LINES_FILE=""
     TEMPLATE_INCLUDES_FILE=""
     TEMPLATE_JSON_FILE=""
+    TEMPLATE_UNBOUND_FILE=""
     local work="$OUTPUT_DIR/.mirror_bridge/plan/$module_name"
     mkdir -p "$work"
 
@@ -682,7 +826,8 @@ plan_templates() {
                    --headers-file "$work/headers.txt" --classes-file "$work/classes.txt"
                    --emit "$work/bindings.inc" --includes-out "$work/includes.txt"
                    --report "$OUTPUT_DIR/${module_name}_plan.txt" --json-out "$work/plan.json"
-                   --template-cap "$TEMPLATE_CAP")
+                   --template-cap "$TEMPLATE_CAP"
+                   --unbound-out "$work/unbound.tsv")
     local inc
     for inc in "${extra_includes[@]}"; do
         [ -n "$inc" ] && args+=(-I "$inc")
@@ -702,6 +847,7 @@ plan_templates() {
         TEMPLATE_LINES_FILE="$work/bindings.inc"
         TEMPLATE_INCLUDES_FILE="$work/includes.txt"
         TEMPLATE_JSON_FILE="$work/plan.json"
+        TEMPLATE_UNBOUND_FILE="$work/unbound.tsv"
         return 0
     fi
     echo -e "${YELLOW}  Templates and free functions not bound (see $work/planner.log); binding classes only.${NC}"
@@ -933,6 +1079,7 @@ cmd_generate() {
 
     echo ""
     echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC}"
+    warn_duplicate_binding_names CLASSES HEADERS
     echo ""
 
     if [ $plans_templates -eq 1 ]; then
@@ -1023,9 +1170,11 @@ cmd_generate() {
     echo ""
     if [ ${#failed_langs[@]} -gt 0 ]; then
         echo -e "${RED}✗ Failed languages: ${failed_langs[*]}${NC}"
+        report_unbound "$module_name"
         exit 1
     fi
     echo -e "${GREEN}✓ Successfully built bindings for: ${languages[*]}${NC}"
+    report_unbound "$module_name"
 }
 
 # Command: pch
@@ -1198,6 +1347,11 @@ cmd_diff() {
             --update|-u) update_snapshot=1; shift ;;
             --check) check_mode=1; shift ;;
             --json) JSON_MODE=1; shift ;;
+            -*)
+                echo -e "${RED}Error: unknown option '$1' for 'diff'${NC}"
+                echo -e "${YELLOW}  'diff' snapshots headers; it does not build a module, so it has no --module.${NC}"
+                echo -e "${YELLOW}  Fix: mirror_bridge diff <src_dir> [--output DIR] [--update] [--check] [--json]${NC}"
+                exit 1 ;;
             *) src_dir="$1"; shift ;;
         esac
     done
@@ -1213,6 +1367,33 @@ cmd_diff() {
 
     local current_sig
     current_sig=$(scan_binding_signatures "$src_dir")
+
+    # An empty snapshot is worse than no snapshot: `--check` then passes
+    # forever, including after every class is deleted. The two ways to get
+    # one are both silent and both common, so say which happened.
+    if [ -z "$(printf '%s' "$current_sig" | tr -d '[:space:]')" ]; then
+        local n_sub=0 n_skip=0
+        if [ -d "$src_dir" ]; then
+            n_sub=$(find "$src_dir" -mindepth 2 -type f \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null | wc -l | tr -d ' ')
+            n_skip=$(grep -rl "MIRROR_BRIDGE_SKIP" "$src_dir" --include="*.hpp" --include="*.h" 2>/dev/null | wc -l | tr -d ' ')
+        fi
+        echo -e "${RED}Error: 'mirror_bridge diff' found no headers to snapshot in $src_dir${NC}"
+        [ ! -d "$src_dir" ] && echo -e "${YELLOW}      Directory not found: $src_dir${NC}"
+        [ "$n_sub" -gt 0 ] && echo -e "${YELLOW}      $n_sub header(s) are in subdirectories; diff scans only the top level${NC}"
+        [ "$n_skip" -gt 0 ] && echo -e "${YELLOW}      $n_skip header(s) contain the text MIRROR_BRIDGE_SKIP and were skipped whole-file${NC}"
+        echo -e "${YELLOW}  Refusing to write or compare an empty baseline: 'diff --check' would then${NC}"
+        echo -e "${YELLOW}  pass forever, including after you delete every class.${NC}"
+        echo -e "${YELLOW}  Fix: gate on the generated stub instead — it is reflection-derived and${NC}"
+        echo -e "${YELLOW}  byte-reproducible:${NC}"
+        echo -e "${YELLOW}      mirror_bridge generate $src_dir --module <m> --lang python --output build --stubs --force${NC}"
+        echo -e "${YELLOW}      diff -u api/<m>.pyi build/<m>.pyi${NC}"
+        echo -e "${YELLOW}  See docs/reference/errors.md#mirror_bridge-diff-snapshot-is-empty${NC}"
+        if [ $JSON_MODE -eq 1 ]; then
+            printf '{"status":"error","changed":null,"reason":"snapshot would be empty: no headers scanned in %s","headers_in_subdirs":%s,"headers_skipped":%s}\n' \
+                "$(json_escape "$src_dir")" "$n_sub" "$n_skip" >&3
+        fi
+        exit 3
+    fi
 
     if [ ! -f "$snapshot_file" ]; then
         # In check mode a missing snapshot is an error, not a fresh start:
@@ -1332,15 +1513,22 @@ ${YELLOW}Usage:${NC}
   mirror_bridge diff <src_dir> [--output <dir>]
 
 Compares the current class definitions in <src_dir> against a stored
-snapshot, showing added/removed members and methods. Useful for catching
-accidental ABI breaks during development.
+snapshot, showing added/removed members and methods.
+
+What it sees: class, member and method lines in headers at the TOP LEVEL of
+<src_dir>, matched as text at the start of a line. What it does not see: a
+class declared inside an indented namespace, anything in a subdirectory, and
+any header containing the text MIRROR_BRIDGE_SKIP. For a check that cannot
+drift from the binding, gate on the generated stub instead:
+  mirror_bridge generate src/ --module m --lang python -o build --stubs --force
+  diff -u api/m.pyi build/m.pyi
 
 ${YELLOW}Options:${NC}
   --output, -o    Build directory for storing snapshots (default: build)
   --update, -u    Update the snapshot without prompting (CI-friendly)
-  --check         Exit 1 if the surface drifted, 2 if no snapshot exists.
-                  Never modifies the snapshot. Use in CI to catch
-                  unintentional binding-surface changes.
+  --check         Exit 1 if the surface drifted, 2 if no snapshot exists,
+                  3 if no headers were scanned at all. Never modifies the
+                  snapshot. Use in CI to catch unintentional changes.
   --json          Emit one JSON result object on stdout (progress -> stderr)
 
 ${YELLOW}Example:${NC}
@@ -1636,7 +1824,7 @@ ${test_cmd}
 mirror_bridge watch src/ --module ${module_name} --lang ${gen_lang}
 
 # See what the binding surface looks like after a change
-mirror_bridge diff src/ --module ${module_name}
+mirror_bridge diff src/
 \`\`\`
 README_EOF
 
