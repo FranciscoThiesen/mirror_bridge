@@ -121,6 +121,15 @@ struct Ticks {
     long raw() const { return count; }
 };
 
+// Polymorphic return by const reference. The copy a wrapper holds is a
+// Shape-sized slice, so labelling it with the dynamic type handed Python an
+// object claiming to be a Square over a Shape-sized allocation.
+struct Holder {
+    Square held;
+    const Shape& as_shape() const { return held; }
+    const Square& as_square() const { return held; }
+};
+
 // A class-typed parameter on a method and on a constructor.
 struct Portfolio {
     double booked = 0.0;

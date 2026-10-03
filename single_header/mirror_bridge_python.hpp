@@ -6611,8 +6611,19 @@ template<typename Expected>
 bool resolve_wrapper_slow(PyObject* obj, void*& raw) {
     if (!obj || obj == Py_None) return false;
 
+    // A class this module did not bind itself is absent from its static
+    // registry, so finding it costs a hash of the mangled typeid name. Back
+    // -filling the static puts every later argument of that type on the
+    // one-compare fast path instead, which is what the cross-module case
+    // was paying for on every call. Safe: the forward registry holds a
+    // reference to that type object, and this module's own bind_class runs
+    // at import, before any conversion can get here. Only a hit is stored,
+    // because the module that binds Expected may not be imported yet.
     PyTypeObject* want = TypeRegistry<Expected>::py_type;
-    if (!want) want = lookup_type_in_python<Expected>();
+    if (!want) {
+        want = lookup_type_in_python<Expected>();
+        if (want) TypeRegistry<Expected>::py_type = want;
+    }
 
     // The expected type itself, or a Python subclass of it (a trampoline).
     // Subclasses extend the wrapper at the tail, so cpp_object stays put and
@@ -6705,22 +6716,16 @@ std::enable_if_t<
 to_python(const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Polymorphic return: if CleanT has a vtable, check typeid(obj) for the
-    // dynamic type and prefer a wrapper of that derived type. Without this,
-    // `shared_ptr<Geometry>` returning a PointCloud would give Python a
-    // Geometry wrapper, missing the derived class's methods.
-    PyTypeObject* py_type = nullptr;
-    if constexpr (std::is_polymorphic_v<CleanT>) {
-        PyObject* registry = get_python_type_registry();
-        if (registry) {
-            const char* dyn_name = typeid(obj).name();
-            PyObject* derived = PyDict_GetItemString(registry, dyn_name);
-            if (derived) py_type = reinterpret_cast<PyTypeObject*>(derived);
-        }
-    }
-
-    // Fall back to static-type lookup
-    if (!py_type) py_type = lookup_type_in_python<CleanT>();
+    // This overload copies, and what it copies is a CleanT: `new CleanT(obj)`
+    // below slices anything more derived. Labelling the wrapper with the
+    // dynamic type was therefore a lie about a smaller allocation — a
+    // `const Geometry&` that happened to refer to a PointCloud produced a
+    // Python object claiming to be a PointCloud over 16 bytes of Geometry,
+    // so reading a derived member went off the end of it. The static type is
+    // the only honest answer for a copy; a wrapper that really holds the
+    // derived object (bind_class on the derived type, or pointer storage)
+    // reports it correctly because the object itself is a derived one.
+    PyTypeObject* py_type = lookup_type_in_python<CleanT>();
     if (!py_type) py_type = TypeRegistry<CleanT>::py_type;
 
     if (py_type) {
