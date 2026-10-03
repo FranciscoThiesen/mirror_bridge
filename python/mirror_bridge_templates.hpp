@@ -612,7 +612,7 @@ bool bind_instance(PyObject* m) {
         std::fprintf(stderr, "mirror_bridge: skipped %s (a parameter or the return type has no converter)\n", c_function<fn>());
         return false;
     } else {
-        static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_VARARGS, nullptr };
+        static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_FASTCALL, nullptr };
         PyObject* func = PyCFunction_New(&def, nullptr);
         if (!func) return false;
         Family* f = family_for(m, false, name, c_qualified<tmpl>(), Kind::Function, nullptr);

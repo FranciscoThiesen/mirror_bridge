@@ -156,6 +156,15 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # Integer and float arguments are range-checked, and a refused
+    # conversion leaves no Python error set behind
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion)
+        mirror_bridge_python_module(numeric_conversion
+            numeric_conversion/numeric_conversion_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion
+        )
+    endif()
+
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref

@@ -851,6 +851,7 @@ consteval bool validate_bindable_members() {
 #include <memory>
 #include <functional>
 #include <cstdint>  // For uint8_t, int32_t, etc.
+#include <limits>   // For numeric_limits in the integer range checks
 #include <cstdio>   // For snprintf in simple repr functions
 #include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
@@ -2196,21 +2197,132 @@ inline PyObject* to_python(const T& ptr) {
     return to_python(*ptr);
 }
 
+// ---------------------------------------------------------------- integers --
+//
+// Reading a Python int costs a call into libpython that cannot be inlined
+// here, and on a list of 80,000 ints that call is the entire difference
+// between the integer and floating-point ingest paths: PyFloat_AS_DOUBLE is
+// a macro, PyLong_AsLong is not. CPython stores any int small enough to fit
+// one 30-bit digit inline, and that covers every price, quantity, index and
+// count a caller is likely to hand over in bulk, so the single-digit case is
+// worth reading without the call.
+//
+// Everything else - a wider int, the stable ABI, PyPy - goes through
+// load_int_checked, which is correct everywhere and merely slower.
+
+// The public-API reader. PyLong_AsLongLong raises on overflow, and an error
+// left set here would surface later at some unrelated call and look like it
+// came from there, so overflow is turned into a plain false.
+template<typename T>
+    requires std::is_integral_v<T>
+inline bool load_int_checked(PyObject* obj, T& out) noexcept {
+    if constexpr (std::is_signed_v<T>) {
+        int overflow = 0;
+        const long long v = PyLong_AsLongLongAndOverflow(obj, &overflow);
+        if (overflow != 0) return false;
+        if (v == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return false;
+        }
+        if (v < static_cast<long long>(std::numeric_limits<T>::min()) ||
+            v > static_cast<long long>(std::numeric_limits<T>::max())) {
+            return false;
+        }
+        out = static_cast<T>(v);
+        return true;
+    } else {
+        const unsigned long long v = PyLong_AsUnsignedLongLong(obj);
+        if (v == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
+            PyErr_Clear();
+            return false;
+        }
+        if (v > static_cast<unsigned long long>(std::numeric_limits<T>::max())) {
+            return false;
+        }
+        out = static_cast<T>(v);
+        return true;
+    }
+}
+
+// Reads an object already known to be an exact int. Returns false when the
+// value does not fit T; nothing here raises, so a caller never has to clear
+// anything. Declining is always safe - it is a conversion failure, which is
+// what an out-of-range value is.
+template<typename T>
+    requires std::is_integral_v<T>
+inline bool load_int_exact(PyObject* obj, T& out) noexcept {
+#if defined(Py_LIMITED_API) || defined(PYPY_VERSION) || defined(MIRROR_BRIDGE_NO_FAST_INT)
+    // No access to the representation, by choice or by platform.
+    return load_int_checked(obj, out);
+#else
+    std::int64_t v;
+#  if PY_VERSION_HEX >= 0x030C0000
+    // 3.12 moved the digits behind a tagged union and added these two
+    // accessors for exactly this use: public, inline, no call into libpython.
+    if (!PyUnstable_Long_IsCompact(reinterpret_cast<PyLongObject*>(obj))) {
+        return load_int_checked(obj, out);
+    }
+    v = PyUnstable_Long_CompactValue(reinterpret_cast<PyLongObject*>(obj));
+#  else
+    // Sign and digit count share ob_size; zero has no digits at all.
+    const Py_ssize_t ndigits = Py_SIZE(obj);
+    if (ndigits < -1 || ndigits > 1) return load_int_checked(obj, out);
+    const std::int64_t magnitude =
+        ndigits == 0 ? 0
+                     : static_cast<std::int64_t>(
+                           reinterpret_cast<PyLongObject*>(obj)->ob_digit[0]);
+    v = ndigits < 0 ? -magnitude : magnitude;
+#  endif
+    // Folds away entirely for T at least as wide as a digit.
+    if constexpr (std::is_signed_v<T>) {
+        if (v < static_cast<std::int64_t>(std::numeric_limits<T>::min()) ||
+            v > static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
+            return false;
+        }
+    } else {
+        if (v < 0 || static_cast<std::uint64_t>(v) >
+                         static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+            return false;
+        }
+    }
+    out = static_cast<T>(v);
+    return true;
+#endif
+}
+
 // Convert Python objects to C++ types
 template<Arithmetic T>
 bool from_python(PyObject* obj, T& out) {
     if constexpr (std::is_floating_point_v<T>) {
+        // An exact float is the common case and its value is readable through
+        // a macro, so it never leaves this header. PyFloat_AsDouble is a call
+        // into libpython that also has to consider __float__ on an arbitrary
+        // object; paid once per argument and once per container element, that
+        // is the single largest cost on the scalar path.
+        if (PyFloat_CheckExact(obj)) {
+            out = static_cast<T>(PyFloat_AS_DOUBLE(obj));
+            return true;
+        }
         if (!PyFloat_Check(obj) && !PyLong_Check(obj)) return false;
         out = static_cast<T>(PyFloat_AsDouble(obj));
         return true;
-    } else if constexpr (std::is_signed_v<T>) {
+    } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
+        // Deliberately not the integer path below: a C++ bool accepts any
+        // int, so 5 is true, where load_int_exact would reject anything
+        // outside {0, 1} as out of range.
+        if (PyBool_Check(obj)) {
+            out = (obj == Py_True);
+            return true;
+        }
         if (!PyLong_Check(obj)) return false;
-        out = static_cast<T>(PyLong_AsLong(obj));
+        std::int64_t v = 0;
+        if (!load_int_checked(obj, v)) return false;
+        out = (v != 0);
         return true;
     } else {
+        if (PyLong_CheckExact(obj)) return load_int_exact(obj, out);
         if (!PyLong_Check(obj)) return false;
-        out = static_cast<T>(PyLong_AsUnsignedLong(obj));
-        return true;
+        return load_int_checked(obj, out);  // an int subclass
     }
 }
 
@@ -3900,6 +4012,32 @@ bool from_python(PyObject* obj, T& container) {
     }
 
     if constexpr (requires { container.push_back(ValueType{}); }) {
+        // Bulk tier: an exact list or tuple of exact scalars into an
+        // arithmetic container. Reading an exact float or int cannot run user
+        // code, so unlike the generic tier this loop needs no per-element
+        // size re-read and no dispatch through from_python — the two things
+        // that cost ~1.2ns an element on a list of 80,000 ints.
+        //
+        // A non-exact element is not an error. The loop stops there and the
+        // generic tier below resumes at that index, which is measurably
+        // cheaper than restarting the whole sequence.
+        if constexpr (std::is_arithmetic_v<ValueType> && !std::is_same_v<ValueType, bool>) {
+            if (is_list || is_tuple) {
+                for (; i < size; ++i) {
+                    PyObject* raw = is_list ? PyList_GET_ITEM(obj, i) : PyTuple_GET_ITEM(obj, i);
+                    if constexpr (std::is_floating_point_v<ValueType>) {
+                        if (!PyFloat_CheckExact(raw)) break;
+                        container.push_back(static_cast<ValueType>(PyFloat_AS_DOUBLE(raw)));
+                    } else {
+                        if (!PyLong_CheckExact(raw)) break;
+                        ValueType v{};
+                        if (!load_int_exact(raw, v)) break;
+                        container.push_back(v);
+                    }
+                }
+            }
+        }
+
         for (; i < size; ++i) {
             ValueType cpp_item;
             if (!convert_at(i, cpp_item)) return false;
@@ -5277,7 +5415,7 @@ consteval std::size_t get_method_param_count_static() {
 
 // Helper to call static methods (no `self` parameter)
 template<typename T, std::size_t Index, std::size_t... Is>
-PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
+PyObject* call_static_method_impl(PyObject* const* args, std::index_sequence<Is...>) {
     constexpr auto static_func = get_static_member_function<T, Index>();
     constexpr auto return_type = get_static_method_return_type<T, Index>();
     using ReturnType = typename [:return_type:];
@@ -5289,7 +5427,7 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
     ([&] {
         if (!success) return;
         if (!extract_param<static_method_param_t<T, Index, Is>>(
-                PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
+                args[Is], std::get<Is>(cpp_args))) {
             PyErr_Format(PyExc_TypeError, "Argument %zu type conversion failed", Is);
             success = false;
         }
@@ -5322,10 +5460,10 @@ PyObject* call_static_method_impl(PyObject* args, std::index_sequence<Is...>) {
 
 // Python static method wrapper
 template<typename T, std::size_t Index>
-PyObject* py_static_method(PyObject* /* self */, PyObject* args) {
+PyObject* py_static_method(PyObject* /* self */, PyObject* const* args, Py_ssize_t nargs) {
     constexpr std::size_t param_count = get_method_param_count_static<T, Index>();
 
-    if (PyTuple_Size(args) != static_cast<Py_ssize_t>(param_count)) {
+    if (nargs != static_cast<Py_ssize_t>(param_count)) {
         PyErr_SetString(PyExc_TypeError, "Incorrect number of arguments");
         return nullptr;
     }
@@ -5554,7 +5692,7 @@ consteval std::size_t min_required_args() {
 // inside the lambda keeps every reflection operation in a constant-evaluated
 // context.
 template<typename T, std::size_t FuncIndex, std::size_t N>
-PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
+PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject* const* resolved) {
     using ReturnType = typename [:get_method_return_type<T, FuncIndex>():];
 
     return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> PyObject* {
@@ -5606,32 +5744,40 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject** resolved) {
 // invokes the method with the resolved leading prefix (remaining params
 // fill in from C++ defaults).
 template<typename T, std::size_t FuncIndex>
-PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* args, PyObject* kwds) {
+PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* const* args,
+                       Py_ssize_t nargs, PyObject* kwnames) {
     constexpr std::size_t P = get_method_param_count<T, FuncIndex>();
     constexpr std::size_t MIN = min_required_args<T, FuncIndex>();
 
-    const Py_ssize_t n_pos = args ? PyTuple_Size(args) : 0;
-    const Py_ssize_t n_kw = kwds ? PyDict_Size(kwds) : 0;
+    const Py_ssize_t n_pos = nargs;
+    const Py_ssize_t n_kw = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
 
     if (n_pos > static_cast<Py_ssize_t>(P)) return OVERLOAD_TRY_NEXT;
     if (n_pos + n_kw > static_cast<Py_ssize_t>(P)) return OVERLOAD_TRY_NEXT;
     if (n_pos + n_kw < static_cast<Py_ssize_t>(MIN)) return OVERLOAD_TRY_NEXT;
 
+    // Fast path: every parameter supplied positionally, nothing to resolve.
+    // The vectorcall args block is already the contiguous PyObject* array the
+    // invoker wants, so it is handed straight through with no copy.
+    if (n_kw == 0 && n_pos == static_cast<Py_ssize_t>(P)) {
+        return invoke_with_n_args<T, FuncIndex, P>(wrapper, args);
+    }
+
     // Resolve positional + keyword args into a contiguous array of PyObject*.
     // resolved[i] holds the arg for the i-th parameter slot.
     PyObject* resolved[P > 0 ? P : 1] = {};
     for (Py_ssize_t i = 0; i < n_pos; ++i) {
-        resolved[i] = PyTuple_GET_ITEM(args, i);
+        resolved[i] = args[i];
     }
 
-    // Match each kwarg by name to a parameter index. We check every kwarg
-    // against every param name; parameter names come from reflection via
-    // identifier_of, so this is O(kw * P) per call (small for typical APIs).
-    if (kwds && n_kw > 0) {
-        PyObject* key;
-        PyObject* value;
-        Py_ssize_t pos = 0;
-        while (PyDict_Next(kwds, &pos, &key, &value)) {
+    // Match each kwarg by name to a parameter index. Under vectorcall the
+    // keyword NAMES arrive in the kwnames tuple and their VALUES sit in the
+    // same flat args block just past the positional ones, so there is no
+    // dict to walk: kwnames[j] names the slot for args[nargs + j].
+    if (n_kw > 0) {
+        for (Py_ssize_t j = 0; j < n_kw; ++j) {
+            PyObject* key = PyTuple_GET_ITEM(kwnames, j);
+            PyObject* value = args[n_pos + j];
             Py_ssize_t key_len;
             const char* key_str = PyUnicode_AsUTF8AndSize(key, &key_len);
             if (!key_str) return OVERLOAD_TRY_NEXT;
@@ -5675,7 +5821,8 @@ PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* args, PyObject* kwds) {
 // matching name. Keyword arguments are supported via each overload's
 // try_overload<...>, which uses reflection to map kwarg names -> param slots.
 template<typename T, std::size_t CanonicalIndex, std::size_t... AllIndices>
-PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, PyObject* kwds,
+PyObject* py_method_dispatch_impl(PyObject* self, PyObject* const* args,
+                                   Py_ssize_t nargs, PyObject* kwnames,
                                    std::index_sequence<AllIndices...>) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
@@ -5692,7 +5839,7 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, PyObject* kwds
         constexpr auto this_name = get_member_function_name<T, AllIndices>();
         if constexpr (std::string_view(this_name) == std::string_view(target_name) &&
                       method_fully_bindable<T, AllIndices>()) {
-            result = try_overload<T, AllIndices>(wrapper, args, kwds);
+            result = try_overload<T, AllIndices>(wrapper, args, nargs, kwnames);
         }
     }(), ...);
 
@@ -5700,20 +5847,25 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* args, PyObject* kwds
         PyErr_Format(PyExc_TypeError,
             "No matching overload for '%s' with %zd positional argument(s)%s",
             target_name,
-            args ? PyTuple_Size(args) : 0,
-            (kwds && PyDict_Size(kwds) > 0) ? " and keyword argument(s)" : "");
+            nargs,
+            (kwnames && PyTuple_GET_SIZE(kwnames) > 0) ? " and keyword argument(s)" : "");
         return nullptr;
     }
 
     return result;
 }
 
-// Entry point registered in the PyMethodDef table. METH_VARARGS | METH_KEYWORDS.
+// Entry point registered in the PyMethodDef table. METH_FASTCALL | METH_KEYWORDS:
+// `args` is a flat PyObject* block of nargs positionals followed by one value
+// per name in `kwnames` (a tuple, or null when the call had no keywords).
+// CPython strips PY_VECTORCALL_ARGUMENTS_OFFSET before reaching a PyMethodDef
+// entry point, so `nargs` is already the plain positional count.
 template<typename T, std::size_t CanonicalIndex>
-PyObject* py_method_dispatch(PyObject* self, PyObject* args, PyObject* kwds) {
+PyObject* py_method_dispatch(PyObject* self, PyObject* const* args,
+                             Py_ssize_t nargs, PyObject* kwnames) {
     constexpr std::size_t total_methods = get_member_function_count<T>();
     return py_method_dispatch_impl<T, CanonicalIndex>(
-        self, args, kwds, std::make_index_sequence<total_methods>{});
+        self, args, nargs, kwnames, std::make_index_sequence<total_methods>{});
 }
 
 // ============================================================================
@@ -5812,9 +5964,11 @@ auto generate_methods(std::index_sequence<Indices...>) {
                 methods[method_idx] = PyMethodDef{
                     .ml_name = method_name,
                     .ml_meth = reinterpret_cast<PyCFunction>(py_method_dispatch<T, Indices>),
-                    // METH_KEYWORDS lets the dispatcher see the kwds dict so it
-                    // can resolve keyword arguments by reflection-provided name.
-                    .ml_flags = METH_VARARGS | METH_KEYWORDS,
+                    // METH_FASTCALL hands the dispatcher the caller's argument
+                    // block directly, with no intermediate tuple; the paired
+                    // METH_KEYWORDS adds the kwnames tuple so keyword arguments
+                    // still resolve by reflection-provided name.
+                    .ml_flags = METH_FASTCALL | METH_KEYWORDS,
                     .ml_doc = nullptr
                 };
                 method_idx++;
@@ -5848,7 +6002,7 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
             methods[Indices] = PyMethodDef{
                 .ml_name = func_name,
                 .ml_meth = reinterpret_cast<PyCFunction>(py_static_method<T, Indices>),
-                .ml_flags = METH_VARARGS,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
+                .ml_flags = METH_FASTCALL,  // No METH_STATIC - we wrap with PyStaticMethod_New instead
                 .ml_doc = nullptr
             };
         }
@@ -7228,14 +7382,13 @@ using StorageType = std::remove_cvref_t<T>;
 
 // Wrapper for calling a free function with Python arguments
 template<auto FuncPtr, std::size_t... Is>
-PyObject* call_free_function_impl(PyObject* args, std::index_sequence<Is...>) {
+PyObject* call_free_function_impl(PyObject* const* args, Py_ssize_t nargs, std::index_sequence<Is...>) {
     using Traits = FunctionTraits<decltype(FuncPtr)>;
     using ArgsTuple = typename Traits::ArgsTuple;
     using ReturnType = typename Traits::ReturnType;
     constexpr std::size_t arity = Traits::arity;
 
     // Check argument count
-    Py_ssize_t nargs = PyTuple_Size(args);
     if (nargs != static_cast<Py_ssize_t>(arity)) {
         PyErr_Format(PyExc_TypeError,
             "Function takes %zu argument(s) but %zd were given",
@@ -7253,7 +7406,7 @@ PyObject* call_free_function_impl(PyObject* args, std::index_sequence<Is...>) {
         if (!conversion_ok) return;
         using ArgType = std::tuple_element_t<Is, ArgsTuple>;
         using CleanArgType = std::remove_cvref_t<ArgType>;
-        PyObject* py_arg = PyTuple_GetItem(args, Is);
+        PyObject* py_arg = args[Is];
 
         CleanArgType value;
         if (from_python(py_arg, value)) {
@@ -7282,9 +7435,9 @@ PyObject* call_free_function_impl(PyObject* args, std::index_sequence<Is...>) {
 }
 
 template<auto FuncPtr>
-PyObject* call_free_function(PyObject* /*self*/, PyObject* args) {
+PyObject* call_free_function(PyObject* /*self*/, PyObject* const* args, Py_ssize_t nargs) {
     using Traits = FunctionTraits<decltype(FuncPtr)>;
-    return call_free_function_impl<FuncPtr>(args, std::make_index_sequence<Traits::arity>{});
+    return call_free_function_impl<FuncPtr>(args, nargs, std::make_index_sequence<Traits::arity>{});
 }
 
 template<auto FuncPtr, std::size_t ParamIndex>
@@ -7316,7 +7469,7 @@ bool bind_function(PyObject* module, const char* name) {
     static PyMethodDef method_def = {
         name,
         reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>),
-        METH_VARARGS,
+        METH_FASTCALL,
         nullptr  // doc
     };
 
@@ -7999,7 +8152,7 @@ bool bind_instance(PyObject* m) {
         std::fprintf(stderr, "mirror_bridge: skipped %s (a parameter or the return type has no converter)\n", c_function<fn>());
         return false;
     } else {
-        static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_VARARGS, nullptr };
+        static PyMethodDef def = { name, reinterpret_cast<PyCFunction>(call_free_function<FuncPtr>), METH_FASTCALL, nullptr };
         PyObject* func = PyCFunction_New(&def, nullptr);
         if (!func) return false;
         Family* f = family_for(m, false, name, c_qualified<tmpl>(), Kind::Function, nullptr);
