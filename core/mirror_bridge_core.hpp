@@ -214,6 +214,11 @@ template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
         return std::meta::is_function(member) &&
+               // A conversion function (`explicit operator double() const`)
+               // is not an operator function and has no identifier, so it
+               // reached identifier_of and made the whole module fail to
+               // compile. Requiring a name says what the callers need.
+               std::meta::has_identifier(member) &&
                !std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
@@ -280,6 +285,7 @@ template<typename T>
 struct StaticMemberFunctionCache {
     static consteval bool is_bindable_static_method(std::meta::info member) {
         return std::meta::is_function(member) &&
+               std::meta::has_identifier(member) &&   // see is_bindable_method
                std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
