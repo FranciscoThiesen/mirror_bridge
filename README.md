@@ -153,7 +153,7 @@ python3 test_greeter.py
 | Topic | Description |
 |-------|-------------|
 | **[Getting Started](docs/getting-started/)** | Quick start, installation, first binding |
-| **[Guides](docs/guides/)** | Workflow, PCH, multi-language, contributing |
+| **[Guides](docs/guides/)** | Workflow, PCH, multi-language, independent teams, contributing |
 | **[Reference](docs/reference/)** | CLI, API, configuration, type conversion |
 | **[Architecture](docs/internals/architecture.md)** | System design and internals |
 | **[Examples](examples/)** | Progressive examples from hello-world to production |

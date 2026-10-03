@@ -16,6 +16,7 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 - **[Workflow Guide](guides/workflow.md)** - Recommended development workflow with PCH
 - **[PCH Optimization](guides/pch-optimization.md)** - 3-6x faster compilation with precompiled headers
 - **[Multi-Language Support](guides/multi-language.md)** - Python, Lua, JavaScript, and Rust bindings
+- **[Independent Teams](guides/independent-teams.md)** - Running in production when a C++ team and a Python team do not coordinate daily
 - **[Packaging](guides/packaging.md)** - Distribute bindings as pip-installable packages
 - **[Single-Header Distribution](guides/single-header.md)** - Simplified integration with amalgamated headers
 - **[Contributing](guides/contributing.md)** - Development guide and contribution workflow
