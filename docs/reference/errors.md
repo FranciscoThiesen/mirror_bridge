@@ -53,6 +53,24 @@ warning: "Compiler defines neither __cpp_impl_reflection nor __cpp_reflection. R
 
 **Fix** None needed. Suppress with `-Wno-#warnings` (clang) only if the warning is noisy in your build logs.
 
+### `mirror_bridge diff` snapshot is empty
+
+**Symptom**
+
+```
+Error: 'mirror_bridge diff' found no headers to snapshot in src/
+      2 header(s) are in subdirectories; diff scans only the top level
+```
+
+**Cause** `diff` scans only the top level of the given directory and skips any header containing the text `MIRROR_BRIDGE_SKIP`. If that leaves nothing, the snapshot would be empty — and an empty baseline makes `diff --check` pass forever, including after you delete every class. It now refuses (exit 3) rather than recording nothing.
+
+**Fix** Point `diff` at a directory whose headers are at the top level, or gate on the generated stub instead. The stub is derived from the same reflection data as the binding and is byte-reproducible, so it cannot drift from what was built:
+
+```bash
+mirror_bridge generate src/ --module m --lang python --output build --stubs --force
+diff -u api/m.pyi build/m.pyi
+```
+
 ### Unconvertible member type (`bind_class` / `MIRROR_BRIDGE_VALIDATE`)
 
 **Symptom**
@@ -96,6 +114,44 @@ error: static assertion failed: Trampoline must derive from T (or be T itself)
 mirror_bridge::python::bind_class<MyBase>(module, "MyBase");                  // no overrides
 mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); // with overrides
 ```
+
+### Names missing from the module
+
+**Symptom**
+
+```
+✓ Successfully built bindings for: python
+
+⚠ 3 names were not bound into 'book' — Python raises AttributeError on them:
+
+    1 enum type(s) — values still cross as plain int, unchecked
+      trading::Side
+      Fix: mirror each enum as a Python enum.IntEnum; stubs annotate these as int
+
+    2 free function(s) overloaded in C++ — overload sets are not bound yet
+      lib::price, lib::delta
+      Fix: give one overload a distinct name, or bind a single non-overloaded wrapper
+```
+
+**Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind.
+
+**Fix** Each group states its own. An enum's values still cross correctly as plain `int`, so the usual answer is to mirror the enum on the Python side; the generated stub annotates those parameters as `int`. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. The full list is also in `<output>/<module>_plan.txt`.
+
+### Two bound classes with the same unqualified name
+
+**Symptom**
+
+```
+⚠ 'Config' is the binding name of 2 classes:
+      shapes.hpp:3
+      shapes.hpp:5
+```
+
+followed, if you continue, by a compiler error such as `reference to 'Config' is ambiguous` or `redefinition of 'Config'`.
+
+**Cause** A module binds every class under its *unqualified* name and recovers scope with one `using namespace` per namespace found in the scanned headers. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in.
+
+**Fix** Bind one of them in a module of its own, or rename one class. Marking one `// MIRROR_BRIDGE_SKIP` is not enough: the using-directive for its namespace is still emitted, so the collision remains.
 
 ### Unsupported container shape
 

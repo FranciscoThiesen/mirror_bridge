@@ -2,6 +2,14 @@
 
 **Difficulty**: Beginner
 
+> **Not implemented yet.** Enum *types* are not exported as Python objects, so
+> `game_enums.Color.Red` does not exist and `test_enums.py` in this directory
+> does not pass. What does work today is that enum *values* cross the boundary
+> as plain `int`, unchecked, in members, parameters and return types; generated
+> stubs annotate them as `int`. `mirror_bridge generate` now reports every enum
+> it found and did not bind, rather than silently dropping it. This example is
+> kept as the specification for the feature, not as a description of it.
+
 Demonstrates binding scoped enums (enum class) to Python.
 
 ## What You'll Learn
