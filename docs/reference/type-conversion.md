@@ -288,6 +288,50 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
+## Argument Type Checking (Python)
+
+This section describes the Python backend. Lua and JavaScript do not check
+argument identity yet.
+
+A parameter, data member, or container element whose type is a bound C++
+class accepts only an object of that class, an object of a class derived
+from it, or a Python subclass of either. Anything else raises `TypeError`:
+
+```python
+curve = pricing.Curve()
+pricing.discount(curve, 2.0)   # fine
+pricing.discount(42, 2.0)      # TypeError: Argument 1: type conversion failed
+pricing.discount(label, 2.0)   # TypeError, even though Label is also bound
+```
+
+Conversion to a base class is offset-adjusted, so it is correct for a base
+that is not the first one:
+
+```cpp
+struct Swap : Observable, Priceable { ... };   // Priceable is not at offset 0
+double value(const Priceable&);
+```
+
+```python
+value(swap)   # reaches the Priceable subobject, not the start of the Swap
+```
+
+Virtual bases work too: the offset is resolved at call time rather than
+assumed, and the same class bound by two different modules interoperates.
+
+The conversion is recorded by the derived class when it is bound, so the
+base and the derived class may live in different modules and be imported in
+either order. Two cases are deliberately not convertible:
+
+- A derived class whose module has never been imported, because nothing has
+  registered it yet.
+- A base that C++ itself would not let you reach from that call site: one
+  that is inaccessible (`private`/`protected`) or ambiguous because it is
+  inherited twice non-virtually.
+
+Inside an overload set a rejected argument simply moves to the next
+candidate, so `TypeError` is raised only when no overload matches.
+
 ## Limitations
 
 ### Not Currently Supported
