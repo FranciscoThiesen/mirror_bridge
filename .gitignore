@@ -56,6 +56,7 @@ improvement_notes.md
 
 # Benchmark results
 benchmarks/runtime/python/runtime_results.json
+benchmarks/runtime/python/trading_results.json
 benchmarks/runtime/lua/runtime_results_lua.json
 benchmarks/runtime/javascript/runtime_results_js.json
 blog/
