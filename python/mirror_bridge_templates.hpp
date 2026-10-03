@@ -436,6 +436,14 @@ inline PyObject* family_call(PyObject* o, PyObject* args, PyObject* kwargs) {
 inline PyObject* family_descr_get(PyObject* o, PyObject* obj, PyObject*) {
     auto* f = reinterpret_cast<Family*>(o);
     if (!obj || obj == Py_None) return Py_NewRef(o);
+    // Attribute access always hands us an instance, but __get__ is reachable
+    // by hand with any object at all, and whatever is bound here becomes the
+    // `self` that call_member reinterprets as the owning class.
+    if (f->kind == Kind::Member && f->owner && !PyObject_TypeCheck(obj, f->owner)) {
+        PyErr_Format(PyExc_TypeError, "%s.%s needs a %s instance, not %s",
+                     f->owner->tp_name, f->name, f->owner->tp_name, Py_TYPE(obj)->tp_name);
+        return nullptr;
+    }
     auto* b = reinterpret_cast<Family*>(FamilyType.tp_alloc(&FamilyType, 0));
     if (!b) return nullptr;
     b->instances = f->instances;

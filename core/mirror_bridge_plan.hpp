@@ -279,6 +279,12 @@ struct Inventory { std::vector<info> fn_templates, class_templates, plain_classe
 consteval void inventory_namespace(Inventory& inv, info ns) {
     for (info m : members_of(ns, access_context::unchecked())) {
         if (is_namespace(m) || !in_source(m)) continue;
+        // A namespace-scope operator has no identifier. Asking for one ends
+        // the whole consteval evaluation, so the discovery TU fails to
+        // compile and the CLI quietly falls back to classes only — every
+        // free function and every template instantiation in the module lost
+        // to one `operator<<`. Nothing nameless is bindable anyway.
+        if (!has_identifier(m)) continue;
         if (is_type_alias(m)) inv.aliases.push_back(m);
         else if (is_class_template(m)) inv.class_templates.push_back(m);
         else if (is_function_template(m)) inv.fn_templates.push_back(m);

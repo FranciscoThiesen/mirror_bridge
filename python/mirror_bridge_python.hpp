@@ -420,10 +420,13 @@ inline bool from_python(PyObject* obj, T& out) {
     if constexpr (std::is_abstract_v<ElementType> ||
                   !std::is_default_constructible_v<ElementType> ||
                   !std::is_copy_assignable_v<ElementType>) {
-        // Can't reconstruct an abstract/non-default-constructible pointee from
-        // a Python dict representation. Leave the smart pointer as-is for non-
-        // None inputs; the caller is expected to populate via typed setters.
-        return true;
+        // An abstract or non-default-constructible pointee cannot be
+        // materialized from a Python value. Reporting success anyway left
+        // `out` empty and handed the callee a null smart pointer to
+        // dereference, so any argument at all crashed the interpreter.
+        // Failing is the honest answer: the dispatcher moves on and the
+        // caller gets a TypeError. Only None converts, handled above.
+        return false;
     } else {
         ElementType value;
         // Let overload resolution choose - non-template overloads have higher priority
@@ -1867,6 +1870,45 @@ PyObject* to_python(const T& container) {
 // Forward declare PyWrapper for use in from_python (will be fully defined later)
 template<typename T> struct PyWrapper;
 
+template<typename T> struct TypeRegistry;
+
+// The part of PyWrapper<X> that does not depend on X. Every wrapper starts
+// this way, which is what makes a generic read possible — and why the read
+// has to be preceded by a check.
+struct WrapperView {
+    PyObject_HEAD
+    void* cpp_object;
+    bool owns;
+};
+
+// Everything except the common case: a Python subclass, a type registered by
+// another module, or a derived class that needs its address adjusted to a
+// base subobject. Defined after the cross-module type registry it consults.
+template<typename Expected>
+bool resolve_wrapper_slow(PyObject* obj, void*& raw);
+
+// Resolve a Python object to the address of the C++ object it wraps, after
+// checking that it really is a wrapper for Expected (or for a class derived
+// from it). Returns false — never a bad pointer — for anything else.
+//
+// Every path that reinterprets a PyObject as a bound class goes through
+// here. The exact-type case is one pointer comparison so that the check
+// costs nothing on the by-reference hot path; everything else is one call
+// away in resolve_wrapper_slow.
+template<typename Expected>
+inline bool resolve_wrapper_object(PyObject* obj, void*& raw) {
+    if (!obj) return false;
+
+    PyTypeObject* want = TypeRegistry<Expected>::py_type;
+    if (want && Py_IS_TYPE(obj, want)) {
+        void* held = reinterpret_cast<WrapperView*>(obj)->cpp_object;
+        if (!held) return false;
+        raw = held;
+        return true;
+    }
+    return resolve_wrapper_slow<Expected>(obj, raw);
+}
+
 // Convert Python wrapped objects to C++ types
 // This handles cases like Sphere(Vec3(...), double, Vec3(...))
 // where Vec3 is a bound C++ class
@@ -1881,20 +1923,13 @@ template<typename T>
 inline bool from_python(PyObject* obj, T& out) {
     using CleanT = std::remove_cvref_t<T>;
 
-    if (!obj) {
-        return false;
-    }
-
-    // Cast to PyWrapper with cleaned type (no const/ref qualifiers)
-    auto* wrapper = reinterpret_cast<PyWrapper<CleanT>*>(obj);
-
-    // Minimal validation: just check if the pointer is non-null
-    if (!wrapper->cpp_object) {
+    void* raw = nullptr;
+    if (!resolve_wrapper_object<CleanT>(obj, raw)) {
         return false;
     }
 
     // Copy the C++ object
-    out = *wrapper->cpp_object;
+    out = *static_cast<CleanT*>(raw);
     return true;
 }
 
@@ -2234,6 +2269,13 @@ template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
         return std::meta::is_function(member) &&
+               // A conversion function (`explicit operator double() const`)
+               // is not an operator function and has no identifier, so it
+               // survived the filter below and then made identifier_of
+               // ill-formed — turning one ordinary value type into a module
+               // that does not compile, with no diagnostic naming the class.
+               // Requiring a name states what the caller actually needs.
+               std::meta::has_identifier(member) &&
                !std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
@@ -2295,6 +2337,7 @@ struct StaticMemberFunctionCache {
     // Helper to check if a member is a bindable static method
     static consteval bool is_bindable_static_method(std::meta::info member) {
         return std::meta::is_function(member) &&
+               std::meta::has_identifier(member) &&   // see is_bindable_method
                std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
@@ -2532,27 +2575,19 @@ decltype(auto) forward_arg(StoredType& arg) {
     }
 }
 
-// from_python for pointer storage: extract cpp_object from Python wrapper.
-// All PyWrapper<X> instances share a common layout (PyObject_HEAD, X*, bool),
-// so we can read the cpp_object pointer generically and cast to the target
-// pointer type. The cast is safe as long as the user passes a Python wrapper
-// whose underlying C++ object is a T* or T-derived*.
+// from_python for pointer storage: alias the C++ object a Python wrapper
+// holds, instead of copying it. resolve_wrapper_object does the identity
+// check and applies the base-offset adjustment when the object is a derived
+// class, so what lands in `out` is a T* and not merely a T-shaped address.
 //
 // None is rejected (returns false): pointer storage is always dereferenced
 // by forward_arg before the call — bindable parameters are never raw
 // pointers — so accepting None as nullptr would guarantee a null deref.
 template<typename T>
 inline bool from_python_pointer(PyObject* obj, T*& out) {
-    if (!obj || obj == Py_None) { out = nullptr; return false; }
-    // Generic layout shared by every PyWrapper<X>
-    struct GenericPyWrapper {
-        PyObject_HEAD
-        void* cpp_object;
-        bool owns;
-    };
-    auto* wrapper = reinterpret_cast<GenericPyWrapper*>(obj);
-    if (!wrapper->cpp_object) return false;
-    out = static_cast<T*>(wrapper->cpp_object);
+    void* raw = nullptr;
+    if (!resolve_wrapper_object<T>(obj, raw)) { out = nullptr; return false; }
+    out = static_cast<T*>(raw);
     return true;
 }
 
@@ -4114,11 +4149,20 @@ consteval bool op_bindable() {
 // wrapper object incref'd to match Python's in-place protocol.
 template<typename T, std::size_t OpIndex, bool InPlace>
 PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
-    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
-    if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
-        return nullptr;
+    // A binary number slot is offered to BOTH operands, so `5 + v` enters
+    // here with self = 5 and `other` = v. self is not ours to assume.
+    void* self_raw = nullptr;
+    if (!resolve_wrapper_object<T>(self, self_raw)) {
+        PyTypeObject* mine = TypeRegistry<T>::py_type;
+        if (mine && PyObject_TypeCheck(self, mine)) {
+            PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+            return nullptr;
+        }
+        // Not our left operand: let Python try the reflected operation and
+        // raise its own TypeError if nothing handles it.
+        Py_RETURN_NOTIMPLEMENTED;
     }
+    T* self_object = static_cast<T*>(self_raw);
 
     if constexpr (op_param_count<T, OpIndex>() != 1) {
         Py_RETURN_NOTIMPLEMENTED;
@@ -4138,7 +4182,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
         try {
             if constexpr (InPlace) {
                 call_gil_aware<T>([&] {
-                    ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                    ((*self_object).[:OperatorCache<T>::at(OpIndex):])(
                         forward_arg<OtherParam>(storage));
                 });
                 Py_INCREF(self);
@@ -4150,7 +4194,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
                     Py_RETURN_NONE;
                 } else {
                     Ret result = call_gil_aware<T>([&]() -> Ret {
-                        return ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])(
+                        return ((*self_object).[:OperatorCache<T>::at(OpIndex):])(
                             forward_arg<OtherParam>(storage));
                     });
                     return to_python(result);
@@ -4187,9 +4231,20 @@ PyObject* unary_op_wrapper(PyObject* self) {
 }
 
 // Subscript: a[i] → a.operator[](i). Returns the result converted to Python.
+//
+// NotImplemented is the right answer for a number slot, where CPython
+// consumes it and tries the reflected operand. mp_subscript has no such
+// protocol, so the singleton would be handed back to the caller as if it
+// were the result; a bad key has to raise instead.
 template<typename T, std::size_t OpIndex>
 PyObject* subscript_wrapper(PyObject* self, PyObject* key) {
-    return binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(self, key);
+    PyObject* result = binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(self, key);
+    if (result == Py_NotImplemented) {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_TypeError, "invalid index type for %s", Py_TYPE(self)->tp_name);
+        return nullptr;
+    }
+    return result;
 }
 
 // Call: a(args...) → a.operator()(args...). For simplicity we support only
@@ -4211,8 +4266,17 @@ PyObject* call_wrapper(PyObject* self, PyObject* args, PyObject* /*kwds*/) {
             PyErr_SetString(PyExc_TypeError, "operator() expects 1 argument");
             return nullptr;
         }
-        return binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(
+        PyObject* result = binary_op_wrapper<T, OpIndex, /*InPlace=*/false>(
             self, PyTuple_GET_ITEM(args, 0));
+        // tp_call has no reflected-operand protocol to consume this (see
+        // subscript_wrapper), so a bad argument has to raise.
+        if (result == Py_NotImplemented) {
+            Py_DECREF(result);
+            PyErr_Format(PyExc_TypeError, "invalid argument type for %s()",
+                         Py_TYPE(self)->tp_name);
+            return nullptr;
+        }
+        return result;
     }
 }
 
@@ -4512,19 +4576,15 @@ struct ConversionOverloadGenerator {
 // C++ type names (via typeid) to Python type objects. This dict is shared
 // across all .so files since it lives in Python's runtime.
 
-// Get or create the global type registry dict in Python
-// This is NOT in an anonymous namespace so it can be used by the public API below
-inline PyObject* get_python_type_registry() {
-    // Get sys.modules
+// Get or create one of our dicts in sys.modules. Returns a borrowed
+// reference, or nullptr if the interpreter is in no state to help.
+// NOT in an anonymous namespace so the public API below can use it.
+inline PyObject* get_python_named_registry(const char* registry_name) {
     PyObject* sys_modules = PyImport_GetModuleDict();
     if (!sys_modules) return nullptr;
 
-    // Check if our registry module exists
-    const char* registry_name = "_mirror_bridge_types";
     PyObject* registry = PyDict_GetItemString(sys_modules, registry_name);
-
     if (!registry) {
-        // Create a new dict to serve as our registry
         registry = PyDict_New();
         if (!registry) return nullptr;
 
@@ -4539,6 +4599,100 @@ inline PyObject* get_python_type_registry() {
     return registry;
 }
 
+inline PyObject* get_python_type_registry() {
+    return get_python_named_registry("_mirror_bridge_types");
+}
+
+// ============================================================================
+// Wrapper identity — what a PyObject is allowed to become
+// ============================================================================
+//
+// Every bound class gets the same wrapper layout (PyObject_HEAD, T*, bool).
+// That uniformity is what lets one generated binding serve every class, and
+// it is also what makes the wrappers indistinguishable from one another at
+// the boundary: reading cpp_object out of whatever PyObject arrives
+// "succeeds" for an int, a dict, or an unrelated bound class just as readily
+// as for the right one. So each conversion has to establish identity first.
+//
+// Three dicts in sys.modules make that possible across .so boundaries, since
+// C++ statics are per-shared-library:
+//   _mirror_bridge_types       typeid name   -> PyTypeObject*   (forward)
+//   _mirror_bridge_type_names  PyTypeObject  -> typeid name     (reverse)
+//   _mirror_bridge_upcasts     "base|derived" -> offset thunk
+// The reverse dict answers "which C++ class is this object?" for an object
+// whose type we did not expect, and the upcast dict converts that object's
+// address to the address of a specific base subobject — an adjustment that
+// reusing the pointer gets wrong for every base after the first.
+
+using UpcastThunk = void* (*)(void*);
+
+inline PyObject* get_python_typename_registry() {
+    return get_python_named_registry("_mirror_bridge_type_names");
+}
+
+inline PyObject* get_python_upcast_registry() {
+    return get_python_named_registry("_mirror_bridge_upcasts");
+}
+
+// The C++ type behind a Python type object, or nullptr when it is not a
+// mirror_bridge wrapper at all — which is the answer for int, str, dict,
+// list and every other thing that can be passed by mistake.
+//
+// Bases are walked too, so a Python subclass of a bound class reports the
+// C++ type it ultimately wraps.
+inline const char* wrapper_typeid_name(PyTypeObject* type) {
+    PyObject* names = get_python_typename_registry();
+    if (!names) return nullptr;
+    for (PyTypeObject* t = type; t; t = t->tp_base) {
+        PyObject* entry = PyDict_GetItem(names, reinterpret_cast<PyObject*>(t));
+        if (entry) return PyUnicode_AsUTF8(entry);
+    }
+    return nullptr;
+}
+
+inline std::string upcast_key(const char* base_tid, const char* derived_tid) {
+    return std::string(base_tid) + "|" + derived_tid;
+}
+
+inline UpcastThunk find_upcast(const char* base_tid, const char* derived_tid) {
+    PyObject* upcasts = get_python_upcast_registry();
+    if (!upcasts) return nullptr;
+    PyObject* capsule = PyDict_GetItemString(upcasts, upcast_key(base_tid, derived_tid).c_str());
+    if (!capsule) return nullptr;
+    // Round-tripping a function pointer through void* is how the C API
+    // carries callbacks; PyCapsule has no function-pointer slot of its own.
+    void* fn = PyCapsule_GetPointer(capsule, "mirror_bridge.upcast");
+    if (!fn) { PyErr_Clear(); return nullptr; }
+    return reinterpret_cast<UpcastThunk>(fn);
+}
+
+// Record how to turn a Derived* into a Base*. Registered by the DERIVED
+// class's bind_class, so the two classes may be bound in different modules
+// and imported in either order.
+//
+// A base the language will not let us reach — inaccessible, or ambiguous
+// because it is inherited twice non-virtually — is skipped rather than
+// registered, so the guard keeps bind_class compiling for hierarchies that
+// have one. Python then declines the conversion, which is the same answer
+// C++ gives at that call site.
+template<typename Derived, typename Base>
+void register_upcast() {
+    if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
+        PyObject* upcasts = get_python_upcast_registry();
+        if (!upcasts) return;
+        UpcastThunk thunk = +[](void* p) -> void* {
+            return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
+        };
+        PyObject* capsule = PyCapsule_New(reinterpret_cast<void*>(thunk),
+                                          "mirror_bridge.upcast", nullptr);
+        if (!capsule) { PyErr_Clear(); return; }
+        PyDict_SetItemString(upcasts,
+                             upcast_key(typeid(Base).name(), typeid(Derived).name()).c_str(),
+                             capsule);
+        Py_DECREF(capsule);
+    }
+}
+
 namespace {
     // Register a type in the Python-based global registry
     template<typename T>
@@ -4549,6 +4703,15 @@ namespace {
         // Use typeid name as the key (unique per type across all modules)
         const char* type_name = typeid(T).name();
         PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
+
+        // And the reverse, so an object arriving from Python whose type we
+        // were not expecting can still be identified (see WrapperView).
+        PyObject* names = get_python_typename_registry();
+        if (!names) return;
+        PyObject* value = PyUnicode_FromString(type_name);
+        if (!value) { PyErr_Clear(); return; }
+        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), value);
+        Py_DECREF(value);
     }
 
     // Look up a type from the Python-based global registry
@@ -4562,6 +4725,87 @@ namespace {
 
         return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
     }
+}
+
+// What an object of some other Python type has to do to become an Expected.
+enum class WrapperRoute : unsigned char {
+    Reject,    // not one of ours, or unrelated to Expected
+    AsIs,      // the same C++ class, reached through a different type object
+    Adjust,    // a derived class: shift the address to the base subobject
+};
+
+struct WrapperDecision {
+    WrapperRoute route = WrapperRoute::Reject;
+    UpcastThunk to_base = nullptr;
+};
+
+// Deciding costs a reverse-dict lookup, a key concatenation and a capsule
+// unwrap, which measured ~5x the cost of an exact-type argument when a
+// derived object was passed in a loop. The decision depends only on the
+// pair (Expected, incoming type), so it is made once per pair.
+//
+// Only positive decisions are remembered: a rejection can legitimately turn
+// into an acceptance later, when the module that binds the derived class is
+// imported and registers its upcasts. The key type is kept alive so its
+// address cannot be reused by a later type object.
+template<typename Expected>
+WrapperDecision decide_route(PyTypeObject* from) {
+    static std::unordered_map<PyTypeObject*, WrapperDecision> memo;
+    if (auto it = memo.find(from); it != memo.end()) return it->second;
+
+    WrapperDecision decision;
+    if (const char* dynamic_tid = wrapper_typeid_name(from)) {
+        if (std::strcmp(dynamic_tid, typeid(Expected).name()) == 0) {
+            decision = {WrapperRoute::AsIs, nullptr};
+        } else if (UpcastThunk thunk = find_upcast(typeid(Expected).name(), dynamic_tid)) {
+            decision = {WrapperRoute::Adjust, thunk};
+        }
+    }
+    if (decision.route != WrapperRoute::Reject) {
+        Py_INCREF(reinterpret_cast<PyObject*>(from));
+        memo.emplace(from, decision);
+    }
+    return decision;
+}
+
+// Declared near the top of this header, where the conversion templates that
+// call it are written. Returning false here is not a dead end: it is the
+// same signal an unconvertible scalar gives, so the overload dispatcher
+// moves to the next candidate and an exhausted dispatcher raises TypeError.
+template<typename Expected>
+bool resolve_wrapper_slow(PyObject* obj, void*& raw) {
+    if (!obj || obj == Py_None) return false;
+
+    PyTypeObject* want = TypeRegistry<Expected>::py_type;
+    if (!want) want = lookup_type_in_python<Expected>();
+
+    // The expected type itself, or a Python subclass of it (a trampoline).
+    // Subclasses extend the wrapper at the tail, so cpp_object stays put and
+    // no adjustment is needed.
+    if (want && PyObject_TypeCheck(obj, want)) {
+        void* held = reinterpret_cast<WrapperView*>(obj)->cpp_object;
+        if (!held) return false;
+        raw = held;
+        return true;
+    }
+
+    // Some other Python type: the same class bound by a second module, a
+    // derived class, or a Python subclass of either. wrapper_typeid_name
+    // walks bases, so all three resolve to the C++ class actually held.
+    WrapperDecision decision = decide_route<Expected>(Py_TYPE(obj));
+    if (decision.route == WrapperRoute::Reject) return false;
+
+    void* held = reinterpret_cast<WrapperView*>(obj)->cpp_object;
+    if (!held) return false;
+
+    if (decision.route == WrapperRoute::AsIs) {
+        raw = held;
+        return true;
+    }
+    // The held pointer addresses the whole derived object, which is not
+    // where a second or virtual base subobject begins.
+    raw = decision.to_base(held);
+    return raw != nullptr;
 }
 
 // ============================================================================
@@ -4824,6 +5068,53 @@ struct BoundClass {
     explicit operator bool() const { return type != nullptr; }
 };
 
+// Every class T is transitively derived from, in breadth-first order.
+// bind_class records one upcast thunk per entry, which is what lets a
+// Derived still be passed where a Base is expected once arguments are
+// identity-checked.
+template<typename T>
+consteval std::vector<std::meta::info> collect_base_closure() {
+    std::vector<std::meta::info> found;
+    std::vector<std::meta::info> layer{^^T};
+    while (!layer.empty()) {
+        std::vector<std::meta::info> next;
+        for (auto cls : layer) {
+            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
+                auto base_type = std::meta::type_of(b);
+                bool seen = false;
+                for (auto f : found) {
+                    if (f == base_type) { seen = true; break; }
+                }
+                if (seen) continue;          // diamond: one entry per base
+                found.push_back(base_type);
+                next.push_back(base_type);
+            }
+        }
+        layer = next;
+    }
+    return found;
+}
+
+template<typename T>
+struct BaseClosure {
+    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
+};
+
+// Alias-template form, because the pack below appears only inside a splice
+// and GCC does not treat that as expandable (see core/mirror_bridge_core.hpp).
+template<typename T, std::size_t I>
+consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+
+template<typename T, std::size_t I>
+using base_t = typename [:base_at<T, I>():];
+
+template<typename T>
+void register_base_upcasts() {
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (register_upcast<T, base_t<T, Is>>(), ...);
+    }(std::make_index_sequence<BaseClosure<T>::types.size()>{});
+}
+
 // Main binding function — generates Python type object for a C++ class.
 //
 // Takes an optional `Trampoline` template parameter (defaulting to T). When
@@ -5015,6 +5306,11 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // from methods in another .so file (C++ static variables are per-.so)
     register_type_in_python<T>(&type_object);
 
+    // Record how to reach each base subobject from a T. Done by the derived
+    // class, so base and derived can be bound in different modules and
+    // imported in either order.
+    register_base_upcasts<T>();
+
     // Feed the stub registry from the same reflection data this binding was
     // generated from; __mirror_bridge_stubs__() serves it per module.
     collect_stub_info<T>(name);
@@ -5061,6 +5357,18 @@ struct FunctionTraits;
 
 template<typename R, typename... Args>
 struct FunctionTraits<R(*)(Args...)> {
+    using ReturnType = R;
+    using ArgsTuple = std::tuple<Args...>;
+    static constexpr std::size_t arity = sizeof...(Args);
+};
+
+// Since C++17 noexcept is part of the function type, so this is a distinct
+// specialization and not a duplicate. Without it a `double mid(...) noexcept`
+// does not merely fail to bind, it fails the whole module: the bindability
+// check that is supposed to skip it instantiates FunctionTraits itself, so
+// the guard cannot fire.
+template<typename R, typename... Args>
+struct FunctionTraits<R(*)(Args...) noexcept> {
     using ReturnType = R;
     using ArgsTuple = std::tuple<Args...>;
     static constexpr std::size_t arity = sizeof...(Args);
