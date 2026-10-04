@@ -156,6 +156,15 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # C++ exceptions reach Python from every path, and constructor
+    # keyword arguments bind instead of being dropped
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/boundary_errors)
+        mirror_bridge_python_module(boundary_errors
+            boundary_errors/boundary_errors_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boundary_errors
+        )
+    endif()
+
     # Integer and float arguments are range-checked, and a refused
     # conversion leaves no Python error set behind
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion)
