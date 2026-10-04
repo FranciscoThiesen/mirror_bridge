@@ -900,9 +900,17 @@ compile_binding() {
         output_file="$output_dir/${module_name}${output_ext}"
     fi
 
+    # -fvisibility=hidden: without it a generated module exports every
+    # template instantiation the reflection pass produced -- 170 of them on
+    # the benchmark class -- which costs about a fifth of the module in
+    # symbol tables and relocations and leaves the dispatch chain calling
+    # itself through the PLT. The entry points stay visible: CPython's
+    # PyMODINIT_FUNC and Node's NAPI_MODULE already carry the attribute, and
+    # the Lua one is marked with MIRROR_BRIDGE_EXPORT.
     local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
         -I. -I$src_dir -I$PROJECT_ROOT \
         -fPIC -shared -O3 -DNDEBUG \
+        -fvisibility=hidden -fvisibility-inlines-hidden \
         -Wno-deprecated-declarations"
 
     # Add user-supplied -I directories
