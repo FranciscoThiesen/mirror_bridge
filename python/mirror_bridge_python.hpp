@@ -3150,12 +3150,20 @@ T* call_constructor_impl(PyObject* args, std::index_sequence<Is...>) {
     }
 }
 
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+consteval std::string_view constructor_param_name() {
+    constexpr auto ctor = get_constructor<T, CtorIndex>();
+    auto p = std::meta::parameters_of(ctor)[ParamIndex];
+    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
+    return {};
+}
+
 // Trampoline-aware constructor caller. Allocates Alloc (== T normally, or
 // Trampoline for classes that support Python subclassing) with T's matching
 // constructor. Alloc must inherit from T and expose T's constructors (the
 // canonical idiom is `using T::T;` in the trampoline).
 template<typename T, typename Alloc, std::size_t CtorIndex, std::size_t... Is>
-Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
+Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>) {
     if constexpr (std::is_abstract_v<T>) {
         PyErr_SetString(PyExc_TypeError,
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
@@ -3168,16 +3176,54 @@ Alloc* call_constructor_impl_alloc(PyObject* args, std::index_sequence<Is...>) {
         ([&] {
             if (!success) return;
             if (!extract_param<constructor_param_t<T, CtorIndex, Is>>(
-                    PyTuple_GET_ITEM(args, Is), std::get<Is>(cpp_args))) {
+                    argv[Is], std::get<Is>(cpp_args))) {
                 success = false;
             }
         }(), ...);
 
-        if (!success) return nullptr;
+        // A conversion failure means "not this overload", not "the call
+        // failed". Clearing here is what lets py_init tell the two apart: it
+        // retries on a null with no error set, and stops on a null with one.
+        if (!success) {
+            PyErr_Clear();
+            return nullptr;
+        }
 
-        return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
-            std::get<Is>(cpp_args))...);
+        // The constructor body is user C++ and may throw. Without this the
+        // exception unwinds past the interpreter and std::terminate aborts
+        // the process, giving the caller no traceback and nothing to catch.
+        try {
+            return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
+                std::get<Is>(cpp_args))...);
+        } catch (const std::exception& e) {
+            set_py_error_from_cpp_exception(e);
+            return nullptr;
+        } catch (...) {
+            PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+            return nullptr;
+        }
     }
+}
+
+// Match one keyword name to a constructor parameter slot.
+//
+// CtorIndex is a scalar template parameter rather than a pack element on
+// purpose: expanding Js... inside py_init's fold over the constructors would
+// put two packs of different lengths in one expansion, which both GCC and
+// clang reject. Hoisting the inner expansion into its own template is the
+// same shape the per-index collectors below use.
+template<typename T, std::size_t CtorIndex, std::size_t P>
+inline bool match_ctor_keyword(std::string_view name, PyObject* value,
+                               PyObject** resolved) {
+    bool matched = false;
+    [&]<std::size_t... Js>(std::index_sequence<Js...>) {
+        ((!matched && constructor_param_name<T, CtorIndex, Js>() == name
+              ? (resolved[Js] == nullptr
+                     ? (resolved[Js] = value, matched = true, void())
+                     : void())
+              : void()), ...);
+    }(std::make_index_sequence<P>{});
+    return matched;
 }
 
 // Initialize Python wrapper with parameterized constructor. If Trampoline != T,
@@ -3187,53 +3233,101 @@ template<typename T, typename Trampoline = T>
 int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
 
-    Py_ssize_t nargs = PyTuple_Size(args);
+    const Py_ssize_t nargs = args ? PyTuple_GET_SIZE(args) : 0;
+    const Py_ssize_t nkw = kwds ? PyDict_GET_SIZE(kwds) : 0;
 
-    // Default constructor case — only if Trampoline is default constructible.
-    if (nargs == 0) {
+    // Default construction is the no-argument case, and a keyword argument is
+    // an argument. Reading only the tuple here meant Cls(a=1, b=2) fell into
+    // this branch and silently produced a DEFAULT object while the caller
+    // believed their values had been used.
+    if (nargs == 0 && nkw == 0) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
-            auto* obj = new Trampoline();
-            wrapper->cpp_object = obj;
-            wrapper->owns = true;
-            if constexpr (!std::is_same_v<T, Trampoline>) {
-                static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(self);
+            try {
+                auto* obj = new Trampoline();
+                wrapper->cpp_object = obj;
+                wrapper->owns = true;
+                if constexpr (!std::is_same_v<T, Trampoline>) {
+                    static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(self);
+                }
+                return 0;
+            } catch (const std::exception& e) {
+                set_py_error_from_cpp_exception(e);
+                return -1;
+            } catch (...) {
+                PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+                return -1;
             }
-            return 0;
         } else {
             PyErr_SetString(PyExc_TypeError, "This class requires constructor arguments");
             return -1;
         }
     }
 
-    // Try to find matching constructor by parameter count.
     constexpr std::size_t ctor_count = get_constructor_count<T>();
 
     bool found = false;
+    bool raised = false;   // the constructor itself threw: stop, do not retry
     [&]<std::size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
-            if (found) return;
+            if (found || raised) return;
 
             if constexpr (constructor_params_all_bindable<T, Is>()) {
-                constexpr std::size_t param_count = get_constructor_param_count<T, Is>();
-                if (nargs == static_cast<Py_ssize_t>(param_count)) {
-                    Trampoline* obj = call_constructor_impl_alloc<T, Trampoline, Is>(
-                        args, std::make_index_sequence<param_count>{});
+                constexpr std::size_t P = get_constructor_param_count<T, Is>();
+                if (nargs + nkw != static_cast<Py_ssize_t>(P)) return;
 
-                    if (obj) {
-                        wrapper->cpp_object = obj;
-                        wrapper->owns = true;
-                        if constexpr (!std::is_same_v<T, Trampoline>) {
-                            obj->_mirror_bridge_set_py_self(self);
+                // resolved[i] is the argument for the i-th constructor
+                // parameter, wherever the caller put it.
+                PyObject* resolved[P > 0 ? P : 1] = {};
+                for (Py_ssize_t i = 0; i < nargs; ++i) {
+                    resolved[i] = PyTuple_GET_ITEM(args, i);
+                }
+
+                // Match each keyword to a slot by the parameter's reflected
+                // name, the same way the method dispatcher does. A name this
+                // constructor does not have, or one that repeats a
+                // positional, just means this is not the overload.
+                if (nkw > 0) {
+                    PyObject *key = nullptr, *value = nullptr;
+                    Py_ssize_t pos = 0;
+                    while (PyDict_Next(kwds, &pos, &key, &value)) {
+                        Py_ssize_t klen = 0;
+                        const char* kstr = PyUnicode_AsUTF8AndSize(key, &klen);
+                        if (!kstr) {
+                            PyErr_Clear();
+                            return;
                         }
-                        found = true;
+                        const std::string_view kview(kstr, static_cast<std::size_t>(klen));
+                        if (!match_ctor_keyword<T, Is, P>(kview, value, resolved)) return;
                     }
+                }
+
+                for (std::size_t i = 0; i < P; ++i) {
+                    if (!resolved[i]) return;
+                }
+
+                Trampoline* obj = call_constructor_impl_alloc<T, Trampoline, Is>(
+                    resolved, std::make_index_sequence<P>{});
+
+                if (obj) {
+                    wrapper->cpp_object = obj;
+                    wrapper->owns = true;
+                    if constexpr (!std::is_same_v<T, Trampoline>) {
+                        obj->_mirror_bridge_set_py_self(self);
+                    }
+                    found = true;
+                } else if (PyErr_Occurred()) {
+                    raised = true;
                 }
             }
         }(), ...);
     }(std::make_index_sequence<ctor_count>{});
 
+    if (raised) return -1;
+
     if (!found) {
-        PyErr_SetString(PyExc_TypeError, "No matching constructor found");
+        PyErr_Format(PyExc_TypeError,
+                     "No matching constructor for %zd positional argument(s)%s",
+                     nargs, nkw > 0 ? " and keyword argument(s)" : "");
         return -1;
     }
 
@@ -5104,14 +5198,6 @@ consteval std::string_view static_param_name() {
     return {};
 }
 
-template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
-consteval std::string_view constructor_param_name() {
-    constexpr auto ctor = get_constructor<T, CtorIndex>();
-    auto p = std::meta::parameters_of(ctor)[ParamIndex];
-    if (std::meta::has_identifier(p)) return std::meta::identifier_of(p);
-    return {};
-}
-
 // Per-index collectors: each takes the outer index as a scalar template
 // parameter so the inner Ps... expansion contains exactly one pack (nesting
 // an outer fold's pack element inside another expansion trips the
@@ -5582,13 +5668,25 @@ PyObject* call_free_function_impl(PyObject* const* args, Py_ssize_t nargs, std::
     }
 
     // Call the function - stored values are passed, references work because
-    // the storage tuple is still in scope
-    if constexpr (std::is_void_v<ReturnType>) {
-        FuncPtr(std::get<Is>(cpp_args)...);
-        Py_RETURN_NONE;
-    } else {
-        auto result = FuncPtr(std::get<Is>(cpp_args)...);
-        return to_python(result);
+    // the storage tuple is still in scope.
+    //
+    // Wrapped the way the method and static-method paths already are. Without
+    // it a C++ exception unwinds past the interpreter and std::terminate
+    // aborts the process: no traceback, nothing to catch, exit 134.
+    try {
+        if constexpr (std::is_void_v<ReturnType>) {
+            FuncPtr(std::get<Is>(cpp_args)...);
+            Py_RETURN_NONE;
+        } else {
+            auto result = FuncPtr(std::get<Is>(cpp_args)...);
+            return to_python(result);
+        }
+    } catch (const std::exception& e) {
+        set_py_error_from_cpp_exception(e);
+        return nullptr;
+    } catch (...) {
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return nullptr;
     }
 }
 
