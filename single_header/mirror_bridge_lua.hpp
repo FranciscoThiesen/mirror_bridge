@@ -83,6 +83,20 @@
 #define MIRROR_BRIDGE_HAS_ENUMERATORS_OF 1
 #define MIRROR_BRIDGE_HAS_TYPE_SIGNATURES 1
 
+// Module entry points must stay visible when the module is compiled with
+// -fvisibility=hidden, which the CLI does: hiding everything else drops 170
+// template instantiations out of the dynamic symbol table and takes about a
+// fifth off the module. CPython's PyMODINIT_FUNC and Node's NAPI_MODULE
+// already carry the attribute; Lua's luaopen_ entry point does not, and
+// without this it becomes invisible and require() fails to find the module.
+#if defined(_WIN32)
+#  define MIRROR_BRIDGE_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define MIRROR_BRIDGE_EXPORT __attribute__((visibility("default")))
+#else
+#  define MIRROR_BRIDGE_EXPORT
+#endif
+
 namespace mirror_bridge {
 namespace core {
 
@@ -2075,7 +2089,7 @@ void bind_class(lua_State* L, const char* name) {
 // ============================================================================
 
 #define MIRROR_BRIDGE_LUA_MODULE(module_name, ...) \
-    extern "C" int luaopen_##module_name(lua_State* L) { \
+    extern "C" MIRROR_BRIDGE_EXPORT int luaopen_##module_name(lua_State* L) { \
         lua_newtable(L); \
         __VA_ARGS__ \
         return 1; \

@@ -1290,7 +1290,7 @@ void bind_class(lua_State* L, const char* name) {
 // ============================================================================
 
 #define MIRROR_BRIDGE_LUA_MODULE(module_name, ...) \
-    extern "C" int luaopen_##module_name(lua_State* L) { \
+    extern "C" MIRROR_BRIDGE_EXPORT int luaopen_##module_name(lua_State* L) { \
         lua_newtable(L); \
         __VA_ARGS__ \
         return 1; \
