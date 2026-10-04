@@ -54,6 +54,22 @@ struct DefaultOnly {
     int tag = 42;
 };
 
+// A call that does not match should say why. With one candidate the
+// parameter names and the arity are compile-time facts, so the message can
+// name the offending keyword instead of reporting only that nothing matched.
+struct Signatures {
+    double scale(double factor, int times) const { return factor * times; }
+    double with_default(double cash, int periods, double spread = 0.0) const {
+        return cash / (1 + periods + spread);
+    }
+    int nullary() const { return 7; }
+
+    // Overloaded: here the generic message is the honest one, because there
+    // really are several candidates.
+    int pick(int a) const { return a; }
+    int pick(double a) const { return static_cast<int>(a); }
+};
+
 inline int free_thrower(int x) {
     if (x < 0) throw std::runtime_error("free function rejects negative");
     return x * 2;

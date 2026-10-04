@@ -5924,6 +5924,73 @@ PyObject* try_overload(PyWrapper<T>* wrapper, PyObject* const* args,
     return result;
 }
 
+// Say why a call did not match, when there is only one thing it could have
+// matched. With a single candidate the parameter names and the arity are
+// compile-time facts, so the message can name the offending keyword or the
+// count it wanted. The generic "no matching overload" line is the right
+// answer only when there really are several candidates; said about one, it
+// withholds information the binding already has.
+template<typename T, std::size_t FuncIndex>
+void describe_call_failure(const char* name, Py_ssize_t nargs, PyObject* kwnames) {
+    constexpr std::size_t P = get_method_param_count<T, FuncIndex>();
+    constexpr std::size_t MIN = min_required_args<T, FuncIndex>();
+    const Py_ssize_t n_kw = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+
+    std::string accepted;
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (((void)(Is ? (accepted += ", ") : accepted),
+          accepted += param_name<T, FuncIndex, Is>()), ...);
+    }(std::make_index_sequence<P>{});
+
+    // An unknown keyword is the most actionable failure, so it is reported
+    // first and by name: "bogus" is what the caller needs to see, not a count.
+    for (Py_ssize_t j = 0; j < n_kw; ++j) {
+        PyObject* key = PyTuple_GET_ITEM(kwnames, j);
+        Py_ssize_t klen = 0;
+        const char* kstr = PyUnicode_AsUTF8AndSize(key, &klen);
+        if (!kstr) {
+            PyErr_Clear();
+            continue;
+        }
+        const std::string_view kview(kstr, static_cast<std::size_t>(klen));
+        bool known = false;
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            ((known = known || param_name<T, FuncIndex, Is>() == kview), ...);
+        }(std::make_index_sequence<P>{});
+        if (!known) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s() got an unexpected keyword argument '%s' (takes %s)",
+                         name, kstr, accepted.c_str());
+            return;
+        }
+    }
+
+    const Py_ssize_t supplied = nargs + n_kw;
+    if (supplied < static_cast<Py_ssize_t>(MIN) ||
+        supplied > static_cast<Py_ssize_t>(P)) {
+        if constexpr (P == 0) {
+            PyErr_Format(PyExc_TypeError, "%s() takes no arguments, got %zd",
+                         name, supplied);
+        } else if constexpr (MIN == P) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s() takes %zu argument(s) (%s), got %zd",
+                         name, P, accepted.c_str(), supplied);
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                         "%s() takes %zu to %zu argument(s) (%s), got %zd",
+                         name, MIN, P, accepted.c_str(), supplied);
+        }
+        return;
+    }
+
+    // Right name, right count: a value did not convert. Naming the signature
+    // is the most the dispatcher knows here without re-running the
+    // conversions, and it is more than the caller had before.
+    PyErr_Format(PyExc_TypeError,
+                 "%s(): could not convert an argument; expected (%s)",
+                 name, accepted.c_str());
+}
+
 // Dispatch function that tries all overloads with a given name.
 // CanonicalIndex is the first method with this name; we try ALL methods with
 // matching name. Keyword arguments are supported via each overload's
@@ -5952,11 +6019,22 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* const* args,
     }(), ...);
 
     if (result == OVERLOAD_TRY_NEXT) {
-        PyErr_Format(PyExc_TypeError,
-            "No matching overload for '%s' with %zd positional argument(s)%s",
-            target_name,
-            nargs,
-            (kwnames && PyTuple_GET_SIZE(kwnames) > 0) ? " and keyword argument(s)" : "");
+        // How many methods actually competed for this call. One is the
+        // common case and the one where a precise message is possible.
+        constexpr std::size_t candidates =
+            ((std::string_view(get_member_function_name<T, AllIndices>()) ==
+                  std::string_view(target_name) &&
+              method_fully_bindable<T, AllIndices>()) + ... + std::size_t{0});
+
+        if constexpr (candidates == 1 && method_fully_bindable<T, CanonicalIndex>()) {
+            describe_call_failure<T, CanonicalIndex>(target_name, nargs, kwnames);
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "No matching overload for '%s' with %zd positional argument(s)%s",
+                target_name,
+                nargs,
+                (kwnames && PyTuple_GET_SIZE(kwnames) > 0) ? " and keyword argument(s)" : "");
+        }
         return nullptr;
     }
 
