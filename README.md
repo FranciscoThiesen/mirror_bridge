@@ -113,7 +113,7 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
-| Rust | Beta | Code generation |
+| Rust | Prototype | Code generation |
 
 ### Feature Matrix
 
@@ -128,7 +128,7 @@ python3 test_greeter.py
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
 | **Variants (std::variant)** | ✅ | ✅ | ✅ |
 | **Nested Objects** | ✅ | ✅ | ✅ |
-| **Enums** | ✅ | ✅ | ✅ |
+| **Enums** | ⚠️ | ⚠️ | ⚠️ |
 | **Inheritance** | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ |
 | **Smart Pointers** | ✅ | ✅ | ✅ |
@@ -140,6 +140,12 @@ python3 test_greeter.py
 | **std::expected** | ✅ | ✅ | ✅ |
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
+
+⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
+enum *types* are not exported, so there is no Python, Lua or JavaScript object
+for them and an out-of-range integer is accepted rather than rejected.
+`generate` names every enum it skipped. Tracked in
+[#20](https://github.com/FranciscoThiesen/mirror_bridge/issues/20).
 
 ### Additional Features
 
