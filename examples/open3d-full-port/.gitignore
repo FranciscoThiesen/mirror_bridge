@@ -1,3 +1,9 @@
 Open3D/
 build/
 *.so
+
+# Open3D's own headers, copied here so the port can be reproduced against a
+# fixed subset. They are third-party source (Copyright (c) 2018-2024
+# www.open3d.org, SPDX-License-Identifier: MIT) and should be fetched from
+# upstream rather than vendored into this repository.
+subset/

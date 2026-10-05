@@ -61,3 +61,26 @@ benchmarks/runtime/lua/runtime_results_lua.json
 benchmarks/runtime/javascript/runtime_results_js.json
 blog/
 examples/open3d-full-port/Open3D
+
+# Build trees. `build/` was already ignored; these are the ones the test and
+# CI paths actually create, and they were being offered as untracked on every
+# status.
+build_ci/
+build_ctest/
+*.gch
+
+# A compiled binary for one architecture is not source. tests/rust/rust_gen
+# is produced by the Rust backend test and was tracked as an aarch64 ELF,
+# which is useless to anyone on another machine.
+tests/rust/rust_gen
+
+# Blog drafts and their artwork live in the blog repository. Keeping them
+# here put unpublished drafts in a public library repo and made a 595 KB
+# screenshot the largest file in it.
+blog_draft/
+
+# Private notes and ideation, deliberately local.
+ideas.md
+
+# Written by examples/open3d-comprehensive/visual_demo.py when it runs.
+examples/open3d-comprehensive/mirror_bridge_open3d_demo.png
