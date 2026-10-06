@@ -207,6 +207,9 @@ SKIP_TESTS=(
     "inheritance/test_inheritance.py:Run via test_inheritance_cli.sh (module built by CLI generate)"
     # template_instantiation's module comes from the CLI's template planner
     "template_instantiation/test_template_instantiation.py:Run via test_template_instantiation_cli.sh (module built by CLI generate)"
+    # export_macro proves discovery sees past an export macro, which only the
+    # CLI's generate pipeline can show
+    "export_macro/test_export_macro.py:Run via test_export_macro_cli.sh (module built by CLI generate)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)

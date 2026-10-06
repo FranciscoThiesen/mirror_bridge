@@ -305,7 +305,7 @@ endif()
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
 set(MB_PYTHON_BASH_ONLY_PATTERN
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation"
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro"
 )
 
 # The same contract for the other two backends. These were spelled out at
@@ -329,6 +329,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/template_instantiation)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/template_instantiation/build_and_test.sh
     )
     set_tests_properties(cli_template_instantiation PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
+# Class discovery reads the headers through reflection, so an export macro
+# in front of a class declaration cannot be mistaken for the class name.
+# A CLI test for the same reason: the generate pipeline is what is on trial.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/export_macro)
+    add_test(NAME cli_export_macro
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/export_macro/build_and_test.sh
+    )
+    set_tests_properties(cli_export_macro PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
     )
 endif()
