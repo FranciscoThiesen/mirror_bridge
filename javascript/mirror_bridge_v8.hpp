@@ -46,9 +46,12 @@
 
 #include "../core/mirror_bridge_core.hpp"
 #include <v8.h>
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <memory>
+#include <vector>
 
 namespace mirror_bridge {
 namespace v8_bindings {  // Named v8_bindings to avoid conflict with ::v8 namespace
@@ -68,8 +71,17 @@ using namespace core;
 //
 // ============================================================================
 
+// Declared ahead of the wrapper, which tags itself with the name the class
+// was bound under so an error message can say what actually arrived.
+template<typename T>
+struct V8TypeRegistry;
+
 template<typename T>
 struct V8Wrapper {
+    // What bind_class called this class, so a rejected conversion can name
+    // what actually arrived. Identity itself comes from the object's
+    // FunctionTemplate, not from here - see resolve_v8_wrapper.
+    const char* type_name = V8TypeRegistry<T>::bound_name;
     T* cpp_object;           // Pointer to the actual C++ object
     bool owns_memory;        // If true, delete cpp_object when V8 GCs this wrapper
 
@@ -332,6 +344,18 @@ bool from_v8(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, T& out) {
 }
 
 // ============================================================================
+// Internal Data Field Indices
+// ============================================================================
+//
+// V8 objects have internal fields where we can store native pointers.
+// We use index 0 to store the V8Wrapper pointer.
+//
+// ============================================================================
+
+constexpr int kWrapperFieldIndex = 0;
+constexpr int kInternalFieldCount = 1;
+
+// ============================================================================
 // Type Registry for V8 Class Templates
 // ============================================================================
 //
@@ -344,7 +368,165 @@ template<typename T>
 struct V8TypeRegistry {
     static inline ::v8::Global<::v8::FunctionTemplate> constructor_template;
     static inline ::v8::Isolate* cached_isolate = nullptr;
+    static inline const char* bound_name = nullptr;
 };
+
+// ============================================================================
+// Wrapper identity - what a JavaScript value is allowed to become
+// ============================================================================
+//
+// Reading the internal field of whatever object arrives is two mistakes at
+// once: the object may not be one of ours at all, and even when it is, it
+// may hold a different C++ class whose bytes then get reinterpreted. Both
+// questions have the same answer in V8: FunctionTemplate::HasInstance says
+// whether an object was made from a given class's template, so the class is
+// established before any internal field is touched. One gate,
+// resolve_v8_wrapper, stands in front of every read.
+
+// The part of V8Wrapper<X> that does not depend on X.
+struct V8WrapperView {
+    const char* type_name;
+    void* cpp_object;
+    bool owns_memory;
+};
+
+using V8UpcastThunk = void* (*)(void*);
+
+// Every class bound in this module, so an object that is not the expected
+// class can still be identified before its address is adjusted. Scanned only
+// on the slow path, and a generated module binds a handful of classes.
+struct V8BoundClass {
+    ::v8::Global<::v8::FunctionTemplate>* constructor_template;
+    const char* type_id;
+};
+
+inline std::vector<V8BoundClass>& v8_bound_classes() {
+    static std::vector<V8BoundClass> classes;
+    return classes;
+}
+
+// Recorded by the DERIVED class's bind_class, keyed "base|derived". Per
+// shared library, which is as far as this backend's cross-module story
+// reaches: to_v8 already falls back to a plain-object snapshot for a class
+// this module did not bind.
+inline std::map<std::string, V8UpcastThunk>& v8_upcast_table() {
+    static std::map<std::string, V8UpcastThunk> table;
+    return table;
+}
+
+inline V8UpcastThunk find_v8_upcast(const char* base_tid, const char* derived_tid) {
+    auto& table = v8_upcast_table();
+    auto it = table.find(std::string(base_tid) + "|" + derived_tid);
+    return it == table.end() ? nullptr : it->second;
+}
+
+// A base the language will not let us reach - inaccessible, or ambiguous
+// because it is inherited twice non-virtually - is skipped rather than
+// recorded, so the guard keeps bind_class compiling for hierarchies that
+// have one.
+template<typename Derived, typename Base>
+void register_v8_upcast() {
+    if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
+        v8_upcast_table()[std::string(typeid(Base).name()) + "|" + typeid(Derived).name()] =
+            +[](void* p) -> void* {
+                return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
+            };
+    }
+}
+
+template<typename T>
+void register_v8_base_upcasts() {
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (register_v8_upcast<T, core::base_t<T, Is>>(), ...);
+    }(std::make_index_sequence<core::BaseClosure<T>::types.size()>{});
+}
+
+inline V8WrapperView* v8_wrapper_view(::v8::Local<::v8::Object> obj) {
+    return static_cast<V8WrapperView*>(
+        obj->GetAlignedPointerFromInternalField(kWrapperFieldIndex));
+}
+
+// Resolve a JavaScript value to the address of the C++ object it wraps, after
+// checking that it really is a wrapper for Expected (or for a class derived
+// from it). Returns false - never a bad pointer - for anything else.
+template<typename Expected>
+bool resolve_v8_wrapper(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, void*& raw) {
+    if (value.IsEmpty() || !value->IsObject()) return false;
+    ::v8::Local<::v8::Object> obj = value.As<::v8::Object>();
+    if (obj->InternalFieldCount() < kInternalFieldCount) return false;
+
+    auto& registry = V8TypeRegistry<Expected>::constructor_template;
+    if (!registry.IsEmpty() && V8TypeRegistry<Expected>::cached_isolate == isolate) {
+        ::v8::Local<::v8::FunctionTemplate> tpl = registry.Get(isolate);
+        if (tpl->HasInstance(obj)) {
+            V8WrapperView* view = v8_wrapper_view(obj);
+            if (!view || !view->cpp_object) return false;
+            raw = view->cpp_object;
+            return true;
+        }
+    }
+
+    // Some other class. HasInstance is what makes reading the internal field
+    // safe, so the dynamic type has to be established the same way rather
+    // than by trusting the field's contents.
+    for (const V8BoundClass& bound : v8_bound_classes()) {
+        if (bound.constructor_template->IsEmpty()) continue;
+        ::v8::Local<::v8::FunctionTemplate> tpl = bound.constructor_template->Get(isolate);
+        if (!tpl->HasInstance(obj)) continue;
+
+        V8UpcastThunk to_base = find_v8_upcast(typeid(Expected).name(), bound.type_id);
+        if (!to_base) return false;
+        V8WrapperView* view = v8_wrapper_view(obj);
+        if (!view || !view->cpp_object) return false;
+        // The held pointer addresses the whole derived object, which is not
+        // where a second or virtual base subobject begins.
+        raw = to_base(view->cpp_object);
+        return raw != nullptr;
+    }
+    return false;
+}
+
+template<typename T>
+inline const char* v8_expected_name() {
+    const char* name = V8TypeRegistry<T>::bound_name;
+    return name ? name : typeid(T).name();
+}
+
+inline void describe_v8_value(::v8::Local<::v8::Value> value, char* out, std::size_t out_size) {
+    if (!value.IsEmpty() && value->IsObject()) {
+        ::v8::Local<::v8::Object> obj = value.As<::v8::Object>();
+        if (obj->InternalFieldCount() >= kInternalFieldCount) {
+            if (V8WrapperView* view = v8_wrapper_view(obj); view && view->type_name) {
+                std::snprintf(out, out_size, "%s", view->type_name);
+                return;
+            }
+        }
+    }
+    const char* kind = "value";
+    if (value.IsEmpty())            kind = "nothing";
+    else if (value->IsUndefined())  kind = "undefined";
+    else if (value->IsNull())       kind = "null";
+    else if (value->IsNumber())     kind = "number";
+    else if (value->IsString())     kind = "string";
+    else if (value->IsBoolean())    kind = "boolean";
+    else if (value->IsFunction())   kind = "function";
+    else if (value->IsArray())      kind = "array";
+    else if (value->IsObject())     kind = "object";
+    std::snprintf(out, out_size, "%s", kind);
+}
+
+template<typename Expected>
+void throw_v8_wrong_type(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value,
+                         const char* context) {
+    char actual[256];
+    describe_v8_value(value, actual, sizeof actual);
+    char message[640];
+    std::snprintf(message, sizeof message, "%s: expected %s, got %s",
+                  context, v8_expected_name<Expected>(), actual);
+    isolate->ThrowException(::v8::Exception::TypeError(
+        ::v8::String::NewFromUtf8(isolate, message, ::v8::NewStringType::kNormal)
+            .ToLocalChecked()));
+}
 
 // ============================================================================
 // Weak Callback for GC
@@ -364,18 +546,6 @@ void weak_callback(const ::v8::WeakCallbackInfo<V8Wrapper<T>>& data) {
 }
 
 // ============================================================================
-// Internal Data Field Indices
-// ============================================================================
-//
-// V8 objects have internal fields where we can store native pointers.
-// We use index 0 to store the V8Wrapper pointer.
-//
-// ============================================================================
-
-constexpr int kWrapperFieldIndex = 0;
-constexpr int kInternalFieldCount = 1;
-
-// ============================================================================
 // Property Accessor (Getter)
 // ============================================================================
 
@@ -383,22 +553,19 @@ template<typename T, std::size_t Index>
 void v8_getter(::v8::Local<::v8::Name> property,
                const ::v8::PropertyCallbackInfo<::v8::Value>& info) {
     ::v8::Isolate* isolate = info.GetIsolate();
-    ::v8::Local<::v8::Object> self = info.Holder();
 
-    // Get wrapper from internal field
-    V8Wrapper<T>* wrapper = static_cast<V8Wrapper<T>*>(
-        self->GetAlignedPointerFromInternalField(kWrapperFieldIndex)
-    );
-
-    if (!wrapper || !wrapper->cpp_object) {
-        isolate->ThrowException(::v8::Exception::Error(
-            ::v8::String::NewFromUtf8Literal(isolate, "Invalid C++ object")
-        ));
+    // An accessor can be lifted off the prototype and called on any
+    // receiver, so the holder is not ours to assume.
+    void* raw = nullptr;
+    if (!resolve_v8_wrapper<T>(isolate, info.Holder(), raw)) {
+        constexpr auto name_sv = std::meta::identifier_of(get_data_member<T, Index>());
+        throw_v8_wrong_type<T>(isolate, info.Holder(), name_sv.data());
         return;
     }
+    T* self = static_cast<T*>(raw);
 
     constexpr auto member = get_data_member<T, Index>();
-    const auto& value = (*wrapper->cpp_object).[:member:];
+    const auto& value = (*self).[:member:];
     info.GetReturnValue().Set(to_v8(isolate, value));
 }
 
@@ -411,21 +578,17 @@ void v8_setter(::v8::Local<::v8::Name> property,
                ::v8::Local<::v8::Value> value,
                const ::v8::PropertyCallbackInfo<void>& info) {
     ::v8::Isolate* isolate = info.GetIsolate();
-    ::v8::Local<::v8::Object> self = info.Holder();
-
-    V8Wrapper<T>* wrapper = static_cast<V8Wrapper<T>*>(
-        self->GetAlignedPointerFromInternalField(kWrapperFieldIndex)
-    );
-
-    if (!wrapper || !wrapper->cpp_object) {
-        isolate->ThrowException(::v8::Exception::Error(
-            ::v8::String::NewFromUtf8Literal(isolate, "Invalid C++ object")
-        ));
-        return;
-    }
 
     constexpr auto member = get_data_member<T, Index>();
+    constexpr auto member_name_sv = std::meta::identifier_of(member);
     using MemberType = typename [:std::meta::type_of(member):];
+
+    void* raw = nullptr;
+    if (!resolve_v8_wrapper<T>(isolate, info.Holder(), raw)) {
+        throw_v8_wrong_type<T>(isolate, info.Holder(), member_name_sv.data());
+        return;
+    }
+    T* self = static_cast<T*>(raw);
 
     MemberType cpp_value;
     if (!from_v8(isolate, value, cpp_value)) {
@@ -435,7 +598,7 @@ void v8_setter(::v8::Local<::v8::Name> property,
         return;
     }
 
-    (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+    (*self).[:member:] = std::move(cpp_value);
 }
 
 // ============================================================================
@@ -445,7 +608,7 @@ void v8_setter(::v8::Local<::v8::Name> property,
 template<typename T, std::size_t FuncIndex, std::size_t... Is>
 ::v8::Local<::v8::Value> call_method_impl(
     ::v8::Isolate* isolate,
-    V8Wrapper<T>* wrapper,
+    T* self,
     const ::v8::FunctionCallbackInfo<::v8::Value>& args,
     std::index_sequence<Is...>)
 {
@@ -472,10 +635,10 @@ template<typename T, std::size_t FuncIndex, std::size_t... Is>
     }
 
     if constexpr (std::is_void_v<ReturnType>) {
-        ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+        ((*self).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
         return ::v8::Undefined(isolate);
     } else {
-        ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+        ReturnType result = ((*self).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
         return to_v8(isolate, result);
     }
 }
@@ -483,18 +646,16 @@ template<typename T, std::size_t FuncIndex, std::size_t... Is>
 template<typename T, std::size_t Index>
 void v8_method(const ::v8::FunctionCallbackInfo<::v8::Value>& args) {
     ::v8::Isolate* isolate = args.GetIsolate();
-    ::v8::Local<::v8::Object> self = args.This();
+    constexpr auto method_name_sv = std::meta::identifier_of(get_member_function<T, Index>());
 
-    V8Wrapper<T>* wrapper = static_cast<V8Wrapper<T>*>(
-        self->GetAlignedPointerFromInternalField(kWrapperFieldIndex)
-    );
-
-    if (!wrapper || !wrapper->cpp_object) {
-        isolate->ThrowException(::v8::Exception::Error(
-            ::v8::String::NewFromUtf8Literal(isolate, "Invalid C++ object")
-        ));
+    // `obj.method(...)` and `Class.prototype.method.call(x, ...)` reach the
+    // same callback, so the receiver is whatever the caller chose.
+    void* raw = nullptr;
+    if (!resolve_v8_wrapper<T>(isolate, args.This(), raw)) {
+        throw_v8_wrong_type<T>(isolate, args.This(), method_name_sv.data());
         return;
     }
+    T* self = static_cast<T*>(raw);
 
     constexpr std::size_t param_count = get_method_param_count<T, Index>();
 
@@ -506,7 +667,7 @@ void v8_method(const ::v8::FunctionCallbackInfo<::v8::Value>& args) {
     }
 
     ::v8::Local<::v8::Value> result = call_method_impl<T, Index>(
-        isolate, wrapper, args, std::make_index_sequence<param_count>{}
+        isolate, self, args, std::make_index_sequence<param_count>{}
     );
     args.GetReturnValue().Set(result);
 }
@@ -714,22 +875,13 @@ std::enable_if_t<
 from_v8(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, T& out) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Try to unwrap if it's a bound object
-    if (value->IsObject()) {
-        ::v8::Local<::v8::Object> obj = value.As<::v8::Object>();
-        if (obj->InternalFieldCount() >= kInternalFieldCount) {
-            V8Wrapper<CleanT>* wrapper = static_cast<V8Wrapper<CleanT>*>(
-                obj->GetAlignedPointerFromInternalField(kWrapperFieldIndex)
-            );
-            if (wrapper && wrapper->cpp_object) {
-                out = *wrapper->cpp_object;
-                return true;
-            }
-        }
+    void* raw = nullptr;
+    if (!resolve_v8_wrapper<CleanT>(isolate, value, raw)) {
+        // Not a wrapper for CleanT: anything else would be a reinterpretation
+        return false;
     }
-
-    // Fall back - object wasn't a wrapped C++ object
-    return false;
+    out = *static_cast<CleanT*>(raw);
+    return true;
 }
 
 // ============================================================================
@@ -771,6 +923,20 @@ template<Bindable T>
     // Store in type registry
     V8TypeRegistry<T>::constructor_template.Reset(isolate, tpl);
     V8TypeRegistry<T>::cached_isolate = isolate;
+    V8TypeRegistry<T>::bound_name = name;
+
+    // Listed so an object of some other bound class can still be identified
+    // by HasInstance, and recorded so a derived object's address can be
+    // shifted to the base subobject it is being passed as.
+    bool already_listed = false;
+    for (const V8BoundClass& bound : v8_bound_classes()) {
+        if (bound.type_id == typeid(T).name()) { already_listed = true; break; }
+    }
+    if (!already_listed) {
+        v8_bound_classes().push_back(
+            V8BoundClass{&V8TypeRegistry<T>::constructor_template, typeid(T).name()});
+    }
+    register_v8_base_upcasts<T>();
 
     // Get prototype template
     ::v8::Local<::v8::ObjectTemplate> proto_tpl = tpl->PrototypeTemplate();

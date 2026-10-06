@@ -687,6 +687,56 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 }
 
 // ============================================================================
+// Base Class Closure
+// ============================================================================
+//
+// Every class T is transitively derived from, in breadth-first order. Each
+// language backend records one address-adjusting thunk per entry when it
+// binds T, which is what lets a Derived still be passed where a Base is
+// expected once arguments are identity-checked: the held pointer addresses
+// the whole derived object, which is not where a second or virtual base
+// subobject begins.
+//
+// ============================================================================
+
+template<typename T>
+consteval std::vector<std::meta::info> collect_base_closure() {
+    std::vector<std::meta::info> found;
+    std::vector<std::meta::info> layer{^^T};
+    while (!layer.empty()) {
+        std::vector<std::meta::info> next;
+        for (auto cls : layer) {
+            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
+                auto base_type = std::meta::type_of(b);
+                bool seen = false;
+                for (auto f : found) {
+                    if (f == base_type) { seen = true; break; }
+                }
+                if (seen) continue;          // diamond: one entry per base
+                found.push_back(base_type);
+                next.push_back(base_type);
+            }
+        }
+        layer = next;
+    }
+    return found;
+}
+
+template<typename T>
+struct BaseClosure {
+    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
+};
+
+// Alias-template form, because a pack used by the backends appears only
+// inside a splice and GCC does not treat that as expandable (see the note
+// on splice hoisting above).
+template<typename T, std::size_t I>
+consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+
+template<typename T, std::size_t I>
+using base_t = typename [:base_at<T, I>():];
+
+// ============================================================================
 // Compile-Time Binding Validation
 // ============================================================================
 //
@@ -829,11 +879,44 @@ using namespace core;
 // JavaScript Wrapper for C++ Objects
 // ============================================================================
 
+// Per-type registry: the constructor to instantiate for a C++ class, and the
+// name it was bound under. Defined here because the wrapper below tags itself
+// with the name at construction.
+template<typename T>
+struct JsTypeRegistry {
+    static inline napi_ref constructor_ref = nullptr;
+    static inline napi_env cached_env = nullptr;
+    static inline const char* bound_name = nullptr;
+};
+
+// Every bound class gets the same wrapper layout. That uniformity is what
+// lets one generated binding serve every class, and it is also what made the
+// wrappers indistinguishable: napi_unwrap answers "yes, this object was
+// wrapped", never "wrapped as what", so reading cpp_object out of whatever
+// object arrived succeeded for an unrelated bound class and the caller got a
+// number computed from the wrong object's bytes.
+//
+// The answer travels with the object: each wrapper records which C++ class it
+// holds. A tag rather than napi_instanceof, because the tag is still right
+// for an object that came from another .node file, where the constructor
+// reference this module holds does not exist.
 template<typename T>
 struct JsWrapper {
-    T* cpp_object;
+    const char* type_id = typeid(T).name();
+    const char* type_name = JsTypeRegistry<T>::bound_name;
+    T* cpp_object = nullptr;
+    bool owns_memory = false;
+    napi_ref js_ref = nullptr;  // JavaScript reference for GC management
+};
+
+// The part of JsWrapper<X> that does not depend on X. Every wrapper starts
+// this way, which is what makes a generic read possible - and why the read
+// has to be preceded by a check.
+struct JsWrapperView {
+    const char* type_id;
+    const char* type_name;
+    void* cpp_object;
     bool owns_memory;
-    napi_ref js_ref;  // JavaScript reference for GC management
 };
 
 // ============================================================================
@@ -1686,15 +1769,153 @@ napi_value to_javascript(napi_env env, const std::shared_future<T>& fut) {
     return promise;
 }
 
-// Forward declaration for JsWrapper (needed for from_javascript with wrapped objects)
-template<typename T> struct JsWrapper;
+// ============================================================================
+// Wrapper identity - what a JavaScript value is allowed to become
+// ============================================================================
+//
+// One gate, resolve_js_wrapper, stands in front of every read of a wrapper's
+// C++ object. The exact type is a pointer comparison against the tag the
+// wrapper carries, so the check costs nothing on the hot path; a derived
+// class resolves through a recorded thunk that shifts the address to the
+// base subobject, which reusing the pointer gets wrong for every base after
+// the first.
 
-// Type-based registry for looking up napi constructor by C++ type
+using JsUpcastThunk = void* (*)(void*);
+
+// Recorded by the DERIVED class's bind_class, keyed "base|derived".
+//
+// This table is per shared library, which is as far as the backend's
+// cross-module story reaches today: to_javascript already falls back to a
+// plain-object snapshot for a class this module did not bind, so a derived
+// object crossing a .node boundary has nowhere to be adjusted anyway. The
+// exact-type case does cross, because the tag compares by value.
+inline std::map<std::string, JsUpcastThunk>& js_upcast_table() {
+    static std::map<std::string, JsUpcastThunk> table;
+    return table;
+}
+
+inline JsUpcastThunk find_js_upcast(const char* base_tid, const char* derived_tid) {
+    auto& table = js_upcast_table();
+    auto it = table.find(std::string(base_tid) + "|" + derived_tid);
+    return it == table.end() ? nullptr : it->second;
+}
+
+// A base the language will not let us reach - inaccessible, or ambiguous
+// because it is inherited twice non-virtually - is skipped rather than
+// recorded, so the guard keeps bind_class compiling for hierarchies that
+// have one. JavaScript then declines the conversion, which is the same
+// answer C++ gives at that call site.
+template<typename Derived, typename Base>
+void register_js_upcast() {
+    if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
+        js_upcast_table()[std::string(typeid(Base).name()) + "|" + typeid(Derived).name()] =
+            +[](void* p) -> void* {
+                return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
+            };
+    }
+}
+
 template<typename T>
-struct JsTypeRegistry {
-    static inline napi_ref constructor_ref = nullptr;
-    static inline napi_env cached_env = nullptr;
-};
+void register_js_base_upcasts() {
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (register_js_upcast<T, core::base_t<T, Is>>(), ...);
+    }(std::make_index_sequence<core::BaseClosure<T>::types.size()>{});
+}
+
+// Resolve a JavaScript value to the address of the C++ object it wraps, after
+// checking that it really is a wrapper for Expected (or for a class derived
+// from it). Returns false - never a bad pointer - for anything else.
+template<typename Expected>
+inline bool resolve_js_wrapper(napi_env env, napi_value value, void*& raw) {
+    JsWrapperView* view = nullptr;
+    if (napi_unwrap(env, value, reinterpret_cast<void**>(&view)) != napi_ok || !view) {
+        return false;
+    }
+
+    const char* want = typeid(Expected).name();
+    // Pointer equality settles every object this module made; the strcmp is
+    // for one that crossed a .node boundary, where the same type's typeid
+    // name lives at a different address.
+    if (view->type_id == want || std::strcmp(view->type_id, want) == 0) {
+        if (!view->cpp_object) return false;
+        raw = view->cpp_object;
+        return true;
+    }
+
+    JsUpcastThunk to_base = find_js_upcast(want, view->type_id);
+    if (!to_base || !view->cpp_object) return false;
+    raw = to_base(view->cpp_object);
+    return raw != nullptr;
+}
+
+// The name a C++ class was bound under, for error messages; the mangled
+// typeid name is the fallback, which still tells two classes apart.
+template<typename T>
+inline const char* js_expected_name() {
+    const char* name = JsTypeRegistry<T>::bound_name;
+    return name ? name : typeid(T).name();
+}
+
+// What arrived, in the words a JavaScript author would use.
+inline void describe_js_value(napi_env env, napi_value value, char* out, std::size_t out_size) {
+    JsWrapperView* view = nullptr;
+    if (napi_unwrap(env, value, reinterpret_cast<void**>(&view)) == napi_ok && view) {
+        std::snprintf(out, out_size, "%s", view->type_name ? view->type_name : view->type_id);
+        return;
+    }
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, value, &type);
+    static const char* const names[] = {
+        "undefined", "null", "boolean", "number", "string",
+        "symbol", "object", "function", "external", "bigint"
+    };
+    std::size_t index = static_cast<std::size_t>(type);
+    std::snprintf(out, out_size, "%s",
+                  index < sizeof(names) / sizeof(names[0]) ? names[index] : "value");
+}
+
+template<typename Expected>
+void throw_js_wrong_type(napi_env env, napi_value value, const char* context) {
+    char actual[256];
+    describe_js_value(env, value, actual, sizeof actual);
+    char message[640];
+    std::snprintf(message, sizeof message, "%s: expected %s, got %s",
+                  context, js_expected_name<Expected>(), actual);
+    napi_throw_type_error(env, nullptr, message);
+}
+
+// An argument that would not convert. Naming the expected class is only
+// possible when it is one of ours; a plain scalar parameter keeps the
+// shorter message rather than printing a mangled typeid.
+inline void throw_js_bad_argument(napi_env env, napi_value value, const char* context,
+                                  int position, const char* expected_name) {
+    char actual[256];
+    describe_js_value(env, value, actual, sizeof actual);
+    char message[768];
+    if (expected_name) {
+        std::snprintf(message, sizeof message, "%s: argument %d expected %s, got %s",
+                      context, position, expected_name, actual);
+    } else {
+        std::snprintf(message, sizeof message, "%s: argument %d could not be converted from %s",
+                      context, position, actual);
+    }
+    napi_throw_type_error(env, nullptr, message);
+}
+
+// A value that cannot be stored in a data member.
+inline void throw_js_bad_field(napi_env env, napi_value value, const char* field,
+                               const char* expected_name) {
+    char actual[256];
+    describe_js_value(env, value, actual, sizeof actual);
+    char message[768];
+    if (expected_name) {
+        std::snprintf(message, sizeof message, "%s: expected %s, got %s",
+                      field, expected_name, actual);
+    } else {
+        std::snprintf(message, sizeof message, "%s: cannot be assigned from %s", field, actual);
+    }
+    napi_throw_type_error(env, nullptr, message);
+}
 
 // Convert JavaScript wrapped objects to C++ types
 // Handles const reference parameters like dot(const Vec3& other)
@@ -1704,16 +1925,12 @@ template<typename T>
 bool from_javascript(napi_env env, napi_value value, T& out) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Try to unwrap as a JsWrapper
-    JsWrapper<CleanT>* wrapper = nullptr;
-    napi_status status = napi_unwrap(env, value, reinterpret_cast<void**>(&wrapper));
-
-    if (status == napi_ok && wrapper && wrapper->cpp_object) {
-        out = *wrapper->cpp_object;
-        return true;
+    void* raw = nullptr;
+    if (!resolve_js_wrapper<CleanT>(env, value, raw)) {
+        return false;
     }
-
-    return false;
+    out = *static_cast<CleanT*>(raw);
+    return true;
 }
 
 // ============================================================================
@@ -1725,19 +1942,21 @@ napi_value js_getter(napi_env env, napi_callback_info info) {
     napi_value this_arg;
     napi_get_cb_info(env, info, nullptr, nullptr, &this_arg, nullptr);
 
-    JsWrapper<T>* wrapper;
-    napi_unwrap(env, this_arg, reinterpret_cast<void**>(&wrapper));
-
-    if (!wrapper || !wrapper->cpp_object) {
-        napi_throw_error(env, nullptr, "Invalid C++ object");
+    // A property accessor can be lifted off the prototype and called on any
+    // receiver, so `this` is not ours to assume.
+    void* raw = nullptr;
+    if (!resolve_js_wrapper<T>(env, this_arg, raw)) {
+        constexpr auto name_sv = std::meta::identifier_of(get_data_member<T, Index>());
+        throw_js_wrong_type<T>(env, this_arg, name_sv.data());
         return nullptr;
     }
+    T* self = static_cast<T*>(raw);
 
     constexpr auto member = get_data_member<T, Index>();
     using MemberType = typename [:std::meta::type_of(member):];
 
     try {
-        auto& value = (*wrapper->cpp_object).[:member:];
+        auto& value = (*self).[:member:];
         return to_javascript(env, value);
     } catch (const std::exception& e) {
         napi_throw_error(env, nullptr, e.what());
@@ -1759,25 +1978,30 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
     napi_value this_arg;
     napi_get_cb_info(env, info, &argc, args, &this_arg, nullptr);
 
-    JsWrapper<T>* wrapper;
-    napi_unwrap(env, this_arg, reinterpret_cast<void**>(&wrapper));
+    constexpr auto member = get_data_member<T, Index>();
+    constexpr auto member_name_sv = std::meta::identifier_of(member);
+    using MemberType = typename [:std::meta::type_of(member):];
 
-    if (!wrapper || !wrapper->cpp_object) {
-        napi_throw_error(env, nullptr, "Invalid C++ object");
+    void* raw = nullptr;
+    if (!resolve_js_wrapper<T>(env, this_arg, raw)) {
+        throw_js_wrong_type<T>(env, this_arg, member_name_sv.data());
         return nullptr;
     }
-
-    constexpr auto member = get_data_member<T, Index>();
-    using MemberType = typename [:std::meta::type_of(member):];
+    T* self = static_cast<T*>(raw);
 
     MemberType cpp_value;
     if (!from_javascript(env, args[0], cpp_value)) {
-        napi_throw_error(env, nullptr, "Type conversion failed");
+        using Member = std::remove_cvref_t<MemberType>;
+        const char* expected = nullptr;
+        if constexpr (core::NestedBindable<Member>) {
+            expected = js_expected_name<Member>();
+        }
+        throw_js_bad_field(env, args[0], member_name_sv.data(), expected);
         return nullptr;
     }
 
     try {
-        (*wrapper->cpp_object).[:member:] = std::move(cpp_value);
+        (*self).[:member:] = std::move(cpp_value);
     } catch (const std::exception& e) {
         napi_throw_error(env, nullptr, e.what());
         return nullptr;
@@ -1796,34 +2020,44 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
 // ============================================================================
 
 template<typename T, std::size_t FuncIndex, std::size_t... Is>
-napi_value call_method_impl(napi_env env, JsWrapper<T>* wrapper, napi_value* args, std::index_sequence<Is...>) {
+napi_value call_method_impl(napi_env env, T* self, napi_value* args, std::index_sequence<Is...>) {
     constexpr auto member_func = get_member_function<T, FuncIndex>();
     constexpr auto return_type = get_method_return_type<T, FuncIndex>();
     using ReturnType = typename [:return_type:];
 
     std::tuple<std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>...> cpp_args;
 
-    bool success = true;
+    // Remember which argument refused and what it was supposed to be, so the
+    // error can say so: "expected Curve, got Label" is the whole point of the
+    // identity check, and "conversion failed" would throw that away.
+    int bad_arg = -1;
+    const char* bad_expected = nullptr;
     ([&] {
-        if (!success) return;
+        if (bad_arg >= 0) return;
         if (!from_javascript(env, args[Is], std::get<Is>(cpp_args))) {
-            success = false;
+            using Param = std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>;
+            bad_arg = static_cast<int>(Is);
+            if constexpr (core::NestedBindable<Param>) {
+                bad_expected = js_expected_name<Param>();
+            }
         }
     }(), ...);
 
-    if (!success) {
-        napi_throw_error(env, nullptr, "Argument type conversion failed");
+    if (bad_arg >= 0) {
+        constexpr auto method_name_sv = std::meta::identifier_of(get_member_function<T, FuncIndex>());
+        throw_js_bad_argument(env, args[bad_arg], method_name_sv.data(),
+                              bad_arg + 1, bad_expected);
         return nullptr;
     }
 
     try {
         if constexpr (std::is_void_v<ReturnType>) {
-            ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+            ((*self).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
             napi_value undefined;
             napi_get_undefined(env, &undefined);
             return undefined;
         } else {
-            ReturnType result = ((*wrapper->cpp_object).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
+            ReturnType result = ((*self).[:member_func:])(std::move(std::get<Is>(cpp_args))...);
             return to_javascript(env, result);
         }
     } catch (const std::exception& e) {
@@ -1844,20 +2078,24 @@ napi_value js_method(napi_env env, napi_callback_info info) {
     napi_value this_arg;
     napi_get_cb_info(env, info, &argc, args, &this_arg, nullptr);
 
-    JsWrapper<T>* wrapper;
-    napi_unwrap(env, this_arg, reinterpret_cast<void**>(&wrapper));
+    constexpr auto method_name_sv = std::meta::identifier_of(get_member_function<T, Index>());
 
-    if (!wrapper || !wrapper->cpp_object) {
-        napi_throw_error(env, nullptr, "Invalid C++ object");
+    // `obj.method(...)` and `Class.prototype.method.call(x, ...)` reach the
+    // same callback, so `this` is whatever the caller chose. Before the
+    // check, an unrelated bound class here was read as a T.
+    void* raw = nullptr;
+    if (!resolve_js_wrapper<T>(env, this_arg, raw)) {
+        throw_js_wrong_type<T>(env, this_arg, method_name_sv.data());
         return nullptr;
     }
+    T* self = static_cast<T*>(raw);
 
     if (argc != param_count) {
         napi_throw_error(env, nullptr, "Incorrect number of arguments");
         return nullptr;
     }
 
-    return call_method_impl<T, Index>(env, wrapper, args, std::make_index_sequence<param_count>{});
+    return call_method_impl<T, Index>(env, self, args, std::make_index_sequence<param_count>{});
 }
 
 // ============================================================================
@@ -2225,9 +2463,17 @@ napi_value bind_class(napi_env env, napi_value exports, const char* name) {
         &constructor
     );
 
-    // Store constructor reference for type registry (used by to_javascript)
+    // Store constructor reference for type registry (used by to_javascript).
+    // bound_name is what an error message calls this class, and every wrapper
+    // made from here on copies it, so an object reaching another module can
+    // still say what it is.
     napi_create_reference(env, constructor, 1, &JsTypeRegistry<T>::constructor_ref);
     JsTypeRegistry<T>::cached_env = env;
+    JsTypeRegistry<T>::bound_name = name;
+
+    // Record how to reach each base subobject from a T. Done by the derived
+    // class, so base and derived may be bound in either order.
+    register_js_base_upcasts<T>();
 
     // Add properties (getters/setters)
     [&]<std::size_t... Is>(std::index_sequence<Is...>) {
