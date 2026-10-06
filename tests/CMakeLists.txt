@@ -260,6 +260,18 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         )
     endif()
 
+    # Class-typed values are identity-checked at the Lua boundary
+    # (wrong class -> Lua error, derived -> base lands on the right subobject)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/type_safety)
+        mirror_bridge_lua_module(type_safety_lua
+            lua/type_safety/type_safety_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/type_safety
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
+        )
+        # require("type_safety") resolves the symbol from the module name
+        set_target_properties(type_safety_lua PROPERTIES OUTPUT_NAME type_safety)
+    endif()
+
 endif()
 
 # ============================================================================
@@ -281,6 +293,15 @@ if(MIRROR_BRIDGE_BUILD_JS AND NAPI_FOUND)
         mirror_bridge_js_module(robot_js
             single_header_test/robot_js.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/single_header_test
+        )
+    endif()
+
+    # Class-typed values are identity-checked at the JavaScript boundary
+    # (wrong class -> TypeError, derived -> base lands on the right subobject)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/js/type_safety)
+        mirror_bridge_js_module(type_safety_js
+            js/type_safety/type_safety_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/type_safety
         )
     endif()
 
