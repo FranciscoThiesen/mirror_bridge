@@ -671,12 +671,12 @@ struct LuaTypeRegistry {
 // A userdata's metatable is the only thing about it that cannot be forged
 // from Lua, so it is the identity, and nothing is read out of the userdata
 // until the metatable has been recognised. Lua already keeps a registry
-// entry per class, keyed by typeid name and created by bind_class, and two
+// entry per class, keyed by core::type_key and created by bind_class, and two
 // modules binding the same class share that one entry - so the exact-type
 // check is cross-module with no extra bookkeeping. Two registry tables of
 // our own carry the rest, both consulted off the hot path:
 //
-//   REGISTRY["mirror_bridge.upcasts"][base typeid][derived metatable] -> thunk
+//   REGISTRY["mirror_bridge.upcasts"][base type key][derived metatable] -> thunk
 //   REGISTRY["mirror_bridge.names"][metatable] -> the name bind_class was given
 //
 // The upcast table converts a derived object's address to the address of a
@@ -727,14 +727,14 @@ void register_lua_upcast(lua_State* L) {
             return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
         };
         push_lua_side_table(L, kLuaUpcastTableKey);
-        lua_getfield(L, -1, typeid(Base).name());
+        lua_getfield(L, -1, core::type_key<Base>);
         if (!lua_istable(L, -1)) {
             lua_pop(L, 1);
             lua_newtable(L);
             lua_pushvalue(L, -1);
-            lua_setfield(L, -3, typeid(Base).name());
+            lua_setfield(L, -3, core::type_key<Base>);
         }
-        luaL_getmetatable(L, typeid(Derived).name());
+        luaL_getmetatable(L, core::type_key<Derived>);
         // Round-tripping a function pointer through void* is how the C API
         // carries callbacks; lightuserdata has no function-pointer form.
         lua_pushlightuserdata(L, reinterpret_cast<void*>(thunk));
@@ -784,9 +784,9 @@ bool resolve_lua_wrapper_slow(lua_State* L, int idx, void*& raw) {
     if (!lua_isuserdata(L, idx)) return false;
     idx = lua_absindex(L, idx);          // the lookups below push
 
-    // Metatables are keyed by typeid name in the registry, so the module
+    // Metatables are keyed by core::type_key in the registry, so the module
     // that bound Expected registered the very table this object carries.
-    if (void* ud = luaL_testudata(L, idx, typeid(Expected).name())) {
+    if (void* ud = luaL_testudata(L, idx, core::type_key<Expected>)) {
         void* held = static_cast<LuaWrapperView*>(ud)->cpp_object;
         if (!held) return false;
         raw = held;
@@ -794,7 +794,7 @@ bool resolve_lua_wrapper_slow(lua_State* L, int idx, void*& raw) {
     }
 
     if (!lua_getmetatable(L, idx)) return false;   // not one of our wrappers
-    LuaUpcastThunk to_base = find_lua_upcast(L, typeid(Expected).name());
+    LuaUpcastThunk to_base = find_lua_upcast(L, core::type_key<Expected>);
     lua_pop(L, 1);
     if (!to_base) return false;
 
@@ -849,8 +849,8 @@ inline const char* lua_name_for_metatable(lua_State* L) {
     return name;        // interned in the registry table, so it outlives the pop
 }
 
-// Copy the bound name of a C++ type into `out`, falling back to the mangled
-// typeid name, which is still enough to tell two classes apart.
+// Copy the bound name of a C++ type into `out`, falling back to its C++
+// spelling, which is still enough to tell two classes apart.
 inline void copy_lua_registered_name(lua_State* L, const char* type_id,
                                      char* out, std::size_t out_size) {
     const char* name = nullptr;
@@ -893,7 +893,7 @@ inline int lua_wrong_type_error(lua_State* L, int idx, const char* context,
 
 // An argument that would not convert. Naming the expected class is only
 // possible when it is one of ours; a plain scalar parameter keeps the
-// shorter message rather than printing a mangled typeid.
+// shorter message.
 inline int lua_bad_argument_error(lua_State* L, const char* context, int position,
                                   const char* expected_type_id, int idx) {
     char actual[256];
@@ -1015,7 +1015,7 @@ int lua_index(lua_State* L) {
                 constexpr auto member = get_data_member<T, Is>();
                 void* raw = nullptr;
                 if (!resolve_lua_wrapper<T>(L, 1, raw)) {
-                    lua_wrong_type_error(L, 1, member_name, typeid(T).name());
+                    lua_wrong_type_error(L, 1, member_name, core::type_key<T>);
                     return;
                 }
                 const auto& value = (*static_cast<T*>(raw)).[:member:];
@@ -1072,14 +1072,14 @@ int lua_newindex(lua_State* L) {
 
                 void* raw = nullptr;
                 if (!resolve_lua_wrapper<T>(L, 1, raw)) {
-                    lua_wrong_type_error(L, 1, member_name, typeid(T).name());
+                    lua_wrong_type_error(L, 1, member_name, core::type_key<T>);
                     return;
                 }
 
                 MemberType cpp_value;
                 if (!from_lua(L, 3, cpp_value)) {
                     lua_bad_field_error(L, member_name,
-                                        typeid(std::remove_cvref_t<MemberType>).name(), 3);
+                                        core::type_key<MemberType>, 3);
                     return;
                 }
 
@@ -1118,7 +1118,7 @@ int call_method_impl(lua_State* L, T* self, std::index_sequence<Is...>) {
         // Lua stack: [1]=self, [2]=arg1, [3]=arg2, etc.
         if (!from_lua(L, 2 + Is, std::get<Is>(cpp_args))) {
             bad_arg = static_cast<int>(Is);
-            bad_type_id = typeid(std::remove_cvref_t<method_param_t<T, FuncIndex, Is>>).name();
+            bad_type_id = core::type_key<method_param_t<T, FuncIndex, Is>>;
         }
     }(), ...);
 
@@ -1160,7 +1160,7 @@ int lua_method(lua_State* L) {
     // unrelated bound class here read that object's bytes as a T.
     void* raw = nullptr;
     if (!resolve_lua_wrapper<T>(L, 1, raw)) {
-        return lua_wrong_type_error(L, 1, method_name_sv.data(), typeid(T).name());
+        return lua_wrong_type_error(L, 1, method_name_sv.data(), core::type_key<T>);
     }
     T* self = static_cast<T*>(raw);
 
@@ -1194,7 +1194,7 @@ int call_static_method_impl(lua_State* L, std::index_sequence<Is...>) {
         // Static methods: args start at index 1 (no self)
         if (!from_lua(L, 1 + Is, std::get<Is>(cpp_args))) {
             bad_arg = static_cast<int>(Is);
-            bad_type_id = typeid(std::remove_cvref_t<static_method_param_t<T, FuncIndex, Is>>).name();
+            bad_type_id = core::type_key<static_method_param_t<T, FuncIndex, Is>>;
         }
     }(), ...);
 
@@ -1251,7 +1251,7 @@ int lua_gc(lua_State* L) {
     // here would be deleted through a base subobject address. `__gc` is also
     // callable by hand off the metatable, so a wrong userdata must leave
     // without freeing anything rather than raise during collection.
-    void* ud = luaL_testudata(L, 1, typeid(T).name());
+    void* ud = luaL_testudata(L, 1, core::type_key<T>);
     if (!ud) return 0;
     LuaWrapper<T>* wrapper = static_cast<LuaWrapper<T>*>(ud);
     if (wrapper->owns_memory && wrapper->cpp_object) {
@@ -1418,7 +1418,7 @@ int lua_constructor(lua_State* L) {
     wrapper->owns_memory = true;
 
     // Set metatable
-    luaL_getmetatable(L, typeid(T).name());
+    luaL_getmetatable(L, core::type_key<T>);
     lua_setmetatable(L, -2);
 
     return 1;
@@ -1539,12 +1539,13 @@ void bind_class(lua_State* L, const char* name) {
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();
 
     // Store metatable name in type registry (for to_lua wrapper creation)
-    LuaTypeRegistry<T>::metatable_name = typeid(T).name();
+    LuaTypeRegistry<T>::metatable_name = core::type_key<T>;
 
-    // Create metatable for this class. The registry keys it by typeid name,
-    // so a second module binding the same class finds this very table and
-    // the identity check agrees across .so boundaries.
-    luaL_newmetatable(L, typeid(T).name());
+    // Create metatable for this class. The registry keys it by the type's
+    // reflection-derived name, so a second module binding the same class
+    // finds this very table and the identity check agrees across .so
+    // boundaries.
+    luaL_newmetatable(L, core::type_key<T>);
 
     // The address of that metatable is what the exact-type check compares
     // against, and the name is what an error message calls the class. The

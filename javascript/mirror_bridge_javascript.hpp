@@ -48,12 +48,14 @@ struct JsTypeRegistry {
 // number computed from the wrong object's bytes.
 //
 // The answer travels with the object: each wrapper records which C++ class it
-// holds. A tag rather than napi_instanceof, because the tag is still right
-// for an object that came from another .node file, where the constructor
-// reference this module holds does not exist.
+// holds, as core::type_key - a reflection-derived name rather than an RTTI
+// one, because node-gyp compiles addons with -fno-rtti. A tag rather than
+// napi_instanceof, because the tag is still right for an object that came
+// from another .node file, where the constructor reference this module holds
+// does not exist.
 template<typename T>
 struct JsWrapper {
-    const char* type_id = typeid(T).name();
+    const char* type_id = core::type_key<T>;
     const char* type_name = JsTypeRegistry<T>::bound_name;
     T* cpp_object = nullptr;
     bool owns_memory = false;
@@ -959,7 +961,7 @@ inline JsUpcastThunk find_js_upcast(const char* base_tid, const char* derived_ti
 template<typename Derived, typename Base>
 void register_js_upcast() {
     if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
-        js_upcast_table()[std::string(typeid(Base).name()) + "|" + typeid(Derived).name()] =
+        js_upcast_table()[std::string(core::type_key<Base>) + "|" + core::type_key<Derived>] =
             +[](void* p) -> void* {
                 return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
             };
@@ -983,10 +985,10 @@ inline bool resolve_js_wrapper(napi_env env, napi_value value, void*& raw) {
         return false;
     }
 
-    const char* want = typeid(Expected).name();
+    const char* want = core::type_key<Expected>;
     // Pointer equality settles every object this module made; the strcmp is
-    // for one that crossed a .node boundary, where the same type's typeid
-    // name lives at a different address.
+    // for one that crossed a .node boundary, where the same type's key is the
+    // same text at a different address.
     if (view->type_id == want || std::strcmp(view->type_id, want) == 0) {
         if (!view->cpp_object) return false;
         raw = view->cpp_object;
@@ -999,12 +1001,12 @@ inline bool resolve_js_wrapper(napi_env env, napi_value value, void*& raw) {
     return raw != nullptr;
 }
 
-// The name a C++ class was bound under, for error messages; the mangled
-// typeid name is the fallback, which still tells two classes apart.
+// The name a C++ class was bound under, for error messages; its C++ spelling
+// is the fallback, for a class only another module bound.
 template<typename T>
 inline const char* js_expected_name() {
     const char* name = JsTypeRegistry<T>::bound_name;
-    return name ? name : typeid(T).name();
+    return name ? name : core::type_key<T>;
 }
 
 // What arrived, in the words a JavaScript author would use.
@@ -1037,7 +1039,7 @@ void throw_js_wrong_type(napi_env env, napi_value value, const char* context) {
 
 // An argument that would not convert. Naming the expected class is only
 // possible when it is one of ours; a plain scalar parameter keeps the
-// shorter message rather than printing a mangled typeid.
+// shorter message.
 inline void throw_js_bad_argument(napi_env env, napi_value value, const char* context,
                                   int position, const char* expected_name) {
     char actual[256];
@@ -1104,7 +1106,6 @@ napi_value js_getter(napi_env env, napi_callback_info info) {
     T* self = static_cast<T*>(raw);
 
     constexpr auto member = get_data_member<T, Index>();
-    using MemberType = typename [:std::meta::type_of(member):];
 
     try {
         auto& value = (*self).[:member:];

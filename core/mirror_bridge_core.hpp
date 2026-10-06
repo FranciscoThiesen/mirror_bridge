@@ -28,6 +28,8 @@
 #include <typeindex>
 #include <shared_mutex>
 
+#include "mirror_bridge_spelling.hpp"
+
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
@@ -661,6 +663,44 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 
     return sig;
 }
+
+// ============================================================================
+// Type Keys
+// ============================================================================
+//
+// A name for a C++ type that reads the same in every module that mentions it,
+// so the backends can agree on which class a wrapper holds across .so
+// boundaries.
+//
+// Not typeid. node-gyp compiles addons with -fno-rtti, following V8's own
+// build settings, so the N-API backend cannot use typeid at all. Reflection
+// answers the same question without RTTI, and spelling::spell is already this
+// project's compiler-independent way to write a type down - fully qualified,
+// aliases resolved, template arguments spelled recursively - so two modules
+// built from the same header produce the same bytes.
+//
+// Not the address of a per-type static, either. Generated modules are built
+// with -fvisibility=hidden, so each .so would get its own copy of that static
+// and cross-module identity would quietly stop matching. Every comparison of
+// these keys is by content; an address comparison is only ever a fast path in
+// front of one.
+//
+// One caveat inherited from the spelling: a class in an unnamed namespace has
+// nothing to qualify it with, so it spells the same as any other class of that
+// name. Such a class is a distinct type in every translation unit and was
+// never shareable between modules to begin with.
+
+// A consteval call returning std::string may only appear inside another
+// constant evaluation, so the string is burned into static storage here and
+// runtime code reads the pointer (see python/mirror_bridge_templates.hpp,
+// which reaches the spelling helpers the same way).
+template<typename T>
+consteval const char* make_type_key() {
+    return std::define_static_string(spelling::spell(^^std::remove_cvref_t<T>));
+}
+
+template<typename T>
+inline constexpr const char* type_key = make_type_key<T>();
 
 // ============================================================================
 // Base Class Closure

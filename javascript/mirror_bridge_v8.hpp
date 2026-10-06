@@ -427,7 +427,7 @@ inline V8UpcastThunk find_v8_upcast(const char* base_tid, const char* derived_ti
 template<typename Derived, typename Base>
 void register_v8_upcast() {
     if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
-        v8_upcast_table()[std::string(typeid(Base).name()) + "|" + typeid(Derived).name()] =
+        v8_upcast_table()[std::string(core::type_key<Base>) + "|" + core::type_key<Derived>] =
             +[](void* p) -> void* {
                 return static_cast<void*>(static_cast<Base*>(static_cast<Derived*>(p)));
             };
@@ -474,7 +474,7 @@ bool resolve_v8_wrapper(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, 
         ::v8::Local<::v8::FunctionTemplate> tpl = bound.constructor_template->Get(isolate);
         if (!tpl->HasInstance(obj)) continue;
 
-        V8UpcastThunk to_base = find_v8_upcast(typeid(Expected).name(), bound.type_id);
+        V8UpcastThunk to_base = find_v8_upcast(core::type_key<Expected>, bound.type_id);
         if (!to_base) return false;
         V8WrapperView* view = v8_wrapper_view(obj);
         if (!view || !view->cpp_object) return false;
@@ -489,7 +489,7 @@ bool resolve_v8_wrapper(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, 
 template<typename T>
 inline const char* v8_expected_name() {
     const char* name = V8TypeRegistry<T>::bound_name;
-    return name ? name : typeid(T).name();
+    return name ? name : core::type_key<T>;
 }
 
 inline void describe_v8_value(::v8::Local<::v8::Value> value, char* out, std::size_t out_size) {
@@ -930,11 +930,11 @@ template<Bindable T>
     // shifted to the base subobject it is being passed as.
     bool already_listed = false;
     for (const V8BoundClass& bound : v8_bound_classes()) {
-        if (bound.type_id == typeid(T).name()) { already_listed = true; break; }
+        if (std::strcmp(bound.type_id, core::type_key<T>) == 0) { already_listed = true; break; }
     }
     if (!already_listed) {
         v8_bound_classes().push_back(
-            V8BoundClass{&V8TypeRegistry<T>::constructor_template, typeid(T).name()});
+            V8BoundClass{&V8TypeRegistry<T>::constructor_template, core::type_key<T>});
     }
     register_v8_base_upcasts<T>();
 
