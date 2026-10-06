@@ -174,6 +174,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A write through a nested data member reaches the owner, not a copy
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/member_views)
+        mirror_bridge_python_module(member_views
+            member_views/member_views_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/member_views
+        )
+    endif()
+
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref
