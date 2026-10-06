@@ -17,6 +17,10 @@ the CLI asks the compiler:
                `mirror_bridge generate` appends to the module it was already
                generating
 
+The discover step also reports every class and enum the headers declare, which
+is where `generate` gets its class list from (--classes-out). That walk is the
+whole of the work under --discover-only, for the runs that plan no templates.
+
 Invoked by tools/mirror_bridge; run with --help for the flags.
 """
 import argparse
@@ -211,8 +215,8 @@ def discover(work, cc, headers):
     src.write_text("#include <array>\n#include <cstdio>\n#include <string>\n" + include_lines(headers)
                    + '#include "plan_inputs.hpp"\n#include "core/mirror_bridge_plan.hpp"\n' + DISCOVER_MAIN)
     exe = work / "discover"
-    plan = {"cands": [], "notes": [], "universe": "", "needs": [], "plain": [], "free": [], "fntemplates": [],
-            "unbindable": []}
+    plan = {"cands": [], "notes": [], "universe": "", "needs": [], "plain": [], "enums": [], "free": [],
+            "fntemplates": [], "unbindable": []}
     r = cc.run(["-I" + str(work), str(src), "-o", str(exe)])
     if r.returncode:
         return plan, r.stderr or "discover compile failed without diagnostics"
@@ -230,6 +234,8 @@ def discover(work, cc, headers):
             plan["unbindable"].append((spelling, origin))
         elif kind == "plain":
             plan["plain"].append(entry)
+        elif kind == "enum":
+            plan["enums"].append(entry)
         elif kind == "free":
             plan["free"].append(entry)
         elif kind == "fntemplate":
@@ -341,7 +347,7 @@ def classify_requested(work, cc, headers, namespaces, specs):
 
 # --------------------------------------------------------------------- loop --
 
-def plan_module(args, cc, work, headers, hints, namespaces, requested, log):
+def plan_module(args, cc, work, headers, hints, namespaces, requested, log, found):
     approved_spellings, rejected_ever, unbindable_ever, rounds, seen_spellings = set(), {}, {}, [], set()
     plan, approved, rejected, unbindable, dropped = {"free": [], "needs": [], "cands": []}, [], [], [], []
     before = set()
@@ -350,6 +356,13 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log):
         plan, err = discover(work, cc, headers)
         if err:
             return None, "discovery failed:\n" + err
+        # The declared classes do not depend on what the probe approved, so
+        # the first round that compiles settles them. Kept separately because
+        # the CLI needs them even when a later round fails: the class list is
+        # what it binds, and the alternative is a text scan that export
+        # macros defeat.
+        found.setdefault("plain", plan["plain"])
+        found.setdefault("enums", plan["enums"])
         approved, rejected, err = probe(work, cc, headers, plan["cands"])
         if err:
             return None, "probe failed:\n" + err
@@ -418,6 +431,16 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log):
             "rounds": rounds, "free": [e for e in plan["free"] if e["spelling"] not in dropped_names]}, ""
 
 
+def write_discovered(path, found):
+    """The class list `mirror_bridge generate` binds from.
+
+    One row per declaration: kind, fully-qualified C++ name, `file:line`.
+    Writing the file at all is the signal that reflection read the headers;
+    the CLI keeps its text scan for when this never arrives."""
+    rows = [("class", e) for e in found.get("plain", [])] + [("enum", e) for e in found.get("enums", [])]
+    pathlib.Path(path).write_text("".join(f"{k}\t{e['spelling']}\t{e['origin']}\n" for k, e in rows))
+
+
 # --------------------------------------------------------------------- emit --
 
 # A name the user wrote that is absent from the finished module, as
@@ -476,7 +499,7 @@ def emit_lines(args, result, bound_classes, notes):
     for c in functions:
         lines.append(f'    mirror_bridge::templates::bind_instance<&{c["spelling"]}>(m);')
     # Member templates of plain classes hang off the class the CLI bound; a
-    # class the tokenizer skipped (MIRROR_BRIDGE_SKIP, private) has no type
+    # class discovery left out (MIRROR_BRIDGE_SKIP, private) has no type
     # object to attach them to.
     for owner, mcs in members.items():
         if owner.split("::")[-1] not in bound_classes and owner not in bound_classes:
@@ -542,20 +565,32 @@ def parse_args():
     ap.add_argument("--work", required=True, help="scratch directory for the discover/probe units")
     ap.add_argument("--headers-file", required=True,
                     help="one header per line as '<include spelling>\\t<1 if the module already includes it>'")
-    ap.add_argument("--classes-file", required=True, help="classes the module binds, one per line")
+    ap.add_argument("--classes-file", default="", help="classes the module binds, one per line")
+    ap.add_argument("--classes-out", default="",
+                    help="write the classes and enums reflection found here, as kind<TAB>C++ name<TAB>file:line")
+    ap.add_argument("--discover-only", action="store_true",
+                    help="only write --classes-out: one discovery round, no probing and no binding lines")
     ap.add_argument("--instantiate", action="append", default=[], help="bind this specialization (repeatable)")
     ap.add_argument("--template-cap", type=int, default=64,
                     help="max argument combinations per function template before falling back to scalars")
     ap.add_argument("--max-rounds", type=int, default=5)
     ap.add_argument("--release-gil", action="store_true")
-    ap.add_argument("--emit", required=True, help="write the binding lines here")
-    ap.add_argument("--includes-out", required=True, help="write extra headers the binding lines need here")
-    ap.add_argument("--report", required=True, help="human-readable plan")
+    ap.add_argument("--emit", default="", help="write the binding lines here")
+    ap.add_argument("--includes-out", default="", help="write extra headers the binding lines need here")
+    ap.add_argument("--report", default="", help="human-readable plan")
     ap.add_argument("--json-out", default="")
     ap.add_argument("--unbound-out", default="",
                     help="tab-separated reason<TAB>C++ name, one per name absent from the module")
     ap.add_argument("--verbose", action="store_true")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.discover_only:
+        if not args.classes_out:
+            ap.error("--discover-only needs --classes-out")
+    else:
+        missing = [f for f in ("emit", "includes_out", "report") if not getattr(args, f)]
+        if missing:
+            ap.error("--" + ", --".join(m.replace("_", "-") for m in missing) + " is required unless --discover-only")
+    return args
 
 
 def main():
@@ -573,7 +608,9 @@ def main():
         headers.append(rel)
         if flag.strip() == "1":
             included.add(rel)
-    bound_classes = {l.strip() for l in pathlib.Path(args.classes_file).read_text().splitlines() if l.strip()}
+    bound_classes = set()
+    if args.classes_file:
+        bound_classes = {l.strip() for l in pathlib.Path(args.classes_file).read_text().splitlines() if l.strip()}
 
     text = ""
     for h in headers:
@@ -589,24 +626,59 @@ def main():
     log.append(f"scopes: {namespaces}")
     log.append(f"template parameter hints: {hints}")
 
+    # What reflection saw. Filled by the first discovery round that compiles,
+    # whether or not the rest of the planning goes on to succeed.
+    found = {}
+
+    if args.discover_only:
+        # --lang lua/js and --no-templates never plan anything, but the class
+        # list still has to come from the compiler rather than from a regex.
+        attempts, reduced, err = [headers], [h for h in headers if h in included], ""
+        if reduced and len(reduced) < len(headers):
+            attempts.append(reduced)
+        for i, attempt_headers in enumerate(attempts):
+            if i:
+                log.append("retrying with the module's own headers only")
+            write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [])
+            plan, err = discover(work, cc, attempt_headers)
+            if not err:
+                found = {"plain": plan["plain"], "enums": plan["enums"]}
+                break
+        if not found:
+            (work / "planner.log").write_text("\n".join(log) + "\n\n" + err)
+            print(f"  discovery: the headers did not compile (details: {work / 'planner.log'})", file=sys.stderr)
+            return 2
+        write_discovered(args.classes_out, found)
+        if args.verbose:
+            for l in log:
+                print("    " + l, file=sys.stderr)
+        return 0
+
     notes = []
     requested, errors = classify_requested(work, cc, headers, namespaces, args.instantiate)
     for e in errors:
         print(f"  warning: {e}", file=sys.stderr)
         notes.append(e)
 
-    result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log)
+    result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log, found)
     if result is None and len(headers) > len(included):
         # A header without classes may not be self-contained; retry with the
         # ones the module already includes.
         log.append("retrying with the module's own headers only")
         headers = [h for h in headers if h in included]
-        result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log)
+        result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log, found)
+    if found and args.classes_out:
+        write_discovered(args.classes_out, found)
     if result is None:
         print(f"  templates: {err.strip().splitlines()[0] if err.strip() else 'planning failed'}", file=sys.stderr)
         (work / "planner.log").write_text("\n".join(log) + "\n\n" + err)
         print(f"  templates: skipped (details: {work / 'planner.log'})", file=sys.stderr)
         return 2
+
+    # A member template hangs off the class the module bound; reflection and
+    # the CLI's own list are both names it may be known by.
+    bound_classes |= {e["spelling"] for e in found.get("plain", [])}
+    bound_classes |= {e["spelling"].rsplit("::", 1)[-1] for e in found.get("plain", [])}
 
     notes = result["plan"]["notes"] + notes
     lines, frees = emit_lines(args, result, bound_classes, notes)

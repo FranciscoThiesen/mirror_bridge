@@ -299,6 +299,90 @@ consteval Inventory inventory() {
     return inv;
 }
 
+// ------------------------------------------------------- declared types --
+
+// Every class and enum the headers declare. This is a different question
+// from the inventory above, and has its own walk for two reasons: the
+// planner only looks at namespace scope and deliberately ignores detail
+// namespaces, while a module binds whatever the headers declare publicly —
+// nested classes and detail namespaces included, because that is what the
+// text scan the CLI used to rely on found.
+//
+// The point of doing it here at all is that the preprocessor has already
+// run. `class JSON_API Value` reads to a tokenizer as a class named
+// JSON_API, which is what every export macro in every shipped C++ library
+// looks like; by the time reflection sees it, the macro is gone.
+struct Declared {
+    std::vector<info> classes, enums, seen_ns;
+};
+
+consteval bool holds(const std::vector<info>& v, info x) {
+    for (info e : v) if (e == x) return true;
+    return false;
+}
+
+// "file:line" of a declaration, so the CLI can report a collision as a
+// source location and can still honour a MIRROR_BRIDGE_SKIP comment on the
+// line above.
+consteval std::string site(info r) {
+    auto loc = source_location_of(r);
+    return std::string(loc.file_name()) + ":" + itoa(loc.line());
+}
+
+consteval void declare_type(Declared& d, info m);
+
+consteval void declare_members_of(Declared& d, info cls) {
+    for (info m : members_of(cls, access_context::unchecked())) {
+        // An alias is not a declaration, and following one does not
+        // terminate: `using iterator = ValueIterator;` inside Json::Value
+        // is a type and a class type, so the walk re-enters a class it is
+        // already inside and only stops at the constexpr step limit.
+        if (is_type_alias(m) || !is_type(m)) continue;
+        // A private nested class cannot be named from the generated module,
+        // and binding one is ill-formed.
+        if (!is_public(m)) continue;
+        declare_type(d, m);
+    }
+}
+
+consteval void declare_type(Declared& d, info m) {
+    if (!has_identifier(m) || !in_source(m)) return;
+    if (is_enum_type(m)) {
+        if (!holds(d.enums, m)) d.enums.push_back(m);
+        return;
+    }
+    if (!is_class_type(m) || has_template_arguments(m) || !is_complete_type(m)) return;
+    // The injected-class-name is a member of the class it names, so without
+    // this the first class walked would recurse into itself forever.
+    if (holds(d.classes, m)) return;
+    d.classes.push_back(m);
+    declare_members_of(d, m);
+}
+
+consteval void declare_namespace(Declared& d, info ns) {
+    if (holds(d.seen_ns, ns)) return;    // a namespace alias can close a cycle
+    d.seen_ns.push_back(ns);
+    for (info m : members_of(ns, access_context::unchecked())) {
+        if (is_namespace(m)) {
+            // Walked so that a class in lib::detail is still found when the
+            // driver only named lib. std and reserved names belong to the
+            // implementation and would cost seconds to walk.
+            if (!has_identifier(m)) continue;
+            std::string_view n = identifier_of(m);
+            if (n == "std" || n.starts_with("_")) continue;
+            declare_namespace(d, m);
+        } else if (is_type(m) && !is_type_alias(m)) {
+            declare_type(d, m);
+        }
+    }
+}
+
+consteval Declared declared() {
+    Declared d;
+    for (info ns : {MIRROR_BRIDGE_PLAN_NAMESPACES}) declare_namespace(d, ns);
+    return d;
+}
+
 // --instantiate: the user named specializations explicitly. They enter the
 // plan as seeds (classes) or candidates (functions) with origin "requested".
 consteval void add_requested(Plan& p) {
@@ -391,15 +475,22 @@ consteval Plan make_plan() {
 
 // Tab-separated, one entry per line: kind, python name, C++ spelling,
 // template arguments, origin, owner. The driver parses this.
+//
+// `plain` and `enum` lines carry the declaration site in the origin column
+// ("file:line"); they are the class list the CLI binds from.
 consteval std::string render() {
     Plan p = make_plan();
     Inventory inv = inventory();
     std::string out;
+    Declared decl = declared();
+    for (info c : decl.classes)
+        out += "plain\t" + std::string(identifier_of(c)) + "\t" + qualified(c) + "\t\t" + site(c) + "\t\n";
+    for (info e : decl.enums)
+        out += "enum\t" + std::string(identifier_of(e)) + "\t" + qualified(e) + "\t\t" + site(e) + "\t\n";
     // The non-template surface: the driver binds free functions from it and
     // learns which names are templates (a plain function that shares a name
     // with a function template has no unique address to bind).
     for (info c : inv.plain_classes) {
-        out += "plain\t" + std::string(identifier_of(c)) + "\t" + qualified(c) + "\t\t\t\n";
         std::vector<std::string> specs;
         for (info f : nonstatic_data_members_of(c, access_context::unchecked())) collect_specs(type_of(f), specs);
         for (info f : members_of(c, access_context::unchecked())) if (plain_method(f)) for (auto& n : needs_of(f)) specs.push_back(n);
