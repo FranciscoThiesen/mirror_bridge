@@ -51,6 +51,7 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <new>
 #include <unordered_map>
 #include <set>
 #include <unordered_set>
@@ -2883,6 +2884,50 @@ struct PyWrapper {
     PyObject* parent;  // Owner of the storage, when this wrapper is a view
 };
 
+// Whether the C++ object can live inside the Python object instead of behind
+// a second allocation.
+//
+// An abstract class has nothing to place. An over-aligned one cannot rely on
+// what the object allocator returns. A trampoline is excluded at the call
+// site rather than here: it is a different, larger type than the one
+// tp_basicsize was computed for.
+template<typename T>
+inline constexpr bool payload_fits_inline_v =
+    !std::is_abstract_v<T> &&
+    std::is_destructible_v<T> &&
+    alignof(T) <= alignof(std::max_align_t);
+
+template<typename T>
+inline constexpr std::size_t inline_payload_offset =
+    (sizeof(PyWrapper<T>) + alignof(T) - 1) / alignof(T) * alignof(T);
+
+template<typename T>
+inline constexpr std::size_t wrapper_basicsize =
+    payload_fits_inline_v<T> ? inline_payload_offset<T> + sizeof(T)
+                             : sizeof(PyWrapper<T>);
+
+// Where the payload sits for this wrapper. A constant offset, so the address
+// is one add; a Python subclass only ever extends the tail, which leaves it
+// where it is.
+template<typename T>
+T* inline_payload(PyWrapper<T>* w) {
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(w) + inline_payload_offset<T>);
+}
+
+// Storage for a default construction: the inline slot when the exact type
+// the wrapper was sized for is what is being built, the heap otherwise. A
+// trampoline is a larger type than tp_basicsize accounts for, so it takes
+// the heap path.
+template<typename T, typename Alloc>
+void* payload_storage_for(PyWrapper<T>* wrapper) {
+    if constexpr (payload_fits_inline_v<T> && std::is_same_v<T, Alloc>) {
+        return static_cast<void*>(inline_payload(wrapper));
+    } else {
+        (void)wrapper;
+        return nullptr;
+    }
+}
+
 // ============================================================================
 // Trampoline support — let Python subclasses override C++ virtual methods
 // ============================================================================
@@ -3050,7 +3095,17 @@ template<typename T>
 void py_dealloc(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (wrapper->owns && wrapper->cpp_object) {
-        delete wrapper->cpp_object;
+        // An inline payload is distinguishable without a flag: it is the only
+        // object that can sit at exactly this address.
+        if constexpr (payload_fits_inline_v<T>) {
+            if (wrapper->cpp_object == inline_payload(wrapper)) {
+                wrapper->cpp_object->~T();
+            } else {
+                delete wrapper->cpp_object;
+            }
+        } else {
+            delete wrapper->cpp_object;
+        }
     }
     // A view owns nothing but the reference that keeps the storage alive.
     Py_XDECREF(wrapper->parent);
@@ -3187,7 +3242,8 @@ consteval std::string_view constructor_param_name() {
 // constructor. Alloc must inherit from T and expose T's constructors (the
 // canonical idiom is `using T::T;` in the trampoline).
 template<typename T, typename Alloc, std::size_t CtorIndex, std::size_t... Is>
-Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>) {
+Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>,
+                                   void* storage) {
     if constexpr (std::is_abstract_v<T>) {
         PyErr_SetString(PyExc_TypeError,
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
@@ -3217,6 +3273,11 @@ Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is
         // exception unwinds past the interpreter and std::terminate aborts
         // the process, giving the caller no traceback and nothing to catch.
         try {
+            if (storage) {
+                return ::new (storage) Alloc(
+                    forward_arg<constructor_param_t<T, CtorIndex, Is>>(
+                        std::get<Is>(cpp_args))...);
+            }
             return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
                 std::get<Is>(cpp_args))...);
         } catch (const std::exception& e) {
@@ -3267,7 +3328,8 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     if (nargs == 0 && nkw == 0) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
             try {
-                auto* obj = new Trampoline();
+                void* storage = payload_storage_for<T, Trampoline>(wrapper);
+                auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
                 wrapper->cpp_object = obj;
                 wrapper->owns = true;
                 wrapper->parent = nullptr;
@@ -3331,7 +3393,8 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                 }
 
                 Trampoline* obj = call_constructor_impl_alloc<T, Trampoline, Is>(
-                    resolved, std::make_index_sequence<P>{});
+                    resolved, std::make_index_sequence<P>{},
+                    payload_storage_for<T, Trampoline>(wrapper));
 
                 if (obj) {
                     wrapper->cpp_object = obj;
@@ -3398,7 +3461,8 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
     if (self) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
-            auto* obj = new Trampoline();
+            void* storage = payload_storage_for<T, Trampoline>(self);
+            auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
             self->cpp_object = obj;
             self->owns = true;
             self->parent = nullptr;
@@ -5022,7 +5086,7 @@ using UpcastThunk = void* (*)(void*);
 // means a mismatched pair simply does not recognise each other's objects, so
 // the failure is a clean TypeError at the boundary. Matching builds are
 // unaffected and still share types as before.
-inline constexpr const char* kWrapperAbiTag = "#mbabi2";
+inline constexpr const char* kWrapperAbiTag = "#mbabi3";
 
 template<typename T>
 const std::string& wrapper_abi_typeid() {
@@ -5384,7 +5448,17 @@ to_python(const T& obj) {
             if (!wrapper) {
                 return nullptr;
             }
-            wrapper->cpp_object = new CleanT(obj);  // Copy the object
+            // tp_alloc sized this object for an inline payload, so the copy
+            // goes in it rather than behind a second allocation. The type
+            // object comes from the shared registry, and the layout tag in
+            // its key is what guarantees it was sized by a build that agrees
+            // with this one.
+            if constexpr (payload_fits_inline_v<CleanT>) {
+                wrapper->cpp_object = ::new (static_cast<void*>(inline_payload(wrapper)))
+                    CleanT(obj);
+            } else {
+                wrapper->cpp_object = new CleanT(obj);
+            }
             wrapper->owns = true;
             wrapper->parent = nullptr;
             return reinterpret_cast<PyObject*>(wrapper);
@@ -5721,7 +5795,7 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     static PyTypeObject type_object = {
         .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = name,
-        .tp_basicsize = sizeof(PyWrapper<T>),
+        .tp_basicsize = static_cast<Py_ssize_t>(wrapper_basicsize<T>),
         .tp_itemsize = 0,
         .tp_dealloc = py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,

@@ -174,6 +174,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # The C++ object lives inside the Python object (one allocation)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc)
+        mirror_bridge_python_module(wrapper_alloc
+            wrapper_alloc/wrapper_alloc_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc
+        )
+    endif()
+
     # A write through a nested data member reaches the owner, not a copy
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/member_views)
         mirror_bridge_python_module(member_views
