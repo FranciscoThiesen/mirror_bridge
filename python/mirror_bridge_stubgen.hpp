@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <sstream>
 #include <fstream>
 #include <typeinfo>
@@ -138,12 +139,13 @@ private:
 
         // Module-level functions
         for (const auto& func : functions_) {
-            ss << "def " << func.name << "(";
-            for (size_t i = 0; i < func.parameters.size(); ++i) {
-                if (i > 0) ss << ", ";
-                ss << func.parameters[i].name << ": " << func.parameters[i].type_hint;
+            if (is_python_keyword(func.name)) {
+                ss << omission_note("", "function", func.name);
+                continue;
             }
-            ss << ") -> " << func.return_type << ": ...\n";
+            ss << "def " << func.name << "("
+               << render_parameters(func.parameters, false)
+               << ") -> " << func.return_type << ": ...\n";
         }
 
         return ss.str();
@@ -174,8 +176,80 @@ private:
 
     static std::string fallback_class_name(const std::string& typeid_name);
 
+    // Python's grammar reserves these, so none of them can appear in a stub as
+    // a name. The runtime binding is unaffected: CPython looks members up by
+    // string, so a C++ member called `pass` is still reachable through
+    // getattr(). It is only the *declaration* that cannot be written down.
+    static bool is_python_keyword(const std::string& s) {
+        static const std::set<std::string> kw = {
+            "False", "None", "True", "and", "as", "assert", "async", "await",
+            "break", "class", "continue", "def", "del", "elif", "else",
+            "except", "finally", "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+            "return", "try", "while", "with", "yield"
+        };
+        return kw.count(s) != 0;
+    }
+
+    // Render a parameter list, renaming anything that cannot be spelled as a
+    // keyword argument and marking it positional-only.
+    //
+    // A parameter named `lambda` or `self` is still accepted by the runtime
+    // through f(**{"lambda": x}), but no Python source can write `lambda=x`,
+    // and a stub cannot declare it either. Renaming alone would be a lie,
+    // because the invented name is not a keyword the module answers to. PEP
+    // 570's `/` says precisely the true thing — these arguments are reachable
+    // by position only — which leaves the substituted name as documentation.
+    // `/` applies to everything before it, so it goes after the *last*
+    // unnameable parameter.
+    static std::string render_parameters(const std::vector<ParameterInfo>& params,
+                                         bool leading_self) {
+        std::vector<std::string> names;
+        names.reserve(params.size());
+        std::set<std::string> taken;
+        std::ptrdiff_t positional_only_through = -1;
+
+        if (leading_self) taken.insert("self");
+        for (size_t i = 0; i < params.size(); ++i) {
+            std::string name = params[i].name;
+            const bool unnameable =
+                name.empty() || is_python_keyword(name) || name == "self";
+            if (unnameable) {
+                positional_only_through = static_cast<std::ptrdiff_t>(i);
+                name = name.empty() ? ("arg" + std::to_string(i)) : (name + "_");
+            }
+            while (taken.count(name)) name += "_";
+            taken.insert(name);
+            names.push_back(name);
+        }
+
+        std::ostringstream ss;
+        if (leading_self) ss << "self";
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (i > 0 || leading_self) ss << ", ";
+            ss << names[i] << ": " << params[i].type_hint;
+            if (static_cast<std::ptrdiff_t>(i) == positional_only_through) ss << ", /";
+        }
+        return ss.str();
+    }
+
+    // A member whose own name is a keyword has no declaration form at all, so
+    // the stub records why it is absent instead of emitting something a type
+    // checker will reject.
+    static std::string omission_note(const std::string& indent,
+                                     const std::string& kind,
+                                     const std::string& name) {
+        return indent + "# " + kind + " \"" + name + "\" omitted: the C++ name is a Python "
+               "keyword and\n" + indent + "# cannot be declared in a stub. Reach it with "
+               "getattr(obj, \"" + name + "\").\n";
+    }
+
     std::string generate_class_stub(const ClassInfo& info) const {
         std::ostringstream ss;
+
+        if (is_python_keyword(info.name)) {
+            return omission_note("", "class", info.name);
+        }
 
         ss << "class " << info.name << ":\n";
 
@@ -183,25 +257,25 @@ private:
         if (info.constructors.empty()) {
             ss << "    def __init__(self) -> None: ...\n";
         } else if (info.constructors.size() == 1) {
-            ss << "    def __init__(self";
-            for (const auto& param : info.constructors[0].parameters) {
-                ss << ", " << param.name << ": " << param.type_hint;
-            }
-            ss << ") -> None: ...\n";
+            ss << "    def __init__("
+               << render_parameters(info.constructors[0].parameters, true)
+               << ") -> None: ...\n";
         } else {
             // Multiple constructors - use @overload
             for (const auto& ctor : info.constructors) {
                 ss << "    @overload\n";
-                ss << "    def __init__(self";
-                for (const auto& param : ctor.parameters) {
-                    ss << ", " << param.name << ": " << param.type_hint;
-                }
-                ss << ") -> None: ...\n";
+                ss << "    def __init__("
+                   << render_parameters(ctor.parameters, true)
+                   << ") -> None: ...\n";
             }
         }
 
         // Properties
         for (const auto& prop : info.properties) {
+            if (is_python_keyword(prop.name)) {
+                ss << omission_note("    ", "attribute", prop.name);
+                continue;
+            }
             if (prop.readonly) {
                 ss << "    @property\n";
                 ss << "    def " << prop.name << "(self) -> " << prop.type_hint << ": ...\n";
@@ -217,20 +291,20 @@ private:
             ++name_counts[method.name];
         }
         for (const auto& method : info.methods) {
+            if (is_python_keyword(method.name)) {
+                ss << omission_note("    ", "method", method.name);
+                continue;
+            }
             if (name_counts[method.name] > 1) {
                 ss << "    @overload\n";
             }
             if (method.is_static) {
                 ss << "    @staticmethod\n";
-                ss << "    def " << method.name << "(";
+                ss << "    def " << method.name << "("
+                   << render_parameters(method.parameters, false);
             } else {
-                ss << "    def " << method.name << "(self";
-                if (!method.parameters.empty()) ss << ", ";
-            }
-
-            for (size_t i = 0; i < method.parameters.size(); ++i) {
-                if (i > 0) ss << ", ";
-                ss << method.parameters[i].name << ": " << method.parameters[i].type_hint;
+                ss << "    def " << method.name << "("
+                   << render_parameters(method.parameters, true);
             }
             ss << ") -> " << method.return_type << ": ...\n";
         }

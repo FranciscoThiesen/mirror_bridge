@@ -971,20 +971,53 @@ emit_stubs() {
     local output_dir="$2"
     local stub_file="$output_dir/${module_name}.pyi"
 
-    if LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}" python3 - "$output_dir" "$module_name" "$stub_file" << 'PYEOF'
-import importlib, sys
+    local notes
+    notes=$(LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}" python3 - "$output_dir" "$module_name" "$stub_file" << 'PYEOF'
+import importlib, sys, ast
 out_dir, mod_name, stub_file = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, out_dir)
-mod = importlib.import_module(mod_name)
-content = mod.__mirror_bridge_stubs__()
+try:
+    mod = importlib.import_module(mod_name)
+    content = mod.__mirror_bridge_stubs__()
+except Exception:
+    sys.exit(2)
+
 with open(stub_file, "w") as f:
     f.write(content)
+
+# The stub is a contract other tools parse: `api` diffs it with ast, and a
+# type checker rejects the whole file over one bad line. So a stub that does
+# not parse is a generator bug and has to be loud rather than written quietly.
+try:
+    ast.parse(content)
+except SyntaxError as exc:
+    print("line %s: %s" % (exc.lineno, exc.msg))
+    sys.exit(3)
+
+for line in content.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("# ") and "omitted:" in stripped:
+        print(stripped[2:])
 PYEOF
-    then
-        echo -e "${GREEN}✓ Stubs: $stub_file${NC}"
-    else
-        echo -e "${YELLOW}⚠ Stub generation skipped (importing the module failed)${NC}"
-    fi
+    )
+    case $? in
+        0)
+            echo -e "${GREEN}✓ Stubs: $stub_file${NC}"
+            if [ -n "$notes" ]; then
+                while IFS= read -r line; do
+                    echo -e "${YELLOW}  ⚠ $line${NC}"
+                done <<< "$notes"
+            fi
+            ;;
+        3)
+            echo -e "${RED}✗ Stub is not valid Python: $stub_file${NC}"
+            echo -e "${RED}  $notes${NC}"
+            echo -e "${YELLOW}  The module itself built fine; this is a stub generator bug.${NC}"
+            ;;
+        *)
+            echo -e "${YELLOW}⚠ Stub generation skipped (importing the module failed)${NC}"
+            ;;
+    esac
 }
 
 # Command: generate
@@ -1253,6 +1286,20 @@ cmd_api() {
     if [ ! -f "$current" ]; then
         echo -e "${RED}Error: the build produced no stub at $current${NC}"
         echo -e "${YELLOW}  The module must import for its stub to be extracted; see $work/generate.log${NC}"
+        exit 1
+    fi
+
+    # A baseline the gate cannot parse would wedge `api --check` forever, so
+    # it is refused rather than stored.
+    if ! python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$current" 2>/dev/null; then
+        echo -e "${RED}Error: the generated stub for '$module_name' is not valid Python${NC}"
+        python3 -c "import ast,sys
+try:
+    ast.parse(open(sys.argv[1]).read())
+except SyntaxError as e:
+    print('  line %s: %s' % (e.lineno, e.msg))" "$current" 2>/dev/null
+        echo -e "${YELLOW}  Not written. Please report this as a stub generator bug.${NC}"
+        [ $JSON_MODE -eq 1 ] && printf '{"status":"error","reason":"stub not valid python"}\n' >&3
         exit 1
     fi
 
