@@ -148,8 +148,10 @@ struct LuaWrapper {
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. DISCOVERY                                                     │
-│    ├─ mirror_bridge_auto scans headers for classes              │
-│    ├─ discover_symbols.py parses C++ syntax                     │
+│    ├─ A consteval TU (core/mirror_bridge_plan.hpp) walks the    │
+│    │  headers' namespaces and class bodies through reflection    │
+│    ├─ Falls back, loudly, to a scan of the header text when      │
+│    │  that TU does not compile                                   │
 │    └─ Respects MIRROR_BRIDGE_SKIP markers                       │
 ├─────────────────────────────────────────────────────────────────┤
 │ 2. CODE GENERATION                                               │
@@ -254,8 +256,9 @@ mirror_bridge::bind_function<&my_function>(m, "my_function");
 ### Skipping a Class
 
 ```cpp
-class MIRROR_BRIDGE_SKIP InternalClass {
-    // Won't be discovered by mirror_bridge_auto
+// MIRROR_BRIDGE_SKIP
+class InternalClass {
+    // Not bound: the marker goes on the line above the declaration
 };
 ```
 
