@@ -300,12 +300,18 @@ detect_eigen_dir() {
     return 0
 }
 
-# Discover classes in source directory.
+# Discover classes by reading the header text. This is the FALLBACK path:
+# adopt_reflected_classes replaces its answer whenever the reflection unit
+# compiles, because a tokenizer cannot see through the preprocessor and
+# `class JSON_API Value` reads to it as a class named JSON_API. It is kept
+# for headers reflection cannot read (not self-contained, missing a
+# dependency), where a guess beats nothing, and the caller says out loud
+# when that happens.
 #
-# Handles nested classes correctly by tracking C++ brace depth and class scope:
-# a class declared inside another class is reported as `Outer::Inner` (scopes
-# joined with ::), so it can be referenced from binding code without needing
-# the original class body. Namespaces are NOT joined — they're handled by the
+# Handles nested classes by tracking C++ brace depth and class scope: a class
+# declared inside another class is reported as `Outer::Inner` (scopes joined
+# with ::), so it can be referenced from binding code without needing the
+# original class body. Namespaces are NOT joined — they're handled by the
 # `using namespace` directives emitted elsewhere.
 discover_classes() {
     local src_dir="$1"
@@ -501,7 +507,6 @@ PYSCRIPT
             classes_ref+=("$class_name")
             headers_ref+=("$rel_path")
             DISCOVERED_LINES+=("$line_num")
-            echo -e "  ${GREEN}✓${NC} Found: $class_name in $rel_path"
         done < <(python3 -c "$parser_script" "$header_file" 2>/dev/null)
     done <<< "$header_files"
 }
@@ -743,12 +748,12 @@ report_unbound() {
     echo "  See docs/reference/errors.md#names-missing-from-the-module"
 }
 
-# A module refers to every class by its UNQUALIFIED name and recovers scope
-# with one `using namespace` per namespace found, so two discovered classes
-# that share a simple name cannot share a module. The compiler says so, but
-# it says it about a generated .cpp the CLI then deletes, so the user is left
-# with "reference to 'Config' is ambiguous" and nothing to act on. Said here
-# instead, before a line of code is generated, in terms of their own headers.
+# A module exposes every class under its UNQUALIFIED name, so two discovered
+# classes that share a simple name cannot share a module: whichever is bound
+# last is the only one the target language can reach. Nothing downstream says
+# so — the C++ side is unambiguous, because the generated file names each
+# class in full — so the collision would otherwise show up as a class that
+# silently has the wrong members at runtime.
 warn_duplicate_binding_names() {
     local -n names_ref=$1
     local -n files_ref=$2
@@ -756,14 +761,16 @@ warn_duplicate_binding_names() {
 
     local -a reported=()
     for (( i = 0; i < ${#names_ref[@]}; i++ )); do
-        name="${names_ref[$i]}"
+        # The binding name is the last scope component: lib::Config and
+        # lib::detail::Config are both bound as Config.
+        name="${names_ref[$i]##*::}"
         local already=0 r
         for r in "${reported[@]:-}"; do [ "$r" = "$name" ] && already=1; done
         [ "$already" -eq 1 ] && continue
 
         local -a where=()
         for (( j = 0; j < ${#names_ref[@]}; j++ )); do
-            [ "${names_ref[$j]}" = "$name" ] && \
+            [ "${names_ref[$j]##*::}" = "$name" ] && \
                 where+=("${files_ref[$j]}:${DISCOVERED_LINES[$j]:-?}")
         done
         [ ${#where[@]} -lt 2 ] && continue
@@ -773,13 +780,61 @@ warn_duplicate_binding_names() {
         echo -e "${YELLOW}⚠ '$name' is the binding name of ${#where[@]} classes:${NC}"
         local f
         for f in "${where[@]}"; do echo "      $f"; done
-        echo "  A module binds every class under its unqualified name, so the C++"
-        echo "  compiler will reject this module as ambiguous or as a redefinition."
-        echo "  Fix: bind one of them in a module of its own, or rename one class."
-        echo "  // MIRROR_BRIDGE_SKIP on one is not enough: the using-directive for"
-        echo "  its namespace is still emitted."
+        echo "  A module exposes every class under its unqualified name, so only one"
+        echo "  of these can answer to '$name': the last one bound replaces the rest."
+        echo "  Fix: bind one of them in a module of its own, rename one class, or put"
+        echo "  // MIRROR_BRIDGE_SKIP on the line above the one this module does not need."
         echo "  See docs/reference/errors.md#two-bound-classes-with-the-same-unqualified-name"
     done
+}
+
+# Both calls into tools/mirror_bridge_templates.py need the same picture of
+# the source tree — every header in it, flagged when the module already
+# includes it, plus the compiler and include flags — so it is built once
+# here into PLANNER_WORK and PLANNER_ARGS.
+PLANNER_WORK=""
+PLANNER_ARGS=()
+planner_setup() {
+    local module_name="$1"
+    local src_dir="$2"
+    local -n ps_classes=$3
+    local -n ps_headers=$4
+    shift 4
+    local extra_includes=("$@")
+
+    PLANNER_WORK="$OUTPUT_DIR/.mirror_bridge/plan/$module_name"
+    mkdir -p "$PLANNER_WORK"
+
+    declare -A already
+    local h
+    for h in "${ps_headers[@]:-}"; do already["$h"]=1; done
+    : > "$PLANNER_WORK/headers.txt"
+    local header_file rel
+    while IFS= read -r header_file; do
+        [ -z "$header_file" ] && continue
+        grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null && continue
+        rel=$(header_include_spelling "$header_file" "$src_dir")
+        printf '%s\t%s\n' "$rel" "${already["$rel"]:-0}" >> "$PLANNER_WORK/headers.txt"
+    done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
+    printf '%s\n' "${ps_classes[@]:-}" > "$PLANNER_WORK/classes.txt"
+
+    PLANNER_ARGS=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS" --project-root "$PROJECT_ROOT"
+                  --src-dir "$src_dir" --module "$module_name" --work "$PLANNER_WORK"
+                  --headers-file "$PLANNER_WORK/headers.txt" --classes-file "$PLANNER_WORK/classes.txt"
+                  --classes-out "$PLANNER_WORK/declared.tsv")
+    local inc
+    for inc in "${extra_includes[@]}"; do
+        [ -n "$inc" ] && PLANNER_ARGS+=(-I "$inc")
+    done
+    local eigen_path
+    eigen_path=$(detect_eigen_dir "$src_dir")
+    [ -n "$eigen_path" ] && PLANNER_ARGS+=(--eigen-dir "$eigen_path")
+    [ "$VERBOSE" -eq 1 ] && PLANNER_ARGS+=(--verbose)
+
+    # A leftover from an earlier run would otherwise read as this run's
+    # answer, which is the one thing the class list must never be.
+    rm -f "$PLANNER_WORK/declared.tsv"
+    REFLECTED_CLASSES_FILE=""
 }
 
 # Template instantiation planning (Python backend). Nothing in a header says
@@ -789,6 +844,10 @@ warn_duplicate_binding_names() {
 # non-overloaded free functions. On success the binding lines wait in
 # TEMPLATE_LINES_FILE (plus TEMPLATE_INCLUDES_FILE for headers the class scan
 # had no reason to include); on failure the module degrades to classes only.
+#
+# Its first discovery round is also where the class list comes from, so the
+# declarations file is picked up whether or not the planning that follows
+# succeeds: the two can fail independently.
 TEMPLATE_LINES_FILE=""
 TEMPLATE_INCLUDES_FILE=""
 TEMPLATE_JSON_FILE=""
@@ -796,64 +855,112 @@ TEMPLATE_UNBOUND_FILE=""
 plan_templates() {
     local module_name="$1"
     local src_dir="$2"
-    local -n classes_ref=$3
-    local -n headers_ref=$4
+    local classes_name="$3"
+    local headers_name="$4"
     shift 4
-    local extra_includes=("$@")
 
     TEMPLATE_LINES_FILE=""
     TEMPLATE_INCLUDES_FILE=""
     TEMPLATE_JSON_FILE=""
     TEMPLATE_UNBOUND_FILE=""
-    local work="$OUTPUT_DIR/.mirror_bridge/plan/$module_name"
-    mkdir -p "$work"
+    planner_setup "$module_name" "$src_dir" "$classes_name" "$headers_name" "$@"
 
-    # Every header in src_dir, flagged when the class scan already includes it
-    declare -A already
-    local h
-    for h in "${headers_ref[@]}"; do already["$h"]=1; done
-    : > "$work/headers.txt"
-    local header_file
-    while IFS= read -r header_file; do
-        [ -z "$header_file" ] && continue
-        grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null && continue
-        local rel
-        rel=$(header_include_spelling "$header_file" "$src_dir")
-        printf '%s\t%s\n' "$rel" "${already["$rel"]:-0}" >> "$work/headers.txt"
-    done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
-    printf '%s\n' "${classes_ref[@]}" > "$work/classes.txt"
-
-    local -a args=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS" --project-root "$PROJECT_ROOT"
-                   --src-dir "$src_dir" --module "$module_name" --work "$work"
-                   --headers-file "$work/headers.txt" --classes-file "$work/classes.txt"
-                   --emit "$work/bindings.inc" --includes-out "$work/includes.txt"
-                   --report "$OUTPUT_DIR/${module_name}_plan.txt" --json-out "$work/plan.json"
+    local -a args=("${PLANNER_ARGS[@]}"
+                   --emit "$PLANNER_WORK/bindings.inc" --includes-out "$PLANNER_WORK/includes.txt"
+                   --report "$OUTPUT_DIR/${module_name}_plan.txt" --json-out "$PLANNER_WORK/plan.json"
                    --template-cap "$TEMPLATE_CAP"
-                   --unbound-out "$work/unbound.tsv")
-    local inc
-    for inc in "${extra_includes[@]}"; do
-        [ -n "$inc" ] && args+=(-I "$inc")
-    done
-    local eigen_path
-    eigen_path=$(detect_eigen_dir "$src_dir")
-    [ -n "$eigen_path" ] && args+=(--eigen-dir "$eigen_path")
+                   --unbound-out "$PLANNER_WORK/unbound.tsv")
     [ "$RELEASE_GIL" -eq 1 ] && args+=(--release-gil)
-    [ "$VERBOSE" -eq 1 ] && args+=(--verbose)
     local spec
     for spec in "${INSTANTIATE[@]}"; do
         [ -n "$spec" ] && args+=(--instantiate "$spec")
     done
 
     echo -e "${YELLOW}Planning template instantiations...${NC}"
-    if python3 "$PROJECT_ROOT/tools/mirror_bridge_templates.py" "${args[@]}"; then
-        TEMPLATE_LINES_FILE="$work/bindings.inc"
-        TEMPLATE_INCLUDES_FILE="$work/includes.txt"
-        TEMPLATE_JSON_FILE="$work/plan.json"
-        TEMPLATE_UNBOUND_FILE="$work/unbound.tsv"
+    local rc=0
+    python3 "$PROJECT_ROOT/tools/mirror_bridge_templates.py" "${args[@]}" || rc=$?
+    [ -f "$PLANNER_WORK/declared.tsv" ] && REFLECTED_CLASSES_FILE="$PLANNER_WORK/declared.tsv"
+    if [ $rc -eq 0 ]; then
+        TEMPLATE_LINES_FILE="$PLANNER_WORK/bindings.inc"
+        TEMPLATE_INCLUDES_FILE="$PLANNER_WORK/includes.txt"
+        TEMPLATE_JSON_FILE="$PLANNER_WORK/plan.json"
+        TEMPLATE_UNBOUND_FILE="$PLANNER_WORK/unbound.tsv"
         return 0
     fi
-    echo -e "${YELLOW}  Templates and free functions not bound (see $work/planner.log); binding classes only.${NC}"
+    echo -e "${YELLOW}  Templates and free functions not bound (see $PLANNER_WORK/planner.log); binding classes only.${NC}"
     return 1
+}
+
+# The class list on its own, for the runs that never plan templates:
+# --lang lua, --lang js, --no-templates. One discovery round, no probing.
+reflect_classes() {
+    local module_name="$1"
+    local src_dir="$2"
+    local classes_name="$3"
+    local headers_name="$4"
+    shift 4
+    planner_setup "$module_name" "$src_dir" "$classes_name" "$headers_name" "$@"
+
+    echo -e "${YELLOW}Reading the declarations through reflection...${NC}"
+    if python3 "$PROJECT_ROOT/tools/mirror_bridge_templates.py" "${PLANNER_ARGS[@]}" --discover-only; then
+        REFLECTED_CLASSES_FILE="$PLANNER_WORK/declared.tsv"
+        return 0
+    fi
+    return 1
+}
+
+# Replace the text scan's guess with what the compiler actually declared.
+#
+# The reflection unit has already run by this point (the template planner's
+# first round, or reflect_classes), and its answer is the one that survives
+# the preprocessor: `class JSON_API Value` is Json::Value here and a class
+# named JSON_API to any tokenizer. Returns 1 when that unit did not compile,
+# leaving the text scan's arrays alone for the caller to warn about.
+REFLECTED_CLASSES_FILE=""
+adopt_reflected_classes() {
+    local -n ar_classes=$1
+    local -n ar_headers=$2
+    local src_dir="$3"
+
+    if [ -z "$REFLECTED_CLASSES_FILE" ] || [ ! -f "$REFLECTED_CLASSES_FILE" ]; then
+        return 1
+    fi
+
+    local -a names=() files=() lines=() enums=()
+    local kind qualified_name where file line header
+    while IFS=$'\t' read -r kind qualified_name where; do
+        [ -z "$qualified_name" ] && continue
+        file="${where%:*}"
+        line="${where##*:}"
+
+        # The compiler reports the path it opened; a module includes the
+        # header the way the user's own sources spell it.
+        header="$file"
+        [ -f "$file" ] && header=$(header_include_spelling "$file" "$src_dir")
+
+        if [ -f "$file" ] && grep -q "MIRROR_BRIDGE_SKIP_FILE" "$file" 2>/dev/null; then
+            continue
+        fi
+        if [ -f "$file" ] && [ "$line" -gt 1 ] 2>/dev/null && \
+           sed -n "$((line - 1))p" "$file" | grep -q "MIRROR_BRIDGE_SKIP"; then
+            [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Skipping: $qualified_name (marked SKIP)${NC}"
+            continue
+        fi
+
+        if [ "$kind" = "enum" ]; then
+            enums+=("$qualified_name")
+            continue
+        fi
+        names+=("$qualified_name")
+        files+=("$header")
+        lines+=("$line")
+    done < "$REFLECTED_CLASSES_FILE"
+
+    ar_classes=("${names[@]}")
+    ar_headers=("${files[@]}")
+    DISCOVERED_LINES=("${lines[@]}")
+    DISCOVERED_ENUMS=("${enums[@]}")
+    return 0
 }
 
 # Compile binding for a specific language
@@ -1081,6 +1188,33 @@ cmd_generate() {
         done
     fi
 
+    local DISCOVERY_SOURCE="text scan" i
+
+    # The class list the module is built from comes from reflection, which
+    # reads the headers after the preprocessor has run. The planner's own
+    # first round produces it for Python; the other backends ask for it on
+    # its own.
+    if [ $plans_templates -eq 1 ]; then
+        plan_templates "$module_name" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}" || true
+    else
+        reflect_classes "$module_name" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}" || true
+    fi
+
+    if adopt_reflected_classes CLASSES HEADERS "$src_dir"; then
+        DISCOVERY_SOURCE="reflection"
+    else
+        echo ""
+        echo -e "${YELLOW}⚠ Reflection could not read these headers; falling back to a scan of the header text.${NC}"
+        echo "  A text scan does not see the preprocessor, so a class declared through an"
+        echo "  export macro (class JSON_API Value) is discovered under the macro's name."
+        echo "  Why the reflection unit failed: $PLANNER_WORK/planner.log"
+    fi
+
+    echo ""
+    for (( i = 0; i < ${#CLASSES[@]}; i++ )); do
+        echo -e "  ${GREEN}✓${NC} Found: ${CLASSES[$i]} in ${HEADERS[$i]}"
+    done
+
     if [ ${#CLASSES[@]} -eq 0 ] && [ $plans_templates -eq 0 ]; then
         echo -e "${RED}Error: No classes found in $src_dir${NC}"
         json_fail "discover" "No classes found in $src_dir" \
@@ -1088,12 +1222,11 @@ cmd_generate() {
     fi
 
     echo ""
-    echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC}"
+    echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC} (${DISCOVERY_SOURCE})"
     warn_duplicate_binding_names CLASSES HEADERS
     echo ""
 
     if [ $plans_templates -eq 1 ]; then
-        plan_templates "$module_name" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}" || true
         if [ ${#CLASSES[@]} -eq 0 ] && { [ -z "$TEMPLATE_LINES_FILE" ] || [ ! -s "$TEMPLATE_LINES_FILE" ]; }; then
             echo -e "${RED}Error: Nothing to bind in $src_dir${NC}"
             json_fail "discover" "No classes, functions or template instantiations found in $src_dir" \

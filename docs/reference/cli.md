@@ -384,7 +384,11 @@ These options work with all commands:
 
 ## Auto-Discovery
 
-When using `generate`, Mirror Bridge scans all `.hpp` and `.h` files in the source directory and automatically binds all `struct` and `class` definitions found.
+When using `generate`, Mirror Bridge reads all `.hpp` and `.h` files in the source directory and automatically binds every `struct` and `class` they declare, nested classes included.
+
+The list comes from the compiler, through reflection, not from a scan of the header text. That matters because the text of a declaration rarely begins with the class name: `class JSON_API Value`, `class V8_EXPORT Isolate` and `struct alignas(64) Wide` all put something else between the keyword and the name, and a scan binds that something else. Reflection reads the headers after the preprocessor has run, so it reports `Json::Value`.
+
+If the headers cannot be compiled on their own — one of them is not self-contained, say — `generate` says so and falls back to a scan of the text, which is approximate for exactly the reason above.
 
 ### Opt-Out Mechanism
 

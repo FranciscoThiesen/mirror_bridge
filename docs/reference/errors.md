@@ -147,11 +147,11 @@ mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); /
       shapes.hpp:5
 ```
 
-followed, if you continue, by a compiler error such as `reference to 'Config' is ambiguous` or `redefinition of 'Config'`.
+The module still builds. Importing it, only one `Config` exists, and it is the one bound last.
 
-**Cause** A module binds every class under its *unqualified* name and recovers scope with one `using namespace` per namespace found in the scanned headers. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in.
+**Cause** A module exposes every class under its *unqualified* name, because Python, Lua and JavaScript identifiers are flat. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in; the C++ side is unambiguous (the generated file names each class in full), so nothing downstream reports it.
 
-**Fix** Bind one of them in a module of its own, or rename one class. Marking one `// MIRROR_BRIDGE_SKIP` is not enough: the using-directive for its namespace is still emitted, so the collision remains.
+**Fix** Bind one of them in a module of its own, rename one class, or put `// MIRROR_BRIDGE_SKIP` on the line above the one this module does not need.
 
 ### Unsupported container shape
 

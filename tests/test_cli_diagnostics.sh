@@ -133,7 +133,8 @@ check "the collision is named" "$out" "'Config' is the binding name of 2 classes
 check "both declaration sites are shown" "$out" "shapes.hpp:3"
 check "the second site too" "$out" "shapes.hpp:5"
 check "it explains the unqualified-name rule" "$out" "unqualified name"
-check "SKIP is called out as insufficient" "$out" "is not enough"
+check "it says which one survives" "$out" "the last one bound replaces the rest"
+check "it offers the opt-out marker" "$out" "MIRROR_BRIDGE_SKIP"
 
 # --------------------------------------------------------------------------
 echo "diff refuses to record a baseline that would pass forever"
