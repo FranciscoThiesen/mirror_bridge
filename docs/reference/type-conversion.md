@@ -332,6 +332,82 @@ either order. Two cases are deliberately not convertible:
 Inside an overload set a rejected argument simply moves to the next
 candidate, so `TypeError` is raised only when no overload matches.
 
+## Python Data Model
+
+This section describes the Python backend. Lua and JavaScript bind neither
+iteration nor serialization yet.
+
+Four protocol slots are filled from the shape of the C++ class, with nothing
+to declare per class.
+
+| You write in C++ | Python gains |
+|------------------|--------------|
+| `begin()` / `end()` over convertible elements | `for x in obj`, `list(obj)`, `x in obj` |
+| the above plus `size()` | `len(obj)`, and `bool(obj)` is `len(obj) != 0` |
+| default-constructible, every member assignable | `pickle`, `copy.copy`, `copy.deepcopy` |
+
+### Iteration
+
+`tp_iter`/`tp_iternext` are generated from `begin()`/`end()`: `++it`, `*it`
+and the sentinel comparison are splices, and the element goes through the
+same conversion gate a method return value does. A range whose `*it` has no
+Python representation — raw pointers, `std::vector<bool>`'s proxy reference —
+declines the slot rather than failing the build. Membership needs nothing
+extra: with no `sq_contains`, CPython answers `in` by iterating.
+
+The iterator holds a reference to the object the range belongs to, so
+`for x in make_bag()` is safe even though nothing else refers to the
+container while the loop runs. This is the equivalent of pybind11's
+`py::keep_alive<0, 1>()`, except that it is not something you can forget.
+
+What ownership cannot fix is mutation: a `push_back` that reallocates
+invalidates C++ iterators whoever holds the memory. For a range that also has
+`size()`, the generated iterator does what CPython's own `dict` and `set`
+iterators do — it records the element count when iteration starts and raises
+`RuntimeError: Bag changed size during iteration` instead of dereferencing.
+A range with no `size()` has nothing to compare, so mutating one during
+iteration is undefined exactly as it is in C++.
+
+### len() and truthiness
+
+`len()` is offered only to a class that is both iterable and sized, never to
+one that merely has a method spelled `size()`. The reason is truthiness: a
+length slot is where CPython gets `bool(obj)` from, so gating on `size()`
+alone would quietly turn `if obj:` into "it has elements" for a gauge whose
+`size()` is a physical dimension. A class with `size()` and no range keeps
+both its truthiness and its absence of `len()`.
+
+A class with `operator[]` and `size()` but no `begin()`/`end()` is also not
+covered. `mp_subscript` accepts whatever key `operator[]` takes, so reading a
+`0..n-1` sequence out of it would be a guess; give the class `begin()` and
+`end()` and it iterates.
+
+### Pickling
+
+`__reduce__` serializes the reflected non-static data member list — the same
+walk `__repr__` uses, so a member added in C++ joins the pickle without
+anyone editing a list. Reconstruction is `cls()` followed by `__setstate__`,
+which is why a class qualifies only when Python can default-construct it and
+assign every member back. A `const` or `[[=readonly{}]]` member disqualifies
+the class, and `pickle.dumps` keeps raising `TypeError` for it rather than
+handing back an object that quietly lost a field.
+
+A Python subclass pickles as itself, and its instance `__dict__` travels with
+the C++ members.
+
+For pickle to find the class again, a bound type's `tp_name` is
+`<module>.<Class>`; CPython reads a static type's `__module__` from the text
+before the last dot, and without it every bound class claimed to live in
+`builtins`. `__name__`, `__qualname__` and `repr()` are unaffected.
+
+### Hashing
+
+`hash()` is unchanged: it is still the default identity hash, even for a
+class with `operator==`. Two equal objects are therefore two different
+dictionary keys. Hashing the member values instead would be worse: every
+non-`const` member is assignable from Python, and a hash that changes when
+the object is mutated corrupts any `set` or `dict` already holding it.
+
 ## Limitations
 
 ### Not Currently Supported

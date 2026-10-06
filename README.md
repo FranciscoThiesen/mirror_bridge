@@ -128,6 +128,8 @@ python3 test_greeter.py
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
 | **Variants (std::variant)** | ✅ | ✅ | ✅ |
 | **Nested Objects** | ✅ | ✅ | ✅ |
+| **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ |
+| **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ |
 | **Enums** | ⚠️ | ⚠️ | ⚠️ |
 | **Inheritance** | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ |
@@ -140,6 +142,17 @@ python3 test_greeter.py
 | **std::expected** | ✅ | ✅ | ✅ |
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
+
+✅ **Python data model**: a class whose `begin()`/`end()` form a range over
+convertible elements iterates and answers `in`; add `size()` and it gains
+`len()`, and an empty one is falsy. A default-constructible class whose members
+are all assignable pickles and deep-copies, with the member list taken from
+reflection so it cannot fall behind the C++ struct; one that cannot be
+reconstructed — a `const` or `[[=readonly{}]]` member — keeps refusing to
+pickle rather than silently dropping a field. `hash()` is still identity-based
+even for a class with `operator==`, so two equal objects are two different
+dictionary keys; a value hash over members that Python can assign would be
+worse, because mutating the object would corrupt any set or dict holding it.
 
 ⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
 enum *types* are not exported, so there is no Python, Lua or JavaScript object
