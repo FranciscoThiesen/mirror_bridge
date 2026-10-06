@@ -288,14 +288,12 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
-## Argument Type Checking (Python)
-
-This section describes the Python backend. Lua and JavaScript do not check
-argument identity yet.
+## Argument Type Checking
 
 A parameter, data member, or container element whose type is a bound C++
 class accepts only an object of that class, an object of a class derived
-from it, or a Python subclass of either. Anything else raises `TypeError`:
+from it, or a host-language subclass of either. Anything else is refused:
+`TypeError` in Python and JavaScript, a Lua error in Lua.
 
 ```python
 curve = pricing.Curve()
@@ -303,6 +301,23 @@ pricing.discount(curve, 2.0)   # fine
 pricing.discount(42, 2.0)      # TypeError: Argument 1: type conversion failed
 pricing.discount(label, 2.0)   # TypeError, even though Label is also bound
 ```
+
+```lua
+local curve = pricing.Curve.new()
+curve:at(2.0)        -- fine
+curve.at(label, 2.0) -- error: at: expected Curve, got Label
+```
+
+```javascript
+const curve = new pricing.Curve();
+curve.at(2.0);                                  // fine
+pricing.Curve.prototype.at.call(label, 2.0);    // TypeError: at: expected Curve, got Label
+```
+
+The receiver is checked as well as the arguments. `obj.method(x, ...)` in Lua
+and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as
+`obj:method(...)` and `obj.method(...)`, with whatever the caller put first as
+`self`, so an object of the wrong class there is refused too.
 
 Conversion to a base class is offset-adjusted, so it is correct for a base
 that is not the first one:
@@ -316,21 +331,41 @@ double value(const Priceable&);
 value(swap)   # reaches the Priceable subobject, not the start of the Swap
 ```
 
-Virtual bases work too: the offset is resolved at call time rather than
-assumed, and the same class bound by two different modules interoperates.
+Virtual bases work too in Python: the offset is resolved at call time rather
+than assumed.
 
 The conversion is recorded by the derived class when it is bound, so the
-base and the derived class may live in different modules and be imported in
+base and the derived class may live in different modules and be loaded in
 either order. Two cases are deliberately not convertible:
 
-- A derived class whose module has never been imported, because nothing has
+- A derived class whose module has never been loaded, because nothing has
   registered it yet.
 - A base that C++ itself would not let you reach from that call site: one
   that is inaccessible (`private`/`protected`) or ambiguous because it is
   inherited twice non-virtually.
 
 Inside an overload set a rejected argument simply moves to the next
-candidate, so `TypeError` is raised only when no overload matches.
+candidate, so the error is raised only when no overload matches.
+
+### What differs between the backends
+
+| | Python | Lua | JavaScript |
+|---|---|---|---|
+| Wrong class refused | yes | yes | yes |
+| Derived-to-base, offset-adjusted | yes | yes | yes |
+| Same class bound by two modules | yes | yes | yes |
+| Derived class bound by *another* module | yes | yes | no |
+
+The first three are what the identity check has to preserve. The last one is
+where the backends differ in how far their cross-module state reaches: Python
+keeps it in `sys.modules` and Lua in the Lua registry, both shared by every
+module in the process, while the JavaScript backends keep theirs per `.node`
+file — which matches the rest of that backend, where `to_javascript` already
+falls back to a plain-object snapshot for a class the module did not bind.
+
+In Lua a plain table is still accepted where a bound class is expected: that
+is how nested structs are written from Lua, and it reads the fields rather
+than the object's bytes, so the check does not close it.
 
 ## Limitations
 
