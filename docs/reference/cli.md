@@ -388,7 +388,9 @@ When using `generate`, Mirror Bridge reads all `.hpp` and `.h` files in the sour
 
 The list comes from the compiler, through reflection, not from a scan of the header text. That matters because the text of a declaration rarely begins with the class name: `class JSON_API Value`, `class V8_EXPORT Isolate` and `struct alignas(64) Wide` all put something else between the keyword and the name, and a scan binds that something else. Reflection reads the headers after the preprocessor has run, so it reports `Json::Value`.
 
-If the headers cannot be compiled on their own — one of them is not self-contained, say — `generate` says so and falls back to a scan of the text, which is approximate for exactly the reason above.
+Only the source directory's own classes are bound. Reflection sees the whole translation unit, so it also sees every system and third-party header reached through `-I`; a class is kept only when the file it is defined in lies inside the directory `generate` was pointed at. A vendored `vendorlib/config.h` next to your own `config.h` contributes nothing to the module.
+
+If the headers cannot be compiled on their own — one of them is not self-contained, say — `generate` says so and falls back to a scan of the text, which is approximate for exactly the reason above. It also falls back, with a different message, when the headers compile but the walk names no class at all: that happens when every class is somewhere the walk does not go, such as an anonymous namespace.
 
 ### Opt-Out Mechanism
 
