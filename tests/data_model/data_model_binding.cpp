@@ -10,4 +10,13 @@ MIRROR_BRIDGE_MODULE(data_model,
     mirror_bridge::bind_class<Stream::Cursor>(m, "Cursor");
     mirror_bridge::bind_class<Stream>(m, "Stream");
     mirror_bridge::bind_class<Tracked>(m, "Tracked");
+    mirror_bridge::bind_class<Countdown::Cursor>(m, "CountdownCursor");
+    mirror_bridge::bind_class<Countdown>(m, "Countdown");
+    mirror_bridge::bind_class<Flags>(m, "Flags");
+    mirror_bridge::bind_class<Secretive>(m, "Secretive");
+    mirror_bridge::bind_class<WithBase>(m, "WithBase");
+    mirror_bridge::bind_class<Derived>(m, "Derived");
+    mirror_bridge::bind_class<Underflowed>(m, "Underflowed");
+    mirror_bridge::bind_class<Sneaky>(m, "Sneaky");
+    mirror_bridge::bind_class<Point>(m, "Point");
 )

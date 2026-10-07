@@ -13,8 +13,11 @@ import os
 import pickle
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'build', 'tests'))
+# build/tests is where CMake puts the module, and it goes last so that it is
+# searched first: a stale build/<module>.so left by a CLI run would otherwise
+# be the one imported, and the test would pass against the wrong artifact.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'build'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'build', 'tests'))
 
 import data_model
 
@@ -200,5 +203,124 @@ assert "def __len__(self) -> int: ..." in stubs, stubs
 gauge_block = stubs.split("class Gauge:")[1].split("\nclass ")[0]
 assert "__len__" not in gauge_block and "__iter__" not in gauge_block, gauge_block
 print("  ✓ __iter__/__len__ in the .pyi for ranges only")
+
+
+print("Test 17: a range that ends at a sentinel iterates...")
+# end() returns Sentinel, not Cursor. Storing it as the iterator type used to
+# be a hard compile error, so a normal C++20 range failed the module build.
+countdown = data_model.Countdown()
+assert list(countdown) == [3, 2, 1], list(countdown)
+assert list(countdown) == [3, 2, 1]
+assert 2 in countdown and 9 not in countdown
+assert sum(countdown) == 6
+assert not hasattr(data_model.Countdown, "__len__"), "no size(), so no len()"
+print("  ✓ begin() and end() of different types")
+
+print("Test 18: a proxy-reference element crosses as its value type...")
+# std::vector<bool>::const_iterator dereferences to a proxy, not to bool.
+# Converting the proxy itself walked its members and produced {} per element.
+flags = data_model.Flags()
+for bit in (True, False, True):
+    flags.add(bit)
+assert list(flags) == [True, False, True], list(flags)
+assert flags.bits == [True, False, True], flags.bits
+assert len(flags) == 3
+assert True in flags and False in flags
+print("  ✓ vector<bool> yields booleans, iterated and as a member")
+
+print("Test 19: a class whose state cannot carry every member refuses to pickle...")
+# Each of these would dump and load into an object that looked right in repr()
+# while holding a default-constructed value for the member Python cannot see.
+secretive = data_model.Secretive()
+secretive.visible = 9
+secretive.set_hidden(77)
+try:
+    pickle.dumps(secretive)
+    raise AssertionError("a private member cannot be restored, so dumps must raise")
+except (TypeError, AttributeError):
+    pass
+derived = data_model.Derived()
+derived.own = 2
+try:
+    pickle.dumps(derived)
+    raise AssertionError("a base class's members are not in the state, so dumps must raise")
+except (TypeError, AttributeError):
+    pass
+assert "__reduce__" not in type(secretive).__dict__
+assert "__reduce__" not in type(derived).__dict__
+# And the classes that can round-trip still do.
+assert pickle.loads(pickle.dumps(bag(4, 5))) is not None
+assert list(pickle.loads(pickle.dumps(bag(4, 5)))) == [4, 5]
+print("  ✓ a private member and an inherited member both refuse, like a const one")
+
+print("Test 20: a size() that cannot be a Python length says so...")
+# items.size() - 1 on an empty container is how an unsigned count underflows.
+# Handed to CPython as a negative length it produces only
+# "SystemError: returned NULL without setting an exception".
+underflowed = data_model.Underflowed()
+for expression in (lambda: len(underflowed), lambda: bool(underflowed),
+                   lambda: list(underflowed)):
+    try:
+        expression()
+        raise AssertionError("a size() past PY_SSIZE_T_MAX must not be reported as a length")
+    except OverflowError as exc:
+        assert "cannot be a Python length" in str(exc), exc
+print("  ✓ OverflowError naming the class and the value, not SystemError")
+
+print("Test 21: a reallocation that keeps size() identical is caught...")
+# The element-count guard sees nothing here: reserve() and swapping in a fresh
+# copy both leave size() alone while moving the buffer, which left the cursor
+# and the end iterator pointing into a freed block.
+for mutation in ("reallocate", "grow_capacity"):
+    sneaky = data_model.Sneaky()
+    for i in range(64):
+        sneaky.add(i)
+    seen = []
+    try:
+        for value in sneaky:
+            seen.append(value)
+            if len(seen) == 2:
+                getattr(sneaky, mutation)()
+        raise AssertionError(f"{mutation} moved the storage and was not caught: {seen[:8]}")
+    except RuntimeError as exc:
+        assert "reallocated its storage during iteration" in str(exc), exc
+# An untouched range still iterates to the end.
+intact = data_model.Sneaky()
+for i in range(8):
+    intact.add(i)
+assert list(intact) == list(range(8))
+print("  ✓ RuntimeError rather than a read of freed memory")
+
+print("Test 22: operator== without a hash leaves the class unhashable...")
+# CPython's inherit_slots copies tp_hash from the base only when
+# tp_richcompare is inherited too, so a class with operator== ends up with
+# __hash__ of None. That is self-consistent — a == b never coexists with
+# hash(a) != hash(b) — but it is what takes the class out of a set.
+first, second = data_model.Point(), data_model.Point()
+first.x, first.y = 1, 2
+second.x, second.y = 1, 2
+assert first == second
+assert data_model.Point.__hash__ is None, data_model.Point.__hash__
+for unhashable_use in (lambda: hash(first), lambda: {first}, lambda: {first: 1}):
+    try:
+        unhashable_use()
+        raise AssertionError("a class with operator== must not be hashable")
+    except TypeError as exc:
+        assert "unhashable" in str(exc), exc
+assert first in [second], "== still finds it in a list"
+# A class with no operator== keeps the identity hash.
+assert data_model.Doc.__hash__ is not None
+assert len({data_model.Doc(), data_model.Doc()}) == 2
+print("  ✓ unhashable with operator==, identity-hashed without it")
+
+print("Test 23: bool() of a range without size() is not emptiness...")
+# Truthiness comes from the length slot, and the length slot needs size(), so
+# an empty Stream is truthy while an empty Bag is falsy. Documented asymmetry.
+empty_stream = data_model.Stream()
+empty_stream.first = empty_stream.last = 0
+assert list(empty_stream) == []
+assert bool(empty_stream) is True, "no size() means no length slot, so still truthy"
+assert bool(data_model.Bag()) is False
+print("  ✓ the asymmetry the reference documents is the one that holds")
 
 print("\nAll Python data model tests passed!")
