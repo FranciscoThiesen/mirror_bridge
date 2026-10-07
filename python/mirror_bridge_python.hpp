@@ -5083,10 +5083,66 @@ void register_upcast() {
     }
 }
 
+// Say so once when a module built against a different wrapper layout is
+// already loaded.
+//
+// The layout tag in every key means such a module's objects are simply not
+// recognised, which is the safe outcome but a baffling one to debug: the
+// conversion failure reads "could not convert an argument" for an argument
+// whose class has the name the signature asks for. The first module to
+// register records the layout it was built against, so a later one can name
+// the real problem.
+//
+// A warning rather than an error, and the error state is cleared if warnings
+// are fatal here: the alternative is a half-initialised module, and the
+// per-call TypeError still stops anything incorrect from happening.
+inline void warn_on_layout_mismatch(const char* untagged_name) {
+    static bool warned = false;
+    if (warned) return;
+
+    PyObject* registry = get_python_type_registry();
+    if (!registry) return;
+
+    // Two ways another layout shows up. A module built before the tag existed
+    // registers this very class under its bare typeid name, which nothing
+    // else would ever write. A module built against a later layout leaves a
+    // different tag in the sentinel below.
+    const char* other = nullptr;
+    if (untagged_name && PyDict_GetItemString(registry, untagged_name)) {
+        other = "untagged (a release before the layout tag)";
+    } else {
+        PyObject* seen = PyDict_GetItemString(registry, "__mirror_bridge_layout__");
+        if (!seen) {
+            PyObject* tag = PyUnicode_FromString(kWrapperAbiTag);
+            if (!tag) { PyErr_Clear(); return; }
+            PyDict_SetItemString(registry, "__mirror_bridge_layout__", tag);
+            Py_DECREF(tag);
+            return;
+        }
+        other = PyUnicode_AsUTF8(seen);
+        if (!other) { PyErr_Clear(); return; }
+        if (std::strcmp(other, kWrapperAbiTag) == 0) return;
+    }
+
+    warned = true;
+
+    if (PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
+            "mirror_bridge: a module already imported in this process was "
+            "built against wrapper layout '%s', and this module was built "
+            "against '%s'. The two disagree about the size of a wrapper, so "
+            "objects cannot be passed between them and conversion will fail "
+            "with a TypeError naming the right class. Rebuild every module "
+            "against one version of mirror_bridge.",
+            other, kWrapperAbiTag) < 0) {
+        PyErr_Clear();
+    }
+}
+
 namespace {
     // Register a type in the Python-based global registry
     template<typename T>
     void register_type_in_python(PyTypeObject* py_type) {
+        warn_on_layout_mismatch(typeid(T).name());
         PyObject* registry = get_python_type_registry();
         if (!registry) return;
 
