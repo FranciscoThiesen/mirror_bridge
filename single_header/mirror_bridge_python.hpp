@@ -3847,6 +3847,11 @@ struct WrapperView {
     PyObject_HEAD
     void* cpp_object;
     bool owns;
+    // Non-null when this wrapper borrows a subobject of another Python
+    // object's C++ object instead of owning one. Held as a strong reference:
+    // the borrowed member lives inside the parent's heap storage, so the
+    // parent has to outlive every view of it.
+    PyObject* parent;
 };
 
 // Everything except the common case: a Python subclass, a type registered by
@@ -3854,6 +3859,22 @@ struct WrapperView {
 // base subobject. Defined after the cross-module type registry it consults.
 template<typename Expected>
 bool resolve_wrapper_slow(PyObject* obj, void*& raw);
+
+// Hand back a wrapper that borrows `ref` rather than copying it, keeping
+// `parent` alive for as long as the view lives. Defined after the
+// cross-module type registry it consults.
+template<typename Member>
+PyObject* to_python_member_view(Member& ref, PyObject* parent);
+
+// The member types to_python would otherwise heap-copy into a fresh wrapper.
+// A const member keeps the copy: a view of it would hand Python a writable
+// reference to something C++ declared it may not change.
+template<typename M>
+inline constexpr bool is_viewable_member_v =
+    Bindable<std::remove_cv_t<M>> && !StringLike<std::remove_cv_t<M>> &&
+    !Container<std::remove_cv_t<M>> && !Arithmetic<std::remove_cv_t<M>> &&
+    !SmartPointer<std::remove_cv_t<M>> && !std::is_const_v<M> &&
+    !std::is_array_v<M> && !std::is_reference_v<M>;
 
 // Resolve a Python object to the address of the C++ object it wraps, after
 // checking that it really is a wrapper for Expected (or for a class derived
@@ -4715,6 +4736,7 @@ struct PyWrapper {
     PyObject_HEAD
     T* cpp_object;  // Pointer to the actual C++ object
     bool owns;      // Whether this wrapper owns the object (for cleanup)
+    PyObject* parent;  // Owner of the storage, when this wrapper is a view
 };
 
 // ============================================================================
@@ -4886,6 +4908,8 @@ void py_dealloc(PyObject* self) {
     if (wrapper->owns && wrapper->cpp_object) {
         delete wrapper->cpp_object;
     }
+    // A view owns nothing but the reference that keeps the storage alive.
+    Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -5102,6 +5126,7 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                 auto* obj = new Trampoline();
                 wrapper->cpp_object = obj;
                 wrapper->owns = true;
+                wrapper->parent = nullptr;
                 if constexpr (!std::is_same_v<T, Trampoline>) {
                     static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(self);
                 }
@@ -5167,6 +5192,7 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                 if (obj) {
                     wrapper->cpp_object = obj;
                     wrapper->owns = true;
+                    wrapper->parent = nullptr;
                     if constexpr (!std::is_same_v<T, Trampoline>) {
                         obj->_mirror_bridge_set_py_self(self);
                     }
@@ -5197,6 +5223,7 @@ PyObject* py_new_with_init(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     if (self) {
         self->cpp_object = nullptr;  // Will be set by py_init
         self->owns = false;
+        self->parent = nullptr;
     }
     return reinterpret_cast<PyObject*>(self);
 }
@@ -5230,6 +5257,7 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
             auto* obj = new Trampoline();
             self->cpp_object = obj;
             self->owns = true;
+            self->parent = nullptr;
             if constexpr (!std::is_same_v<T, Trampoline>) {
                 static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(
                     reinterpret_cast<PyObject*>(self));
@@ -5238,6 +5266,7 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
             // Not default constructible — caller should have used tp_init path.
             self->cpp_object = nullptr;
             self->owns = false;
+            self->parent = nullptr;
         }
     }
     return reinterpret_cast<PyObject*>(self);
@@ -5286,11 +5315,22 @@ PyObject* py_getter(PyObject* self, void* closure) {
     // Dereference pointer first to work around compiler bug with -> operator
     auto& value = (*wrapper->cpp_object).[:member:];
 
-    // Type conversion to Python uses overload resolution:
+    // A bound-class member is handed back as a view onto the parent rather
+    // than a copy, or `o.p.x = 7` would write to a temporary that is
+    // discarded when the expression ends. Interiority is known here by
+    // construction -- `member` is a non-static data member of the object
+    // this wrapper holds -- so unlike a method return it needs no policy
+    // from the author and no runtime instance lookup to establish.
+    //
+    // Everything else converts by value as before:
     // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
     // - String → PyUnicode_FromStringAndSize (direct C API)
     // - Container → Recursive to_python for elements
-    return to_python(value);
+    if constexpr (is_viewable_member_v<MemberType>) {
+        return to_python_member_view(value, self);
+    } else {
+        return to_python(value);
+    }
 }
 
 // Setter for class members using reflection
@@ -5362,7 +5402,11 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
     using MemberType = typename [:std::meta::type_of(member):];
 
     auto& value = (*wrapper->cpp_object).[:member:];
-    return to_python(value);
+    if constexpr (is_viewable_member_v<MemberType>) {
+        return to_python_member_view(value, self);
+    } else {
+        return to_python(value);
+    }
 }
 
 // Setter for visible class members (same logic as py_setter but uses visible index).
@@ -6808,6 +6852,25 @@ inline PyObject* get_python_type_registry() {
 
 using UpcastThunk = void* (*)(void*);
 
+// Bump whenever the layout of PyWrapper<T> changes.
+//
+// The forward registry hands out one PyTypeObject per C++ class, process
+// wide, and tp_basicsize comes from whichever module registered it first. Two
+// modules built against different revisions of this header therefore disagree
+// about how big a wrapper is, and the newer one would write its own trailing
+// fields past the end of an allocation the older one sized -- a heap
+// overflow, not a wrong answer. Making the tag part of every cross-module key
+// means a mismatched pair simply does not recognise each other's objects, so
+// the failure is a clean TypeError at the boundary. Matching builds are
+// unaffected and still share types as before.
+inline constexpr const char* kWrapperAbiTag = "#mbabi2";
+
+template<typename T>
+const std::string& wrapper_abi_typeid() {
+    static const std::string name = std::string(typeid(T).name()) + kWrapperAbiTag;
+    return name;
+}
+
 inline PyObject* get_python_typename_registry() {
     return get_python_named_registry("_mirror_bridge_type_names");
 }
@@ -6869,9 +6932,65 @@ void register_upcast() {
                                           "mirror_bridge.upcast", nullptr);
         if (!capsule) { PyErr_Clear(); return; }
         PyDict_SetItemString(upcasts,
-                             upcast_key(typeid(Base).name(), typeid(Derived).name()).c_str(),
+                             upcast_key(wrapper_abi_typeid<Base>().c_str(),
+                                        wrapper_abi_typeid<Derived>().c_str()).c_str(),
                              capsule);
         Py_DECREF(capsule);
+    }
+}
+
+// Say so once when a module built against a different wrapper layout is
+// already loaded.
+//
+// The layout tag in every key means such a module's objects are simply not
+// recognised, which is the safe outcome but a baffling one to debug: the
+// conversion failure reads "could not convert an argument" for an argument
+// whose class has the name the signature asks for. The first module to
+// register records the layout it was built against, so a later one can name
+// the real problem.
+//
+// A warning rather than an error, and the error state is cleared if warnings
+// are fatal here: the alternative is a half-initialised module, and the
+// per-call TypeError still stops anything incorrect from happening.
+inline void warn_on_layout_mismatch(const char* untagged_name) {
+    static bool warned = false;
+    if (warned) return;
+
+    PyObject* registry = get_python_type_registry();
+    if (!registry) return;
+
+    // Two ways another layout shows up. A module built before the tag existed
+    // registers this very class under its bare typeid name, which nothing
+    // else would ever write. A module built against a later layout leaves a
+    // different tag in the sentinel below.
+    const char* other = nullptr;
+    if (untagged_name && PyDict_GetItemString(registry, untagged_name)) {
+        other = "untagged (a release before the layout tag)";
+    } else {
+        PyObject* seen = PyDict_GetItemString(registry, "__mirror_bridge_layout__");
+        if (!seen) {
+            PyObject* tag = PyUnicode_FromString(kWrapperAbiTag);
+            if (!tag) { PyErr_Clear(); return; }
+            PyDict_SetItemString(registry, "__mirror_bridge_layout__", tag);
+            Py_DECREF(tag);
+            return;
+        }
+        other = PyUnicode_AsUTF8(seen);
+        if (!other) { PyErr_Clear(); return; }
+        if (std::strcmp(other, kWrapperAbiTag) == 0) return;
+    }
+
+    warned = true;
+
+    if (PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
+            "mirror_bridge: a module already imported in this process was "
+            "built against wrapper layout '%s', and this module was built "
+            "against '%s'. The two disagree about the size of a wrapper, so "
+            "objects cannot be passed between them and conversion will fail "
+            "with a TypeError naming the right class. Rebuild every module "
+            "against one version of mirror_bridge.",
+            other, kWrapperAbiTag) < 0) {
+        PyErr_Clear();
     }
 }
 
@@ -6879,11 +6998,13 @@ namespace {
     // Register a type in the Python-based global registry
     template<typename T>
     void register_type_in_python(PyTypeObject* py_type) {
+        warn_on_layout_mismatch(typeid(T).name());
         PyObject* registry = get_python_type_registry();
         if (!registry) return;
 
-        // Use typeid name as the key (unique per type across all modules)
-        const char* type_name = typeid(T).name();
+        // Use typeid name as the key (unique per type across all modules),
+        // qualified by the wrapper layout this module was built against.
+        const char* type_name = wrapper_abi_typeid<T>().c_str();
         PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
 
         // And the reverse, so an object arriving from Python whose type we
@@ -6902,7 +7023,7 @@ namespace {
         PyObject* registry = get_python_type_registry();
         if (!registry) return nullptr;
 
-        const char* type_name = typeid(T).name();
+        const char* type_name = wrapper_abi_typeid<T>().c_str();
         PyObject* py_type = PyDict_GetItemString(registry, type_name);
 
         return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
@@ -6937,9 +7058,10 @@ WrapperDecision decide_route(PyTypeObject* from) {
 
     WrapperDecision decision;
     if (const char* dynamic_tid = wrapper_typeid_name(from)) {
-        if (std::strcmp(dynamic_tid, typeid(Expected).name()) == 0) {
+        if (wrapper_abi_typeid<Expected>() == dynamic_tid) {
             decision = {WrapperRoute::AsIs, nullptr};
-        } else if (UpcastThunk thunk = find_upcast(typeid(Expected).name(), dynamic_tid)) {
+        } else if (UpcastThunk thunk =
+                       find_upcast(wrapper_abi_typeid<Expected>().c_str(), dynamic_tid)) {
             decision = {WrapperRoute::Adjust, thunk};
         }
     }
@@ -7038,7 +7160,7 @@ void unregister_type() {
     PyObject* registry = get_python_type_registry();
     if (!registry) return;
 
-    const char* type_name = typeid(T).name();
+    const char* type_name = wrapper_abi_typeid<T>().c_str();
     PyDict_DelItemString(registry, type_name);
     PyErr_Clear();  // Ignore KeyError if type wasn't registered
 }
@@ -7095,12 +7217,39 @@ to_python(const T& obj) {
             }
             wrapper->cpp_object = new CleanT(obj);  // Copy the object
             wrapper->owns = true;
+            wrapper->parent = nullptr;
             return reinterpret_cast<PyObject*>(wrapper);
         }
     }
 
     // Fall back to dict conversion for unregistered types
     return ConversionOverloadGenerator<T>::to_python_impl(obj);
+}
+
+// A wrapper over a subobject of some other Python object's C++ object. The
+// member is interior to storage the parent owns, so the view holds a strong
+// reference to the parent and frees nothing of its own.
+template<typename Member>
+PyObject* to_python_member_view(Member& ref, PyObject* parent) {
+    using CleanM = std::remove_cv_t<Member>;
+
+    PyTypeObject* py_type = lookup_type_in_python<CleanM>();
+    if (!py_type) py_type = TypeRegistry<CleanM>::py_type;
+    if (!py_type) {
+        // The member's class was never bound anywhere, so there is no wrapper
+        // type to view it through. The dict snapshot is what this returned
+        // before and is still better than nothing.
+        return to_python(ref);
+    }
+
+    auto* wrapper = reinterpret_cast<PyWrapper<CleanM>*>(py_type->tp_alloc(py_type, 0));
+    if (!wrapper) return nullptr;
+
+    wrapper->cpp_object = std::addressof(ref);
+    wrapper->owns = false;
+    Py_INCREF(parent);
+    wrapper->parent = parent;
+    return reinterpret_cast<PyObject*>(wrapper);
 }
 
 template<typename T>
