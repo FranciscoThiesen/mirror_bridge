@@ -188,7 +188,13 @@ while IFS= read -r -d '' binding_file; do
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
 # P3394_EXCLUDE drops the clang-only annotation tests when on GCC (set above).
-done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -name "test_validation.cpp" "${P3394_EXCLUDE[@]}" -print0)
+# Exclude .mirror_bridge/ - the template planner's scratch units (discover.cpp,
+# probe.cpp, request.cpp) are left behind by the CLI tests and are not bindings.
+# They only compile with the generated inputs beside them and the source
+# directory as the cwd, so every run after the first reported them as failed
+# bindings on a tree that was otherwise green.
+done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_bridge/*" \
+              -not -name "test_validation.cpp" "${P3394_EXCLUDE[@]}" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"
