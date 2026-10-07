@@ -324,6 +324,19 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/export_macro)
     )
 endif()
 
+# Reading the headers through reflection means reading the whole translation
+# unit, so what the walk is allowed to report needs a test of its own: a
+# third-party header the project includes must not contribute classes to the
+# module, and a walk that reports nothing must not empty it.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/discovery_scope)
+    add_test(NAME cli_discovery_scope
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/discovery_scope/build_and_test.sh
+    )
+    set_tests_properties(cli_discovery_scope PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")
 
