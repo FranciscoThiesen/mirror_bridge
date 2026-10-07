@@ -145,9 +145,13 @@ consteval std::vector<info> args_of(info spec) {
 consteval std::string spell(info t) {
     if (is_lvalue_reference_type(t)) return spell(remove_reference(t)) + "&";
     if (is_rvalue_reference_type(t)) return spell(remove_reference(t)) + "&&";
-    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
+    // cv before pointer, because remove_pointer drops the qualifiers on the
+    // pointer itself: taking the pointer branch first spelled `int* const`
+    // as `int*`, so the two shared a key and the backends could not tell
+    // Box<int*> from Box<int* const> apart.
     if (is_const(t))                 return spell(remove_const(t)) + " const";
     if (is_volatile(t))              return spell(remove_volatile(t)) + " volatile";
+    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
     t = dealias(t);
     for (auto f : fundamentals()) {
         if (t == dealias(f.type)) return std::string(f.spelling);
@@ -893,6 +897,25 @@ consteval const char* make_type_key() {
 template<typename T>
 inline constexpr const char* type_key = make_type_key<T>();
 
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Base Class Closure
 // ============================================================================
@@ -1063,6 +1086,8 @@ consteval bool validate_bindable_members() {
 // Generates Node.js bindings that expose C++ classes to JavaScript.
 
 #include <node_api.h>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -1109,8 +1134,28 @@ struct JsTypeRegistry {
 // napi_instanceof, because the tag is still right for an object that came
 // from another .node file, where the constructor reference this module holds
 // does not exist.
+//
+// The tag has to be preceded by something blunter, because napi_unwrap is a
+// weaker statement than it looks. It says the object was napi_wrap'd; it does
+// not say by whom. Every other native addon in the process wraps payloads of
+// its own - node-addon-api's ObjectWrap wraps a C++ object, so its first word
+// is a vtable pointer - and napi_unwrap hands those back just as readily,
+// because the private key it reads belongs to the Node environment and not to
+// any one module. Reading type_id out of a foreign payload and following it is
+// then a dereference of whatever that addon happened to store first: a crash
+// for a null or small integer, and a page of that addon's heap copied into our
+// error message for anything unterminated.
+//
+// So the first field is a magic number, and nothing else is read until it
+// matches. It leaves a 2^-64 coincidence rather than a proof - N-API's own
+// napi_type_tag_object would be a proof, but it arrived in N-API 8 (Node
+// 14.17) and costs a property lookup on every boundary crossing, where this
+// costs one load of a word we wrote ourselves.
+inline constexpr std::uint64_t kJsWrapperMagic = 0x6d'62'72'69'64'67'65'01ull;
+
 template<typename T>
 struct JsWrapper {
+    std::uint64_t magic = kJsWrapperMagic;
     const char* type_id = core::type_key<T>;
     const char* type_name = JsTypeRegistry<T>::bound_name;
     T* cpp_object = nullptr;
@@ -1122,11 +1167,22 @@ struct JsWrapper {
 // this way, which is what makes a generic read possible - and why the read
 // has to be preceded by a check.
 struct JsWrapperView {
+    std::uint64_t magic;
     const char* type_id;
     const char* type_name;
     void* cpp_object;
     bool owns_memory;
 };
+
+// The view is read out of memory laid out as a JsWrapper<T>, so the two have
+// to agree. A member added to one and not the other would make every boundary
+// check read the wrong word.
+static_assert(offsetof(JsWrapperView, magic) == offsetof(JsWrapper<int>, magic) &&
+              offsetof(JsWrapperView, type_id) == offsetof(JsWrapper<int>, type_id) &&
+              offsetof(JsWrapperView, type_name) == offsetof(JsWrapper<int>, type_name) &&
+              offsetof(JsWrapperView, cpp_object) == offsetof(JsWrapper<int>, cpp_object) &&
+              offsetof(JsWrapperView, owns_memory) == offsetof(JsWrapper<int>, owns_memory),
+              "JsWrapperView must mirror JsWrapper<T>");
 
 // ============================================================================
 // Type Conversion: C++ → JavaScript
@@ -2011,9 +2067,13 @@ inline JsUpcastThunk find_js_upcast(const char* base_tid, const char* derived_ti
 
 // A base the language will not let us reach - inaccessible, or ambiguous
 // because it is inherited twice non-virtually - is skipped rather than
-// recorded, so the guard keeps bind_class compiling for hierarchies that
-// have one. JavaScript then declines the conversion, which is the same
+// recorded, and JavaScript then declines the conversion, which is the same
 // answer C++ gives at that call site.
+//
+// The guard does not make such a hierarchy bindable, though: a class that
+// inherits one base twice non-virtually also inherits its members twice, and
+// reflection enumerates both, so bind_class fails earlier on the ambiguous
+// member call. That is older than the upcast table and unchanged by it.
 template<typename Derived, typename Base>
 void register_js_upcast() {
     if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
@@ -2031,20 +2091,31 @@ void register_js_base_upcasts() {
     }(std::make_index_sequence<core::BaseClosure<T>::types.size()>{});
 }
 
+// A JavaScript value as one of our wrappers, or nullptr. This is the only
+// place that turns a napi_value into a pointer into our own memory, so it is
+// the only place the magic has to be checked - see the note on JsWrapper for
+// why napi_unwrap alone does not establish that.
+inline JsWrapperView* js_wrapper_view(napi_env env, napi_value value) {
+    JsWrapperView* view = nullptr;
+    if (napi_unwrap(env, value, reinterpret_cast<void**>(&view)) != napi_ok || !view) {
+        return nullptr;
+    }
+    return view->magic == kJsWrapperMagic ? view : nullptr;
+}
+
 // Resolve a JavaScript value to the address of the C++ object it wraps, after
 // checking that it really is a wrapper for Expected (or for a class derived
 // from it). Returns false - never a bad pointer - for anything else.
 template<typename Expected>
 inline bool resolve_js_wrapper(napi_env env, napi_value value, void*& raw) {
-    JsWrapperView* view = nullptr;
-    if (napi_unwrap(env, value, reinterpret_cast<void**>(&view)) != napi_ok || !view) {
-        return false;
-    }
+    JsWrapperView* view = js_wrapper_view(env, value);
+    if (!view) return false;
 
     const char* want = core::type_key<Expected>;
     // Pointer equality settles every object this module made; the strcmp is
     // for one that crossed a .node boundary, where the same type's key is the
-    // same text at a different address.
+    // same text at a different address. Both are safe to do now: the magic
+    // established that type_id is a pointer we wrote.
     if (view->type_id == want || std::strcmp(view->type_id, want) == 0) {
         if (!view->cpp_object) return false;
         raw = view->cpp_object;
@@ -2067,8 +2138,10 @@ inline const char* js_expected_name() {
 
 // What arrived, in the words a JavaScript author would use.
 inline void describe_js_value(napi_env env, napi_value value, char* out, std::size_t out_size) {
-    JsWrapperView* view = nullptr;
-    if (napi_unwrap(env, value, reinterpret_cast<void**>(&view)) == napi_ok && view) {
+    // Through the same gate, so an object belonging to another addon is
+    // described as the JavaScript value it is rather than by copying bytes
+    // out of that addon's payload.
+    if (JsWrapperView* view = js_wrapper_view(env, value)) {
         std::snprintf(out, out_size, "%s", view->type_name ? view->type_name : view->type_id);
         return;
     }
@@ -2653,6 +2726,12 @@ napi_value bind_class(napi_env env, napi_value exports, const char* name) {
     static_assert(core::validate_bindable_members<T>(),
         "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
         "Mark unconvertible members with [[=exclude{}]] or add a custom type converter.");
+
+    static_assert(core::type_key_is_distinctive<T>(),
+        "bind_class<T>: this compiler cannot spell T distinctly, so T's tag would equal "
+        "another specialisation's and the boundary check could not tell them apart. "
+        "Reached by a template argument that is an enum value or a type with no name; "
+        "give the argument a named type, or bind a named alias of T.");
 
     constexpr std::size_t member_count = get_data_member_count<T>();
     constexpr std::size_t method_count = get_member_function_count<T>();

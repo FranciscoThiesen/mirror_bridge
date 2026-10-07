@@ -145,9 +145,13 @@ consteval std::vector<info> args_of(info spec) {
 consteval std::string spell(info t) {
     if (is_lvalue_reference_type(t)) return spell(remove_reference(t)) + "&";
     if (is_rvalue_reference_type(t)) return spell(remove_reference(t)) + "&&";
-    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
+    // cv before pointer, because remove_pointer drops the qualifiers on the
+    // pointer itself: taking the pointer branch first spelled `int* const`
+    // as `int*`, so the two shared a key and the backends could not tell
+    // Box<int*> from Box<int* const> apart.
     if (is_const(t))                 return spell(remove_const(t)) + " const";
     if (is_volatile(t))              return spell(remove_volatile(t)) + " volatile";
+    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
     t = dealias(t);
     for (auto f : fundamentals()) {
         if (t == dealias(f.type)) return std::string(f.spelling);
@@ -893,6 +897,25 @@ consteval const char* make_type_key() {
 template<typename T>
 inline constexpr const char* type_key = make_type_key<T>();
 
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Base Class Closure
 // ============================================================================
@@ -1067,6 +1090,7 @@ extern "C" {
 #include <lauxlib.h>
 #include <lualib.h>
 }
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -1089,8 +1113,13 @@ using namespace core;
 // Lua Wrapper for C++ Objects
 // ============================================================================
 
+// class_mt is the address of T's metatable in the lua_State the wrapper was
+// made in, and it is what every boundary check compares. It leads the layout
+// so the check is a load at offset zero. See "Wrapper identity" below for why
+// the identity lives in the userdata's own bytes rather than in its metatable.
 template<typename T>
 struct LuaWrapper {
+    const void* class_mt;
     T* cpp_object;
     bool owns_memory;
 };
@@ -1724,20 +1753,42 @@ struct LuaTypeRegistry {
 // then gets a number computed from the wrong object's bytes. So each
 // conversion has to establish identity first.
 //
-// A userdata's metatable is the only thing about it that cannot be forged
-// from Lua, so it is the identity, and nothing is read out of the userdata
-// until the metatable has been recognised. Lua already keeps a registry
-// entry per class, keyed by core::type_key and created by bind_class, and two
-// modules binding the same class share that one entry - so the exact-type
-// check is cross-module with no extra bookkeeping. Two registry tables of
-// our own carry the rest, both consulted off the hot path:
+// The identity is a value written into the wrapper when it is created: the
+// address of its class's metatable. Not the userdata's *attached* metatable,
+// which is the obvious choice and is wrong, because Lua hands scripts two
+// ways to put any metatable on any value:
 //
-//   REGISTRY["mirror_bridge.upcasts"][base type key][derived metatable] -> thunk
-//   REGISTRY["mirror_bridge.names"][metatable] -> the name bind_class was given
+//   setmetatable({}, getmetatable(curve))        -- plain Lua, no debug
+//   debug.setmetatable(io.stdout, getmetatable(curve))
+//
+// The first makes a table that answers the metatable test and then has no
+// userdata payload at all; the second makes any full userdata in the process
+// answer it, including the standard library's file handles, whose first word
+// is a FILE*. Trusting the attached metatable therefore turns a bad script
+// into a read, a write and a free at an address the script chose.
+//
+// Lua has no API in the other direction: nothing in the language or the debug
+// library can write a full userdata's payload bytes. So the bytes are the one
+// place a forgery cannot reach, provided two things are established first -
+// that the value really is a full userdata, and that it is long enough to
+// hold a wrapper. lua_touserdata and lua_rawlen answer both, and together
+// they are cheaper than fetching the metatable was.
+//
+// What remains is a foreign full userdata whose first word happens to equal a
+// registered class metatable's address. A script cannot aim for one: it never
+// learns that address, and cannot write those bytes if it did.
+//
+// Two registry tables of our own carry the rest, both consulted off the hot
+// path, and both keyed by that same metatable address as a light userdata:
+//
+//   REGISTRY["mirror_bridge.upcasts"][base type key][derived class_mt] -> thunk
+//   REGISTRY["mirror_bridge.names"][class_mt] -> the name bind_class was given
 //
 // The upcast table converts a derived object's address to the address of a
 // specific base subobject, an adjustment that reusing the pointer gets wrong
-// for every base after the first. The name table is for error messages.
+// for every base after the first. The name table is for error messages, and
+// keying it on the stored identity rather than the attached metatable is what
+// stops a forged value from describing itself as the class it is imitating.
 //
 // Nothing is stored on the class metatables themselves: they are what Lua
 // consults on every `obj.field`, and extra entries there measurably slow
@@ -1747,9 +1798,35 @@ struct LuaTypeRegistry {
 // this way, which is what makes a generic read possible - and why the read
 // has to be preceded by a check.
 struct LuaWrapperView {
+    const void* class_mt;
     void* cpp_object;
     bool owns_memory;
 };
+
+// The view is read out of memory laid out as a LuaWrapper<T>, so the two have
+// to agree. A member added to one and not the other would make every boundary
+// check read the wrong word.
+static_assert(sizeof(LuaWrapperView) == sizeof(LuaWrapper<int>) &&
+              offsetof(LuaWrapperView, class_mt) == offsetof(LuaWrapper<int>, class_mt) &&
+              offsetof(LuaWrapperView, cpp_object) == offsetof(LuaWrapper<int>, cpp_object) &&
+              offsetof(LuaWrapperView, owns_memory) == offsetof(LuaWrapper<int>, owns_memory),
+              "LuaWrapperView must mirror LuaWrapper<T>");
+
+// A Lua value as one of our wrappers, or nullptr. This is the only place
+// that turns a Lua value into a pointer into our own memory, so it is the
+// only place the bounds argument has to be made.
+//
+// lua_touserdata is non-null for a light userdata as well, whose payload is
+// an address the script chose and whose length is not ours to assume.
+// lua_rawlen reports 0 for one - and 0 for every other non-userdata value
+// that could reach here - so the length test is what rules it out. It also
+// rules out a full userdata from another C library that is too short to hold
+// a wrapper, which would otherwise be read out of bounds.
+inline LuaWrapperView* lua_wrapper_view(lua_State* L, int idx) {
+    void* p = lua_touserdata(L, idx);
+    if (!p || lua_rawlen(L, idx) < sizeof(LuaWrapperView)) return nullptr;
+    return static_cast<LuaWrapperView*>(p);
+}
 
 using LuaUpcastThunk = void* (*)(void*);
 
@@ -1773,9 +1850,13 @@ inline void push_lua_side_table(lua_State* L, const char* key) {
 //
 // A base the language will not let us reach - inaccessible, or ambiguous
 // because it is inherited twice non-virtually - is skipped rather than
-// registered, so the guard keeps bind_class compiling for hierarchies that
-// have one. Lua then declines the conversion, which is the same answer C++
-// gives at that call site.
+// registered, and Lua then declines the conversion, which is the same answer
+// C++ gives at that call site.
+//
+// The guard does not make such a hierarchy bindable, though: a class that
+// inherits one base twice non-virtually also inherits its members twice, and
+// reflection enumerates both, so bind_class fails earlier on the ambiguous
+// member call. That is older than the upcast table and unchanged by it.
 template<typename Derived, typename Base>
 void register_lua_upcast(lua_State* L) {
     if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
@@ -1790,7 +1871,12 @@ void register_lua_upcast(lua_State* L) {
             lua_pushvalue(L, -1);
             lua_setfield(L, -3, core::type_key<Base>);
         }
+        // Keyed by the address of Derived's metatable, which is what an
+        // arriving wrapper carries in its bytes, not by the metatable value:
+        // the lookup must not depend on anything a script can attach.
         luaL_getmetatable(L, core::type_key<Derived>);
+        lua_pushlightuserdata(L, const_cast<void*>(lua_topointer(L, -1)));
+        lua_remove(L, -2);
         // Round-tripping a function pointer through void* is how the C API
         // carries callbacks; lightuserdata has no function-pointer form.
         lua_pushlightuserdata(L, reinterpret_cast<void*>(thunk));
@@ -1806,17 +1892,17 @@ void register_lua_base_upcasts(lua_State* L) {
     }(std::make_index_sequence<core::BaseClosure<T>::types.size()>{});
 }
 
-// How to reach Expected from the class whose metatable is on top of the
-// stack, or nullptr when there is no such conversion. Leaves the stack as
-// it found it, metatable included.
-inline LuaUpcastThunk find_lua_upcast(lua_State* L, const char* base_tid) {
+// How to reach Expected from the class identified by `derived_mt`, or
+// nullptr when there is no such conversion. Leaves the stack as it found it.
+inline LuaUpcastThunk find_lua_upcast(lua_State* L, const char* base_tid,
+                                      const void* derived_mt) {
     push_lua_side_table(L, kLuaUpcastTableKey);
     lua_getfield(L, -1, base_tid);
     if (!lua_istable(L, -1)) {
         lua_pop(L, 2);
         return nullptr;
     }
-    lua_pushvalue(L, -3);                // the metatable, as the key
+    lua_pushlightuserdata(L, const_cast<void*>(derived_mt));
     lua_rawget(L, -2);
     LuaUpcastThunk thunk = nullptr;
     if (lua_islightuserdata(L, -1)) {
@@ -1824,6 +1910,20 @@ inline LuaUpcastThunk find_lua_upcast(lua_State* L, const char* base_tid) {
     }
     lua_pop(L, 3);
     return thunk;
+}
+
+// Whether `id` names T's metatable in this lua_State. The address bind_class
+// cached answers the common case without touching the stack; the registry
+// answers when the cache belongs to a different state, or when the class was
+// bound by a module other than this one.
+template<typename T>
+inline bool lua_identity_is(lua_State* L, const void* id) {
+    if (!id) return false;
+    if (id == LuaTypeRegistry<T>::metatable) return true;
+    bool same = luaL_getmetatable(L, core::type_key<T>) == LUA_TTABLE &&
+                lua_topointer(L, -1) == id;
+    lua_pop(L, 1);
+    return same;
 }
 
 // Everything except the common case: the exact class reached in a state this
@@ -1836,30 +1936,21 @@ inline LuaUpcastThunk find_lua_upcast(lua_State* L, const char* base_tid) {
 // lua_close/lua_newstate, where the allocator can hand the same address to
 // an unrelated class.
 template<typename Expected>
-bool resolve_lua_wrapper_slow(lua_State* L, int idx, void*& raw) {
-    if (!lua_isuserdata(L, idx)) return false;
-    idx = lua_absindex(L, idx);          // the lookups below push
+bool resolve_lua_wrapper_slow(lua_State* L, LuaWrapperView* view, void*& raw) {
+    if (!view->cpp_object) return false;
 
-    // Metatables are keyed by core::type_key in the registry, so the module
-    // that bound Expected registered the very table this object carries.
-    if (void* ud = luaL_testudata(L, idx, core::type_key<Expected>)) {
-        void* held = static_cast<LuaWrapperView*>(ud)->cpp_object;
-        if (!held) return false;
-        raw = held;
+    if (lua_identity_is<Expected>(L, view->class_mt)) {
+        raw = view->cpp_object;
         return true;
     }
 
-    if (!lua_getmetatable(L, idx)) return false;   // not one of our wrappers
-    LuaUpcastThunk to_base = find_lua_upcast(L, core::type_key<Expected>);
-    lua_pop(L, 1);
+    LuaUpcastThunk to_base =
+        find_lua_upcast(L, core::type_key<Expected>, view->class_mt);
     if (!to_base) return false;
-
-    void* held = static_cast<LuaWrapperView*>(lua_touserdata(L, idx))->cpp_object;
-    if (!held) return false;
 
     // The held pointer addresses the whole derived object, which is not where
     // a second or virtual base subobject begins.
-    raw = to_base(held);
+    raw = to_base(view->cpp_object);
     return raw != nullptr;
 }
 
@@ -1868,37 +1959,33 @@ bool resolve_lua_wrapper_slow(lua_State* L, int idx, void*& raw) {
 // from it). Returns false - never a bad pointer - for anything else.
 //
 // Every path that reinterprets a Lua value as a bound class goes through
-// here, so the exact-type case is kept to a comparison of two metatable
-// addresses rather than luaL_testudata, which looks the expected metatable
-// up in the registry by name and so interns and hashes the mangled type name
-// on every call. Everything else is one call away in the slow path, which
-// does use luaL_testudata.
+// here. The common case is two Lua C API calls and a load: establish the
+// value is a full userdata long enough to be ours, then compare the identity
+// it carries against the address bind_class cached for Expected.
 //
-// The cached address is the one bind_class saw. Two live Lua states cannot
-// have two live tables at the same address, so a stale cache can only cost a
-// trip through the slow path, never a wrong answer.
+// A stale cache - this module bound Expected in a different lua_State - only
+// costs a trip through the slow path, which asks that state's registry.
 template<typename Expected>
 inline bool resolve_lua_wrapper(lua_State* L, int idx, void*& raw) {
+    LuaWrapperView* view = lua_wrapper_view(L, idx);
+    if (!view) return false;
+
     const void* want = LuaTypeRegistry<Expected>::metatable;
-    if (want && lua_getmetatable(L, idx)) {
-        bool same = lua_topointer(L, -1) == want;
-        lua_pop(L, 1);
-        if (same) {
-            void* held = static_cast<LuaWrapperView*>(lua_touserdata(L, idx))->cpp_object;
-            if (!held) return false;
-            raw = held;
-            return true;
-        }
+    if (want && view->class_mt == want) {
+        if (!view->cpp_object) return false;
+        raw = view->cpp_object;
+        return true;
     }
-    return resolve_lua_wrapper_slow<Expected>(L, idx, raw);
+    return resolve_lua_wrapper_slow<Expected>(L, view, raw);
 }
 
-// The name bind_class gave the class whose metatable is on top of the stack,
-// or nullptr. Read out of the registry rather than a C++ static so it is
-// right even for a class another module bound.
-inline const char* lua_name_for_metatable(lua_State* L) {
+// The name bind_class gave the class `id` identifies, or nullptr. Read out of
+// the registry rather than a C++ static so it is right even for a class
+// another module bound.
+inline const char* lua_name_for_identity(lua_State* L, const void* id) {
+    if (!id) return nullptr;
     push_lua_side_table(L, kLuaNameTableKey);
-    lua_pushvalue(L, -2);
+    lua_pushlightuserdata(L, const_cast<void*>(id));
     lua_rawget(L, -2);
     const char* name = lua_tostring(L, -1);
     lua_pop(L, 2);
@@ -1911,7 +1998,7 @@ inline void copy_lua_registered_name(lua_State* L, const char* type_id,
                                      char* out, std::size_t out_size) {
     const char* name = nullptr;
     if (luaL_getmetatable(L, type_id) == LUA_TTABLE) {
-        name = lua_name_for_metatable(L);
+        name = lua_name_for_identity(L, lua_topointer(L, -1));
     }
     lua_pop(L, 1);
     std::snprintf(out, out_size, "%s", name ? name : type_id);
@@ -1919,11 +2006,13 @@ inline void copy_lua_registered_name(lua_State* L, const char* type_id,
 
 // What arrived, in the words a Lua author would use: the bound class name for
 // one of our wrappers, otherwise the Lua type name.
+//
+// Reads the identity the wrapper carries, not the metatable attached to it,
+// so a value wearing a borrowed metatable is described as what it is.
 inline void describe_lua_value(lua_State* L, int idx, char* out, std::size_t out_size) {
     const char* name = nullptr;
-    if (lua_getmetatable(L, idx)) {
-        name = lua_name_for_metatable(L);
-        lua_pop(L, 1);
+    if (LuaWrapperView* view = lua_wrapper_view(L, idx)) {
+        name = lua_name_for_identity(L, view->class_mt);
     }
     std::snprintf(out, out_size, "%s", name ? name : luaL_typename(L, idx));
 }
@@ -2306,10 +2395,12 @@ int lua_gc(lua_State* L) {
     // Strictly exact, unlike the other metamethods: a derived object reaching
     // here would be deleted through a base subobject address. `__gc` is also
     // callable by hand off the metatable, so a wrong userdata must leave
-    // without freeing anything rather than raise during collection.
-    void* ud = luaL_testudata(L, 1, core::type_key<T>);
-    if (!ud) return 0;
-    LuaWrapper<T>* wrapper = static_cast<LuaWrapper<T>*>(ud);
+    // without freeing anything rather than raise during collection - and the
+    // identity has to come from the wrapper's own bytes, since the whole
+    // point of reaching __gc by hand is to bring a borrowed metatable along.
+    LuaWrapperView* view = lua_wrapper_view(L, 1);
+    if (!view || !lua_identity_is<T>(L, view->class_mt)) return 0;
+    LuaWrapper<T>* wrapper = static_cast<LuaWrapper<T>*>(static_cast<void*>(view));
     if (wrapper->owns_memory && wrapper->cpp_object) {
         delete wrapper->cpp_object;
         wrapper->cpp_object = nullptr;
@@ -2473,8 +2564,11 @@ int lua_constructor(lua_State* L) {
     wrapper->cpp_object = cpp_object;
     wrapper->owns_memory = true;
 
-    // Set metatable
+    // Set metatable. The identity is taken from the table actually being
+    // installed rather than from the cached address, so a wrapper made in a
+    // second lua_State carries that state's metatable.
     luaL_getmetatable(L, core::type_key<T>);
+    wrapper->class_mt = lua_topointer(L, -1);
     lua_setmetatable(L, -2);
 
     return 1;
@@ -2561,8 +2655,10 @@ to_lua(lua_State* L, const T& obj) {
             wrapper->cpp_object = new CleanT(obj);
             wrapper->owns_memory = true;
 
-            // Set the metatable
+            // Set the metatable, and take the identity from it (see
+            // lua_constructor)
             luaL_getmetatable(L, LuaTypeRegistry<CleanT>::metatable_name);
+            wrapper->class_mt = lua_topointer(L, -1);
             lua_setmetatable(L, -2);
 
             return;
@@ -2592,6 +2688,12 @@ void bind_class(lua_State* L, const char* name) {
         "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
         "Mark unconvertible members with [[=exclude{}]] or add a custom type converter.");
 
+    static_assert(core::type_key_is_distinctive<T>(),
+        "bind_class<T>: this compiler cannot spell T distinctly, so T would share a "
+        "metatable with another specialisation and the boundary check could not tell "
+        "them apart. Reached by a template argument that is an enum value or a type "
+        "with no name; give the argument a named type, or bind a named alias of T.");
+
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();
 
     // Store metatable name in type registry (for to_lua wrapper creation)
@@ -2609,7 +2711,7 @@ void bind_class(lua_State* L, const char* name) {
     // Lua reads on every property access.
     LuaTypeRegistry<T>::metatable = lua_topointer(L, -1);
     push_lua_side_table(L, kLuaNameTableKey);
-    lua_pushvalue(L, -2);
+    lua_pushlightuserdata(L, const_cast<void*>(LuaTypeRegistry<T>::metatable));
     lua_pushstring(L, name);
     lua_rawset(L, -3);
     lua_pop(L, 1);
