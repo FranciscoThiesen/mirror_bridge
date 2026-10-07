@@ -4969,8 +4969,23 @@ inline PyObject* get_python_named_registry(const char* registry_name) {
     return registry;
 }
 
+// The three registries live in sys.modules for the life of the process, so
+// re-finding them is pure overhead after the first call: PyDict_GetItemString
+// builds and discards a str, hashes it, and probes sys.modules every time,
+// and the outbound conversion path did that twice per returned object. The
+// cache changes nothing about what is returned -- it is the same dict every
+// later lookup would find -- and the strong reference keeps it that way.
+inline PyObject* cached_named_registry(PyObject*& slot, const char* name) {
+    if (!slot) {
+        slot = get_python_named_registry(name);
+        Py_XINCREF(slot);
+    }
+    return slot;
+}
+
 inline PyObject* get_python_type_registry() {
-    return get_python_named_registry("_mirror_bridge_types");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_types");
 }
 
 // ============================================================================
@@ -5015,12 +5030,23 @@ const std::string& wrapper_abi_typeid() {
     return name;
 }
 
+// The same key as a str, interned once per type. PyDict_GetItemString builds
+// and throws away a str on every call; an interned one also carries its hash
+// already computed, which is the rest of what that probe was costing.
+template<typename T>
+PyObject* wrapper_abi_typeid_key() {
+    static PyObject* key = PyUnicode_InternFromString(wrapper_abi_typeid<T>().c_str());
+    return key;
+}
+
 inline PyObject* get_python_typename_registry() {
-    return get_python_named_registry("_mirror_bridge_type_names");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_type_names");
 }
 
 inline PyObject* get_python_upcast_registry() {
-    return get_python_named_registry("_mirror_bridge_upcasts");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_upcasts");
 }
 
 // The C++ type behind a Python type object, or nullptr when it is not a
@@ -5148,17 +5174,15 @@ namespace {
 
         // Use typeid name as the key (unique per type across all modules),
         // qualified by the wrapper layout this module was built against.
-        const char* type_name = wrapper_abi_typeid<T>().c_str();
-        PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
+        PyObject* key = wrapper_abi_typeid_key<T>();
+        if (!key) { PyErr_Clear(); return; }
+        PyDict_SetItem(registry, key, reinterpret_cast<PyObject*>(py_type));
 
         // And the reverse, so an object arriving from Python whose type we
         // were not expecting can still be identified (see WrapperView).
         PyObject* names = get_python_typename_registry();
         if (!names) return;
-        PyObject* value = PyUnicode_FromString(type_name);
-        if (!value) { PyErr_Clear(); return; }
-        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), value);
-        Py_DECREF(value);
+        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), key);
     }
 
     // Look up a type from the Python-based global registry
@@ -5167,8 +5191,9 @@ namespace {
         PyObject* registry = get_python_type_registry();
         if (!registry) return nullptr;
 
-        const char* type_name = wrapper_abi_typeid<T>().c_str();
-        PyObject* py_type = PyDict_GetItemString(registry, type_name);
+        PyObject* key = wrapper_abi_typeid_key<T>();
+        if (!key) { PyErr_Clear(); return nullptr; }
+        PyObject* py_type = PyDict_GetItem(registry, key);
 
         return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
     }
@@ -5304,8 +5329,8 @@ void unregister_type() {
     PyObject* registry = get_python_type_registry();
     if (!registry) return;
 
-    const char* type_name = wrapper_abi_typeid<T>().c_str();
-    PyDict_DelItemString(registry, type_name);
+    PyObject* key = wrapper_abi_typeid_key<T>();
+    if (key) PyDict_DelItem(registry, key);
     PyErr_Clear();  // Ignore KeyError if type wasn't registered
 }
 
