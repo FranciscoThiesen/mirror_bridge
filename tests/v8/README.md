@@ -38,7 +38,12 @@ binding implementations have equivalent functionality:
 
 ## Running Tests
 
-Tests are automatically run by `./tests/run_all_tests.sh` when libv8-dev is installed.
+**These tests do not currently build.** They and `v8_test_harness.hpp` target the
+V8 8.x+ API, while the dev image ships V8 7.8 by way of `libnode-dev`
+(`/usr/include/node/v8.h`). `./tests/run_all_tests.sh` attempts them, because it
+gates on that path, and reports the failures without failing the run. The
+`test-v8` CI job gates on `/usr/include/v8.h`, which no image provides, so it
+skips instead.
 
 Manual compilation:
 ```bash
