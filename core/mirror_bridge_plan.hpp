@@ -37,6 +37,7 @@
 // header:
 //
 //   namespace mirror_bridge::plan::input {
+//       inline constexpr std::string_view source_root = "/abs/src";
 //       inline constexpr std::string_view sources[] = { "/abs/src", "geom.hpp" };
 //       inline constexpr std::pair<std::string_view, std::string_view> kind_hints[] = {
 //           {"Vector3", "T"}, {"Matrix", "TV"}, {"clamp", "T"} };
@@ -71,15 +72,33 @@ using namespace mirror_bridge::spelling;
 
 // ------------------------------------------------------------------ inputs --
 
+// A source spelling is an include path with no directory anchor on it
+// ("value.h", "json/value.h"), so the only way to match it against the file
+// name the compiler reports is from the end. That on its own cannot tell one
+// of these headers apart from a third-party header of the same name: a
+// vendored <json/value.h> ends with the same "/value.h" as a header of the
+// user's own, and every class jsoncpp declares would then be adopted into
+// the module. `source_root` is the directory the driver was pointed at,
+// already resolved, and anchors the suffix to it.
+consteval bool under_source_root(std::string_view f) {
+    std::string_view root = input::source_root;
+    // Nothing to anchor against: no root, a root of "/", or a file name the
+    // compiler reported relative to its own working directory.
+    if (root.size() <= 1 || root.front() != '/' || f.empty() || f.front() != '/') return true;
+    return f.size() > root.size() && f.starts_with(root) && f[root.size()] == '/';
+}
+
 // The file name is spelled the way the include was resolved ("./inc/x.hpp",
 // "inc/x.hpp", or absolute), so absolute sources match by prefix and
 // relative ones (include spellings) by suffix.
 consteval bool in_source(info r) {
     std::string_view f = source_location_of(r).file_name();
+    if (!under_source_root(f)) return false;
     for (std::string_view s : input::sources) {
         if (s.empty()) continue;
         if (s.front() == '/') {
-            if (f.starts_with(s)) return true;
+            // The separator keeps "/x/src" from matching "/x/src_vendor/y.hpp".
+            if (f.starts_with(s) && (f.size() == s.size() || f[s.size()] == '/')) return true;
         } else if (f == s || f.ends_with(std::string("/") + std::string(s))) {
             return true;
         }

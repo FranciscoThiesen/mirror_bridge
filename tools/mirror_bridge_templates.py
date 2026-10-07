@@ -175,9 +175,14 @@ def include_lines(headers):
 
 # ----------------------------------------------------------------- discover --
 
-def write_inputs(work, headers, hints, approved, namespaces, cap, requested):
+def write_inputs(work, headers, hints, approved, namespaces, cap, requested, root):
     lines = ["#pragma once", "#include <cstddef>", "#include <string_view>", "#include <utility>", "#include <meta>",
              "namespace mirror_bridge::plan::input {",
+             # The headers are listed by include spelling, which a third-party
+             # header of the same name matches just as well; the root is what
+             # tells the two apart. Resolved, because the compiler reports the
+             # path it opened and -I carries the resolved directory.
+             f'inline constexpr std::string_view source_root = "{os.path.realpath(root)}";',
              "inline constexpr std::string_view sources[] = {"]
     lines += [f'    "{h}",' for h in headers]
     lines += ["};", "inline constexpr std::pair<std::string_view, std::string_view> kind_hints[] = {"]
@@ -352,7 +357,7 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
     plan, approved, rejected, unbindable, dropped = {"free": [], "needs": [], "cands": []}, [], [], [], []
     before = set()
     for rnd in range(1, max(1, args.max_rounds) + 1):
-        write_inputs(work, headers, hints, approved_spellings, namespaces, args.template_cap, requested)
+        write_inputs(work, headers, hints, approved_spellings, namespaces, args.template_cap, requested, args.src_dir)
         plan, err = discover(work, cc, headers)
         if err:
             return None, "discovery failed:\n" + err
@@ -639,7 +644,7 @@ def main():
         for i, attempt_headers in enumerate(attempts):
             if i:
                 log.append("retrying with the module's own headers only")
-            write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [])
+            write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [], args.src_dir)
             plan, err = discover(work, cc, attempt_headers)
             if not err:
                 found = {"plain": plan["plain"], "enums": plan["enums"]}
