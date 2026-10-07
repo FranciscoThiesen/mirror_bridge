@@ -807,7 +807,12 @@ planner_setup() {
 
     declare -A already
     local h
-    for h in "${ps_headers[@]:-}"; do already["$h"]=1; done
+    # A header set with no classes in it at all is ordinary (templates and
+    # free functions only), and "${a[@]:-}" on an empty array yields one
+    # empty word, which is not a subscript bash accepts.
+    for h in "${ps_headers[@]:-}"; do
+        [ -n "$h" ] && already["$h"]=1
+    done
     : > "$PLANNER_WORK/headers.txt"
     local header_file rel
     while IFS= read -r header_file; do
