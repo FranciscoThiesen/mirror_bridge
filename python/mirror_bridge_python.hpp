@@ -5391,45 +5391,13 @@ struct BoundClass {
     explicit operator bool() const { return type != nullptr; }
 };
 
-// Every class T is transitively derived from, in breadth-first order.
-// bind_class records one upcast thunk per entry, which is what lets a
-// Derived still be passed where a Base is expected once arguments are
-// identity-checked.
-template<typename T>
-consteval std::vector<std::meta::info> collect_base_closure() {
-    std::vector<std::meta::info> found;
-    std::vector<std::meta::info> layer{^^T};
-    while (!layer.empty()) {
-        std::vector<std::meta::info> next;
-        for (auto cls : layer) {
-            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
-                auto base_type = std::meta::type_of(b);
-                bool seen = false;
-                for (auto f : found) {
-                    if (f == base_type) { seen = true; break; }
-                }
-                if (seen) continue;          // diamond: one entry per base
-                found.push_back(base_type);
-                next.push_back(base_type);
-            }
-        }
-        layer = next;
-    }
-    return found;
-}
-
-template<typename T>
-struct BaseClosure {
-    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
-};
-
-// Alias-template form, because the pack below appears only inside a splice
-// and GCC does not treat that as expandable (see core/mirror_bridge_core.hpp).
-template<typename T, std::size_t I>
-consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+// The base closure itself lives in core/mirror_bridge_core.hpp: all three
+// backends need it to keep derived-to-base conversions working once
+// arguments are identity-checked.
+using core::BaseClosure;
 
 template<typename T, std::size_t I>
-using base_t = typename [:base_at<T, I>():];
+using base_t = core::base_t<T, I>;
 
 template<typename T>
 void register_base_upcasts() {

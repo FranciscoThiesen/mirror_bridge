@@ -288,14 +288,12 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
-## Argument Type Checking (Python)
-
-This section describes the Python backend. Lua and JavaScript do not check
-argument identity yet.
+## Argument Type Checking
 
 A parameter, data member, or container element whose type is a bound C++
 class accepts only an object of that class, an object of a class derived
-from it, or a Python subclass of either. Anything else raises `TypeError`:
+from it, or a host-language subclass of either. Anything else is refused:
+`TypeError` in Python and JavaScript, a Lua error in Lua.
 
 ```python
 curve = pricing.Curve()
@@ -303,6 +301,23 @@ pricing.discount(curve, 2.0)   # fine
 pricing.discount(42, 2.0)      # TypeError: Argument 1: type conversion failed
 pricing.discount(label, 2.0)   # TypeError, even though Label is also bound
 ```
+
+```lua
+local curve = pricing.Curve.new()
+curve:at(2.0)        -- fine
+curve.at(label, 2.0) -- error: at: expected Curve, got Label
+```
+
+```javascript
+const curve = new pricing.Curve();
+curve.at(2.0);                                  // fine
+pricing.Curve.prototype.at.call(label, 2.0);    // TypeError: at: expected Curve, got Label
+```
+
+The receiver is checked as well as the arguments. `obj.method(x, ...)` in Lua
+and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as
+`obj:method(...)` and `obj.method(...)`, with whatever the caller put first as
+`self`, so an object of the wrong class there is refused too.
 
 Conversion to a base class is offset-adjusted, so it is correct for a base
 that is not the first one:
@@ -316,21 +331,89 @@ double value(const Priceable&);
 value(swap)   # reaches the Priceable subobject, not the start of the Swap
 ```
 
-Virtual bases work too: the offset is resolved at call time rather than
-assumed, and the same class bound by two different modules interoperates.
+Virtual bases work too in Python: the offset is resolved at call time rather
+than assumed.
 
 The conversion is recorded by the derived class when it is bound, so the
-base and the derived class may live in different modules and be imported in
+base and the derived class may live in different modules and be loaded in
 either order. Two cases are deliberately not convertible:
 
-- A derived class whose module has never been imported, because nothing has
+- A derived class whose module has never been loaded, because nothing has
   registered it yet.
 - A base that C++ itself would not let you reach from that call site: one
   that is inaccessible (`private`/`protected`) or ambiguous because it is
   inherited twice non-virtually.
 
 Inside an overload set a rejected argument simply moves to the next
-candidate, so `TypeError` is raised only when no overload matches.
+candidate, so the error is raised only when no overload matches.
+
+### What differs between the backends
+
+| | Python | Lua | JS (N-API) | V8 (direct) |
+|---|---|---|---|---|
+| Wrong class refused | yes | yes | yes | untested |
+| Derived-to-base, offset-adjusted | yes | yes | yes | untested |
+| Same class bound by two modules | yes | yes | yes | untested |
+| Derived class bound by *another* module | yes | yes | no | no |
+
+The first three are what the identity check has to preserve. The fourth is
+where the backends differ in how far their cross-module state reaches: Python
+keeps it in `sys.modules` and Lua in the Lua registry, both shared by every
+module in the process, while the N-API backend keeps its upcast table per
+`.node` file — which matches the rest of that backend, where `to_javascript`
+already falls back to a plain-object snapshot for a class the module did not
+bind.
+
+The V8 column is marked untested because it is. `javascript/mirror_bridge_v8.hpp`
+does not compile against the V8 in the dev image (7.8, from `libnode-dev`): it
+calls `String::NewFromUtf8Literal` and the one-argument
+`String::NewFromUtf8`, both V8 8.x, and a bound-class parameter or data member
+hits a declaration-order defect in `from_v8` besides. The gate it carries was
+exercised by hand against a locally patched copy and behaved, but nothing in
+CI covers it. Use the N-API backend.
+
+Two modules recognise each other's objects by the class's reflected C++
+spelling, so they have to spell it the same way. For every shape a discovered
+class actually has — plain, nested, namespaced, inherited — clang-p2996 and
+GCC 16 agree byte for byte, and `std::string` and `std::string_view` are
+special-cased so they agree too. They do not agree on a key that names any
+other standard-library template, because clang is only usable with libc++ and
+that puts its ABI inline namespace in the name: `std::__1::vector<int, ...>`
+against `std::vector<int, ...>`. Those keys reach error messages, not
+identity, since a container can never be the expected class. The exception is
+a class that *is* a template specialisation mentioning one — a hand-written
+`bind_class<MyVec<int>>`, where `MyVec`'s defaulted allocator is spelled out,
+or a discovered class deriving from one. Two such modules built by different
+compilers would stop recognising each other, in a process where they are
+already ABI-incompatible for other reasons.
+
+### Forged identity
+
+The check asks what a value *is*, so it is worth being precise about what it
+trusts. Both backends read the answer out of memory the backend itself wrote
+into the wrapper, after establishing that the memory is theirs:
+
+- **Lua** reads the class's metatable address from the wrapper's payload,
+  having first confirmed with `lua_touserdata` and `lua_rawlen` that the value
+  is a full userdata long enough to hold one. It deliberately does *not* trust
+  the metatable attached to the value, because Lua lets a script attach any
+  metatable to any value — `setmetatable({}, getmetatable(curve))` needs no
+  privileged library, and `debug.setmetatable` reaches userdata that belongs to
+  other C libraries entirely. Nothing in Lua writes a full userdata's payload,
+  so the payload cannot be forged the same way.
+- **N-API** reads a magic word and then the class tag, because `napi_unwrap`
+  establishes that an object was wrapped and not by whom: another addon's
+  wrapped objects come back through it with that addon's payload layout.
+
+Neither is a proof. A full userdata or a foreign payload whose first word
+happened to match would be accepted, which is a coincidence a script cannot
+aim for — it never learns the address and cannot write those bytes. N-API 8
+(Node 14.17+) offers `napi_type_tag_object`, which would be a proof, at the
+cost of a property lookup on every boundary crossing.
+
+In Lua a plain table is still accepted where a bound class is expected: that
+is how nested structs are written from Lua, and it reads the fields rather
+than the object's bytes, so the check does not close it.
 
 ## Limitations
 

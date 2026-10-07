@@ -28,6 +28,8 @@
 #include <typeindex>
 #include <shared_mutex>
 
+#include "mirror_bridge_spelling.hpp"
+
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
@@ -661,6 +663,113 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 
     return sig;
 }
+
+// ============================================================================
+// Type Keys
+// ============================================================================
+//
+// A name for a C++ type that reads the same in every module that mentions it,
+// so the backends can agree on which class a wrapper holds across .so
+// boundaries.
+//
+// Not typeid. node-gyp compiles addons with -fno-rtti, following V8's own
+// build settings, so the N-API backend cannot use typeid at all. Reflection
+// answers the same question without RTTI, and spelling::spell is already this
+// project's compiler-independent way to write a type down - fully qualified,
+// aliases resolved, template arguments spelled recursively - so two modules
+// built from the same header produce the same bytes.
+//
+// Not the address of a per-type static, either. Generated modules are built
+// with -fvisibility=hidden, so each .so would get its own copy of that static
+// and cross-module identity would quietly stop matching. Every comparison of
+// these keys is by content; an address comparison is only ever a fast path in
+// front of one.
+//
+// One caveat inherited from the spelling: a class in an unnamed namespace has
+// nothing to qualify it with, so it spells the same as any other class of that
+// name. Such a class is a distinct type in every translation unit and was
+// never shareable between modules to begin with.
+
+// A consteval call returning std::string may only appear inside another
+// constant evaluation, so the string is burned into static storage here and
+// runtime code reads the pointer (see python/mirror_bridge_templates.hpp,
+// which reaches the spelling helpers the same way).
+template<typename T>
+consteval const char* make_type_key() {
+    return std::define_static_string(spelling::spell(^^std::remove_cvref_t<T>));
+}
+
+template<typename T>
+inline constexpr const char* type_key = make_type_key<T>();
+
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Base Class Closure
+// ============================================================================
+//
+// Every class T is transitively derived from, in breadth-first order. Each
+// language backend records one address-adjusting thunk per entry when it
+// binds T, which is what lets a Derived still be passed where a Base is
+// expected once arguments are identity-checked: the held pointer addresses
+// the whole derived object, which is not where a second or virtual base
+// subobject begins.
+//
+// ============================================================================
+
+template<typename T>
+consteval std::vector<std::meta::info> collect_base_closure() {
+    std::vector<std::meta::info> found;
+    std::vector<std::meta::info> layer{^^T};
+    while (!layer.empty()) {
+        std::vector<std::meta::info> next;
+        for (auto cls : layer) {
+            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
+                auto base_type = std::meta::type_of(b);
+                bool seen = false;
+                for (auto f : found) {
+                    if (f == base_type) { seen = true; break; }
+                }
+                if (seen) continue;          // diamond: one entry per base
+                found.push_back(base_type);
+                next.push_back(base_type);
+            }
+        }
+        layer = next;
+    }
+    return found;
+}
+
+template<typename T>
+struct BaseClosure {
+    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
+};
+
+// Alias-template form, because a pack used by the backends appears only
+// inside a splice and GCC does not treat that as expandable (see the note
+// on splice hoisting above).
+template<typename T, std::size_t I>
+consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+
+template<typename T, std::size_t I>
+using base_t = typename [:base_at<T, I>():];
 
 // ============================================================================
 // Compile-Time Binding Validation

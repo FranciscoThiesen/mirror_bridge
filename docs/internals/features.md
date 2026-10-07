@@ -178,7 +178,7 @@ pointee can't be materialized by value.
 
 | Limitation | Status |
 |------------|--------|
-| Cross-module types | Not supported |
+| Cross-module types | The same class bound by two modules is recognised in both; a *derived* class bound by another module is not convertible to its base in JavaScript. See [type-conversion](../reference/type-conversion.md#what-differs-between-the-backends) |
 | Method overloading | Limited |
 
 ## Performance

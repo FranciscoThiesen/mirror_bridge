@@ -24,6 +24,178 @@
 // ============================================================================
 
 
+// ============================================================================
+// Mirror Bridge - Reflection Spelling Helpers
+// ============================================================================
+//
+// Shared by the template planner (core/mirror_bridge_plan.hpp, compile-time
+// discovery run by the CLI) and the Python template runtime
+// (python/mirror_bridge_templates.hpp): a stable, compiler-independent way to
+// spell a type or a template argument list as C++ source, and to synthesize
+// Python names for instantiations nobody aliased.
+//
+// display_string_of is deliberately avoided for anything that ends up in
+// generated code or in a Python name: clang prints unqualified names and GCC
+// prints "long int", so the two compilers would disagree on the identity of
+// the same specialization.
+//
+// ============================================================================
+
+#include <meta>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace mirror_bridge {
+namespace spelling {
+
+using namespace std::meta;
+
+// The fundamental types (plus the two string types the runtime treats as
+// scalars), with their C++ spelling and the short name used in Python
+// identifiers: Vector3<unsigned char> becomes Vector3_uint8.
+struct Fundamental {
+    info type;
+    std::string_view spelling;
+    std::string_view pretty;
+};
+
+consteval std::vector<Fundamental> fundamentals() {
+    return {
+        {^^bool, "bool", "bool"},
+        {^^char, "char", "char"},
+        {^^signed char, "signed char", "int8"},
+        {^^unsigned char, "unsigned char", "uint8"},
+        {^^short, "short", "short"},
+        {^^unsigned short, "unsigned short", "ushort"},
+        {^^int, "int", "int"},
+        {^^unsigned, "unsigned", "uint"},
+        {^^long, "long", "long"},
+        {^^unsigned long, "unsigned long", "ulong"},
+        {^^long long, "long long", "llong"},
+        {^^unsigned long long, "unsigned long long", "ullong"},
+        {^^float, "float", "float"},
+        {^^double, "double", "double"},
+        {^^long double, "long double", "ldouble"},
+        {^^char8_t, "char8_t", "char8"},
+        {^^char16_t, "char16_t", "char16"},
+        {^^char32_t, "char32_t", "char32"},
+        {^^wchar_t, "wchar_t", "wchar"},
+        {^^void, "void", "void"},
+        {^^std::string, "std::string", "string"},
+        {^^std::string_view, "std::string_view", "string_view"},
+    };
+}
+
+consteval std::string itoa(std::size_t n) {
+    std::string s;
+    do {
+        s.insert(s.begin(), char('0' + n % 10));
+        n /= 10;
+    } while (n);
+    return s;
+}
+
+consteval std::string spell(info t);
+
+// Qualified name of a named entity: walks parent_of through namespaces and
+// enclosing classes (a member of a specialization is spelled through the
+// specialization, e.g. geom::Vector3<float>::cast).
+consteval std::string qualified(info entity) {
+    std::string name(identifier_of(entity));
+    info p = parent_of(entity);
+    while (true) {
+        if (is_namespace(p)) {
+            if (!has_identifier(p)) break;   // global (or anonymous) namespace
+            name = std::string(identifier_of(p)) + "::" + name;
+            p = parent_of(p);
+        } else if (is_type(p)) {
+            name = spell(p) + "::" + name;
+            break;
+        } else {
+            break;
+        }
+    }
+    return name;
+}
+
+// A template argument: a type, or a value such as "3" for Matrix<float, 3>.
+consteval std::string spell_arg(info a) {
+    return is_type(a) ? spell(a) : std::string(display_string_of(a));
+}
+
+consteval std::string spell_args(const std::vector<info>& args) {
+    std::string s;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i) s += ", ";
+        s += spell_arg(args[i]);
+    }
+    return s;
+}
+
+// template_arguments_of returns a span; the planner wants to append to it.
+consteval std::vector<info> args_of(info spec) {
+    std::vector<info> v;
+    for (info a : template_arguments_of(spec)) v.push_back(a);
+    return v;
+}
+
+// C++ source spelling of a type, valid in any scope: fully qualified, aliases
+// resolved, template arguments spelled recursively.
+consteval std::string spell(info t) {
+    if (is_lvalue_reference_type(t)) return spell(remove_reference(t)) + "&";
+    if (is_rvalue_reference_type(t)) return spell(remove_reference(t)) + "&&";
+    // cv before pointer, because remove_pointer drops the qualifiers on the
+    // pointer itself: taking the pointer branch first spelled `int* const`
+    // as `int*`, so the two shared a key and the backends could not tell
+    // Box<int*> from Box<int* const> apart.
+    if (is_const(t))                 return spell(remove_const(t)) + " const";
+    if (is_volatile(t))              return spell(remove_volatile(t)) + " volatile";
+    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
+    t = dealias(t);
+    for (auto f : fundamentals()) {
+        if (t == dealias(f.type)) return std::string(f.spelling);
+    }
+    if (has_template_arguments(t)) return qualified(template_of(t)) + "<" + spell_args(args_of(t)) + ">";
+    if (has_identifier(t))         return qualified(t);
+    return std::string(display_string_of(t));
+}
+
+// Python-facing identifier fragment for a type:
+//   float -> float, unsigned char -> uint8, geom::Robot -> Robot,
+//   Vector3<Vector3<unsigned>> -> Vector3_Vector3_uint
+consteval std::string pretty(info t) {
+    t = dealias(remove_cvref(t));
+    for (auto f : fundamentals()) {
+        if (t == dealias(f.type)) return std::string(f.pretty);
+    }
+    std::string s = has_template_arguments(t) ? std::string(identifier_of(template_of(t)))
+                  : has_identifier(t)         ? std::string(identifier_of(t))
+                                              : std::string("anon");
+    if (has_template_arguments(t)) {
+        for (info a : template_arguments_of(t)) {
+            s += "_";
+            s += is_type(a) ? pretty(a) : std::string(display_string_of(a));
+        }
+    }
+    return s;
+}
+
+// Python name for an instantiation nobody aliased:
+//   Vector3<float> -> Vector3_float, Matrix<float, 3> -> Matrix_float_3,
+//   Stack<std::string> -> Stack_string, Stack<geom::Robot> -> Stack_Robot
+consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
+    std::string s(identifier_of(tmpl));
+    for (info a : args) {
+        s += "_";
+        s += is_type(a) ? pretty(a) : std::string(display_string_of(a));
+    }
+    return s;
+}
+
+} // namespace spelling
+} // namespace mirror_bridge
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Mirror Bridge Core - Language-Agnostic Reflection Infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,6 +223,7 @@
 #include <mutex>
 #include <typeindex>
 #include <shared_mutex>
+
 
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
@@ -687,6 +860,113 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 }
 
 // ============================================================================
+// Type Keys
+// ============================================================================
+//
+// A name for a C++ type that reads the same in every module that mentions it,
+// so the backends can agree on which class a wrapper holds across .so
+// boundaries.
+//
+// Not typeid. node-gyp compiles addons with -fno-rtti, following V8's own
+// build settings, so the N-API backend cannot use typeid at all. Reflection
+// answers the same question without RTTI, and spelling::spell is already this
+// project's compiler-independent way to write a type down - fully qualified,
+// aliases resolved, template arguments spelled recursively - so two modules
+// built from the same header produce the same bytes.
+//
+// Not the address of a per-type static, either. Generated modules are built
+// with -fvisibility=hidden, so each .so would get its own copy of that static
+// and cross-module identity would quietly stop matching. Every comparison of
+// these keys is by content; an address comparison is only ever a fast path in
+// front of one.
+//
+// One caveat inherited from the spelling: a class in an unnamed namespace has
+// nothing to qualify it with, so it spells the same as any other class of that
+// name. Such a class is a distinct type in every translation unit and was
+// never shareable between modules to begin with.
+
+// A consteval call returning std::string may only appear inside another
+// constant evaluation, so the string is burned into static storage here and
+// runtime code reads the pointer (see python/mirror_bridge_templates.hpp,
+// which reaches the spelling helpers the same way).
+template<typename T>
+consteval const char* make_type_key() {
+    return std::define_static_string(spelling::spell(^^std::remove_cvref_t<T>));
+}
+
+template<typename T>
+inline constexpr const char* type_key = make_type_key<T>();
+
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Base Class Closure
+// ============================================================================
+//
+// Every class T is transitively derived from, in breadth-first order. Each
+// language backend records one address-adjusting thunk per entry when it
+// binds T, which is what lets a Derived still be passed where a Base is
+// expected once arguments are identity-checked: the held pointer addresses
+// the whole derived object, which is not where a second or virtual base
+// subobject begins.
+//
+// ============================================================================
+
+template<typename T>
+consteval std::vector<std::meta::info> collect_base_closure() {
+    std::vector<std::meta::info> found;
+    std::vector<std::meta::info> layer{^^T};
+    while (!layer.empty()) {
+        std::vector<std::meta::info> next;
+        for (auto cls : layer) {
+            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
+                auto base_type = std::meta::type_of(b);
+                bool seen = false;
+                for (auto f : found) {
+                    if (f == base_type) { seen = true; break; }
+                }
+                if (seen) continue;          // diamond: one entry per base
+                found.push_back(base_type);
+                next.push_back(base_type);
+            }
+        }
+        layer = next;
+    }
+    return found;
+}
+
+template<typename T>
+struct BaseClosure {
+    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
+};
+
+// Alias-template form, because a pack used by the backends appears only
+// inside a splice and GCC does not treat that as expandable (see the note
+// on splice hoisting above).
+template<typename T, std::size_t I>
+consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+
+template<typename T, std::size_t I>
+using base_t = typename [:base_at<T, I>():];
+
+// ============================================================================
 // Compile-Time Binding Validation
 // ============================================================================
 //
@@ -873,174 +1153,6 @@ consteval bool validate_bindable_members() {
 // Include core header for GlobalTypeRegistry
 // Compiler-independent spelling of types and template arguments (shared with
 // the CLI's template planner and used by the template family runtime)
-
-// ============================================================================
-// Mirror Bridge - Reflection Spelling Helpers
-// ============================================================================
-//
-// Shared by the template planner (core/mirror_bridge_plan.hpp, compile-time
-// discovery run by the CLI) and the Python template runtime
-// (python/mirror_bridge_templates.hpp): a stable, compiler-independent way to
-// spell a type or a template argument list as C++ source, and to synthesize
-// Python names for instantiations nobody aliased.
-//
-// display_string_of is deliberately avoided for anything that ends up in
-// generated code or in a Python name: clang prints unqualified names and GCC
-// prints "long int", so the two compilers would disagree on the identity of
-// the same specialization.
-//
-// ============================================================================
-
-#include <meta>
-#include <string>
-#include <string_view>
-#include <vector>
-
-namespace mirror_bridge {
-namespace spelling {
-
-using namespace std::meta;
-
-// The fundamental types (plus the two string types the runtime treats as
-// scalars), with their C++ spelling and the short name used in Python
-// identifiers: Vector3<unsigned char> becomes Vector3_uint8.
-struct Fundamental {
-    info type;
-    std::string_view spelling;
-    std::string_view pretty;
-};
-
-consteval std::vector<Fundamental> fundamentals() {
-    return {
-        {^^bool, "bool", "bool"},
-        {^^char, "char", "char"},
-        {^^signed char, "signed char", "int8"},
-        {^^unsigned char, "unsigned char", "uint8"},
-        {^^short, "short", "short"},
-        {^^unsigned short, "unsigned short", "ushort"},
-        {^^int, "int", "int"},
-        {^^unsigned, "unsigned", "uint"},
-        {^^long, "long", "long"},
-        {^^unsigned long, "unsigned long", "ulong"},
-        {^^long long, "long long", "llong"},
-        {^^unsigned long long, "unsigned long long", "ullong"},
-        {^^float, "float", "float"},
-        {^^double, "double", "double"},
-        {^^long double, "long double", "ldouble"},
-        {^^char8_t, "char8_t", "char8"},
-        {^^char16_t, "char16_t", "char16"},
-        {^^char32_t, "char32_t", "char32"},
-        {^^wchar_t, "wchar_t", "wchar"},
-        {^^void, "void", "void"},
-        {^^std::string, "std::string", "string"},
-        {^^std::string_view, "std::string_view", "string_view"},
-    };
-}
-
-consteval std::string itoa(std::size_t n) {
-    std::string s;
-    do {
-        s.insert(s.begin(), char('0' + n % 10));
-        n /= 10;
-    } while (n);
-    return s;
-}
-
-consteval std::string spell(info t);
-
-// Qualified name of a named entity: walks parent_of through namespaces and
-// enclosing classes (a member of a specialization is spelled through the
-// specialization, e.g. geom::Vector3<float>::cast).
-consteval std::string qualified(info entity) {
-    std::string name(identifier_of(entity));
-    info p = parent_of(entity);
-    while (true) {
-        if (is_namespace(p)) {
-            if (!has_identifier(p)) break;   // global (or anonymous) namespace
-            name = std::string(identifier_of(p)) + "::" + name;
-            p = parent_of(p);
-        } else if (is_type(p)) {
-            name = spell(p) + "::" + name;
-            break;
-        } else {
-            break;
-        }
-    }
-    return name;
-}
-
-// A template argument: a type, or a value such as "3" for Matrix<float, 3>.
-consteval std::string spell_arg(info a) {
-    return is_type(a) ? spell(a) : std::string(display_string_of(a));
-}
-
-consteval std::string spell_args(const std::vector<info>& args) {
-    std::string s;
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        if (i) s += ", ";
-        s += spell_arg(args[i]);
-    }
-    return s;
-}
-
-// template_arguments_of returns a span; the planner wants to append to it.
-consteval std::vector<info> args_of(info spec) {
-    std::vector<info> v;
-    for (info a : template_arguments_of(spec)) v.push_back(a);
-    return v;
-}
-
-// C++ source spelling of a type, valid in any scope: fully qualified, aliases
-// resolved, template arguments spelled recursively.
-consteval std::string spell(info t) {
-    if (is_lvalue_reference_type(t)) return spell(remove_reference(t)) + "&";
-    if (is_rvalue_reference_type(t)) return spell(remove_reference(t)) + "&&";
-    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
-    if (is_const(t))                 return spell(remove_const(t)) + " const";
-    if (is_volatile(t))              return spell(remove_volatile(t)) + " volatile";
-    t = dealias(t);
-    for (auto f : fundamentals()) {
-        if (t == dealias(f.type)) return std::string(f.spelling);
-    }
-    if (has_template_arguments(t)) return qualified(template_of(t)) + "<" + spell_args(args_of(t)) + ">";
-    if (has_identifier(t))         return qualified(t);
-    return std::string(display_string_of(t));
-}
-
-// Python-facing identifier fragment for a type:
-//   float -> float, unsigned char -> uint8, geom::Robot -> Robot,
-//   Vector3<Vector3<unsigned>> -> Vector3_Vector3_uint
-consteval std::string pretty(info t) {
-    t = dealias(remove_cvref(t));
-    for (auto f : fundamentals()) {
-        if (t == dealias(f.type)) return std::string(f.pretty);
-    }
-    std::string s = has_template_arguments(t) ? std::string(identifier_of(template_of(t)))
-                  : has_identifier(t)         ? std::string(identifier_of(t))
-                                              : std::string("anon");
-    if (has_template_arguments(t)) {
-        for (info a : template_arguments_of(t)) {
-            s += "_";
-            s += is_type(a) ? pretty(a) : std::string(display_string_of(a));
-        }
-    }
-    return s;
-}
-
-// Python name for an instantiation nobody aliased:
-//   Vector3<float> -> Vector3_float, Matrix<float, 3> -> Matrix_float_3,
-//   Stack<std::string> -> Stack_string, Stack<geom::Robot> -> Stack_Robot
-consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
-    std::string s(identifier_of(tmpl));
-    for (info a : args) {
-        s += "_";
-        s += is_type(a) ? pretty(a) : std::string(display_string_of(a));
-    }
-    return s;
-}
-
-} // namespace spelling
-} // namespace mirror_bridge
 
 // Include P3394 annotations support for field-level binding control
 // Requires -freflection-latest with Bloomberg's clang-p2996
@@ -7247,45 +7359,13 @@ struct BoundClass {
     explicit operator bool() const { return type != nullptr; }
 };
 
-// Every class T is transitively derived from, in breadth-first order.
-// bind_class records one upcast thunk per entry, which is what lets a
-// Derived still be passed where a Base is expected once arguments are
-// identity-checked.
-template<typename T>
-consteval std::vector<std::meta::info> collect_base_closure() {
-    std::vector<std::meta::info> found;
-    std::vector<std::meta::info> layer{^^T};
-    while (!layer.empty()) {
-        std::vector<std::meta::info> next;
-        for (auto cls : layer) {
-            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
-                auto base_type = std::meta::type_of(b);
-                bool seen = false;
-                for (auto f : found) {
-                    if (f == base_type) { seen = true; break; }
-                }
-                if (seen) continue;          // diamond: one entry per base
-                found.push_back(base_type);
-                next.push_back(base_type);
-            }
-        }
-        layer = next;
-    }
-    return found;
-}
-
-template<typename T>
-struct BaseClosure {
-    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
-};
-
-// Alias-template form, because the pack below appears only inside a splice
-// and GCC does not treat that as expandable (see core/mirror_bridge_core.hpp).
-template<typename T, std::size_t I>
-consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+// The base closure itself lives in core/mirror_bridge_core.hpp: all three
+// backends need it to keep derived-to-base conversions working once
+// arguments are identity-checked.
+using core::BaseClosure;
 
 template<typename T, std::size_t I>
-using base_t = typename [:base_at<T, I>():];
+using base_t = core::base_t<T, I>;
 
 template<typename T>
 void register_base_upcasts() {
