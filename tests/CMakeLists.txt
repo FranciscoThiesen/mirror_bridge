@@ -300,6 +300,19 @@ set(MB_PYTHON_BASH_ONLY_PATTERN
     "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation"
 )
 
+# The same contract for the other two backends. These were spelled out at
+# each registration loop instead of here, and the two drifted: js/exception_test
+# has its own binding.gyp and build_and_test.sh, so CMake never builds its
+# module, but only the Lua loop excluded it. ctest therefore ran a node test
+# against a module that was not there and reported MODULE_NOT_FOUND, which is
+# the one thing ctest is supposed not to do.
+set(MB_LUA_BASH_ONLY_PATTERN
+    "auto_discovery|custom_converter|smart_ptr_test|exception_test"
+)
+set(MB_JS_BASH_ONLY_PATTERN
+    "auto_discovery|custom_converter|smart_ptr_test|basic|comprehensive|exception_test"
+)
+
 # Template instantiation planning is a CLI feature (discover/probe rounds
 # driven by tools/mirror_bridge_templates.py), so its test runs the CLI
 # end to end with this build's compiler.
@@ -362,7 +375,7 @@ if(LUA_FOUND)
 
             # Skip tests whose modules the bash harness builds, not CMake
             # (same contract as the Python runner above)
-            if(REL_PATH MATCHES "auto_discovery|custom_converter|smart_ptr_test|exception_test")
+            if(REL_PATH MATCHES "${MB_LUA_BASH_ONLY_PATTERN}")
                 continue()
             endif()
 
@@ -401,7 +414,7 @@ if(NAPI_FOUND)
 
             # Skip tests whose modules the bash harness builds, not CMake
             # (same contract as the Python runner above)
-            if(REL_PATH MATCHES "auto_discovery|custom_converter|smart_ptr_test|basic|comprehensive")
+            if(REL_PATH MATCHES "${MB_JS_BASH_ONLY_PATTERN}")
                 continue()
             endif()
 
