@@ -34,4 +34,10 @@ struct Owner : Base {
     double read_leaf(const Leaf& l) const { return l.x; }
 };
 
+// A four-level chain: each level's view holds the one above it, so holding
+// only the deepest has to keep the whole ancestry alive.
+struct Level3 { Leaf leaf; };
+struct Level2 { Level3 three; };
+struct Level1 { Level2 two; };
+
 }  // namespace views

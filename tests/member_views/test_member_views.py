@@ -104,4 +104,39 @@ after = sys.getrefcount(o)
 assert before == after, (before, after)
 print("  ✓ owner refcount is stable over 1000 member reads")
 
+print("Test 11: a four-level chain writes through...")
+deep = mv.Level1()
+deep.two.three.leaf.x = 9.0
+assert deep.two.three.leaf.x == 9.0, deep.two.three.leaf.x
+print("  ✓ deep.two.three.leaf.x = 9.0 persists")
+
+print("Test 12: holding only the deepest view keeps the whole chain alive...")
+# Each level is a view holding a reference to the level above, so the
+# intermediate views are the only thing keeping the root's storage alive once
+# the root itself is unreferenced.
+leaf_view = mv.Level1().two.three.leaf
+gc.collect()
+leaf_view.x = 4.0
+assert leaf_view.x == 4.0, leaf_view.x
+del leaf_view
+gc.collect()
+print("  ✓ no use-after-free with every intermediate owner unreferenced")
+
+print("Test 13: assigning a whole member is visible through an existing view...")
+# py_setter assigns into the member in place, so the view's pointer stays
+# good and sees the new value rather than going stale.
+m = mv.Middle()
+lv = m.leaf
+m.leaf = mv.Leaf()
+m.leaf.x = 7.0
+assert lv.x == 7.0, lv.x
+print("  ✓ the view tracks the member across a whole-member assignment")
+
+print("Test 14: refcounts stay balanced over a deep chain...")
+before = sys.getrefcount(deep)
+for _ in range(2000):
+    deep.two.three.leaf.x
+assert sys.getrefcount(deep) == before, (before, sys.getrefcount(deep))
+print("  ✓ 2000 four-level reads leak no references")
+
 print("\nAll member view tests passed!")
