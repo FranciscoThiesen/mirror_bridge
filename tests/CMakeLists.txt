@@ -138,6 +138,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # ...and must actually be the current amalgamation of the modular
+    # headers, which nothing checked: a change under python/ or core/ that
+    # skipped amalgamate.sh left the single-header distribution on different
+    # code from the modular one, silently.
+    add_test(NAME single_header_sync
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/check_single_header_sync.sh
+    )
+
     # The single header must also compile with no repo include path at all
     # (issue #12). Runs the compiler directly against a copy in a temp dir.
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/single_header_test)

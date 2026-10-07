@@ -203,3 +203,9 @@ jobs:
         run: |
           # The test script auto-detects GCC vs Clang and uses appropriate flags
           ./tests/run_all_tests.sh
+
+      # single_header/*.hpp is generated from the modular headers and
+      # committed, so it can drift with nothing to notice. Compiler-
+      # independent, so it runs in one job rather than all of them.
+      - name: Check the single headers are the current amalgamation
+        run: ./tests/check_single_header_sync.sh
