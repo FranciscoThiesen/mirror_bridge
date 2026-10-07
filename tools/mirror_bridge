@@ -1152,7 +1152,13 @@ cmd_generate() {
     [ ! -d "$src_dir" ] && { echo -e "${RED}Error: Directory not found: $src_dir${NC}"; json_fail "args" "Directory not found: $src_dir"; }
 
     src_dir=$(realpath "$src_dir")
-    OUTPUT_DIR=$(realpath "$OUTPUT_DIR" 2>/dev/null || echo "$OUTPUT_DIR")
+    # -m, because the directory does not exist yet and plain realpath refuses
+    # a path whose parent is missing ("--output build/py" on a clean tree).
+    # Left relative, the planner's work directory under it is unreachable from
+    # the compiler, which runs with the source directory as its cwd: the
+    # discovery unit then fails for a reason that has nothing to do with the
+    # headers, and the class list silently drops back to the text scan.
+    OUTPUT_DIR=$(realpath -m "$OUTPUT_DIR" 2>/dev/null || echo "$OUTPUT_DIR")
     mkdir -p "$OUTPUT_DIR"
 
     echo -e "${CYAN}Mirror Bridge - Generate Bindings${NC}"
