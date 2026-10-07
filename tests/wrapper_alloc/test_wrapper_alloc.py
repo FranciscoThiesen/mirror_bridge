@@ -99,4 +99,75 @@ assert h3.c.x == 7.25
 assert h3.label == "holder"
 print("  ✓ inline payload and member views coexist")
 
+print("Test 9: re-initialising an initialised object is refused...")
+# Python lets __init__ be called directly, so the payload can already hold a
+# live object. Writing over it skips its destructor; freeing it first leaves
+# any member view reading freed memory. Neither is acceptable, so it is
+# refused and the object is left exactly as it was.
+wa.Holder.reset()
+c = wa.Counted(1.0)
+try:
+    c.__init__(2.0)
+    raise AssertionError("expected re-initialisation to be refused")
+except TypeError as exc:
+    assert "already initialised" in str(exc), exc
+assert c.x == 1.0, c.x
+assert wa.Holder.destroyed() == 0, wa.Holder.destroyed()
+del c
+gc.collect()
+assert wa.Holder.destroyed() == 1, wa.Holder.destroyed()
+print("  ✓ refused, object untouched, destroyed exactly once at the end")
+
+print("Test 10: a throwing constructor is not even reached on re-init...")
+# Reaching it was a double free: unwinding destroys the members the
+# constructor had built, and tp_dealloc then destroyed them again.
+f = wa.Fragile(5)
+assert f.get() == 5
+try:
+    f.__init__(-1)
+    raise AssertionError("expected re-initialisation to be refused")
+except TypeError as exc:
+    assert "already initialised" in str(exc), exc
+assert f.get() == 5, f.get()
+del f
+gc.collect()
+print("  ✓ refused before the constructor runs, object still usable")
+
+print("Test 10b: a member view is never left dangling by a re-init...")
+# The owner here is over-aligned, so its C++ object is on the heap rather
+# than in the payload. Freeing it would have left this view reading freed
+# memory, which read back as 9.2689507951829e-310.
+assert wa.WideNest.__basicsize__ == 40, wa.WideNest.__basicsize__  # heap, not inline
+n = wa.WideNest(2.0)
+nv = n.held
+assert nv.x == 2.0, nv.x
+try:
+    n.__init__(5.0)
+    raise AssertionError("expected re-initialisation to be refused")
+except TypeError as exc:
+    assert "already initialised" in str(exc), exc
+assert nv.x == 2.0, nv.x
+assert n.held.x == 2.0, n.held.x
+nv.x = 6.0
+assert n.held.x == 6.0, n.held.x
+print("  ✓ the view still reads and writes the owner's live member")
+
+print("Test 10c: a failed FIRST construction leaves a clearly empty object...")
+try:
+    wa.Fragile(-1)
+    raise AssertionError("expected the constructor to raise")
+except RuntimeError as exc:
+    assert "negative tag" in str(exc), exc
+print("  ✓ the constructor's own exception propagates")
+
+print("Test 11: a 16-byte-aligned payload stays inline and is aligned...")
+# 16 is what CPython's object allocator promises, so this one must not fall
+# back, and its members must be readable at the computed offset.
+assert wa.Snug.__basicsize__ > 40, wa.Snug.__basicsize__
+sn = wa.Snug()
+assert sn.sum() == 3.0, sn.sum()
+sn.a = 10.0
+assert sn.sum() == 12.0
+print(f"  ✓ Snug {wa.Snug.__basicsize__} bytes inline, reads correctly")
+
 print("\nAll wrapper allocation tests passed!")

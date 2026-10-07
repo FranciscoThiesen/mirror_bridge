@@ -2914,6 +2914,33 @@ T* inline_payload(PyWrapper<T>* w) {
     return reinterpret_cast<T*>(reinterpret_cast<char*>(w) + inline_payload_offset<T>);
 }
 
+// Destroy whatever this wrapper owns and leave it holding nothing.
+//
+// Shared by tp_dealloc and by py_init, which can be reached a second time on
+// an object that is already built: Python lets __init__ be called directly.
+// Clearing cpp_object is the part that matters for an inline payload. A
+// constructor that throws part way has already had its built sub-objects
+// destroyed by unwinding, so leaving the pointer in place would let
+// tp_dealloc destroy them a second time.
+template<typename T>
+void release_held_object(PyWrapper<T>* wrapper) {
+    if (wrapper->owns && wrapper->cpp_object) {
+        // An inline payload is distinguishable without a flag: it is the only
+        // object that can sit at exactly this address.
+        if constexpr (payload_fits_inline_v<T>) {
+            if (wrapper->cpp_object == inline_payload(wrapper)) {
+                wrapper->cpp_object->~T();
+                wrapper->cpp_object = nullptr;
+                wrapper->owns = false;
+                return;
+            }
+        }
+        delete wrapper->cpp_object;
+    }
+    wrapper->cpp_object = nullptr;
+    wrapper->owns = false;
+}
+
 // Storage for a default construction: the inline slot when the exact type
 // the wrapper was sized for is what is being built, the heap otherwise. A
 // trampoline is a larger type than tp_basicsize accounts for, so it takes
@@ -3094,19 +3121,7 @@ public:
 template<typename T>
 void py_dealloc(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
-    if (wrapper->owns && wrapper->cpp_object) {
-        // An inline payload is distinguishable without a flag: it is the only
-        // object that can sit at exactly this address.
-        if constexpr (payload_fits_inline_v<T>) {
-            if (wrapper->cpp_object == inline_payload(wrapper)) {
-                wrapper->cpp_object->~T();
-            } else {
-                delete wrapper->cpp_object;
-            }
-        } else {
-            delete wrapper->cpp_object;
-        }
-    }
+    release_held_object(wrapper);
     // A view owns nothing but the reference that keeps the storage alive.
     Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
@@ -3318,6 +3333,28 @@ template<typename T, typename Trampoline = T>
 int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
 
+    // Re-initialising an object that already holds one is refused rather than
+    // attempted, because there is no safe way to do it.
+    //
+    // Constructing over live storage skips the old object's destructor, and
+    // with an inline payload a constructor that throws part way leaves the
+    // slot already unwound for tp_dealloc to destroy a second time. Freeing
+    // the old object first fixes both of those and introduces something
+    // worse: a member view (py_getter) holds a raw pointer into the owner's
+    // storage, kept alive by a reference to the wrapper rather than to the
+    // C++ object, so freeing it leaves the view reading freed memory. There
+    // is no view count to consult. Refusing costs nothing real -- the first
+    // __init__ after tp_new still has a null pointer here -- and replaces a
+    // leak, a double free and a dangling read with one clear error.
+    if (wrapper->cpp_object) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s is already initialised; calling __init__ again is "
+                     "refused because anything holding a reference into this "
+                     "object would be left dangling. Construct a new one.",
+                     Py_TYPE(self)->tp_name);
+        return -1;
+    }
+
     const Py_ssize_t nargs = args ? PyTuple_GET_SIZE(args) : 0;
     const Py_ssize_t nkw = kwds ? PyDict_GET_SIZE(kwds) : 0;
 
@@ -3510,7 +3547,9 @@ template<typename T, std::size_t Index>
 PyObject* py_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3546,7 +3585,9 @@ template<typename T, std::size_t Index>
 int py_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -3602,7 +3643,9 @@ template<typename T, std::size_t VisibleIndex>
 PyObject* py_visible_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3624,7 +3667,9 @@ template<typename T, std::size_t VisibleIndex>
 int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -3735,7 +3780,9 @@ template<typename T, std::size_t Index>
 PyObject* py_method(PyObject* self, PyObject* args) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -4253,7 +4300,9 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* const* args,
                                    std::index_sequence<AllIndices...>) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -4589,7 +4638,9 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
     if (!resolve_wrapper_object<T>(self, self_raw)) {
         PyTypeObject* mine = TypeRegistry<T>::py_type;
         if (mine && PyObject_TypeCheck(self, mine)) {
-            PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+            PyErr_SetString(PyExc_RuntimeError,
+                            "this object holds no C++ value: its constructor "
+                            "raised, or __init__ was called again and failed");
             return nullptr;
         }
         // Not our left operand: let Python try the reflected operation and
@@ -4646,7 +4697,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* unary_op_wrapper(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
     using Ret = typename [:std::meta::return_type_of(OperatorCache<T>::at(OpIndex)):];
@@ -4688,7 +4741,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* call_wrapper(PyObject* self, PyObject* args, PyObject* /*kwds*/) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
