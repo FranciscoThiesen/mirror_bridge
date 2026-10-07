@@ -95,5 +95,40 @@ portfolio.held = new ts.Curve();
 assert(portfolio.held.rate === 0.05, "class-typed property assignment broke");
 ok("class-typed property assignment is checked");
 
+
+// ------------------------------------------------------------------------
+// An object from another native addon. napi_unwrap says an object was
+// wrapped, never by whom, so a second addon's object comes back out of it
+// with that addon's payload layout. mirror_bridge read a const char* from
+// the front of that payload and followed it, which is a crash for a null or
+// a small integer and a page of the other addon's heap in the error message
+// for anything else. The tag is now preceded by a magic word, so nothing is
+// read out of a payload that is not ours.
+let foreign;
+try {
+    foreign = require('foreign_addon');
+} catch (e) {
+    try { foreign = require('../../../build/tests/foreign_addon.node'); } catch (e2) { foreign = null; }
+}
+
+if (foreign) {
+    for (const maker of ['nullFirst', 'smallFirst', 'pointerFirst']) {
+        const alien = foreign[maker]();
+        const message = rejects(() => ts.Curve.prototype.at.call(alien, 2.0),
+                                `Curve.at on a ${maker} object from another addon`);
+        // The old failure printed bytes out of the other addon's payload.
+        assert(message.endsWith('got object'),
+               `error describes a foreign payload: ${message}`);
+        rejects(() => new ts.Portfolio().book(alien),
+                `${maker} object from another addon as an argument`);
+        rejects(() => Object.getOwnPropertyDescriptor(ts.Curve.prototype, 'rate')
+                            .get.call(alien),
+                `rate getter on a ${maker} object from another addon`);
+    }
+    ok("an object from another native addon is refused, not dereferenced");
+} else {
+    console.log("  SKIP: foreign addon helper not built");
+}
+
 console.log();
 console.log(`All ${passed} JavaScript type safety tests passed`);

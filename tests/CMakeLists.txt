@@ -303,6 +303,24 @@ if(MIRROR_BRIDGE_BUILD_JS AND NAPI_FOUND)
             js/type_safety/type_safety_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/type_safety
         )
+
+        # A second native addon, so the test can hand the boundary an object
+        # that napi_unwrap accepts and mirror_bridge did not wrap. Plain C++
+        # against node_api.h, not a mirror_bridge binding.
+        add_library(foreign_addon MODULE js/type_safety/foreign_addon.cpp)
+        target_include_directories(foreign_addon PRIVATE ${NAPI_INCLUDE_DIR})
+        # Plain C++ with no reflection: it must not pick up the project's
+        # -freflection flags or the mirror_bridge headers.
+        set_target_properties(foreign_addon PROPERTIES
+            PREFIX "" SUFFIX ".node"
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+        )
+        # Node resolves the addon's N-API symbols at load time
+        if(APPLE)
+            target_link_options(foreign_addon PRIVATE -Wl,-undefined,dynamic_lookup)
+        endif()
+        add_dependencies(type_safety_js foreign_addon)
     endif()
 
 endif()
@@ -330,6 +348,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/template_instantiation)
     )
     set_tests_properties(cli_template_instantiation PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
+# core::type_key is the cross-module identity of a bound class, so two
+# distinct types sharing a key is a type confusion at the Lua and JavaScript
+# boundaries. All static_assert, so the test is a compile.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/type_key)
+    add_test(NAME type_key_distinctness
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/type_key/check_type_keys.sh
+                ${CMAKE_CXX_COMPILER}
     )
 endif()
 
