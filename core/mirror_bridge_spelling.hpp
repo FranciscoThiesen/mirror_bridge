@@ -121,9 +121,13 @@ consteval std::vector<info> args_of(info spec) {
 consteval std::string spell(info t) {
     if (is_lvalue_reference_type(t)) return spell(remove_reference(t)) + "&";
     if (is_rvalue_reference_type(t)) return spell(remove_reference(t)) + "&&";
-    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
+    // cv before pointer, because remove_pointer drops the qualifiers on the
+    // pointer itself: taking the pointer branch first spelled `int* const`
+    // as `int*`, so the two shared a key and the backends could not tell
+    // Box<int*> from Box<int* const> apart.
     if (is_const(t))                 return spell(remove_const(t)) + " const";
     if (is_volatile(t))              return spell(remove_volatile(t)) + " volatile";
+    if (is_pointer_type(t))          return spell(remove_pointer(t)) + "*";
     t = dealias(t);
     for (auto f : fundamentals()) {
         if (t == dealias(f.type)) return std::string(f.spelling);

@@ -702,6 +702,25 @@ consteval const char* make_type_key() {
 template<typename T>
 inline constexpr const char* type_key = make_type_key<T>();
 
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Base Class Closure
 // ============================================================================
