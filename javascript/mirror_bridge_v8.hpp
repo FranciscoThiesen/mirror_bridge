@@ -398,6 +398,11 @@ using V8UpcastThunk = void* (*)(void*);
 struct V8BoundClass {
     ::v8::Global<::v8::FunctionTemplate>* constructor_template;
     const char* type_id;
+    // Which isolate the template belongs to. A Global may only be read back
+    // through the isolate it was created in, and bind_class overwrites the
+    // one Global per class, so an embedder with two isolates would otherwise
+    // have the scan below read a template through the wrong one.
+    ::v8::Isolate* isolate;
 };
 
 inline std::vector<V8BoundClass>& v8_bound_classes() {
@@ -422,8 +427,13 @@ inline V8UpcastThunk find_v8_upcast(const char* base_tid, const char* derived_ti
 
 // A base the language will not let us reach - inaccessible, or ambiguous
 // because it is inherited twice non-virtually - is skipped rather than
-// recorded, so the guard keeps bind_class compiling for hierarchies that
-// have one.
+// recorded, and the conversion is then declined, which is the same answer
+// C++ gives at that call site.
+//
+// The guard does not make such a hierarchy bindable, though: a class that
+// inherits one base twice non-virtually also inherits its members twice, and
+// reflection enumerates both, so bind_class fails earlier on the ambiguous
+// member call. That is older than the upcast table and unchanged by it.
 template<typename Derived, typename Base>
 void register_v8_upcast() {
     if constexpr (requires (Derived* d) { static_cast<Base*>(d); }) {
@@ -470,7 +480,7 @@ bool resolve_v8_wrapper(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value, 
     // safe, so the dynamic type has to be established the same way rather
     // than by trusting the field's contents.
     for (const V8BoundClass& bound : v8_bound_classes()) {
-        if (bound.constructor_template->IsEmpty()) continue;
+        if (bound.constructor_template->IsEmpty() || bound.isolate != isolate) continue;
         ::v8::Local<::v8::FunctionTemplate> tpl = bound.constructor_template->Get(isolate);
         if (!tpl->HasInstance(obj)) continue;
 
@@ -492,15 +502,31 @@ inline const char* v8_expected_name() {
     return name ? name : core::type_key<T>;
 }
 
-inline void describe_v8_value(::v8::Local<::v8::Value> value, char* out, std::size_t out_size) {
-    if (!value.IsEmpty() && value->IsObject()) {
-        ::v8::Local<::v8::Object> obj = value.As<::v8::Object>();
-        if (obj->InternalFieldCount() >= kInternalFieldCount) {
-            if (V8WrapperView* view = v8_wrapper_view(obj); view && view->type_name) {
-                std::snprintf(out, out_size, "%s", view->type_name);
-                return;
-            }
-        }
+// The bound name of an object made from one of this module's templates, or
+// nullptr. Through HasInstance like everything else: an internal field count
+// is not a sign the object is ours. Node hands scripts plenty of objects with
+// internal fields of their own - Buffer, MessagePort, vm.Script - and reading
+// the field out of one of those yields whatever Node stored there, which is
+// then followed as a const char*.
+inline const char* v8_bound_name_of(::v8::Isolate* isolate,
+                                    ::v8::Local<::v8::Value> value) {
+    if (value.IsEmpty() || !value->IsObject()) return nullptr;
+    ::v8::Local<::v8::Object> obj = value.As<::v8::Object>();
+    if (obj->InternalFieldCount() < kInternalFieldCount) return nullptr;
+    for (const V8BoundClass& bound : v8_bound_classes()) {
+        if (bound.constructor_template->IsEmpty() || bound.isolate != isolate) continue;
+        if (!bound.constructor_template->Get(isolate)->HasInstance(obj)) continue;
+        V8WrapperView* view = v8_wrapper_view(obj);
+        return (view && view->type_name) ? view->type_name : bound.type_id;
+    }
+    return nullptr;
+}
+
+inline void describe_v8_value(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value,
+                              char* out, std::size_t out_size) {
+    if (const char* name = v8_bound_name_of(isolate, value)) {
+        std::snprintf(out, out_size, "%s", name);
+        return;
     }
     const char* kind = "value";
     if (value.IsEmpty())            kind = "nothing";
@@ -519,7 +545,7 @@ template<typename Expected>
 void throw_v8_wrong_type(::v8::Isolate* isolate, ::v8::Local<::v8::Value> value,
                          const char* context) {
     char actual[256];
-    describe_v8_value(value, actual, sizeof actual);
+    describe_v8_value(isolate, value, actual, sizeof actual);
     char message[640];
     std::snprintf(message, sizeof message, "%s: expected %s, got %s",
                   context, v8_expected_name<Expected>(), actual);
@@ -554,8 +580,11 @@ void v8_getter(::v8::Local<::v8::Name> property,
                const ::v8::PropertyCallbackInfo<::v8::Value>& info) {
     ::v8::Isolate* isolate = info.GetIsolate();
 
-    // An accessor can be lifted off the prototype and called on any
-    // receiver, so the holder is not ours to assume.
+    // Checked like everything else, although V8 is stricter here than
+    // N-API is: these accessors are installed on the instance template with
+    // SetNativeDataProperty, so V8 surfaces them as data descriptors and
+    // always passes the holder it found the property on. The gate is what
+    // makes that an invariant rather than an assumption about V8 internals.
     void* raw = nullptr;
     if (!resolve_v8_wrapper<T>(isolate, info.Holder(), raw)) {
         constexpr auto name_sv = std::meta::identifier_of(get_data_member<T, Index>());
@@ -929,12 +958,17 @@ template<Bindable T>
     // by HasInstance, and recorded so a derived object's address can be
     // shifted to the base subobject it is being passed as.
     bool already_listed = false;
-    for (const V8BoundClass& bound : v8_bound_classes()) {
-        if (std::strcmp(bound.type_id, core::type_key<T>) == 0) { already_listed = true; break; }
+    for (V8BoundClass& bound : v8_bound_classes()) {
+        if (std::strcmp(bound.type_id, core::type_key<T>) == 0) {
+            bound.isolate = isolate;   // the Global was just reset into this one
+            already_listed = true;
+            break;
+        }
     }
     if (!already_listed) {
         v8_bound_classes().push_back(
-            V8BoundClass{&V8TypeRegistry<T>::constructor_template, core::type_key<T>});
+            V8BoundClass{&V8TypeRegistry<T>::constructor_template, core::type_key<T>,
+                         isolate});
     }
     register_v8_base_upcasts<T>();
 
