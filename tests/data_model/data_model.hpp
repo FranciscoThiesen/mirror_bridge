@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -89,25 +90,53 @@ struct Countdown {
     int from = 3;
 
     struct Sentinel {};
-    struct Cursor {
+    struct Tick {
         int value;
         int operator*() const { return value; }
-        Cursor& operator++() { --value; return *this; }
+        Tick& operator++() { --value; return *this; }
     };
-    friend bool operator!=(const Cursor& c, Sentinel) { return c.value > 0; }
+    friend bool operator!=(const Tick& c, Sentinel) { return c.value > 0; }
 
-    Cursor begin() const { return Cursor{from}; }
+    Tick begin() const { return Tick{from}; }
     Sentinel end() const { return Sentinel{}; }
 };
 
-// std::vector<bool> dereferences to a proxy reference, not to bool.
+// An iterator whose dereference type is not its element type, the way
+// std::vector<bool>'s is. What has to reach Python is value_type: converting
+// the proxy itself walks its members and hands back a dict. Spelled out here
+// rather than using std::vector<bool> so the test does not depend on whether
+// a standard library makes its bit-iterator members public.
 struct Flags {
-    std::vector<bool> bits;
+    int packed = 0;
+    int count = 0;
 
-    void add(bool b) { bits.push_back(b); }
-    std::size_t size() const { return bits.size(); }
-    std::vector<bool>::const_iterator begin() const { return bits.begin(); }
-    std::vector<bool>::const_iterator end() const { return bits.end(); }
+    struct BitRef {
+        int value;
+        explicit operator bool() const { return value != 0; }
+    };
+
+    struct BitCursor {
+        using iterator_category = std::input_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = BitRef;
+
+        int packed;
+        int index;
+
+        BitRef operator*() const { return BitRef{(packed >> index) & 1}; }
+        BitCursor& operator++() { ++index; return *this; }
+        bool operator!=(const BitCursor& other) const { return index != other.index; }
+    };
+
+    void add(bool bit) {
+        if (bit) packed |= (1 << count);
+        ++count;
+    }
+    std::size_t size() const { return static_cast<std::size_t>(count); }
+    BitCursor begin() const { return BitCursor{packed, 0}; }
+    BitCursor end() const { return BitCursor{packed, count}; }
 };
 
 // A private member is absent from the reflected visible member list, so the

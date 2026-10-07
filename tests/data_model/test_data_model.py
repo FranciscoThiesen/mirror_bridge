@@ -217,16 +217,17 @@ assert not hasattr(data_model.Countdown, "__len__"), "no size(), so no len()"
 print("  ✓ begin() and end() of different types")
 
 print("Test 18: a proxy-reference element crosses as its value type...")
-# std::vector<bool>::const_iterator dereferences to a proxy, not to bool.
-# Converting the proxy itself walked its members and produced {} per element.
+# Flags::Cursor dereferences to BitRef and declares value_type = bool, the
+# shape std::vector<bool>'s iterator has. Converting the proxy itself walked
+# its members, so every element arrived as {'value': 1} instead of a bool.
 flags = data_model.Flags()
 for bit in (True, False, True):
     flags.add(bit)
 assert list(flags) == [True, False, True], list(flags)
-assert flags.bits == [True, False, True], flags.bits
+assert all(isinstance(bit, bool) for bit in flags), list(flags)
 assert len(flags) == 3
 assert True in flags and False in flags
-print("  ✓ vector<bool> yields booleans, iterated and as a member")
+print("  ✓ the element is the iterator's value_type, not its reference")
 
 print("Test 19: a class whose state cannot carry every member refuses to pickle...")
 # Each of these would dump and load into an object that looked right in repr()

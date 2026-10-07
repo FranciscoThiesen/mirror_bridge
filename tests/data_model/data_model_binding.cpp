@@ -10,7 +10,7 @@ MIRROR_BRIDGE_MODULE(data_model,
     mirror_bridge::bind_class<Stream::Cursor>(m, "Cursor");
     mirror_bridge::bind_class<Stream>(m, "Stream");
     mirror_bridge::bind_class<Tracked>(m, "Tracked");
-    mirror_bridge::bind_class<Countdown::Cursor>(m, "CountdownCursor");
+    mirror_bridge::bind_class<Countdown::Tick>(m, "CountdownTick");
     mirror_bridge::bind_class<Countdown>(m, "Countdown");
     mirror_bridge::bind_class<Flags>(m, "Flags");
     mirror_bridge::bind_class<Secretive>(m, "Secretive");
