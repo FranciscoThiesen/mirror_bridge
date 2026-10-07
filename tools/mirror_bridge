@@ -919,14 +919,18 @@ reflect_classes() {
 # The reflection unit has already run by this point (the template planner's
 # first round, or reflect_classes), and its answer is the one that survives
 # the preprocessor: `class JSON_API Value` is Json::Value here and a class
-# named JSON_API to any tokenizer. Returns 1 when that unit did not compile,
-# leaving the text scan's arrays alone for the caller to warn about.
+# named JSON_API to any tokenizer. Returns 1 when that unit did not compile
+# or when it compiled and reported no class at all, leaving the text scan's
+# arrays alone for the caller to warn about; REFLECTED_EMPTY tells those two
+# apart, because the second needs a different explanation.
 REFLECTED_CLASSES_FILE=""
+REFLECTED_EMPTY=0
 adopt_reflected_classes() {
     local -n ar_classes=$1
     local -n ar_headers=$2
     local src_dir="$3"
 
+    REFLECTED_EMPTY=0
     if [ -z "$REFLECTED_CLASSES_FILE" ] || [ ! -f "$REFLECTED_CLASSES_FILE" ]; then
         return 1
     fi
@@ -960,6 +964,16 @@ adopt_reflected_classes() {
         files+=("$header")
         lines+=("$line")
     done < "$REFLECTED_CLASSES_FILE"
+
+    # Reflection compiled and still named nothing, while the text scan has
+    # candidates. Every class the headers declare is then somewhere the walk
+    # does not reach, and an empty module is not the better answer: a header
+    # that built before would stop building, reported as "(reflection)" with
+    # no hint that a list was thrown away. Keep the scan's and say so.
+    if [ ${#names[@]} -eq 0 ] && [ ${#ar_classes[@]} -gt 0 ]; then
+        REFLECTED_EMPTY=1
+        return 1
+    fi
 
     ar_classes=("${names[@]}")
     ar_headers=("${files[@]}")
@@ -1215,10 +1229,17 @@ cmd_generate() {
         DISCOVERY_SOURCE="reflection"
     else
         echo ""
-        echo -e "${YELLOW}⚠ Reflection could not read these headers; falling back to a scan of the header text.${NC}"
+        if [ "$REFLECTED_EMPTY" -eq 1 ]; then
+            echo -e "${YELLOW}⚠ Reflection read these headers and found no class in them; falling back to a scan of the header text.${NC}"
+            echo "  Every class below is somewhere the walk does not go: an anonymous namespace,"
+            echo "  a namespace whose name starts with an underscore, or a file that resolved"
+            echo "  outside $src_dir."
+        else
+            echo -e "${YELLOW}⚠ Reflection could not read these headers; falling back to a scan of the header text.${NC}"
+            echo "  Why the reflection unit failed: $PLANNER_WORK/planner.log"
+        fi
         echo "  A text scan does not see the preprocessor, so a class declared through an"
         echo "  export macro (class JSON_API Value) is discovered under the macro's name."
-        echo "  Why the reflection unit failed: $PLANNER_WORK/planner.log"
     fi
 
     echo ""
