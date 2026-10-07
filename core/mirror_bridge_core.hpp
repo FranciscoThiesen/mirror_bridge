@@ -701,6 +701,11 @@ struct is_container<T, std::void_t<
 >> : std::bool_constant<!std::is_same_v<T, std::string> &&
                          !std::is_same_v<T, std::string_view>> {};
 
+// Mutually recursive with is_convertible_type: a nested struct is convertible
+// only if each of its members is, and a member may itself be a nested struct.
+template<Bindable T>
+consteval bool validate_bindable_members();
+
 // Checks if a type is convertible by mirror_bridge
 template<typename T>
 consteval bool is_convertible_type() {
@@ -725,7 +730,15 @@ consteval bool is_convertible_type() {
     } else if constexpr (is_container<U>::value) {
         return true;
     } else if constexpr (Bindable<U>) {
-        return true;
+        // A nested struct crosses as a dict built by walking exactly the
+        // members validate_bindable_members checks, so a member the walk
+        // cannot convert is a hard build error rather than a declined slot.
+        // libstdc++'s std::vector<bool>::const_iterator is the case that
+        // shows up: reflection reports its inherited, public _Bit_type*
+        // member, so a method returning one failed the module build under
+        // GCC while declining cleanly under libc++, where the equivalent
+        // member is private.
+        return validate_bindable_members<U>();
     } else {
         return false;
     }

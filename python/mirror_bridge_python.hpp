@@ -69,6 +69,8 @@
 #include <cstdio>   // For snprintf in simple repr functions
 #include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
+#include <iterator> // For iterator_traits in the iteration slots
+#include <utility>  // For cmp_less/cmp_greater in the length slot
 
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
@@ -1969,7 +1971,16 @@ PyObject* to_python(const T& container) {
 
     Py_ssize_t index = 0;
     for (const auto& item : container) {
-        PyObject* py_item = to_python(item);
+        // std::vector<bool> yields a proxy reference rather than a bool, and
+        // converting the proxy itself walks its members and produces an empty
+        // dict. Where the dereference type is not the element type, convert
+        // through the element type.
+        PyObject* py_item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(item)>, ValueType>) {
+            py_item = to_python(item);
+        } else {
+            py_item = to_python(static_cast<ValueType>(item));
+        }
         if (!py_item) {
             Py_DECREF(list);
             return nullptr;
@@ -4378,6 +4389,15 @@ template<HasBeginEnd T> struct iterator_of<T> {
 };
 template<typename T> using iterator_of_t = typename iterator_of<T>::type;
 
+// end() is not required to return the same type as begin(). A C++20 range may
+// end at a sentinel, which compares against the iterator but is not one, so
+// the type stored for the end of the range is this and not iterator_of_t.
+template<typename T> struct sentinel_of { using type = void; };
+template<HasBeginEnd T> struct sentinel_of<T> {
+    using type = decltype(std::declval<T&>().end());
+};
+template<typename T> using sentinel_of_t = typename sentinel_of<T>::type;
+
 template<typename T>
 concept Iterable = HasBeginEnd<T> && requires(T& t, iterator_of_t<T> it) {
     { it != t.end() } -> std::convertible_to<bool>;
@@ -4385,8 +4405,32 @@ concept Iterable = HasBeginEnd<T> && requires(T& t, iterator_of_t<T> it) {
     *it;
 };
 
+// Dereferencing an iterator need not yield the element type: std::vector<bool>
+// hands back a proxy reference, and converting that proxy as a struct produces
+// an empty dict rather than a bool. iterator_traits names the value type, so
+// prefer it, and fall back to the dereference type for a hand-rolled cursor
+// that has no traits.
+template<typename It>
+struct element_of {
+    using type = std::remove_cvref_t<decltype(*std::declval<It&>())>;
+};
+template<typename It>
+    requires requires { typename std::iterator_traits<It>::value_type; }
+struct element_of<It> {
+    using type = typename std::iterator_traits<It>::value_type;
+};
+
 template<typename T>
-using iter_element_t = std::remove_cvref_t<decltype(*std::declval<iterator_of_t<T>&>())>;
+using iter_element_t = typename element_of<iterator_of_t<T>>::type;
+
+// Re-reading begin() to detect a reallocation (see py_iter_next) needs the
+// iterator compared against another iterator, which the Iterable concept does
+// not ask for — it only asks for a comparison against end().
+template<typename T>
+concept IteratorSelfComparable = Iterable<T> &&
+    requires(iterator_of_t<T> a, iterator_of_t<T> b) {
+        { a != b } -> std::convertible_to<bool>;
+    };
 
 template<typename T>
 concept HasSize = requires(T& t) {
@@ -4435,7 +4479,22 @@ Py_ssize_t py_length(PyObject* self) {
         return -1;
     }
     try {
-        return static_cast<Py_ssize_t>(wrapper->cpp_object->size());
+        const auto count = wrapper->cpp_object->size();
+        // Py_ssize_t covers half the range of the usual std::size_t, and a
+        // count that does not fit would reach CPython as a negative length.
+        // CPython reports that as "returned NULL without setting an
+        // exception", which tells the caller nothing; an OverflowError names
+        // the class and the value instead. An unsigned size() that underflowed
+        // — items.size() - 1 on an empty container — arrives here too, which
+        // is the realistic way to land in this branch.
+        if (std::cmp_less(count, 0) || std::cmp_greater(count, PY_SSIZE_T_MAX)) {
+            const std::string text = std::to_string(count);
+            PyErr_Format(PyExc_OverflowError,
+                         "%s.size() is %s, which cannot be a Python length",
+                         Py_TYPE(self)->tp_name, text.c_str());
+            return -1;
+        }
+        return static_cast<Py_ssize_t>(count);
     } catch (const std::exception& e) {
         set_py_error_from_cpp_exception(e);
         return -1;
@@ -4468,7 +4527,8 @@ struct PyIter {
     PyObject_HEAD
     PyObject* owner;              // strong reference — see py_get_iter
     iterator_of_t<T> cursor;
-    iterator_of_t<T> stop;
+    sentinel_of_t<T> stop;
+    iterator_of_t<T> start;       // begin() when iteration started
     std::size_t guard;            // element count when iteration started
     bool finished;
 };
@@ -4483,6 +4543,7 @@ void py_iter_dealloc(PyObject* self) {
     auto* it = reinterpret_cast<PyIter<T>*>(self);
     std::destroy_at(&it->cursor);
     std::destroy_at(&it->stop);
+    std::destroy_at(&it->start);
     Py_XDECREF(it->owner);
     Py_TYPE(self)->tp_free(self);
 }
@@ -4500,11 +4561,12 @@ PyObject* py_iter_next(PyObject* self) {
     }
 
     // Holding a reference to the container keeps it alive but does not stop
-    // the Python side appending to it, and a reallocation leaves cursor and
-    // stop pointing into freed memory — a read, not a crash, so it would
-    // surface as wrong numbers. CPython's own dict and set iterators guard
-    // the same way: compare the element count against the count iteration
-    // started with, and refuse rather than dereference.
+    // the Python side mutating it, and a reallocation leaves cursor and stop
+    // pointing into freed memory — a read, not a crash, so it would surface
+    // as wrong numbers. Two cheap checks cover what is detectable:
+    //
+    // The element count, the way CPython's own dict and set iterators do it.
+    // This catches an append or a clear.
     if constexpr (HasSize<T>) {
         if (static_cast<std::size_t>(owner->cpp_object->size()) != it->guard) {
             it->finished = true;
@@ -4514,12 +4576,45 @@ PyObject* py_iter_next(PyObject* self) {
         }
     }
 
+    // Where begin() is, which the count alone does not cover: reserve() and
+    // shrink_to_fit() move a vector's storage without changing its size, and
+    // that is exactly the case that reads freed memory. Neither check sees a
+    // mutation that keeps both the count and the buffer — an erase paired with
+    // a push_back — so this narrows the window rather than closing it, and the
+    // reference docs say so.
+    if constexpr (IteratorSelfComparable<T>) {
+        try {
+            if (owner->cpp_object->begin() != it->start) {
+                it->finished = true;
+                PyErr_Format(PyExc_RuntimeError,
+                             "%s reallocated its storage during iteration",
+                             Py_TYPE(it->owner)->tp_name);
+                return nullptr;
+            }
+        } catch (const std::exception& e) {
+            it->finished = true;
+            set_py_error_from_cpp_exception(e);
+            return nullptr;
+        }
+    }
+
     try {
         if (!(it->cursor != it->stop)) {
             it->finished = true;
             return nullptr;
         }
-        PyObject* item = to_python(*it->cursor);
+        // The gate in is_iterable() accepted the element type, which for a
+        // proxy reference such as std::vector<bool>'s is not what *cursor
+        // yields; convert through the element type so the value, not the
+        // proxy's own layout, is what crosses.
+        decltype(auto) raw = *it->cursor;
+        PyObject* item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(raw)>,
+                                     iter_element_t<T>>) {
+            item = to_python(raw);
+        } else {
+            item = to_python(static_cast<iter_element_t<T>>(raw));
+        }
         if (!item) {
             it->finished = true;
             return nullptr;
@@ -4575,13 +4670,18 @@ PyObject* py_get_iter(PyObject* self) {
     auto* it = reinterpret_cast<PyIter<T>*>(iter_type->tp_alloc(iter_type, 0));
     if (!it) return nullptr;
 
-    bool cursor_built = false;
+    int built = 0;
     try {
         std::construct_at(&it->cursor, wrapper->cpp_object->begin());
-        cursor_built = true;
+        ++built;
         std::construct_at(&it->stop, wrapper->cpp_object->end());
+        ++built;
+        std::construct_at(&it->start, wrapper->cpp_object->begin());
+        ++built;
     } catch (...) {
-        if (cursor_built) std::destroy_at(&it->cursor);
+        if (built > 2) std::destroy_at(&it->start);
+        if (built > 1) std::destroy_at(&it->stop);
+        if (built > 0) std::destroy_at(&it->cursor);
         // tp_free rather than Py_DECREF: py_iter_dealloc would destroy
         // iterators that were never constructed.
         iter_type->tp_free(it);
@@ -4629,15 +4729,47 @@ consteval bool members_restorable(std::index_sequence<Is...>) {
                             !is_visible_member_const<T, Is>()));
 }
 
+// Does this type carry any state of its own, directly or through a base?
+consteval bool type_holds_no_state(std::meta::info type) {
+    if (!std::meta::nonstatic_data_members_of(
+            type, std::meta::access_context::unchecked()).empty()) {
+        return false;
+    }
+    for (auto base : std::meta::bases_of(type, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
+// The state is built from the *visible* member list, and three kinds of member
+// are missing from it: a private one, one marked [[=exclude{}]], and anything
+// a base class declares, because nonstatic_data_members_of reports only direct
+// members. Each of those still holds state that __setstate__ cannot put back,
+// so a class that has one would dump and load into a plausible object that had
+// quietly lost a field — the failure mode this whole gate exists to avoid.
+template<typename T>
+consteval bool every_member_in_state() {
+    const auto all = std::meta::nonstatic_data_members_of(
+        ^^T, std::meta::access_context::unchecked());
+    if (all.size() != annotations::count_visible_members<T>()) return false;
+    for (auto base : std::meta::bases_of(^^T, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
 // Reconstruction is `cls()` followed by __setstate__, so a class qualifies
 // only when Python can default-construct it and put every member back. A
 // const or [[=readonly{}]] member would be read into the state and then
 // silently dropped on the way back in, handing the caller a plausible object
 // that had quietly lost a field; such a class keeps raising at dumps() time,
-// which is at least the truth.
+// which is at least the truth. A member the state cannot even see is the same
+// bug with less warning, so every_member_in_state() rules those out too.
 template<typename T>
 consteval bool is_picklable() {
     if constexpr (!std::is_default_constructible_v<T>) {
+        return false;
+    } else if constexpr (!every_member_in_state<T>()) {
         return false;
     } else {
         return members_restorable<T>(
