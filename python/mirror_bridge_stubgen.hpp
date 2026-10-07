@@ -22,6 +22,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <algorithm>
 #include <sstream>
 #include <fstream>
 #include <typeinfo>
@@ -144,7 +145,7 @@ private:
                 continue;
             }
             ss << "def " << func.name << "("
-               << render_parameters(func.parameters, false)
+               << render_parameters(func.parameters, false, false)
                << ") -> " << func.return_type << ": ...\n";
         }
 
@@ -203,24 +204,43 @@ private:
     // `/` applies to everything before it, so it goes after the *last*
     // unnameable parameter.
     static std::string render_parameters(const std::vector<ParameterInfo>& params,
-                                         bool leading_self) {
-        std::vector<std::string> names;
-        names.reserve(params.size());
+                                         bool leading_self, bool accepts_keywords) {
+        std::vector<std::string> names(params.size());
         std::set<std::string> taken;
-        std::ptrdiff_t positional_only_through = -1;
+        std::ptrdiff_t positional_only_through = accepts_keywords
+            ? -1
+            : static_cast<std::ptrdiff_t>(params.size()) - 1;
 
         if (leading_self) taken.insert("self");
+
+        // Reserve the names the runtime really answers to before inventing
+        // any. Doing it in one pass let a substitute claim a later
+        // parameter's real name: `f(double lambda, double lambda_)` rendered
+        // as `lambda_, lambda__`, and `lambda__` is a keyword the module
+        // does not have.
         for (size_t i = 0; i < params.size(); ++i) {
-            std::string name = params[i].name;
+            const std::string& name = params[i].name;
             const bool unnameable =
-                name.empty() || is_python_keyword(name) || name == "self";
-            if (unnameable) {
-                positional_only_through = static_cast<std::ptrdiff_t>(i);
-                name = name.empty() ? ("arg" + std::to_string(i)) : (name + "_");
+                name.empty() || is_python_keyword(name) || (leading_self && name == "self");
+            if (!unnameable) {
+                names[i] = name;
+                taken.insert(name);
             }
+        }
+
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (!names[i].empty()) continue;
+            // No keyword reaches this one, whether because it is spelled like
+            // a Python keyword, because it collides with the receiver, or
+            // because the C++ declaration never named it.
+            positional_only_through =
+                std::max(positional_only_through, static_cast<std::ptrdiff_t>(i));
+            std::string name = params[i].name.empty()
+                                   ? ("arg" + std::to_string(i))
+                                   : (params[i].name + "_");
             while (taken.count(name)) name += "_";
             taken.insert(name);
-            names.push_back(name);
+            names[i] = name;
         }
 
         std::ostringstream ss;
@@ -258,14 +278,14 @@ private:
             ss << "    def __init__(self) -> None: ...\n";
         } else if (info.constructors.size() == 1) {
             ss << "    def __init__("
-               << render_parameters(info.constructors[0].parameters, true)
+               << render_parameters(info.constructors[0].parameters, true, true)
                << ") -> None: ...\n";
         } else {
             // Multiple constructors - use @overload
             for (const auto& ctor : info.constructors) {
                 ss << "    @overload\n";
                 ss << "    def __init__("
-                   << render_parameters(ctor.parameters, true)
+                   << render_parameters(ctor.parameters, true, true)
                    << ") -> None: ...\n";
             }
         }
@@ -301,10 +321,10 @@ private:
             if (method.is_static) {
                 ss << "    @staticmethod\n";
                 ss << "    def " << method.name << "("
-                   << render_parameters(method.parameters, false);
+                   << render_parameters(method.parameters, false, false);
             } else {
                 ss << "    def " << method.name << "("
-                   << render_parameters(method.parameters, true);
+                   << render_parameters(method.parameters, true, true);
             }
             ss << ") -> " << method.return_type << ": ...\n";
         }
@@ -464,9 +484,7 @@ void register_function_stub(const char* name, const std::vector<std::string>& pa
 
     std::vector<std::string> type_hints = {type_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
-        std::string pname = (i < param_names.size() && !param_names[i].empty())
-                                ? param_names[i]
-                                : "arg" + std::to_string(i);
+        std::string pname = i < param_names.size() ? param_names[i] : std::string();
         func.parameters.push_back({pname, type_hints[i]});
     }
 
@@ -496,9 +514,7 @@ void register_method_stub(const char* class_name, const char* method_name,
     // Generate parameters
     std::vector<std::string> type_hints = {type_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
-        std::string pname = (i < param_names.size() && !param_names[i].empty())
-                                ? param_names[i]
-                                : "arg" + std::to_string(i);
+        std::string pname = i < param_names.size() ? param_names[i] : std::string();
         method.parameters.push_back({pname, type_hints[i]});
     }
 
@@ -525,9 +541,7 @@ void register_constructor_stub(const char* class_name,
     ConstructorInfo ctor;
     std::vector<std::string> type_hints = {type_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
-        std::string pname = (i < param_names.size() && !param_names[i].empty())
-                                ? param_names[i]
-                                : "arg" + std::to_string(i);
+        std::string pname = i < param_names.size() ? param_names[i] : std::string();
         ctor.parameters.push_back({pname, type_hints[i]});
     }
 

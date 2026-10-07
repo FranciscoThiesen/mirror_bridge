@@ -907,8 +907,13 @@ compile_binding() {
     # itself through the PLT. The entry points stay visible: CPython's
     # PyMODINIT_FUNC and Node's NAPI_MODULE already carry the attribute, and
     # the Lua one is marked with MIRROR_BRIDGE_EXPORT.
+    # PROJECT_ROOT leads the include path on purpose. With `-I.` first,
+    # running the CLI from a directory that holds a mirror_bridge.hpp -- a
+    # vendored copy, or the repository itself while generating for some
+    # other project -- built the module against that header instead of
+    # this installation's, silently and with no diagnostic.
     local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
-        -I. -I$src_dir -I$PROJECT_ROOT \
+        -I$PROJECT_ROOT -I$src_dir -I. \
         -fPIC -shared -O3 -DNDEBUG \
         -fvisibility=hidden -fvisibility-inlines-hidden \
         -Wno-deprecated-declarations"

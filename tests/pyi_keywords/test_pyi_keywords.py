@@ -66,4 +66,49 @@ assert g.shadow(1.0, 2.0) == 3.0
 assert g.scale(**{"lambda": 3.0, "vega": 4.0}) == 12.0
 print("  ✓ positional, getattr and **{} access all behave as before")
 
+print("Test 9: a substitute never claims another parameter's real name...")
+# `lambda` has no keyword, so it is renamed; `lambda_` has one and must keep
+# it. Renaming in one pass let the substitute take `lambda_` and push the
+# real parameter to `lambda__`, advertising a keyword the module refuses.
+assert "def collide(self, lambda__: float, /, lambda_: float) -> float" in stubs, stubs
+assert g.collide(**{"lambda": 1.0, "lambda_": 2.0}) == 3.0
+try:
+    g.collide(**{"lambda": 1.0, "lambda__": 2.0})
+    raise AssertionError("lambda__ is not a keyword this module has")
+except TypeError:
+    pass
+print("  ✓ the real name survives, the substitute is positional-only")
+
+print("Test 10: an unnamed parameter has no keyword either...")
+assert "def unnamed(self, arg0: float, arg1: float, /) -> float" in stubs, stubs
+try:
+    gg = pyi_keywords.Greeks()
+    gg.unnamed(arg0=1.0, arg1=2.0)
+    raise AssertionError("an unnamed parameter has no keyword")
+except TypeError:
+    pass
+print("  ✓ rendered argN and marked positional-only")
+
+print("Test 11: static methods and free functions take no keywords...")
+# This is what the runtime does -- "takes no keyword arguments" -- so a stub
+# that leaves them nameable makes a type checker bless a call that raises.
+assert "def fold(lambda_: float, /) -> float" in stubs, stubs
+assert "def ratio(numerator: float, denominator: float, /) -> float" in stubs, stubs
+for call in (lambda: pyi_keywords.Greeks.fold(**{"lambda": 1.0}),
+             lambda: pyi_keywords.ratio(numerator=1.0, denominator=2.0)):
+    try:
+        call()
+        raise AssertionError("expected TypeError: takes no keyword arguments")
+    except TypeError:
+        pass
+assert pyi_keywords.ratio(1.0, 2.0) == 0.5
+print("  ✓ both marked positional-only, matching the runtime")
+
+print("Test 12: methods and constructors still accept keywords...")
+# The vectorcall path for methods and py_init both resolve keywords, so these
+# must NOT be marked positional-only.
+assert "def scale(self, lambda_: float, /, vega: float) -> float" in stubs, stubs
+assert g.scale(3.0, vega=4.0) == 12.0
+print("  ✓ vega stays nameable")
+
 print("\nAll .pyi keyword tests passed!")

@@ -14,6 +14,18 @@ struct Greeks {
     double shadow(double self, double other) const { return self + other; }
     double plain(double first, double second) const { return first - second; }
     static double fold(double lambda) { return lambda; }
+    // The second parameter's real name is a legal Python identifier, so it
+    // must survive: the substitute for the first must not claim it.
+    double collide(double lambda, double lambda_) const { return lambda + lambda_; }
+
+    // Unnamed in the declaration, so there is no keyword for either.
+    double unnamed(double, double) const { return 0.0; }
 };
+
+// A static method and a free function take no keyword arguments at all, so
+// every parameter of theirs is reachable by position only.
+double ratio(double numerator, double denominator) {
+    return denominator == 0.0 ? 0.0 : numerator / denominator;
+}
 
 }  // namespace kwtest

@@ -134,8 +134,10 @@ def test_baseline_and_containers():
 def test_stubs():
     pyi = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "geom.pyi")
     text = open(pyi).read()
+    # A free function takes no keyword arguments at runtime, so its stub
+    # marks every parameter positional-only.
     for needle in ("class Vec3f:", "class Vector3_long:", "position: Vec3d", "path: list[Vec3f]",
-                   "def dot3(a: Vec3f, b: Vec3f) -> float", "def answer() -> int"):
+                   "def dot3(a: Vec3f, b: Vec3f, /) -> float", "def answer() -> int"):
         assert needle in text, needle
     print("✓ stubs name instantiations")
 
