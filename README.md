@@ -148,11 +148,19 @@ convertible elements iterates and answers `in`; add `size()` and it gains
 `len()`, and an empty one is falsy. A default-constructible class whose members
 are all assignable pickles and deep-copies, with the member list taken from
 reflection so it cannot fall behind the C++ struct; one that cannot be
-reconstructed — a `const` or `[[=readonly{}]]` member — keeps refusing to
-pickle rather than silently dropping a field. `hash()` is still identity-based
-even for a class with `operator==`, so two equal objects are two different
-dictionary keys; a value hash over members that Python can assign would be
-worse, because mutating the object would corrupt any set or dict holding it.
+reconstructed — a `const` or `[[=readonly{}]]` member, a private or
+`[[=exclude{}]]` one the state cannot see, or a member a base class declares —
+keeps refusing to pickle rather than silently dropping a field.
+
+`hash()` is not generated, and what that leaves differs by class. A class with
+`operator==` is **unhashable**: CPython inherits `tp_hash` from `object` only
+when it also inherits `tp_richcompare`, so defining comparison and no hash
+makes `set`, `dict` and `in` over a set raise
+`TypeError: unhashable type: 'mod.Point'`. Use a list, or key on a member. A
+class without `operator==` keeps the identity hash, so two equal-looking
+objects remain two distinct keys. Hashing the member values instead would be
+worse: every non-`const` member is assignable from Python, and a hash that
+moves corrupts any set or dict already holding the object.
 
 ⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
 enum *types* are not exported, so there is no Python, Lua or JavaScript object
