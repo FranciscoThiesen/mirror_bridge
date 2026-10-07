@@ -411,7 +411,7 @@ length`. The realistic way to get there is an unsigned count that underflowed,
 length instead produces only `SystemError: returned NULL without setting an
 exception`.
 
-### bool() is a behaviour change
+### bool() is a behavior change
 
 A class that is iterable and sized used to be truthy always, because nothing
 in the type defined otherwise. It is now falsy when empty. This changes more
@@ -482,7 +482,7 @@ before the last dot, and without it every bound class claimed to live in
 
 ### Hashing
 
-No `tp_hash` is generated, which leaves two different behaviours depending on
+No `tp_hash` is generated, which leaves two different behaviors depending on
 whether the class defines `operator==`.
 
 | the class | `hash()` | in a `set` or as a `dict` key |
