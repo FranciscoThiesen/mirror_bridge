@@ -193,7 +193,14 @@ while IFS= read -r -d '' binding_file; do
 # They only compile with the generated inputs beside them and the source
 # directory as the cwd, so every run after the first reported them as failed
 # bindings on a tree that was otherwise green.
+# Exclude build output directories - the CLI tests generate <module>_binding.cpp
+# into tests/*/build/, which only compiles with the generated headers beside it.
+# Running ctest and then this script reported those as failed bindings on a tree
+# that is green from a fresh checkout, which is the worst kind of false alarm:
+# it only appears for people who ran the fast suite first.
 done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_bridge/*" \
+              -not -path "*/build/*" -not -path "*/build_ci/*" -not -path "*/build_ctest/*" \
+              -not -path "*/.worktrees/*" \
               -not -name "test_validation.cpp" "${P3394_EXCLUDE[@]}" -print0)
 
 # Step 2: Run all Python tests
