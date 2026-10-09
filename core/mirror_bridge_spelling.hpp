@@ -79,11 +79,22 @@ consteval std::string spell(info t);
 // specialization, e.g. geom::Vector3<float>::cast).
 consteval std::string qualified(info entity) {
     std::string name(identifier_of(entity));
+
+    // parent_of is only a constant expression for a class or namespace
+    // member -- its own contract says so -- and asking anyway is a hard
+    // error, not an empty answer. box2d declares entities that are neither,
+    // and one of them took the whole discovery unit down: the unit failed to
+    // compile, so discovery fell back to the text scan for the entire
+    // library and reported 92 classes all called B2_API. One unanswerable
+    // name should cost that name, not the library.
+    if (!is_class_member(entity) && !is_namespace_member(entity)) return name;
+
     info p = parent_of(entity);
     while (true) {
         if (is_namespace(p)) {
             if (!has_identifier(p)) break;   // global (or anonymous) namespace
             name = std::string(identifier_of(p)) + "::" + name;
+            if (!is_class_member(p) && !is_namespace_member(p)) break;
             p = parent_of(p);
         } else if (is_type(p)) {
             name = spell(p) + "::" + name;
