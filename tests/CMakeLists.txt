@@ -206,6 +206,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # Python data model: iteration, len(), `in`, and pickling
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data_model)
+        mirror_bridge_python_module(data_model
+            data_model/data_model_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/data_model
+        )
+    endif()
+
 endif()
 
 # ============================================================================

@@ -69,6 +69,8 @@
 #include <cstdio>   // For snprintf in simple repr functions
 #include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
+#include <iterator> // For iterator_traits in the iteration slots
+#include <utility>  // For cmp_less/cmp_greater in the length slot
 
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
@@ -1969,7 +1971,16 @@ PyObject* to_python(const T& container) {
 
     Py_ssize_t index = 0;
     for (const auto& item : container) {
-        PyObject* py_item = to_python(item);
+        // std::vector<bool> yields a proxy reference rather than a bool, and
+        // converting the proxy itself walks its members and produces an empty
+        // dict. Where the dereference type is not the element type, convert
+        // through the element type.
+        PyObject* py_item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(item)>, ValueType>) {
+            py_item = to_python(item);
+        } else {
+            py_item = to_python(static_cast<ValueType>(item));
+        }
         if (!py_item) {
             Py_DECREF(list);
             return nullptr;
@@ -4345,6 +4356,548 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
 }
 
 // ============================================================================
+// Python Data Model — iteration, len(), `in`, and pickling
+// ============================================================================
+//
+// A bound class used to answer only half of what Python asks of an object:
+// `for x in obj`, `len(obj)`, `x in obj` and `pickle.dumps(obj)` all raised
+// TypeError no matter what the C++ type offered. Each of the four is derived
+// from the type itself, so no per-class glue is needed:
+//
+//   for x in obj   tp_iter/tp_iternext driven by T::begin()/T::end()
+//   x in obj       falls out of tp_iter — with no sq_contains, CPython's
+//                  PySequence_Contains searches by iterating
+//   len(obj)       mp_length/sq_length from T::size()
+//   pickle, copy   __reduce__/__setstate__ over the reflected member list
+//
+// Detection is a requires-expression rather than a reflected search for a
+// method named "begin": what has to compile is `++it`, `*it` and `it != end`,
+// and a requires-expression asks exactly those questions of exactly the
+// iterator type the class hands back.
+
+namespace datamodel {
+
+template<typename T>
+concept HasBeginEnd = requires(T& t) { t.begin(); t.end(); };
+
+// void for a type with no begin(), so the Iterable conjunct below can name
+// the iterator type in its parameter list without that being ill-formed for
+// every class that is not a range.
+template<typename T> struct iterator_of { using type = void; };
+template<HasBeginEnd T> struct iterator_of<T> {
+    using type = decltype(std::declval<T&>().begin());
+};
+template<typename T> using iterator_of_t = typename iterator_of<T>::type;
+
+// end() is not required to return the same type as begin(). A C++20 range may
+// end at a sentinel, which compares against the iterator but is not one, so
+// the type stored for the end of the range is this and not iterator_of_t.
+template<typename T> struct sentinel_of { using type = void; };
+template<HasBeginEnd T> struct sentinel_of<T> {
+    using type = decltype(std::declval<T&>().end());
+};
+template<typename T> using sentinel_of_t = typename sentinel_of<T>::type;
+
+template<typename T>
+concept Iterable = HasBeginEnd<T> && requires(T& t, iterator_of_t<T> it) {
+    { it != t.end() } -> std::convertible_to<bool>;
+    ++it;
+    *it;
+};
+
+// Dereferencing an iterator need not yield the element type: std::vector<bool>
+// hands back a proxy reference, and converting that proxy as a struct produces
+// an empty dict rather than a bool. iterator_traits names the value type, so
+// prefer it, and fall back to the dereference type for a hand-rolled cursor
+// that has no traits.
+template<typename It>
+struct element_of {
+    using type = std::remove_cvref_t<decltype(*std::declval<It&>())>;
+};
+template<typename It>
+    requires requires { typename std::iterator_traits<It>::value_type; }
+struct element_of<It> {
+    using type = typename std::iterator_traits<It>::value_type;
+};
+
+template<typename T>
+using iter_element_t = typename element_of<iterator_of_t<T>>::type;
+
+// Re-reading begin() to detect a reallocation (see py_iter_next) needs the
+// iterator compared against another iterator, which the Iterable concept does
+// not ask for — it only asks for a comparison against end().
+template<typename T>
+concept IteratorSelfComparable = Iterable<T> &&
+    requires(iterator_of_t<T> a, iterator_of_t<T> b) {
+        { a != b } -> std::convertible_to<bool>;
+    };
+
+template<typename T>
+concept HasSize = requires(T& t) {
+    { t.size() };
+    requires std::integral<std::remove_cvref_t<decltype(t.size())>>;
+    requires !std::same_as<std::remove_cvref_t<decltype(t.size())>, bool>;
+};
+
+// Iterable, and every element convertible to Python. The element goes
+// through the same gate named methods do, so a range of raw pointers or of
+// proxy references (vector<bool>) declines the slot instead of failing the
+// module build.
+template<typename T>
+consteval bool is_iterable() {
+    if constexpr (!Iterable<T>) {
+        return false;
+    } else {
+        return return_type_convertible<iter_element_t<T>>();
+    }
+}
+
+// len() is offered to classes that are iterable *and* sized, not to every
+// class with a method spelled size().
+//
+// A length slot is not a neutral addition. CPython derives truthiness from
+// it, so gating on size() alone would silently redefine `if obj:` for a
+// gauge whose size() is a physical dimension, or a kernel whose size() is
+// its width. Requiring begin()/end() as well means a class only gains len()
+// when "how many elements" is the question size() was already answering,
+// and for those classes len()-derived truthiness is the correct Python
+// semantics rather than a change of meaning.
+template<typename T>
+consteval bool is_sized() {
+    return is_iterable<T>() && HasSize<T>;
+}
+
+// ----------------------------------------------------------------------------
+// len() and truthiness
+// ----------------------------------------------------------------------------
+
+template<typename T>
+Py_ssize_t py_length(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return -1;
+    }
+    try {
+        const auto count = wrapper->cpp_object->size();
+        // Py_ssize_t covers half the range of the usual std::size_t, and a
+        // count that does not fit would reach CPython as a negative length.
+        // CPython reports that as "returned NULL without setting an
+        // exception", which tells the caller nothing; an OverflowError names
+        // the class and the value instead. An unsigned size() that underflowed
+        // — items.size() - 1 on an empty container — arrives here too, which
+        // is the realistic way to land in this branch.
+        if (std::cmp_less(count, 0) || std::cmp_greater(count, PY_SSIZE_T_MAX)) {
+            const std::string text = std::to_string(count);
+            PyErr_Format(PyExc_OverflowError,
+                         "%s.size() is %s, which cannot be a Python length",
+                         Py_TYPE(self)->tp_name, text.c_str());
+            return -1;
+        }
+        return static_cast<Py_ssize_t>(count);
+    } catch (const std::exception& e) {
+        set_py_error_from_cpp_exception(e);
+        return -1;
+    } catch (...) {
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return -1;
+    }
+}
+
+// Written out rather than left to CPython's default, which would reach back
+// through mp_length. Stating it here is what makes the truthiness of a sized
+// class a decision in this file instead of a side effect of adding a length
+// slot, and it answers from size() directly with no Py_ssize_t round trip.
+template<typename T>
+int py_bool(PyObject* self) {
+    Py_ssize_t n = py_length<T>(self);
+    if (n < 0) return -1;
+    return n != 0 ? 1 : 0;
+}
+
+// ----------------------------------------------------------------------------
+// Iteration
+// ----------------------------------------------------------------------------
+
+// The iterator object. Never constructed as a whole: tp_alloc hands back raw
+// memory and the two C++ iterators are placement-new'd into it, because an
+// arbitrary iterator type need not be default-constructible.
+template<typename T>
+struct PyIter {
+    PyObject_HEAD
+    PyObject* owner;              // strong reference — see py_get_iter
+    iterator_of_t<T> cursor;
+    sentinel_of_t<T> stop;
+    iterator_of_t<T> start;       // begin() when iteration started
+    std::size_t guard;            // element count when iteration started
+    bool finished;
+};
+
+template<typename T>
+struct IterTypeSlot {
+    static inline PyTypeObject* ptr = nullptr;
+};
+
+template<typename T>
+void py_iter_dealloc(PyObject* self) {
+    auto* it = reinterpret_cast<PyIter<T>*>(self);
+    std::destroy_at(&it->cursor);
+    std::destroy_at(&it->stop);
+    std::destroy_at(&it->start);
+    Py_XDECREF(it->owner);
+    Py_TYPE(self)->tp_free(self);
+}
+
+template<typename T>
+PyObject* py_iter_next(PyObject* self) {
+    auto* it = reinterpret_cast<PyIter<T>*>(self);
+    if (it->finished) return nullptr;
+
+    auto* owner = reinterpret_cast<PyWrapper<T>*>(it->owner);
+    if (!owner->cpp_object) {
+        it->finished = true;
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    // Holding a reference to the container keeps it alive but does not stop
+    // the Python side mutating it, and a reallocation leaves cursor and stop
+    // pointing into freed memory — a read, not a crash, so it would surface
+    // as wrong numbers. Two cheap checks cover what is detectable:
+    //
+    // The element count, the way CPython's own dict and set iterators do it.
+    // This catches an append or a clear.
+    if constexpr (HasSize<T>) {
+        if (static_cast<std::size_t>(owner->cpp_object->size()) != it->guard) {
+            it->finished = true;
+            PyErr_Format(PyExc_RuntimeError, "%s changed size during iteration",
+                         Py_TYPE(it->owner)->tp_name);
+            return nullptr;
+        }
+    }
+
+    // Where begin() is, which the count alone does not cover: reserve() and
+    // shrink_to_fit() move a vector's storage without changing its size, and
+    // that is exactly the case that reads freed memory. Neither check sees a
+    // mutation that keeps both the count and the buffer — an erase paired with
+    // a push_back — so this narrows the window rather than closing it, and the
+    // reference docs say so.
+    if constexpr (IteratorSelfComparable<T>) {
+        try {
+            if (owner->cpp_object->begin() != it->start) {
+                it->finished = true;
+                PyErr_Format(PyExc_RuntimeError,
+                             "%s reallocated its storage during iteration",
+                             Py_TYPE(it->owner)->tp_name);
+                return nullptr;
+            }
+        } catch (const std::exception& e) {
+            it->finished = true;
+            set_py_error_from_cpp_exception(e);
+            return nullptr;
+        }
+    }
+
+    try {
+        if (!(it->cursor != it->stop)) {
+            it->finished = true;
+            return nullptr;
+        }
+        // The gate in is_iterable() accepted the element type, which for a
+        // proxy reference such as std::vector<bool>'s is not what *cursor
+        // yields; convert through the element type so the value, not the
+        // proxy's own layout, is what crosses.
+        decltype(auto) raw = *it->cursor;
+        PyObject* item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(raw)>,
+                                     iter_element_t<T>>) {
+            item = to_python(raw);
+        } else {
+            item = to_python(static_cast<iter_element_t<T>>(raw));
+        }
+        if (!item) {
+            it->finished = true;
+            return nullptr;
+        }
+        ++it->cursor;
+        return item;
+    } catch (const std::exception& e) {
+        it->finished = true;
+        set_py_error_from_cpp_exception(e);
+        return nullptr;
+    } catch (...) {
+        it->finished = true;
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return nullptr;
+    }
+}
+
+// One iterator type per bound class, readied once from bind_class. It is not
+// added to the module: nothing constructs it except iter(), and a name in the
+// module that cannot be called is noise in dir() and in the stubs.
+template<typename T>
+PyTypeObject* make_iter_type(const char* owner_qualified_name) {
+    static std::string iter_name = std::string(owner_qualified_name) + "_iterator";
+    static PyTypeObject iter_type = {
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
+        .tp_name = iter_name.c_str(),
+        .tp_basicsize = sizeof(PyIter<T>),
+        .tp_itemsize = 0,
+        .tp_dealloc = py_iter_dealloc<T>,
+        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_doc = "Iterator over a mirror_bridge-bound C++ range",
+        .tp_iter = PyObject_SelfIter,
+        .tp_iternext = py_iter_next<T>,
+        .tp_new = nullptr,
+    };
+    static const bool ready = (PyType_Ready(&iter_type) == 0);
+    return ready ? &iter_type : nullptr;
+}
+
+template<typename T>
+PyObject* py_get_iter(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+    PyTypeObject* iter_type = IterTypeSlot<T>::ptr;
+    if (!iter_type) {
+        PyErr_SetString(PyExc_RuntimeError, "Iterator type was not registered");
+        return nullptr;
+    }
+
+    auto* it = reinterpret_cast<PyIter<T>*>(iter_type->tp_alloc(iter_type, 0));
+    if (!it) return nullptr;
+
+    int built = 0;
+    try {
+        std::construct_at(&it->cursor, wrapper->cpp_object->begin());
+        ++built;
+        std::construct_at(&it->stop, wrapper->cpp_object->end());
+        ++built;
+        std::construct_at(&it->start, wrapper->cpp_object->begin());
+        ++built;
+    } catch (...) {
+        if (built > 2) std::destroy_at(&it->start);
+        if (built > 1) std::destroy_at(&it->stop);
+        if (built > 0) std::destroy_at(&it->cursor);
+        // tp_free rather than Py_DECREF: py_iter_dealloc would destroy
+        // iterators that were never constructed.
+        iter_type->tp_free(it);
+        try { throw; }
+        catch (const std::exception& e) { set_py_error_from_cpp_exception(e); }
+        catch (...) { PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception"); }
+        return nullptr;
+    }
+
+    it->guard = 0;
+    if constexpr (HasSize<T>) {
+        it->guard = static_cast<std::size_t>(wrapper->cpp_object->size());
+    }
+    it->finished = false;
+
+    // The iterator owns a reference to the object the range belongs to, for
+    // its whole lifetime. This is what pybind11 makes the author request with
+    // keep_alive<0,1> and segfaults without: `for x in make_bag()` drops the
+    // last reference to the container the moment the loop starts, and
+    // py_dealloc would delete the C++ object out from under begin()/end().
+    Py_INCREF(self);
+    it->owner = self;
+    return reinterpret_cast<PyObject*>(it);
+}
+
+// PyIter<T> names the iterator type in a member declaration, so it is only
+// instantiable for a T that has one. Selecting the slot has to be an
+// if constexpr, not a ternary.
+template<typename T>
+getiterfunc build_iter() {
+    if constexpr (is_iterable<T>()) {
+        return py_get_iter<T>;
+    } else {
+        return nullptr;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Pickling
+// ----------------------------------------------------------------------------
+
+template<typename T, std::size_t... Is>
+consteval bool members_restorable(std::index_sequence<Is...>) {
+    return (true && ... && (!annotations::is_visible_member_readonly<T, Is>() &&
+                            !is_visible_member_const<T, Is>()));
+}
+
+// Does this type carry any state of its own, directly or through a base?
+consteval bool type_holds_no_state(std::meta::info type) {
+    if (!std::meta::nonstatic_data_members_of(
+            type, std::meta::access_context::unchecked()).empty()) {
+        return false;
+    }
+    for (auto base : std::meta::bases_of(type, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
+// The state is built from the *visible* member list, and three kinds of member
+// are missing from it: a private one, one marked [[=exclude{}]], and anything
+// a base class declares, because nonstatic_data_members_of reports only direct
+// members. Each of those still holds state that __setstate__ cannot put back,
+// so a class that has one would dump and load into a plausible object that had
+// quietly lost a field — the failure mode this whole gate exists to avoid.
+template<typename T>
+consteval bool every_member_in_state() {
+    const auto all = std::meta::nonstatic_data_members_of(
+        ^^T, std::meta::access_context::unchecked());
+    if (all.size() != annotations::count_visible_members<T>()) return false;
+    for (auto base : std::meta::bases_of(^^T, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
+// Reconstruction is `cls()` followed by __setstate__, so a class qualifies
+// only when Python can default-construct it and put every member back. A
+// const or [[=readonly{}]] member would be read into the state and then
+// silently dropped on the way back in, handing the caller a plausible object
+// that had quietly lost a field; such a class keeps raising at dumps() time,
+// which is at least the truth. A member the state cannot even see is the same
+// bug with less warning, so every_member_in_state() rules those out too.
+template<typename T>
+consteval bool is_picklable() {
+    if constexpr (!std::is_default_constructible_v<T>) {
+        return false;
+    } else if constexpr (!every_member_in_state<T>()) {
+        return false;
+    } else {
+        return members_restorable<T>(
+            std::make_index_sequence<annotations::count_visible_members<T>()>{});
+    }
+}
+
+// The state is the reflected non-static data member list — the same walk
+// __repr__ does, so a member added in C++ joins the pickle automatically
+// instead of being forgotten by a hand-written py::pickle() that lists every
+// field twice.
+template<typename T>
+PyObject* py_member_state(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    PyObject* state = PyDict_New();
+    if (!state) return nullptr;
+
+    bool ok = true;
+    constexpr std::size_t member_count = annotations::count_visible_members<T>();
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            if (!ok) return;
+            constexpr auto member = annotations::get_visible_member<T>(Is);
+            constexpr const char* member_name = std::meta::identifier_of(member).data();
+            PyObject* value = to_python((*wrapper->cpp_object).[:member:]);
+            if (!value) {
+                if (!PyErr_Occurred()) {
+                    PyErr_Format(PyExc_TypeError,
+                                 "cannot pickle %s: member '%s' has no Python "
+                                 "representation", Py_TYPE(self)->tp_name, member_name);
+                }
+                ok = false;
+                return;
+            }
+            if (PyDict_SetItemString(state, member_name, value) < 0) ok = false;
+            Py_DECREF(value);
+        }(), ...);
+    }(std::make_index_sequence<member_count>{});
+
+    if (!ok) {
+        Py_DECREF(state);
+        return nullptr;
+    }
+    return state;
+}
+
+template<typename T>
+PyObject* py_reduce(PyObject* self, PyObject* /*unused*/) {
+    PyObject* members = py_member_state<T>(self);
+    if (!members) return nullptr;
+
+    // A Python subclass of a bound class gets an instance __dict__ of its
+    // own. Carrying it alongside the C++ members is what keeps a subclass's
+    // attributes from disappearing through a round trip; the base type has
+    // no instance dict, and getattr says so.
+    PyObject* instance_dict = PyObject_GetAttrString(self, "__dict__");
+    if (!instance_dict) PyErr_Clear();
+
+    PyObject* state = PyTuple_Pack(2, members, instance_dict ? instance_dict : Py_None);
+    Py_DECREF(members);
+    Py_XDECREF(instance_dict);
+    if (!state) return nullptr;
+
+    PyObject* empty_args = PyTuple_New(0);
+    if (!empty_args) {
+        Py_DECREF(state);
+        return nullptr;
+    }
+
+    // Py_TYPE(self), not the bound type, so a Python subclass pickles as
+    // itself. pickle finds it by __module__ and __qualname__, which is why
+    // bind_class qualifies tp_name with the module name.
+    PyObject* result = PyTuple_Pack(3, reinterpret_cast<PyObject*>(Py_TYPE(self)),
+                                    empty_args, state);
+    Py_DECREF(empty_args);
+    Py_DECREF(state);
+    return result;
+}
+
+template<typename T>
+PyObject* py_setstate(PyObject* self, PyObject* state) {
+    PyObject* members = state;
+    PyObject* instance_dict = nullptr;
+    if (PyTuple_Check(state) && PyTuple_GET_SIZE(state) == 2) {
+        members = PyTuple_GET_ITEM(state, 0);
+        instance_dict = PyTuple_GET_ITEM(state, 1);
+    }
+    if (!PyDict_Check(members)) {
+        PyErr_Format(PyExc_TypeError, "%s.__setstate__ expects the state this "
+                     "type's __reduce__ produces", Py_TYPE(self)->tp_name);
+        return nullptr;
+    }
+
+    PyObject* key = nullptr;
+    PyObject* value = nullptr;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(members, &pos, &key, &value)) {
+        if (PyObject_SetAttr(self, key, value) < 0) {
+            // The setter's own "Type conversion failed" names neither the
+            // member nor the class, and at unpickling time that is all the
+            // caller would get.
+            PyErr_Clear();
+            PyErr_Format(PyExc_TypeError,
+                         "%s: cannot restore member '%U' from pickled state",
+                         Py_TYPE(self)->tp_name, key);
+            return nullptr;
+        }
+    }
+
+    if (instance_dict && instance_dict != Py_None) {
+        PyObject* own = PyObject_GetAttrString(self, "__dict__");
+        if (!own) return nullptr;
+        int rc = PyDict_Update(own, instance_dict);
+        Py_DECREF(own);
+        if (rc < 0) return nullptr;
+    }
+
+    Py_RETURN_NONE;
+}
+
+}  // namespace datamodel
+
+// ============================================================================
 // Operator Overloading — Reflection-Driven Python Slot Binding
 // ============================================================================
 //
@@ -4676,8 +5229,13 @@ PyNumberMethods* build_number_methods() {
     if constexpr (op_bindable<T, neg_idx>())  nm.nb_negative = unary_op_wrapper<T, neg_idx>;
     if constexpr (op_bindable<T, pos_idx>())  nm.nb_positive = unary_op_wrapper<T, pos_idx>;
 
+    // Adding a length slot hands CPython a definition of truthiness whether
+    // or not one was intended, so a sized class states its own.
+    if constexpr (datamodel::is_sized<T>()) nm.nb_bool = datamodel::py_bool<T>;
+
     // Return null if nothing was populated, so tp_as_number stays null.
-    if constexpr (add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
+    if constexpr (!datamodel::is_sized<T>() &&
+                  add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
                   mod_idx >= N && iadd_idx >= N && isub_idx >= N && imul_idx >= N &&
                   idiv_idx >= N && imod_idx >= N && neg_idx >= N && pos_idx >= N) {
         return nullptr;
@@ -4685,16 +5243,36 @@ PyNumberMethods* build_number_methods() {
     return &nm;
 }
 
-// Build PyMappingMethods with mp_subscript set if operator[] exists.
+// Build PyMappingMethods: mp_subscript if operator[] exists, mp_length if T
+// is a sized range (see datamodel::is_sized for why size() alone is not it).
 template<typename T>
 PyMappingMethods* build_mapping_methods() {
     static PyMappingMethods mm{};
     constexpr std::size_t sub_idx = find_op<T>(Slot::Subscript);
-    if constexpr (op_bindable<T, sub_idx>()) {
+    constexpr bool has_subscript = op_bindable<T, sub_idx>();
+    if constexpr (has_subscript) {
         mm.mp_subscript = subscript_wrapper<T, sub_idx>;
+    }
+    if constexpr (datamodel::is_sized<T>()) {
+        mm.mp_length = datamodel::py_length<T>;
+    }
+    if constexpr (has_subscript || datamodel::is_sized<T>()) {
         return &mm;
     }
     return nullptr;
+}
+
+// sq_length as well as mp_length: len() reads either, but PySequence_Size and
+// the length hint list() uses to presize its result only read this one.
+template<typename T>
+PySequenceMethods* build_sequence_methods() {
+    if constexpr (datamodel::is_sized<T>()) {
+        static PySequenceMethods sm{};
+        sm.sq_length = datamodel::py_length<T>;
+        return &sm;
+    } else {
+        return nullptr;
+    }
 }
 
 template<typename T>
@@ -5369,6 +5947,17 @@ void collect_stub_info(const char* class_name) {
             (collect_static_method_stub<T, Is>(class_name), ...);
         }(std::make_index_sequence<static_count>{});
     }
+
+    // The protocol slots bind_class fills from the type's own shape, so a
+    // type checker agrees with what the module actually does.
+    if constexpr (datamodel::is_iterable<T>()) {
+        stubgen::register_dunder_stub(
+            class_name, "__iter__",
+            "Iterator[" + stubgen::type_hint<datamodel::iter_element_t<T>>() + "]");
+    }
+    if constexpr (datamodel::is_sized<T>()) {
+        stubgen::register_dunder_stub(class_name, "__len__", "int");
+    }
 }
 
 // Fluent handle returned by bind_class. Converts implicitly to
@@ -5538,34 +6127,76 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // pointer only if T declares at least one operator of that category,
     // so types with no operators pay nothing.
     static PyNumberMethods* num_slots = ops::build_number_methods<T>();
+    static PySequenceMethods* seq_slots = ops::build_sequence_methods<T>();
     static PyMappingMethods* map_slots = ops::build_mapping_methods<T>();
     static ternaryfunc call_slot = ops::build_call<T>();
     static richcmpfunc rich_slot = ops::build_richcompare<T>();
+    static getiterfunc iter_slot = datamodel::build_iter<T>();
+
+    // CPython reads a static type's __module__ out of the text before the
+    // last dot in tp_name, so an unqualified name makes every bound class
+    // claim to live in `builtins` and pickle then fails to find the class it
+    // has just serialized. __name__, __qualname__ and __repr__ still show the
+    // plain name: for a static type both are the text after the last dot.
+    static const std::string qualified_name = [&] {
+        const char* module_name = module ? PyModule_GetName(module) : nullptr;
+        if (!module_name) {
+            PyErr_Clear();
+            return std::string(name);
+        }
+        return std::string(module_name) + "." + name;
+    }();
 
     // Define the Python type structure
     // Note: Inheritance is implicitly supported - reflection sees all members including inherited ones
     static PyTypeObject type_object = {
         .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
-        .tp_name = name,
+        .tp_name = qualified_name.c_str(),
         .tp_basicsize = sizeof(PyWrapper<T>),
         .tp_itemsize = 0,
         .tp_dealloc = py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,
         .tp_as_number = num_slots,
+        .tp_as_sequence = seq_slots,
         .tp_as_mapping = map_slots,
         .tp_call = call_slot,
         .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  // Allow subclassing
         .tp_doc = "Auto-generated binding via mirror_bridge reflection",
         .tp_richcompare = rich_slot,
+        .tp_iter = iter_slot,
         .tp_methods = methods.data(),
         .tp_getset = getsetters.data(),
         .tp_init = (ctor_count > 0) ? (initproc)py_init<T, Trampoline> : nullptr,
         .tp_new = (ctor_count > 0) ? py_new_with_init<T> : py_new<T, Trampoline>,
     };
 
+    if constexpr (datamodel::is_iterable<T>()) {
+        datamodel::IterTypeSlot<T>::ptr =
+            datamodel::make_iter_type<T>(qualified_name.c_str());
+    }
+
     // Initialize and register the type with Python
     if (PyType_Ready(&type_object) < 0) {
         return {nullptr};
+    }
+
+    // __reduce__ and __setstate__ go into the type dict as method descriptors
+    // rather than into tp_methods, which reflection sizes exactly to the
+    // class's own methods.
+    if constexpr (datamodel::is_picklable<T>()) {
+        static PyMethodDef reduce_def = {
+            "__reduce__", (PyCFunction)datamodel::py_reduce<T>, METH_NOARGS,
+            "Return the pickle reconstruction tuple for this object."};
+        static PyMethodDef setstate_def = {
+            "__setstate__", (PyCFunction)datamodel::py_setstate<T>, METH_O,
+            "Restore this object from the state __reduce__ produced."};
+        for (PyMethodDef* def : {&reduce_def, &setstate_def}) {
+            PyObject* descr = PyDescr_NewMethod(&type_object, def);
+            if (descr) {
+                PyDict_SetItemString(type_object.tp_dict, def->ml_name, descr);
+                Py_DECREF(descr);
+            }
+        }
     }
 
     // Add static methods to the type dictionary
@@ -5611,6 +6242,10 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
             }(), ...);
         }(std::make_index_sequence<static_data_member_count>{});
     }
+
+    // Everything above added entries to tp_dict after PyType_Ready finished;
+    // this is what tells CPython's attribute cache about them.
+    PyType_Modified(&type_object);
 
     Py_INCREF(&type_object);
     if (PyModule_AddObject(module, name, reinterpret_cast<PyObject*>(&type_object)) < 0) {
