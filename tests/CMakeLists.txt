@@ -358,6 +358,19 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/discovery_scope)
     )
 endif()
 
+# A header subtree you do not own cannot be annotated with
+# MIRROR_BRIDGE_SKIP_FILE, so `generate --exclude` is the only way to keep it
+# out of a module. pmp-library is the case: pointing at src/pmp pulls in its
+# OpenGL viewer, which nobody wants callable from Python.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/exclude_headers)
+    add_test(NAME cli_exclude_headers
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/exclude_headers/build_and_test.sh
+    )
+    set_tests_properties(cli_exclude_headers PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")
 

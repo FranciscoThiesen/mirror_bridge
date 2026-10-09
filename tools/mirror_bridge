@@ -53,6 +53,7 @@ DISCOVERED_ENUMS=()
 DISCOVERED_LINES=()
 TEMPLATE_CAP=64
 INSTANTIATE=()
+EXCLUDE_PATTERNS=()
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -189,6 +190,13 @@ ${YELLOW}Options:${NC}
                       names (no runtime parsing; stubs can't drift)
   --link-args ARGS    Extra link inputs for non-header-only libraries
                       (e.g. --link-args "/path/to/libFoo.a -lz")
+  --exclude GLOB      Skip headers matching this shell glob. Matched against
+                      the path as an include spells it, and -- like
+                      .gitignore -- a pattern without a leading / matches at
+                      any depth, so 'visualization/*' also excludes
+                      'pmp/visualization/window.h'. For third-party headers
+                      you cannot annotate with MIRROR_BRIDGE_SKIP_FILE
+                      (repeatable)
   --instantiate SPEC  Python: also bind this template specialization, e.g.
                       --instantiate "geom::Vector3<short>" or
                       --instantiate "geom::clamp<float>" (repeatable)
@@ -474,9 +482,52 @@ for name, lineno in enums:
 PYSCRIPT
     )
 
+# Whether a header is excluded by a --exclude pattern.
+#
+# MIRROR_BRIDGE_SKIP_FILE is a marker inside the header, which is no use for a
+# library you did not write -- and binding a library you did not write is the
+# whole point of auto-discovery. Pointing `generate` at pmp-library's src/pmp
+# pulled in its OpenGL viewer, which needs GL libraries at link time and is
+# not something anyone wants callable from Python; there was no way to say so
+# without editing someone else's headers.
+#
+# Patterns are shell globs matched against the path as the include walk spells
+# it, so --exclude 'visualization/*' and --exclude '*_detail.hpp' both work.
+header_is_excluded() {
+    local rel="$1" pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]:-}"; do
+        [ -z "$pattern" ] && continue
+        # shellcheck disable=SC2254
+        case "$rel" in
+            $pattern) return 0 ;;
+        esac
+        # A pattern with no leading slash matches at any depth, the way
+        # .gitignore does. Without this, `--exclude 'visualization/*'` silently
+        # matched nothing on pmp-library, whose headers are spelled
+        # `pmp/visualization/...` because the include root is the directory
+        # above. Matching only the full spelling is the kind of rule that is
+        # correct and still wrong every time someone uses it.
+        case "$pattern" in
+            /*) : ;;
+            *)
+                # shellcheck disable=SC2254
+                case "$rel" in
+                    */$pattern) return 0 ;;
+                esac
+                ;;
+        esac
+    done
+    return 1
+}
+
     while IFS= read -r header_file; do
         local rel_path
         rel_path=$(header_include_spelling "$header_file" "$src_dir")
+
+        if header_is_excluded "$rel_path"; then
+            [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Excluded: $rel_path${NC}"
+            continue
+        fi
 
         # Skip files marked with MIRROR_BRIDGE_SKIP_FILE
         if grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null; then
@@ -819,6 +870,7 @@ planner_setup() {
         [ -z "$header_file" ] && continue
         grep -q "MIRROR_BRIDGE_SKIP_FILE" "$header_file" 2>/dev/null && continue
         rel=$(header_include_spelling "$header_file" "$src_dir")
+        header_is_excluded "$rel" && continue
         printf '%s\t%s\n' "$rel" "${already["$rel"]:-0}" >> "$PLANNER_WORK/headers.txt"
     done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
     printf '%s\n' "${ps_classes[@]:-}" > "$PLANNER_WORK/classes.txt"
@@ -947,6 +999,9 @@ adopt_reflected_classes() {
         header="$file"
         [ -f "$file" ] && header=$(header_include_spelling "$file" "$src_dir")
 
+        if header_is_excluded "$header"; then
+            continue
+        fi
         if [ -f "$file" ] && grep -q "MIRROR_BRIDGE_SKIP_FILE" "$file" 2>/dev/null; then
             continue
         fi
@@ -1134,6 +1189,7 @@ cmd_generate() {
             --stubs) GEN_STUBS=1; shift ;;
             --link-args) LINK_ARGS="$2"; shift 2 ;;
             --instantiate) INSTANTIATE+=("$2"); shift 2 ;;
+            --exclude) EXCLUDE_PATTERNS+=("$2"); shift 2 ;;
             --template-cap) TEMPLATE_CAP="$2"; shift 2 ;;
             --no-templates) NO_TEMPLATES=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
