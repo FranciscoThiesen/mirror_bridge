@@ -16,7 +16,8 @@ import sys
 CATEGORY_ORDER = [
     "ok", "needs-linking", "imports-failed", "export-macro-discovery",
     "duplicate-binding-name", "reflection-tu-failed",
-    "unsupported-container", "inaccessible-destructor", "incomplete-type",
+    "unsupported-container", "inaccessible-destructor",
+    "private-nested-type", "no-converter-for-parameter", "incomplete-type",
     "template-depth", "constexpr-limit", "no-classes-found",
     "header-needs-flags", "manifest-wrong", "compile-error", "timeout",
     "fetch-failed", "unknown",
