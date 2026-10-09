@@ -25,7 +25,9 @@
       "include_dirs": ["include"],
       "module": "jsoncpp_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -c @CHECKOUT@/src/lib_json/json_reader.cpp @CHECKOUT@/src/lib_json/json_value.cpp @CHECKOUT@/src/lib_json/json_writer.cpp",
+      "link_args": "@BUILD@/json_reader.o @BUILD@/json_value.o @BUILD@/json_writer.o",
+      "expect": "bind"
     },
     {
       "name": "tinyxml2",

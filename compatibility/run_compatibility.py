@@ -46,6 +46,16 @@ FAILURE_SIGNATURES = [
      r"binding name of \d+ classes|redefinition of '\w+'",
      "two classes share an unqualified name, so the module cannot name both",
      re.I),
+    # The template planner names a type it is not allowed to name. tinyxml2's
+    # MemPoolT<N>::Block is the case; it needs an access check.
+    ("private-nested-type",
+     r"'\w+' is a private member of",
+     "the generated binding names a private nested type",
+     0),
+    ("no-converter-for-parameter",
+     r"no matching function for call to 'from_python'",
+     "a method parameter has no conversion from Python",
+     re.I),
     ("incomplete-type",
      r"incomplete type|has incomplete type|invalid application of 'sizeof'",
      "a member or parameter type is only forward-declared",
