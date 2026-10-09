@@ -251,9 +251,10 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
         category, reason, line = classify_failure(cli_json, combined)
         if row["discovery"] == "text-scan":
             category = "reflection-tu-failed"
-            reason = ("the reflection pass could not read these headers, so "
-                      "discovery fell back to the text scan and reported what "
-                      "that sees")
+            # Terse on purpose: this is the most common row, the Discovery
+            # column already says `text-scan`, and the page explains what that
+            # means once instead of sixteen times in a table.
+            reason = "reflection could not read these headers"
         row.update(status="failed", category=category, reason=reason, detail=line)
         return row
 
