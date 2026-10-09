@@ -182,6 +182,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A C++ name that is a Python keyword still yields a parseable .pyi
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pyi_keywords)
+        mirror_bridge_python_module(pyi_keywords
+            pyi_keywords/pyi_keywords_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/pyi_keywords
+        )
+    endif()
+
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref

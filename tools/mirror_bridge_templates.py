@@ -155,7 +155,9 @@ class Compiler:
         # The probe needs every diagnostic: an error the compiler never printed
         # would leave a broken candidate approved.
         self.flags += ["-ferror-limit=0" if self.is_clang else "-fmax-errors=0"]
-        self.includes = ["-I" + args.src_dir, "-I.", "-I" + args.project_root] + ["-I" + d for d in args.include_dir]
+        # project_root leads: a mirror_bridge.hpp in the working directory
+        # would otherwise shadow this installation's own headers.
+        self.includes = ["-I" + args.project_root, "-I" + args.src_dir, "-I."] + ["-I" + d for d in args.include_dir]
         if args.eigen_dir:
             self.includes.append("-I" + args.eigen_dir)
         self.src_dir = args.src_dir
