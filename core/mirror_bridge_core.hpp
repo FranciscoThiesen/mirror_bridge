@@ -710,9 +710,19 @@ consteval bool is_convertible_type() {
         return true;
     } else if constexpr (std::is_same_v<U, std::string> ||
                          std::is_same_v<U, std::string_view> ||
-                         std::is_same_v<U, const char*> ||
-                         std::is_same_v<U, char*>) {
+                         std::is_same_v<U, const char*>) {
         return true;
+    } else if constexpr (std::is_same_v<U, char*>) {
+        // Claimed convertible and never was: the conversion assigns the
+        // `const char*` from PyUnicode_AsUTF8 straight into it, which does
+        // not compile. Nothing in the test suite binds a mutable char*, so
+        // it went unnoticed until pugixml, which uses char_t* throughout and
+        // lost its whole module to the qualifier error.
+        //
+        // Declining is also the right answer on its merits. A Python str is
+        // immutable, so there is nothing a mutable char* could point at that
+        // the callee may legitimately write through.
+        return false;
     } else if constexpr (std::is_enum_v<U>) {
         return true;
     } else if constexpr (std::is_array_v<U>) {
