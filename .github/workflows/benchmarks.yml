@@ -30,6 +30,16 @@ jobs:
       - name: Run benchmark suite
         run: ./benchmarks/run_all_benchmarks.sh
 
+      # The page was regenerated monthly and nothing read it, so a regression
+      # could sit in a table for a month. Ratios are the stable signal across
+      # machines, so the gate compares those against committed floors. It
+      # reports where a competitor is faster without failing for it: that is a
+      # fact to see, not a regression.
+      - name: Gate the runtime ratios against the committed floors
+        run: |
+          python3 benchmarks/check_ratios.py \
+            benchmarks/runtime/python/runtime_results.json
+
       - name: Splice regenerated runtime table into the benchmarks page
         run: |
           python3 benchmarks/format_results.py \
@@ -62,7 +72,9 @@ jobs:
       - name: Open PR with the regenerated page
         uses: peter-evans/create-pull-request@v6
         with:
-          add-paths: docs/internals/benchmarks.md
+          add-paths: |
+            docs/internals/benchmarks.md
+            benchmarks/ratio_floors.json
           commit-message: "Regenerate runtime benchmarks page"
           title: "Regenerate runtime benchmarks page"
           body: |
