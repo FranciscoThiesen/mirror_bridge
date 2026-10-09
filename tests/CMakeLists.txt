@@ -173,6 +173,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # One awkward class or parameter must cost itself, not the module
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/declinable)
+        mirror_bridge_python_module(declinable
+            declinable/declinable_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/declinable
+        )
+    endif()
+
     # Integer and float arguments are range-checked, and a refused
     # conversion leaves no Python error set behind
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion)

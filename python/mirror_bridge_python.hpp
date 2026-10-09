@@ -2117,6 +2117,15 @@ bool from_python(PyObject* obj, T& container) {
         }
     }
 
+    // The element-wise tiers build a ValueType and convert into it, so a
+    // container whose element has no default constructor cannot be filled
+    // this way. cxxopts::KeyValue and cxxopts::Option are both like that,
+    // and reaching the loop anyway was a compile error that failed the whole
+    // module rather than declining one conversion.
+    if constexpr (!std::is_default_constructible_v<ValueType>) {
+        return false;
+    } else {
+
     // Tier 2/3 share one loop; list/tuple hits resolve to borrowed-ref
     // macros. Element conversion can run arbitrary Python code (__float__,
     // nested containers), which may mutate the sequence — the borrowed
@@ -2164,8 +2173,25 @@ bool from_python(PyObject* obj, T& container) {
         } else if constexpr (requires { container.insert(cpp_item); }) {
             container.insert(std::move(cpp_item));
         } else {
-            static_assert(requires { container.push_back(cpp_item); },
-                         "Container must support indexing, push_back, or insert");
+            // A type can satisfy is_container -- value_type, begin(), size()
+            // -- and still offer no way to put an element in. Json::Value is
+            // one: it has all three and none of indexing by a signed index,
+            // push_back or insert.
+            //
+            // This was a static_assert, which failed the whole module. On a
+            // library bound by auto-discovery that is the wrong trade: one
+            // method taking one such parameter cost jsoncpp all twenty-three
+            // of its classes. Declining the conversion instead leaves the
+            // module buildable and turns the call into a TypeError naming the
+            // argument, which is what every other unconvertible value does.
+            //
+            // Deliberately not mirrored as a compile-time predicate on the
+            // bindability gate: the gate would have to reproduce the overload
+            // resolution above, and under clang-p2996 the ambiguous
+            // Json::Value indexing is a hard error inside a
+            // requires-expression rather than an unsatisfied requirement, so
+            // the predicate cannot be written.
+            return false;
         }
     }
 
@@ -2203,7 +2229,20 @@ bool from_python(PyObject* obj, T& container) {
         }
     }
 
+    // Everything the sequence held has to have gone somewhere. Reaching here
+    // with elements left over means the container took some and could not
+    // take the rest, which is a failed conversion however container-like it
+    // looked.
+    //
+    // This is also the only thing that catches a container that cannot be
+    // filled at all and happens to start empty: the element-wise loop is
+    // bounded by container.size(), so for Json::Value it never runs, and the
+    // conversion used to report success having transferred nothing. A list
+    // silently becoming an empty value is worse than a TypeError.
+    if (i < size) return false;
+
     return true;
+    }  // close the default-constructible ValueType branch
 }
 
 // ============================================================================
@@ -5653,6 +5692,15 @@ BoundClass<T> bind_class_when_bindable(PyObject* module, const char* name) {
         std::fprintf(stderr,
             "mirror_bridge: skipped '%s' (not bindable: no reflectable "
             "members/methods)\n", name);
+        return {nullptr};
+    } else if constexpr (!std::is_destructible_v<std::remove_cvref_t<T>>) {
+        // A private or deleted destructor means tp_dealloc cannot free the
+        // object, so there is no wrapper to make. tinyxml2::XMLElement is the
+        // case: binding it failed the entire module on a class the library
+        // deliberately makes undestroyable from outside.
+        std::fprintf(stderr,
+            "mirror_bridge: skipped '%s' (its destructor is not accessible, so "
+            "a wrapper could not free it)\n", name);
         return {nullptr};
     } else if constexpr (!core::validate_bindable_members<T>()) {
         std::fprintf(stderr,
