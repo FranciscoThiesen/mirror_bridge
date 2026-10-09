@@ -1,0 +1,186 @@
+{
+  "_comment": [
+    "The corpus the compatibility matrix is measured against. Adding a library",
+    "is one entry here; nothing else needs to change.",
+    "",
+    "  name          display name, and the cache directory",
+    "  repo          git URL, cloned shallow at ref",
+    "  ref           tag or commit, pinned so a run is reproducible",
+    "  headers       directory passed to `mirror_bridge generate`, relative to the checkout",
+    "  include_dirs  extra -I paths the headers need to parse, relative to the checkout",
+    "  module        Python module name to build",
+    "  shape         'oo' (classes with methods) or 'template' (header-only generic).",
+    "                Recorded so the summary can report the two separately: they fail",
+    "                for different reasons and conflating them hides the signal.",
+    "  expect        what the matrix asserts. 'bind' means a regression if it stops",
+    "                binding. 'unknown' means not yet triaged. Nothing is marked",
+    "                'bind' until it has actually bound once."
+  ],
+  "corpus": [
+    {
+      "name": "jsoncpp",
+      "repo": "https://github.com/open-source-parsers/jsoncpp",
+      "ref": "1.9.5",
+      "headers": "include/json",
+      "include_dirs": ["include"],
+      "module": "jsoncpp_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "tinyxml2",
+      "repo": "https://github.com/leethomason/tinyxml2",
+      "ref": "10.0.0",
+      "headers": ".",
+      "include_dirs": ["."],
+      "module": "tinyxml2_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "pugixml",
+      "repo": "https://github.com/zeux/pugixml",
+      "ref": "v1.14",
+      "headers": "src",
+      "include_dirs": ["src"],
+      "module": "pugixml_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "yaml-cpp",
+      "repo": "https://github.com/jbeder/yaml-cpp",
+      "ref": "0.8.0",
+      "headers": "include/yaml-cpp",
+      "include_dirs": ["include"],
+      "module": "yamlcpp_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "clipper2",
+      "repo": "https://github.com/AngusJohnson/Clipper2",
+      "ref": "Clipper2_1.4.0",
+      "headers": "CPP/Clipper2Lib/include/clipper2",
+      "include_dirs": ["CPP/Clipper2Lib/include"],
+      "module": "clipper2_compat",
+      "shape": "oo",
+      "build": "clang++ -std=c++17 -stdlib=libc++ -O2 -fPIC -I@CHECKOUT@/CPP/Clipper2Lib/include -c @CHECKOUT@/CPP/Clipper2Lib/src/clipper.engine.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.offset.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.rectclip.cpp",
+      "link_args": "@BUILD@/clipper.engine.o @BUILD@/clipper.offset.o @BUILD@/clipper.rectclip.o",
+      "expect": "bind"
+    },
+    {
+      "name": "pmp-library",
+      "repo": "https://github.com/pmp-library/pmp-library",
+      "ref": "3.0.0",
+      "headers": "src/pmp",
+      "include_dirs": ["src", "external/eigen-3.4.0"],
+      "module": "pmp_compat",
+      "shape": "oo",
+      "exclude": ["visualization/*"],
+      "build": "for f in @CHECKOUT@/src/pmp/surface_mesh.cpp @CHECKOUT@/src/pmp/algorithms/*.cpp @CHECKOUT@/src/pmp/io/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -I@CHECKOUT@/external/eigen-3.4.0 -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
+      "link_args": "@BUILD@/*.o",
+      "expect": "bind"
+    },
+    {
+      "name": "cxxopts",
+      "repo": "https://github.com/jarro2783/cxxopts",
+      "ref": "v3.2.0",
+      "headers": "include",
+      "include_dirs": ["include"],
+      "module": "cxxopts_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "CLI11",
+      "repo": "https://github.com/CLIUtils/CLI11",
+      "ref": "v2.4.2",
+      "headers": "include/CLI",
+      "include_dirs": ["include"],
+      "module": "cli11_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "spdlog",
+      "repo": "https://github.com/gabime/spdlog",
+      "ref": "v1.14.1",
+      "headers": "include/spdlog",
+      "include_dirs": ["include"],
+      "module": "spdlog_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "nlohmann-json",
+      "repo": "https://github.com/nlohmann/json",
+      "ref": "v3.11.3",
+      "headers": "single_include/nlohmann",
+      "include_dirs": ["single_include"],
+      "module": "nlohmannjson_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "fmt",
+      "repo": "https://github.com/fmtlib/fmt",
+      "ref": "10.2.1",
+      "headers": "include/fmt",
+      "include_dirs": ["include"],
+      "module": "fmt_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "glm",
+      "repo": "https://github.com/g-truc/glm",
+      "ref": "1.0.1",
+      "headers": "glm",
+      "include_dirs": ["."],
+      "module": "glm_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "magic_enum",
+      "repo": "https://github.com/Neargye/magic_enum",
+      "ref": "v0.9.6",
+      "headers": "include/magic_enum",
+      "include_dirs": ["include"],
+      "module": "magicenum_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "doctest",
+      "repo": "https://github.com/doctest/doctest",
+      "ref": "v2.4.11",
+      "headers": "doctest",
+      "include_dirs": ["."],
+      "module": "doctest_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "entt",
+      "repo": "https://github.com/skypjack/entt",
+      "ref": "v3.13.2",
+      "headers": "src/entt/entity",
+      "include_dirs": ["src"],
+      "module": "entt_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "box2d",
+      "repo": "https://github.com/erincatto/box2d",
+      "ref": "v2.4.1",
+      "headers": "include/box2d",
+      "include_dirs": ["include"],
+      "module": "box2d_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    }
+  ]
+}
