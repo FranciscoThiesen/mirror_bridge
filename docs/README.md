@@ -31,6 +31,7 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 - **[Architecture](internals/architecture.md)** - System design and component overview
 - **[Features Matrix](internals/features.md)** - Verified features across all languages
 - **[Benchmarks](internals/benchmarks.md)** - Performance analysis and results
+- **[Real-library compatibility](internals/compatibility.md)** - `mirror_bridge generate` run against a corpus of unmodified third-party C++ libraries, with the reason for every failure
 
 ## Overview
 

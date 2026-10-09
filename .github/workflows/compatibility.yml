@@ -1,0 +1,104 @@
+name: Compatibility
+
+# The real-library matrix: point `mirror_bridge generate` at a corpus of C++
+# libraries nobody here wrote and publish what happens, failures included.
+# Auto-discovery is what distinguishes this project from pybind11 and nanobind,
+# and this is the evidence for it. Weekly + on demand.
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Run a single library from the manifest (blank = all)"
+        required: false
+        default: ""
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: compatibility
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    # Needs the reflection compiler, plus git and network to fetch the corpus.
+    container:
+      image: ghcr.io/franciscothiesen/mirror_bridge:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Run the corpus
+        id: run
+        # A library that has never bound is data, not a broken build, so the
+        # runner only exits non-zero when one marked expect=bind regresses.
+        # That exit code is kept and re-raised at the end, after the page has
+        # been regenerated, so a regression still publishes its own evidence.
+        run: |
+          set +e
+          ARGS=""
+          if [ -n "${{ github.event.inputs.only }}" ]; then
+            ARGS="--only ${{ github.event.inputs.only }}"
+          fi
+          python3 compatibility/run_compatibility.py \
+            --out compatibility/results.json \
+            --cache-dir /tmp/mb-compat-cache \
+            --timeout 300 $ARGS
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Splice the regenerated matrix into the page
+        run: |
+          python3 compatibility/format_matrix.py compatibility/results.json \
+            --commit "$GITHUB_SHA" \
+            --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
+            --fragment > /tmp/compat_fragment.md
+          awk '
+            /<!-- COMPAT:BEGIN/ { print; system("cat /tmp/compat_fragment.md"); skip=1; next }
+            /<!-- COMPAT:END/   { skip=0 }
+            !skip
+          ' docs/internals/compatibility.md > /tmp/compatibility.md
+          mv /tmp/compatibility.md docs/internals/compatibility.md
+
+      - name: Upload the raw results
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-results
+          path: compatibility/results.json
+
+      # main is protected (PR-only), so the refresh lands as a PR. The action
+      # is a no-op when the page is unchanged.
+      - name: Open PR with the regenerated matrix
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: docs/internals/compatibility.md
+          commit-message: "Regenerate the real-library compatibility matrix"
+          title: "Regenerate the real-library compatibility matrix"
+          body: |
+            Automated refresh: `mirror_bridge generate` was run against the
+            corpus in `compatibility/libraries.json` on a GitHub Actions
+            runner, and the matrix in `docs/internals/compatibility.md`
+            regenerated from the results.
+
+            Read the `What is in the way` table first — it groups the corpus
+            by cause, so the most valuable thing to fix is the row with the
+            most libraries on it. A cause of `compile-error` or `unknown` is
+            a gap in the classifier rather than a property of the library.
+          branch: bot/compatibility-refresh
+          delete-branch: true
+
+      - name: Fail if a library that used to bind has stopped
+        run: |
+          if [ "${{ steps.run.outputs.rc }}" != "0" ]; then
+            echo "A library marked expect=bind no longer binds; see the matrix above."
+            exit 1
+          fi

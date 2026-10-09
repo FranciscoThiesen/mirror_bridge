@@ -64,6 +64,22 @@ mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/
 
 And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
 
+### And on sixteen libraries we didn't pick
+
+Open3D is a case we worked, so on its own it proves only that it can be done.
+To make the claim falsifiable instead, CI runs the same one-line command every
+week against a corpus of unmodified third-party libraries and publishes the
+result, failures included: **[the compatibility
+matrix](docs/internals/compatibility.md)**.
+
+Today that page is mostly a work queue, which is the reason to publish it. The
+discovery half holds up — reflection reads the headers and reports the real
+class list without anyone naming a class by hand, 23 in jsoncpp, 41 in
+yaml-cpp, 108 in spdlog — and the matrix then says, per library, exactly what
+stops a module coming out, grouped so the most valuable thing to fix is the
+line with the most libraries on it. pybind11 and nanobind have nothing to put
+in that first column, because the class list is the thing their user writes.
+
 ## Try It Now
 
 No installation required — run in your browser or with Docker:
@@ -192,7 +208,7 @@ From the CI-regenerated benchmark table (same C++ class, same compiler, `-O3` fo
 | **Point-cloud ingest** (1M × `[x,y,z]` → `vector<Eigen::Vector3d>`) | 12.2ms | 509ms | — | **42x faster** |
 | **Binding code** | 0 lines | 18+ lines/class | 18+ lines/class | **Zero boilerplate** |
 
-Honest summary: 2-4x faster than pybind11 across the board, parity with nanobind on scalar dispatch (nanobind wins some by ~10%), and far ahead of both on container traffic. Compile time is ~3.4x faster than pybind11 (567ms vs 1,938ms, no PCH for either); nanobind compiles faster still — Mirror Bridge only matches it with `--pch` (194ms). The full table is **[regenerated monthly by CI](docs/internals/benchmarks.md)** so it tracks the current code, with methodology and SWIG numbers included.
+Honest summary: 2-4x faster than pybind11 across the board, parity with nanobind on scalar dispatch (nanobind wins some by ~10%), and far ahead of both on container traffic. Compile time is ~3.4x faster than pybind11 (567ms vs 1,938ms, no PCH for either); nanobind compiles faster still — Mirror Bridge only matches it with `--pch` (194ms). The full table is **[regenerated monthly by CI](docs/internals/benchmarks.md)** so it tracks the current code, with methodology and SWIG numbers included. The same run now gates the ratios against committed floors, so a regression fails the build instead of sitting in a table for a month — and it reports every operation where a competitor is still faster rather than rounding that away.
 
 ## For AI Agents
 
