@@ -294,6 +294,17 @@ consteval void note_signature(Plan& p, info inst, const std::string& sp) {
 // left to the probe. Approved instantiations from an earlier round may be
 // substituted here: their signatures extend the closure.
 consteval void plan_function_template(Plan& p, info ft, const std::string& owner_spelling) {
+    // A template conversion function has no identifier, and identifier_of on
+    // one is a hard error rather than an empty answer. yaml-cpp's Node has
+    // `template <typename T> operator T() const`, and reaching it failed the
+    // whole discovery unit -- so the library fell back to the text scan and
+    // reported classes the preprocessor had never seen.
+    //
+    // The same mistake was already found and fixed in core's
+    // is_bindable_method, whose comment says exactly this. It was never fixed
+    // here.
+    if (!has_identifier(ft)) return;
+
     std::string_view kinds = kind_hint(ft);
     std::string qname = owner_spelling.empty() ? qualified(ft) : owner_spelling + "::" + std::string(identifier_of(ft));
     if (kinds.empty()) { p.notes.push_back("skip " + qname + ": no template-parameter hint"); return; }

@@ -215,6 +215,64 @@ int main() { std::fputs(mb_plan.data(), stdout); }
 """
 
 
+UNDECLARED_IDENT = re.compile(r"use of undeclared identifier '([A-Za-z_]\w*)'")
+
+
+def roots_the_compiler_rejected(err, namespaces):
+    """Namespace roots the compiler says are not there.
+
+    The roots come from a text scan, which cannot see the preprocessor, so
+    some of them do not exist. Three real cases from the corpus:
+
+        doctest   `namespace ns_name {` inside a macro *definition*
+        glm       `namespace neon {` inside an #if that is false here
+        nlohmann  `namespace detail2 {` whose parent is NLOHMANN_JSON_NAMESPACE_BEGIN
+
+    Any one of them fails the whole discovery unit, and the library then falls
+    back to the text scan that reflection was supposed to replace -- so a
+    cosmetic mistake in the root list costs the real class list.
+
+    Rather than try to out-guess the preprocessor, ask the compiler: it names
+    every identifier it cannot resolve, and those roots are dropped.
+    """
+    # Only diagnostics raised where the roots are spliced count. The roots
+    # appear in exactly one place -- the MIRROR_BRIDGE_PLAN_NAMESPACES
+    # expansion inside core/mirror_bridge_plan.hpp -- and an undeclared
+    # identifier reported anywhere else is a different problem. Matching the
+    # whole log instead dropped `doctest` itself, a root that exists, because
+    # an unrelated cascade happened to mention the name.
+    bad = set()
+    for line in (err or "").splitlines():
+        if "mirror_bridge_plan.hpp" not in line:
+            continue
+        bad.update(UNDECLARED_IDENT.findall(line))
+    if not bad:
+        return []
+    return [ns for ns in namespaces if any(part in bad for part in ns.split("::"))]
+
+
+def discover_resilient(work, cc, headers, namespaces, log, write_roots, max_drops=4):
+    """discover(), retrying without the roots the compiler rejects.
+
+    Returns (plan, err, roots). If every root turns out to be wrong it falls
+    back to the global namespace, which always resolves: slower, because the
+    walk then has the whole standard library in reach, but correct. Falling
+    back to reflection-over-everything beats falling back to a text scan.
+    """
+    roots, plan, err = list(namespaces), None, None
+    for _ in range(max_drops + 1):
+        write_roots(roots)
+        plan, err = discover(work, cc, headers)
+        if not err:
+            return plan, err, roots
+        bad = roots_the_compiler_rejected(err, roots)
+        if not bad:
+            return plan, err, roots
+        log.append("dropping namespace roots the compiler does not have: " + ", ".join(bad))
+        roots = [r for r in roots if r not in bad] or ["::"]
+    return plan, err, roots
+
+
 def discover(work, cc, headers):
     src = work / "discover.cpp"
     src.write_text("#include <array>\n#include <cstdio>\n#include <string>\n" + include_lines(headers)
@@ -372,8 +430,10 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
     plan, approved, rejected, unbindable, dropped = {"free": [], "needs": [], "cands": []}, [], [], [], []
     before = set()
     for rnd in range(1, max(1, args.max_rounds) + 1):
-        write_inputs(work, headers, hints, approved_spellings, namespaces, args.template_cap, requested, args.src_dir)
-        plan, err = discover(work, cc, headers)
+        plan, err, namespaces = discover_resilient(
+            work, cc, headers, namespaces, log,
+            lambda roots: write_inputs(work, headers, hints, approved_spellings, roots,
+                                       args.template_cap, requested, args.src_dir))
         if err:
             return None, "discovery failed:\n" + err
         # The declared classes do not depend on what the probe approved, so
@@ -659,8 +719,10 @@ def main():
         for i, attempt_headers in enumerate(attempts):
             if i:
                 log.append("retrying with the module's own headers only")
-            write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [], args.src_dir)
-            plan, err = discover(work, cc, attempt_headers)
+            plan, err, namespaces = discover_resilient(
+                work, cc, attempt_headers, namespaces, log,
+                lambda roots, _h=attempt_headers: write_inputs(
+                    work, _h, hints, set(), roots, args.template_cap, [], args.src_dir))
             if not err:
                 found = {"plain": plan["plain"], "enums": plan["enums"]}
                 break
