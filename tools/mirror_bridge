@@ -55,6 +55,9 @@ TEMPLATE_CAP=64
 INSTANTIATE=()
 EXCLUDE_PATTERNS=()
 EXTRA_DEFINES=()
+# Which path named the classes. Read when the binding is written: the two
+# paths spell names differently, so what the binding needs differs too.
+DISCOVERY_SOURCE="text scan"
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -694,7 +697,19 @@ PYSCRIPT
         [ -n "$full_path" ] && ns_paths+=("$full_path")
     done
 
-    if [ ${#ns_paths[@]} -gt 0 ]; then
+    # `using namespace` directives are emitted only for the text-scan
+    # fallback, which is the only path that needs them.
+    #
+    # They exist so the binding can reach a class the scan named without its
+    # namespace. Reflection names every class fully qualified --
+    # `nlohmann::json_abi_v3_11_3::detail2::end_tag` -- so on that path the
+    # directives do nothing except carry the risk of being wrong, and they
+    # come from a brace-tracking text scan that cannot see the preprocessor.
+    # On nlohmann it emitted `using namespace detail;` with the parent
+    # dropped (hidden behind NLOHMANN_JSON_NAMESPACE_BEGIN) and nesting that
+    # does not exist at all, `detail::detail::detail::detail`, and the module
+    # failed to compile for a reason with nothing to do with binding.
+    if [ ${#ns_paths[@]} -gt 0 ] && [ "$DISCOVERY_SOURCE" = "text scan" ]; then
         while IFS= read -r fqn; do
             if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
                 echo "using namespace $fqn;" >> "$output_file"
@@ -1281,7 +1296,8 @@ cmd_generate() {
         done
     fi
 
-    local DISCOVERY_SOURCE="text scan" i
+    DISCOVERY_SOURCE="text scan"
+    local i
 
     # The class list the module is built from comes from reflection, which
     # reads the headers after the preprocessor has run. The planner's own
