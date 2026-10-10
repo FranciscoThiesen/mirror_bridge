@@ -326,6 +326,28 @@ struct Inventory { std::vector<info> fn_templates, class_templates, plain_classe
 // anywhere, and anything starting with an underscore followed by a capital.
 // These are the compiler's, not the library's, and a reflection walk that
 // reaches global scope will find them.
+// Whether a function takes a trailing ellipsis.
+//
+// There is no portable way to ask. clang-p2996 has
+// has_ellipsis_parameter; GCC 16 has no ellipsis query at all, and using the
+// clang one there is a hard error -- which is how the first version of this
+// broke the GCC job while passing on clang. GCC does print the ellipsis in
+// the function type, which is enough to recognise, and clang does not. So
+// each compiler gets the one it actually has.
+//
+// The GCC branch is conservative in the safe direction: a function whose
+// parameter is itself a variadic function pointer prints an ellipsis too and
+// would be declined. Declining a bindable function costs that function;
+// reaching a variadic one costs the module, because FunctionTraits has no
+// specialization for it.
+consteval bool takes_ellipsis(info f) {
+#if defined(__clang__)
+    return std::meta::has_ellipsis_parameter(f);
+#else
+    return display_string_of(type_of(f)).find("...") != std::string_view::npos;
+#endif
+}
+
 consteval bool is_reserved_identifier(std::string_view name) {
     if (name.size() >= 2 && name[0] == '_' && name[1] >= 'A' && name[1] <= 'Z') return true;
     for (std::size_t i = 1; i < name.size(); ++i) {
@@ -361,7 +383,7 @@ consteval void inventory_namespace(Inventory& inv, info ns) {
         // FunctionTraits has no specialization for one, so reaching it is a
         // hard error rather than a declined binding. box2d's b2Log is the case.
         else if (is_function(m)) {
-            if (!std::meta::has_ellipsis_parameter(m)) inv.functions.push_back(m);
+            if (!takes_ellipsis(m)) inv.functions.push_back(m);
         }
         else if (is_type(m) && is_class_type(m) && !has_template_arguments(m) && is_complete_type(m)) inv.plain_classes.push_back(m);
     }
