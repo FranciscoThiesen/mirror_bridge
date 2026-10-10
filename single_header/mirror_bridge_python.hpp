@@ -260,6 +260,13 @@ struct MemberFunctionCache {
                !std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               // An explicitly deleted overload is still a member
+               // reflection reports. SQLite::Statement deletes
+               // `bindNoCopy(const std::string&, std::string&&)` to stop
+               // callers binding a temporary, and calling it is not a
+               // runtime error but "attempt to use a deleted function" at
+               // compile time, which costs the whole module.
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -327,6 +334,7 @@ struct StaticMemberFunctionCache {
                std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -560,6 +568,18 @@ consteval bool static_method_params_are_value_bindable() {
 template<typename T>
 consteval bool is_param_bindable() {
     using U = std::remove_cvref_t<T>;
+    // A smart pointer to an opaque handle -- sqlite3_stmt, FILE, SSL_CTX, the
+    // shape every C library hands out -- is itself a complete class whose
+    // pointee is only forward declared. The converter for it asks
+    // is_abstract_v and is_default_constructible_v about that pointee, and
+    // both are ill-formed on an incomplete type rather than merely false. So
+    // this has to be decided here, before the complete-class branch below
+    // accepts the smart pointer for being complete itself. SQLite::Column's
+    // constructor takes a shared_ptr<sqlite3_stmt>, which failed the whole
+    // module to compile instead of declining that one constructor.
+    if constexpr (SmartPointer<U>) {
+        if constexpr (!requires { sizeof(typename U::element_type); }) return false;
+    }
     if constexpr (is_value_bindable<U>()) return true;
     // Complete, non-pointer class type → use pointer-holder
     if constexpr (requires { sizeof(U); } && std::is_class_v<U> && !std::is_pointer_v<U>) {
@@ -4347,6 +4367,13 @@ struct MemberFunctionCache {
                !std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               // An explicitly deleted overload is still a member
+               // reflection reports. SQLite::Statement deletes
+               // `bindNoCopy(const std::string&, std::string&&)` to stop
+               // callers binding a temporary, and calling it is not a
+               // runtime error but "attempt to use a deleted function" at
+               // compile time, which costs the whole module.
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -4409,6 +4436,7 @@ struct StaticMemberFunctionCache {
                std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -4975,7 +5003,8 @@ consteval std::size_t get_constructor_count() {
     for (auto member : all_members) {
         if (std::meta::is_constructor(member) &&
             !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
+            !std::meta::is_move_constructor(member) &&
+            !std::meta::is_deleted(member)) {
             auto params = std::meta::parameters_of(member);
             // Only count non-default constructors
             if (params.size() > 0) {
@@ -4994,7 +5023,8 @@ consteval auto get_constructor() {
     for (auto member : all_members) {
         if (std::meta::is_constructor(member) &&
             !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
+            !std::meta::is_move_constructor(member) &&
+            !std::meta::is_deleted(member)) {
             auto params = std::meta::parameters_of(member);
             if (params.size() > 0) {
                 if (ctor_index == Index) {
@@ -5287,6 +5317,30 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     // object.__new__ semantics: excess arguments are an error unless a
     // Python-level __init__ override (e.g. on a trampoline subclass) will
     // receive them.
+    // Nothing here can produce an object: this allocator is installed only
+    // when there is no bindable parameterized constructor, and the class is
+    // not default constructible either. Allocating anyway handed back a
+    // wrapper with a null payload whose repr() read "<Cls object (invalid)>",
+    // and the first attribute access then failed with "Invalid C++ object" --
+    // blaming the access instead of the call that was already wrong. The
+    // "caller should have used tp_init" this replaces was not reachable:
+    // tp_init is null in exactly this case. cxxopts::Value is abstract, so a
+    // real library meets this on its first line.
+    if constexpr (!std::is_default_constructible_v<Trampoline>) {
+        if constexpr (std::is_abstract_v<T>) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s is abstract in C++ and cannot be constructed from "
+                         "Python; construct a concrete derived class instead",
+                         type->tp_name);
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                         "%s cannot be constructed from Python: it is not "
+                         "default constructible and has no bindable constructor",
+                         type->tp_name);
+        }
+        return nullptr;
+    }
+
     const bool has_args = (args && PyTuple_GET_SIZE(args) > 0) ||
                           (kwds && PyDict_GET_SIZE(kwds) > 0);
     if (has_args && type->tp_init == PyBaseObject_Type.tp_init) {
@@ -6630,7 +6684,11 @@ PyMappingMethods* build_mapping_methods() {
 template<typename T>
 ternaryfunc build_call() {
     constexpr std::size_t idx = find_op<T>(Slot::Call);
-    if constexpr (idx < OperatorCache<T>::count) {
+    // op_bindable, like every other operator slot below. Without it,
+    // SQLite::Database::Deleter -- whose operator() takes a `sqlite3**` --
+    // instantiated a conversion that does not exist and failed the module
+    // rather than leaving tp_call unset on that one class.
+    if constexpr (idx < OperatorCache<T>::count && op_bindable<T, idx>()) {
         return call_wrapper<T, idx>;
     }
     return nullptr;
@@ -7711,11 +7769,19 @@ PyObject* call_free_function_impl(PyObject* const* args, Py_ssize_t nargs, std::
     // it a C++ exception unwinds past the interpreter and std::terminate
     // aborts the process: no traceback, nothing to catch, exit 134.
     try {
+        // forward_arg, not the slot itself: a parameter declared `T&&` cannot
+        // bind to the storage slot, which is an lvalue. Moving out of the slot
+        // is safe because the storage tuple exists only for this call. The
+        // method, constructor and static-method paths already went through
+        // forward_arg; this one passed raw lvalues, so cxxopts' `bool&&`
+        // parameter failed the whole module to compile.
         if constexpr (std::is_void_v<ReturnType>) {
-            FuncPtr(std::get<Is>(cpp_args)...);
+            FuncPtr(forward_arg<std::tuple_element_t<Is, ArgsTuple>>(
+                        std::get<Is>(cpp_args))...);
             Py_RETURN_NONE;
         } else {
-            auto result = FuncPtr(std::get<Is>(cpp_args)...);
+            auto result = FuncPtr(forward_arg<std::tuple_element_t<Is, ArgsTuple>>(
+                                      std::get<Is>(cpp_args))...);
             return to_python(result);
         }
     } catch (const std::exception& e) {
@@ -8120,10 +8186,16 @@ PyObject* call_member_impl(T& obj, PyObject* args, std::index_sequence<Is...>) {
     if (!ok) return nullptr;
     using R = typename[:std::meta::return_type_of(Inst):];
     if constexpr (std::is_void_v<R>) {
-        (obj.[:Inst:])(std::get<Is>(cpp_args)...);
+        (obj.[:Inst:])(forward_arg<param_t<Inst, Is>>(std::get<Is>(cpp_args))...);
         Py_RETURN_NONE;
     } else {
-        auto r = (obj.[:Inst:])(std::get<Is>(cpp_args)...);
+        // decltype(auto), not auto: for a member template returning `U&`,
+        // `auto` deduces `U` and copies. That is a silent extra copy for an
+        // ordinary type and does not compile at all when U is abstract, which
+        // is how cxxopts (whose `Value` is abstract and handed out by
+        // reference) failed its whole module here.
+        decltype(auto) r = (obj.[:Inst:])(
+            forward_arg<param_t<Inst, Is>>(std::get<Is>(cpp_args))...);
         return to_python(r);
     }
 }

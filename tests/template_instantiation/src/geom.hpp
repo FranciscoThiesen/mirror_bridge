@@ -26,6 +26,29 @@ using Vec3f = Vector3<float>;
 using Vec3d = Vector3<double>;
 typedef Vector3<int> Vec3i;
 
+// An abstract base handed out by reference. cxxopts::Value is shaped exactly
+// like this, and a member template returning `Interface&` used to be deduced
+// as `Interface` by `auto`: copying an abstract class is not a slice, it does
+// not compile, and it failed the whole module rather than that one member.
+struct Interface {
+    virtual ~Interface() = default;
+    virtual int tag() const = 0;
+};
+
+struct Concrete : Interface {
+    int value = 7;
+    int tag() const override { return value; }
+};
+
+struct Holder {
+    Concrete held;
+    int bias = 3;
+    template <typename T> Interface& interface_for() { return held; }
+    // The other half: a parameter declared `T&&` cannot bind to the storage
+    // slot, which is an lvalue.
+    template <typename T> T consume(T&& v) const { return T(v + bias); }
+};
+
 template <typename T, int N>
 struct Matrix {
     std::array<T, N * N> m{};
