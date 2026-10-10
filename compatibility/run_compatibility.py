@@ -52,6 +52,13 @@ FAILURE_SIGNATURES = [
      r"'\w+' is a private member of",
      "the generated binding names a private nested type",
      0),
+    # The compiler itself fell over. Not a binding problem and not fixable
+    # here; it wants reporting upstream. yaml-cpp does this once the roots and
+    # the unnamed-template guard are right.
+    ("compiler-crash",
+     r"clang frontend command failed due to signal|internal compiler error|Segmentation fault",
+     "the compiler crashed on these headers",
+     re.I),
     ("no-converter-for-parameter",
      r"no matching function for call to 'from_python'",
      "a method parameter has no conversion from Python",
