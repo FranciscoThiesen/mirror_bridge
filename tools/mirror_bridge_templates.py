@@ -268,13 +268,27 @@ CHAIN_RE = re.compile(r"probe\.cpp:(\d+)(?::\d+)?:\s+(?:note: )?(?:in instantiat
 ERR_RE = re.compile(r"^(.*?):(\d+):(?:\d+:)?\s*(?:fatal )?error: (.*)$")
 
 
-def probe(work, cc, headers, cands):
-    if not cands:
-        return [], [], ""
+def probe(work, cc, headers, cands, already_rejected=None):
+    already_rejected = already_rejected or {}
+    # A specialization the compiler has already rejected must leave the probe
+    # TU, not merely be filtered out of the result afterwards. Both compilers
+    # diagnose a failing specialization once: when two candidates fail
+    # *through the same* sub-instantiation, only the first one listed gets a
+    # diagnostic and the second is approved for want of evidence. In
+    # SQLiteCpp, bind_exec<sqlite3_value> masked reset_bind_exec<sqlite3_value>
+    # exactly that way, and the module then failed to compile on a candidate
+    # the probe had blessed. Dropping the known-bad lines lets the next round
+    # see the failure that was hidden behind them; the loop already runs until
+    # the approved set stops changing.
+    live = [c for c in cands if c["spelling"] not in already_rejected]
+    carried = [(c, already_rejected[c["spelling"]])
+               for c in cands if c["spelling"] in already_rejected]
+    if not live:
+        return [], carried, ""
     src = work / "probe.cpp"
     lines = [f'#include "{h}"' for h in headers]
     prologue = len(lines)
-    lines += [probe_line(i, c) for i, c in enumerate(cands)]
+    lines += [probe_line(i, c) for i, c in enumerate(live)]
     src.write_text("\n".join(lines) + "\n")
     r = cc.run(["-fsyntax-only", str(src)])
     # Attribute every diagnostic block to the probe line it mentions. A block
@@ -294,13 +308,14 @@ def probe(work, cc, headers, cands):
             failed.add(int(m.group(1)))
             reasons.setdefault(int(m.group(1)), current_err)
     approved, rejected = [], []
-    for i, c in enumerate(cands, start=prologue + 1):
+    for i, c in enumerate(live, start=prologue + 1):
         (rejected if i in failed else approved).append((c, reasons.get(i, "")))
     if r.returncode and not failed:
         # Errors that no probe line owns (a broken header, a missing include):
         # nothing can be trusted, so treat the round as failed.
         return [], [], r.stderr or "probe compile failed without diagnostics"
-    return approved, [(c, friendly_reason(why)) for c, why in rejected], ""
+    # `carried` reasons came out of a previous round already made friendly.
+    return approved, carried + [(c, friendly_reason(why)) for c, why in rejected], ""
 
 
 # The raw diagnostic for a probe line that names no valid specialization is
@@ -368,7 +383,7 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
         # macros defeat.
         found.setdefault("plain", plan["plain"])
         found.setdefault("enums", plan["enums"])
-        approved, rejected, err = probe(work, cc, headers, plan["cands"])
+        approved, rejected, err = probe(work, cc, headers, plan["cands"], rejected_ever)
         if err:
             return None, "probe failed:\n" + err
         # Verdicts are final: a spelling rejected in any round stays rejected
