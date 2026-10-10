@@ -248,6 +248,28 @@ consteval std::size_t get_data_member_count() {
 // when we splice the base method onto a derived object (P2996 allows
 // `derived.[:base_method_info:](args)` — we verified this compiles and
 // respects overriding).
+// Whether a class is a standard-library type, by looking for a `std` among
+// its enclosing namespaces (libc++'s `std::__1` is reached the same way).
+//
+// Methods inherited from a standard-library base are not the API anyone asked
+// to bind, and they are reliably the ones that do not compile.
+// magic_enum::customize_t derives from std::pair, so the method walk picked up
+// std::pair::swap, whose const overload is ill-formed for those members --
+// "no matching function for call to 'swap'" inside libc++, costing the whole
+// module. The parent_of guards matter: the metafunction has a precondition,
+// and calling it on a non-member is a hard error rather than an empty answer.
+consteval bool is_std_library_type(std::meta::info cls) {
+    std::meta::info scope = cls;
+    while (std::meta::is_class_member(scope) || std::meta::is_namespace_member(scope)) {
+        scope = std::meta::parent_of(scope);
+        if (std::meta::is_namespace(scope) && std::meta::has_identifier(scope) &&
+            std::meta::identifier_of(scope) == "std") {
+            return true;
+        }
+    }
+    return false;
+}
+
 template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
@@ -302,7 +324,9 @@ struct MemberFunctionCache {
                     layer_new_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    if (is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
@@ -4290,7 +4314,12 @@ struct DataMemberCache {
                     layer_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    // See core::is_std_library_type: a base from the standard
+                    // library is not the API anyone asked to bind, and it is
+                    // reliably the one that does not compile.
+                    if (mirror_bridge::core::is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
@@ -4415,7 +4444,12 @@ struct MemberFunctionCache {
                     layer_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    // See core::is_std_library_type: a base from the standard
+                    // library is not the API anyone asked to bind, and it is
+                    // reliably the one that does not compile.
+                    if (mirror_bridge::core::is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
