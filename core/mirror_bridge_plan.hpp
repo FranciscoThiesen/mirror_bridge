@@ -150,6 +150,34 @@ struct Plan {
 
 consteval bool ours(info entity) { return in_source(entity); }
 
+// Whether the generated module can name this type at all.
+//
+// A nested class its enclosing class made private is spelled out verbatim in
+// the binding, and the compiler rejects it:
+//
+//     bind_instance<tinyxml2::DynArray<tinyxml2::MemPoolT<120>::Block*, 10>>
+//     error: 'Block' is a private member of 'tinyxml2::MemPoolT<120>'
+//
+// It arrives as a template argument through signature closure, not as a class
+// anyone asked for, and one of them cost tinyxml2 all fifteen of its classes.
+// Pointers and references are peeled first, and template arguments are
+// checked recursively, because that is how it gets in.
+consteval bool nameable_in_module(info t) {
+    t = dealias(t);
+    while (is_pointer_type(t) || is_reference_type(t)) {
+        t = is_pointer_type(t) ? std::meta::remove_pointer(t)
+                               : std::meta::remove_reference(t);
+        t = dealias(t);
+    }
+    if (is_class_member(t) && !is_public(t)) return false;
+    if (has_template_arguments(t)) {
+        for (info a : template_arguments_of(t)) {
+            if (is_type(a) && !nameable_in_module(a)) return false;
+        }
+    }
+    return true;
+}
+
 // Strip references/pointers/cv and walk into foreign templates' arguments
 // (std::vector<Vec3f> contributes Vec3f, not std::vector). Every type that
 // survives is a universe member and, if it is a specialization of one of our
@@ -171,6 +199,7 @@ consteval void visit_type(Plan& p, info t, const std::string& origin, bool exten
         if (is_class_template(tm) && ours(tm)) {
             if (extend_universe) p.add_unique(p.universe, t);
             std::string sp = spell(t);
+            if (!nameable_in_module(t)) return;
             if (!p.has_cand(sp)) {
                 auto args = args_of(t);
                 p.cands.push_back({"class", p.name_for(t, tm, args), sp, spell_args(args), origin, qualified(tm)});
@@ -293,6 +322,18 @@ consteval void plan_function_template(Plan& p, info ft, const std::string& owner
 
 struct Inventory { std::vector<info> fn_templates, class_templates, plain_classes, aliases, functions; };
 
+// Identifiers the implementation reserves: anything with a double underscore
+// anywhere, and anything starting with an underscore followed by a capital.
+// These are the compiler's, not the library's, and a reflection walk that
+// reaches global scope will find them.
+consteval bool is_reserved_identifier(std::string_view name) {
+    if (name.size() >= 2 && name[0] == '_' && name[1] >= 'A' && name[1] <= 'Z') return true;
+    for (std::size_t i = 1; i < name.size(); ++i) {
+        if (name[i - 1] == '_' && name[i] == '_') return true;
+    }
+    return false;
+}
+
 // One namespace, no recursion: the driver lists every namespace it wants
 // scanned (nested ones included) and leaves out detail/impl/std.
 consteval void inventory_namespace(Inventory& inv, info ns) {
@@ -304,10 +345,24 @@ consteval void inventory_namespace(Inventory& inv, info ns) {
         // free function and every template instantiation in the module lost
         // to one `operator<<`. Nothing nameless is bindable anyway.
         if (!has_identifier(m)) continue;
+
+        // A name the implementation reserved is never ours to bind. box2d's
+        // headers use va_start, and the walk over the global namespace picked
+        // up the compiler's own declarations: the module came out with
+        // `bind_function_when_bindable<&__builtin_va_start>`, which does not
+        // compile ("builtin functions must be directly called") and cost
+        // box2d all 81 of its classes.
+        if (is_reserved_identifier(identifier_of(m))) continue;
+
         if (is_type_alias(m)) inv.aliases.push_back(m);
         else if (is_class_template(m)) inv.class_templates.push_back(m);
         else if (is_function_template(m)) inv.fn_templates.push_back(m);
-        else if (is_function(m)) inv.functions.push_back(m);
+        // A variadic function cannot be called from a fixed argument list, and
+        // FunctionTraits has no specialization for one, so reaching it is a
+        // hard error rather than a declined binding. box2d's b2Log is the case.
+        else if (is_function(m)) {
+            if (!std::meta::has_ellipsis_parameter(m)) inv.functions.push_back(m);
+        }
         else if (is_type(m) && is_class_type(m) && !has_template_arguments(m) && is_complete_type(m)) inv.plain_classes.push_back(m);
     }
 }

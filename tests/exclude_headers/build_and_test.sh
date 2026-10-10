@@ -52,4 +52,23 @@ assert not hasattr(xh_excl, 'Viewer'), 'Viewer present after exclusion'
 print('   imported, Point works, Viewer absent')
 " || fail "the excluded module did not import"
 
+echo "5. --define reaches both the reflection pass and the module compile"
+# A library configured by macros needs both or neither: a discovery unit
+# preprocessed differently from the module reports a different library from
+# the one that gets compiled. glm is the case that needed this.
+defd=$("$CLI" generate "$HERE/src" --module xh_def --lang python \
+       --output "$OUT/def" --force --json -D XH_EXTRA_CLASS 2>/dev/null)
+echo "$defd" | grep -q 'xh::Gated' \
+  || fail "a class behind -D XH_EXTRA_CLASS was not discovered; got: $defd"
+nodef=$("$CLI" generate "$HERE/src" --module xh_nodef --lang python \
+        --output "$OUT/nodef" --force --json 2>/dev/null)
+if echo "$nodef" | grep -q 'xh::Gated'; then
+    fail "Gated appeared without the define"
+fi
+PYTHONPATH="$OUT/def" python3 -c "
+import xh_def
+assert xh_def.Gated().value == 42
+print('   the gated class binds and works')
+" || fail "the module built with -D did not import"
+
 echo "PASS: exclude_headers"
