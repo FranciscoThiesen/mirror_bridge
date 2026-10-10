@@ -131,6 +131,25 @@ def test_baseline_and_containers():
     print("✓ baseline instantiations and containers")
 
 
+def test_abstract_and_rvalue_members():
+    # A member template returning `Interface&` used to fail the whole module
+    # to compile (`auto` deduced the abstract class and tried to copy it), and
+    # one taking `T&&` could not bind to its storage slot.
+    assert geom.Concrete().tag() == 7
+    h = geom.Holder()
+    assert h.bias == 3 and h.held.value == 7
+
+    # Constructing an abstract class is refused at the call, not left to fail
+    # confusingly at the first attribute access.
+    try:
+        geom.Interface()
+    except TypeError as e:
+        assert "abstract" in str(e), e
+    else:
+        raise AssertionError("constructing an abstract class should raise TypeError")
+    print("✓ abstract classes refuse construction, awkward member templates cost themselves")
+
+
 def test_stubs():
     pyi = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "geom.pyi")
     text = open(pyi).read()

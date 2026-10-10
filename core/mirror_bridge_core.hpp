@@ -236,6 +236,13 @@ struct MemberFunctionCache {
                !std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               // An explicitly deleted overload is still a member
+               // reflection reports. SQLite::Statement deletes
+               // `bindNoCopy(const std::string&, std::string&&)` to stop
+               // callers binding a temporary, and calling it is not a
+               // runtime error but "attempt to use a deleted function" at
+               // compile time, which costs the whole module.
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -303,6 +310,7 @@ struct StaticMemberFunctionCache {
                std::meta::is_static_member(member) &&
                !std::meta::is_constructor(member) &&
                !std::meta::is_special_member_function(member) &&
+               !std::meta::is_deleted(member) &&
                !std::meta::is_operator_function(member);
     }
 
@@ -536,6 +544,18 @@ consteval bool static_method_params_are_value_bindable() {
 template<typename T>
 consteval bool is_param_bindable() {
     using U = std::remove_cvref_t<T>;
+    // A smart pointer to an opaque handle -- sqlite3_stmt, FILE, SSL_CTX, the
+    // shape every C library hands out -- is itself a complete class whose
+    // pointee is only forward declared. The converter for it asks
+    // is_abstract_v and is_default_constructible_v about that pointee, and
+    // both are ill-formed on an incomplete type rather than merely false. So
+    // this has to be decided here, before the complete-class branch below
+    // accepts the smart pointer for being complete itself. SQLite::Column's
+    // constructor takes a shared_ptr<sqlite3_stmt>, which failed the whole
+    // module to compile instead of declining that one constructor.
+    if constexpr (SmartPointer<U>) {
+        if constexpr (!requires { sizeof(typename U::element_type); }) return false;
+    }
     if constexpr (is_value_bindable<U>()) return true;
     // Complete, non-pointer class type → use pointer-holder
     if constexpr (requires { sizeof(U); } && std::is_class_v<U> && !std::is_pointer_v<U>) {

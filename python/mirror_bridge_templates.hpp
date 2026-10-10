@@ -287,10 +287,16 @@ PyObject* call_member_impl(T& obj, PyObject* args, std::index_sequence<Is...>) {
     if (!ok) return nullptr;
     using R = typename[:std::meta::return_type_of(Inst):];
     if constexpr (std::is_void_v<R>) {
-        (obj.[:Inst:])(std::get<Is>(cpp_args)...);
+        (obj.[:Inst:])(forward_arg<param_t<Inst, Is>>(std::get<Is>(cpp_args))...);
         Py_RETURN_NONE;
     } else {
-        auto r = (obj.[:Inst:])(std::get<Is>(cpp_args)...);
+        // decltype(auto), not auto: for a member template returning `U&`,
+        // `auto` deduces `U` and copies. That is a silent extra copy for an
+        // ordinary type and does not compile at all when U is abstract, which
+        // is how cxxopts (whose `Value` is abstract and handed out by
+        // reference) failed its whole module here.
+        decltype(auto) r = (obj.[:Inst:])(
+            forward_arg<param_t<Inst, Is>>(std::get<Is>(cpp_args))...);
         return to_python(r);
     }
 }

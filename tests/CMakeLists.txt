@@ -181,6 +181,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A parameter declared `T&&` has to be moved out of its storage slot
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/rvalue_params)
+        mirror_bridge_python_module(rvalue_params
+            rvalue_params/rvalue_params_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/rvalue_params
+        )
+    endif()
+
     # Integer and float arguments are range-checked, and a refused
     # conversion leaves no Python error set behind
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion)
