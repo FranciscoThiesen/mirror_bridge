@@ -181,6 +181,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # C++ default arguments on constructors, not just on methods
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ctor_defaults)
+        mirror_bridge_python_module(ctor_defaults
+            ctor_defaults/ctor_defaults_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/ctor_defaults
+        )
+    endif()
+
     # A parameter declared `T&&` has to be moved out of its storage slot
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/rvalue_params)
         mirror_bridge_python_module(rvalue_params

@@ -3162,6 +3162,32 @@ consteval bool constructor_params_all_bindable() {
     }(std::make_index_sequence<param_count>{});
 }
 
+// Default arguments, for constructors. The method path has had these since
+// kwargs landed (min_required_args / invoke_with_n_args); constructors
+// required an exact count, so `Database(path)` on a class declaring
+// `Database(const char*, int = OPEN_READONLY, int = 0, const char* = nullptr)`
+// raised "No matching constructor for 1 positional argument(s)". A defaulted
+// pointer is not even expressible from Python -- passing "" for a `const
+// char* = nullptr` reached SQLite as an empty VFS name and threw -- so the
+// only correct answer is to let C++ supply the default.
+template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
+consteval bool constructor_param_has_default() {
+    constexpr auto ctor = get_constructor<T, CtorIndex>();
+    return std::meta::has_default_argument(std::meta::parameters_of(ctor)[ParamIndex]);
+}
+
+// Index of the first defaulted parameter: the smallest count Python may pass.
+template<typename T, std::size_t CtorIndex>
+consteval std::size_t constructor_min_required_args() {
+    constexpr std::size_t P = get_constructor_param_count<T, CtorIndex>();
+    return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> std::size_t {
+        std::size_t result = P;
+        (((result == P && constructor_param_has_default<T, CtorIndex, Is>())
+            ? (result = Is) : 0), ...);
+        return result;
+    }(std::make_index_sequence<P>{});
+}
+
 // Variadic helper to call constructor with N parameters.
 // Uses the same pointer-holder pattern as method dispatch: params that can't
 // be held by value in std::tuple (abstract types, types with protected ctors)
@@ -3275,6 +3301,27 @@ inline bool match_ctor_keyword(std::string_view name, PyObject* value,
     return matched;
 }
 
+// Pick the arity variant matching what the caller actually supplied; the
+// parameters past it take their C++ default arguments.
+//
+// A named function rather than a lambda inside py_init's fold over the
+// constructors: an inner `(pattern, ...)` written inside that fold is read as
+// expanding the outer constructor-index pack as well, which is an error as
+// soon as a class has two constructors ("pack expansion contains parameter
+// pack 'Ns' that has a different length from outer parameter packs"). Here Ns
+// is the only pack in scope.
+template<typename T, typename Trampoline, std::size_t CtorIndex, std::size_t MIN,
+         std::size_t... Ns>
+Trampoline* construct_with_supplied(PyObject* const* resolved, std::size_t n_used,
+                                    std::index_sequence<Ns...>) {
+    Trampoline* obj = nullptr;
+    ((n_used == Ns + MIN
+        ? (obj = call_constructor_impl_alloc<T, Trampoline, CtorIndex>(
+               resolved, std::make_index_sequence<Ns + MIN>{}), void())
+        : void()), ...);
+    return obj;
+}
+
 // Initialize Python wrapper with parameterized constructor. If Trampoline != T,
 // allocates a Trampoline (which must derive from T) and sets its py_self back-
 // reference so virtual overrides can dispatch to Python.
@@ -3322,7 +3369,10 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
 
             if constexpr (constructor_params_all_bindable<T, Is>()) {
                 constexpr std::size_t P = get_constructor_param_count<T, Is>();
-                if (nargs + nkw != static_cast<Py_ssize_t>(P)) return;
+                constexpr std::size_t MIN = constructor_min_required_args<T, Is>();
+                const Py_ssize_t supplied = nargs + nkw;
+                if (supplied < static_cast<Py_ssize_t>(MIN) ||
+                    supplied > static_cast<Py_ssize_t>(P)) return;
 
                 // resolved[i] is the argument for the i-th constructor
                 // parameter, wherever the caller put it.
@@ -3350,12 +3400,19 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                     }
                 }
 
-                for (std::size_t i = 0; i < P; ++i) {
+                // A keyword may have filled a slot past the first gap, which
+                // would mean skipping a parameter that has no default. Only a
+                // contiguous prefix can be handed to the constructor, since
+                // everything after it comes from C++.
+                const std::size_t n_used = static_cast<std::size_t>(supplied);
+                for (std::size_t i = 0; i < n_used; ++i) {
                     if (!resolved[i]) return;
                 }
 
-                Trampoline* obj = call_constructor_impl_alloc<T, Trampoline, Is>(
-                    resolved, std::make_index_sequence<P>{});
+                // Dispatch to the variant for the count actually supplied;
+                // params [n_used, P) take their C++ default arguments.
+                Trampoline* obj = construct_with_supplied<T, Trampoline, Is, MIN>(
+                    resolved, n_used, std::make_index_sequence<P - MIN + 1>{});
 
                 if (obj) {
                     wrapper->cpp_object = obj;
@@ -5386,7 +5443,8 @@ void collect_ctor_stub(const char* class_name) {
             std::vector<std::string> names = {
                 std::string(constructor_param_name<T, CtorIndex, Ps>())...};
             stubgen::register_constructor_stub<
-                constructor_param_t<T, CtorIndex, Ps>...>(class_name, names);
+                constructor_param_t<T, CtorIndex, Ps>...>(
+                    class_name, names, constructor_min_required_args<T, CtorIndex>());
         }(std::make_index_sequence<pc>{});
     }
 }
@@ -5402,8 +5460,13 @@ void collect_method_stub(const char* class_name) {
         [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
             std::vector<std::string> names = {
                 std::string(param_name<T, FuncIndex, Ps>())...};
+            // Static methods are deliberately left unmarked: call_static_method_impl
+            // is instantiated with every parameter, so the runtime really does
+            // require them all, and a stub claiming otherwise would be the same
+            // kind of lie in the other direction.
             stubgen::register_method_stub<Ret, method_param_t<T, FuncIndex, Ps>...>(
-                class_name, mname, names, /*is_static=*/false);
+                class_name, mname, names, /*is_static=*/false,
+                min_required_args<T, FuncIndex>());
         }(std::make_index_sequence<pc>{});
     }
 }
