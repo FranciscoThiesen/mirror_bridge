@@ -204,6 +204,11 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
     # and it needs GL libraries at link time.
     for pattern in lib.get("exclude", []):
         cmd += ["--exclude", pattern]
+    # A library configured by macros. glm will not parse without
+    # GLM_FORCE_ALIGNED_GENTYPES and GLM_ENABLE_EXPERIMENTAL, which is the
+    # library's own requirement, not a mirror_bridge limitation.
+    for macro in lib.get("defines", []):
+        cmd += ["-D", macro]
     if lib.get("link_args"):
         cmd += ["--link-args", lib["link_args"]
                 .replace("@CHECKOUT@", checkout).replace("@BUILD@", build_dir)]

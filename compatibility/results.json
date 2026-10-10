@@ -1,5 +1,5 @@
 {
-  "generated_unix": 1791571460,
+  "generated_unix": 1791669106,
   "results": [
     {
       "category": "ok",
@@ -28,13 +28,13 @@
       "reason": "",
       "ref": "1.9.5",
       "repo": "https://github.com/open-source-parsers/jsoncpp",
-      "seconds": 22.5,
+      "seconds": 23.3,
       "shape": "oo",
       "status": "ok",
       "stub_written": true
     },
     {
-      "category": "private-nested-type",
+      "category": "ok",
       "class_names": [
         "tinyxml2::MemPool",
         "tinyxml2::StrPair",
@@ -50,22 +50,23 @@
         "tinyxml2::XMLText"
       ],
       "classes_found": 15,
-      "detail": "{\"status\":\"error\",\"module\":\"tinyxml2_compat\",\"languages\":[\"python\"],\"classes\":[{\"name\":\"tinyxml2::XMLDocument\",\"header\":\"tinyxml2.h\"},{\"name\":\"tinyxml2::XMLElement\",\"header\":\"tinyxml2.h\"},{\"name\":\"tinyxml2::XMLAttribute\"",
+      "detail": "",
       "discovery": "reflection",
-      "expect": "unknown",
-      "module_built": false,
-      "module_bytes": 0,
+      "expect": "bind",
+      "exported_names": 16,
+      "module_built": true,
+      "module_bytes": 889704,
       "name": "tinyxml2",
-      "reason": "the generated binding names a private nested type",
+      "reason": "",
       "ref": "10.0.0",
       "repo": "https://github.com/leethomason/tinyxml2",
-      "seconds": 18.1,
+      "seconds": 16.6,
       "shape": "oo",
-      "status": "failed",
-      "stub_written": false
+      "status": "ok",
+      "stub_written": true
     },
     {
-      "category": "no-converter-for-parameter",
+      "category": "ok",
       "class_names": [
         "pugi::xml_attribute",
         "pugi::xml_attribute_iterator",
@@ -81,19 +82,20 @@
         "pugi::xml_writer_stream"
       ],
       "classes_found": 19,
-      "detail": "{\"status\":\"error\",\"module\":\"pugixml_compat\",\"languages\":[\"python\"],\"classes\":[{\"name\":\"pugi::xml_node_iterator\",\"header\":\"pugixml.hpp\"},{\"name\":\"pugi::xml_attribute_iterator\",\"header\":\"pugixml.hpp\"},{\"name\":\"pugi::xml_na",
+      "detail": "",
       "discovery": "reflection",
-      "expect": "unknown",
-      "module_built": false,
-      "module_bytes": 0,
+      "expect": "bind",
+      "exported_names": 19,
+      "module_built": true,
+      "module_bytes": 1651864,
       "name": "pugixml",
-      "reason": "a method parameter has no conversion from Python",
+      "reason": "",
       "ref": "v1.14",
       "repo": "https://github.com/zeux/pugixml",
-      "seconds": 23.4,
+      "seconds": 31.8,
       "shape": "oo",
-      "status": "failed",
-      "stub_written": false
+      "status": "ok",
+      "stub_written": true
     },
     {
       "category": "reflection-tu-failed",
@@ -121,7 +123,7 @@
       "reason": "reflection could not read these headers",
       "ref": "0.8.0",
       "repo": "https://github.com/jbeder/yaml-cpp",
-      "seconds": 13.9,
+      "seconds": 14.5,
       "shape": "oo",
       "status": "failed",
       "stub_written": false
@@ -153,7 +155,7 @@
       "reason": "",
       "ref": "Clipper2_1.4.0",
       "repo": "https://github.com/AngusJohnson/Clipper2",
-      "seconds": 100.4,
+      "seconds": 108.3,
       "shape": "oo",
       "status": "ok",
       "stub_written": true
@@ -185,13 +187,13 @@
       "reason": "",
       "ref": "3.0.0",
       "repo": "https://github.com/pmp-library/pmp-library",
-      "seconds": 50.1,
+      "seconds": 53.5,
       "shape": "oo",
       "status": "ok",
       "stub_written": true
     },
     {
-      "category": "no-converter-for-parameter",
+      "category": "compile-error",
       "class_names": [
         "cxxopts::HelpGroupDetails",
         "cxxopts::HelpOptionDetails",
@@ -213,10 +215,10 @@
       "module_built": false,
       "module_bytes": 0,
       "name": "cxxopts",
-      "reason": "a method parameter has no conversion from Python",
+      "reason": "unclassified compile failure",
       "ref": "v3.2.0",
       "repo": "https://github.com/jarro2783/cxxopts",
-      "seconds": 40.4,
+      "seconds": 43.6,
       "shape": "oo",
       "status": "failed",
       "stub_written": false
@@ -238,7 +240,7 @@
         "CheckedTransformer"
       ],
       "classes_found": 53,
-      "detail": "/workspace/.worktrees/fixable/python/mirror_bridge_python.hpp:2152:20: error: no matching function for call to 'from_python'",
+      "detail": "/workspace/.worktrees/cover/python/mirror_bridge_python.hpp:2152:20: error: no matching function for call to 'from_python'",
       "discovery": "text-scan",
       "expect": "unknown",
       "module_built": false,
@@ -247,7 +249,7 @@
       "reason": "reflection could not read these headers",
       "ref": "v2.4.2",
       "repo": "https://github.com/CLIUtils/CLI11",
-      "seconds": 16.2,
+      "seconds": 17.6,
       "shape": "oo",
       "status": "failed",
       "stub_written": false
@@ -278,7 +280,7 @@
       "reason": "reflection could not read these headers",
       "ref": "v1.14.1",
       "repo": "https://github.com/gabime/spdlog",
-      "seconds": 6.4,
+      "seconds": 7.3,
       "shape": "oo",
       "status": "failed",
       "stub_written": false
@@ -309,7 +311,7 @@
       "reason": "reflection could not read these headers",
       "ref": "v3.11.3",
       "repo": "https://github.com/nlohmann/json",
-      "seconds": 9.6,
+      "seconds": 9.8,
       "shape": "template",
       "status": "failed",
       "stub_written": false
@@ -340,7 +342,7 @@
       "reason": "reflection could not read these headers",
       "ref": "10.2.1",
       "repo": "https://github.com/fmtlib/fmt",
-      "seconds": 4.7,
+      "seconds": 5.3,
       "shape": "template",
       "status": "failed",
       "stub_written": false
@@ -362,7 +364,7 @@
       "reason": "reflection could not read these headers",
       "ref": "1.0.1",
       "repo": "https://github.com/g-truc/glm",
-      "seconds": 7.2,
+      "seconds": 7.8,
       "shape": "template",
       "status": "failed",
       "stub_written": false
@@ -386,7 +388,7 @@
       "reason": "unclassified compile failure",
       "ref": "v0.9.6",
       "repo": "https://github.com/Neargye/magic_enum",
-      "seconds": 15.6,
+      "seconds": 16.3,
       "shape": "template",
       "status": "failed",
       "stub_written": false
@@ -407,7 +409,7 @@
         "FatalConditionHandler",
         "FatalConditionHandler::sigaction"
       ],
-      "classes_found": 89,
+      "classes_found": 84,
       "detail": "\u26a0 'DOCTEST_INTERFACE' is the binding name of 48 classes:",
       "discovery": "text-scan",
       "expect": "unknown",
@@ -417,35 +419,36 @@
       "reason": "reflection could not read these headers",
       "ref": "v2.4.11",
       "repo": "https://github.com/doctest/doctest",
-      "seconds": 5.8,
+      "seconds": 6.2,
       "shape": "template",
       "status": "failed",
       "stub_written": false
     },
     {
-      "category": "reflection-tu-failed",
+      "category": "ok",
       "class_names": [
         "group_descriptor",
         "null_t",
         "tombstone_t"
       ],
       "classes_found": 3,
-      "detail": "{\"status\":\"error\",\"module\":\"entt_compat\",\"languages\":[\"python\"],\"classes\":[{\"name\":\"null_t\",\"header\":\"entt/entity/entity.hpp\"},{\"name\":\"tombstone_t\",\"header\":\"entt/entity/entity.hpp\"},{\"name\":\"group_descriptor\",\"header\":",
+      "detail": "",
       "discovery": "text-scan",
       "expect": "unknown",
-      "module_built": false,
-      "module_bytes": 0,
+      "exported_names": 3,
+      "module_built": true,
+      "module_bytes": 99792,
       "name": "entt",
-      "reason": "reflection could not read these headers",
+      "reason": "",
       "ref": "v3.13.2",
       "repo": "https://github.com/skypjack/entt",
-      "seconds": 5.4,
+      "seconds": 6.9,
       "shape": "template",
-      "status": "failed",
-      "stub_written": false
+      "status": "ok",
+      "stub_written": true
     },
     {
-      "category": "no-converter-for-parameter",
+      "category": "ok",
       "class_names": [
         "b2AABB",
         "b2BlockAllocator",
@@ -461,30 +464,29 @@
         "b2ContactEdge"
       ],
       "classes_found": 81,
-      "detail": "/workspace/.worktrees/fixable/python/mirror_bridge_python.hpp:2847:16: error: no matching function for call to 'from_python'",
+      "detail": "",
       "discovery": "reflection",
-      "expect": "unknown",
-      "module_built": false,
-      "module_bytes": 0,
+      "expect": "bind",
+      "exported_names": 79,
+      "module_built": true,
+      "module_bytes": 2135792,
       "name": "box2d",
-      "reason": "a method parameter has no conversion from Python",
+      "reason": "",
       "ref": "v2.4.1",
       "repo": "https://github.com/erincatto/box2d",
-      "seconds": 49.8,
+      "seconds": 59.8,
       "shape": "oo",
-      "status": "failed",
-      "stub_written": false
+      "status": "ok",
+      "stub_written": true
     }
   ],
   "summary": {
     "by_category": {
-      "compile-error": 1,
-      "no-converter-for-parameter": 3,
-      "ok": 3,
-      "private-nested-type": 1,
-      "reflection-tu-failed": 8
+      "compile-error": 2,
+      "ok": 7,
+      "reflection-tu-failed": 7
     },
-    "ok": 3,
+    "ok": 7,
     "total": 16
   }
 }
