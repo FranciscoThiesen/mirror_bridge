@@ -36,6 +36,11 @@ namespace stubgen {
 struct ParameterInfo {
     std::string name;
     std::string type_hint;
+    // The parameter has a C++ default argument, so the call is legal without
+    // it. Rendered as `= ...`: a stub that demands every parameter makes a
+    // type checker reject calls the module accepts, which for SQLite::Database
+    // means rejecting `Database(path)` -- the first line anyone writes.
+    bool has_default = false;
 };
 
 struct MethodInfo {
@@ -186,6 +191,7 @@ private:
             ss << "    def __init__(self";
             for (const auto& param : info.constructors[0].parameters) {
                 ss << ", " << param.name << ": " << param.type_hint;
+                if (param.has_default) ss << " = ...";
             }
             ss << ") -> None: ...\n";
         } else {
@@ -195,6 +201,7 @@ private:
                 ss << "    def __init__(self";
                 for (const auto& param : ctor.parameters) {
                     ss << ", " << param.name << ": " << param.type_hint;
+                    if (param.has_default) ss << " = ...";
                 }
                 ss << ") -> None: ...\n";
             }
@@ -231,6 +238,7 @@ private:
             for (size_t i = 0; i < method.parameters.size(); ++i) {
                 if (i > 0) ss << ", ";
                 ss << method.parameters[i].name << ": " << method.parameters[i].type_hint;
+                if (method.parameters[i].has_default) ss << " = ...";
             }
             ss << ") -> " << method.return_type << ": ...\n";
         }
@@ -411,7 +419,8 @@ void register_property_stub(const char* class_name, const char* prop_name, bool 
 template<typename ReturnT, typename... Args>
 void register_method_stub(const char* class_name, const char* method_name,
                           const std::vector<std::string>& param_names = {},
-                          bool is_static = false) {
+                          bool is_static = false,
+                          std::size_t min_required = static_cast<std::size_t>(-1)) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
 
     MethodInfo method;
@@ -425,7 +434,7 @@ void register_method_stub(const char* class_name, const char* method_name,
         std::string pname = (i < param_names.size() && !param_names[i].empty())
                                 ? param_names[i]
                                 : "arg" + std::to_string(i);
-        method.parameters.push_back({pname, type_hints[i]});
+        method.parameters.push_back({pname, type_hints[i], i >= min_required});
     }
 
     info.methods.push_back(method);
@@ -445,7 +454,8 @@ inline void register_default_constructor_if_missing(const char* class_name) {
 // Register a constructor
 template<typename... Args>
 void register_constructor_stub(const char* class_name,
-                               const std::vector<std::string>& param_names = {}) {
+                               const std::vector<std::string>& param_names = {},
+                               std::size_t min_required = static_cast<std::size_t>(-1)) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
 
     ConstructorInfo ctor;
@@ -454,7 +464,7 @@ void register_constructor_stub(const char* class_name,
         std::string pname = (i < param_names.size() && !param_names[i].empty())
                                 ? param_names[i]
                                 : "arg" + std::to_string(i);
-        ctor.parameters.push_back({pname, type_hints[i]});
+        ctor.parameters.push_back({pname, type_hints[i], i >= min_required});
     }
 
     info.constructors.push_back(ctor);
