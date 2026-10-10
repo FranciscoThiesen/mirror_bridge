@@ -22,7 +22,9 @@
       "repo": "https://github.com/open-source-parsers/jsoncpp",
       "ref": "1.9.5",
       "headers": "include/json",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "jsoncpp_compat",
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -c @CHECKOUT@/src/lib_json/json_reader.cpp @CHECKOUT@/src/lib_json/json_value.cpp @CHECKOUT@/src/lib_json/json_writer.cpp",
@@ -34,7 +36,9 @@
       "repo": "https://github.com/leethomason/tinyxml2",
       "ref": "10.0.0",
       "headers": ".",
-      "include_dirs": ["."],
+      "include_dirs": [
+        "."
+      ],
       "module": "tinyxml2_compat",
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@ -c @CHECKOUT@/tinyxml2.cpp -o @BUILD@/tinyxml2.o",
@@ -46,7 +50,9 @@
       "repo": "https://github.com/zeux/pugixml",
       "ref": "v1.14",
       "headers": "src",
-      "include_dirs": ["src"],
+      "include_dirs": [
+        "src"
+      ],
       "module": "pugixml_compat",
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -c @CHECKOUT@/src/pugixml.cpp -o @BUILD@/pugixml.o",
@@ -58,7 +64,9 @@
       "repo": "https://github.com/jbeder/yaml-cpp",
       "ref": "0.8.0",
       "headers": "include/yaml-cpp",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "yamlcpp_compat",
       "shape": "oo",
       "expect": "unknown"
@@ -68,7 +76,9 @@
       "repo": "https://github.com/AngusJohnson/Clipper2",
       "ref": "Clipper2_1.4.0",
       "headers": "CPP/Clipper2Lib/include/clipper2",
-      "include_dirs": ["CPP/Clipper2Lib/include"],
+      "include_dirs": [
+        "CPP/Clipper2Lib/include"
+      ],
       "module": "clipper2_compat",
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O2 -fPIC -I@CHECKOUT@/CPP/Clipper2Lib/include -c @CHECKOUT@/CPP/Clipper2Lib/src/clipper.engine.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.offset.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.rectclip.cpp",
@@ -80,10 +90,15 @@
       "repo": "https://github.com/pmp-library/pmp-library",
       "ref": "3.0.0",
       "headers": "src/pmp",
-      "include_dirs": ["src", "external/eigen-3.4.0"],
+      "include_dirs": [
+        "src",
+        "external/eigen-3.4.0"
+      ],
       "module": "pmp_compat",
       "shape": "oo",
-      "exclude": ["visualization/*"],
+      "exclude": [
+        "visualization/*"
+      ],
       "build": "for f in @CHECKOUT@/src/pmp/surface_mesh.cpp @CHECKOUT@/src/pmp/algorithms/*.cpp @CHECKOUT@/src/pmp/io/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -I@CHECKOUT@/external/eigen-3.4.0 -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
       "link_args": "@BUILD@/*.o",
       "expect": "bind"
@@ -93,7 +108,9 @@
       "repo": "https://github.com/jarro2783/cxxopts",
       "ref": "v3.2.0",
       "headers": "include",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "cxxopts_compat",
       "shape": "oo",
       "expect": "unknown"
@@ -103,7 +120,9 @@
       "repo": "https://github.com/CLIUtils/CLI11",
       "ref": "v2.4.2",
       "headers": "include/CLI",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "cli11_compat",
       "shape": "oo",
       "expect": "unknown"
@@ -113,7 +132,9 @@
       "repo": "https://github.com/gabime/spdlog",
       "ref": "v1.14.1",
       "headers": "include/spdlog",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "spdlog_compat",
       "shape": "oo",
       "expect": "unknown"
@@ -123,7 +144,9 @@
       "repo": "https://github.com/nlohmann/json",
       "ref": "v3.11.3",
       "headers": "single_include/nlohmann",
-      "include_dirs": ["single_include"],
+      "include_dirs": [
+        "single_include"
+      ],
       "module": "nlohmannjson_compat",
       "shape": "template",
       "expect": "unknown"
@@ -133,7 +156,9 @@
       "repo": "https://github.com/fmtlib/fmt",
       "ref": "10.2.1",
       "headers": "include/fmt",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "fmt_compat",
       "shape": "template",
       "expect": "unknown"
@@ -143,18 +168,30 @@
       "repo": "https://github.com/g-truc/glm",
       "ref": "1.0.1",
       "headers": "glm",
-      "include_dirs": ["."],
+      "include_dirs": [
+        "."
+      ],
       "module": "glm_compat",
       "shape": "template",
-      "defines": ["GLM_FORCE_ALIGNED_GENTYPES", "GLM_ENABLE_EXPERIMENTAL"],
-      "expect": "unknown"
+      "defines": [
+        "GLM_ENABLE_EXPERIMENTAL"
+      ],
+      "expect": "unknown",
+      "exclude": [
+        "gtc/type_aligned.hpp",
+        "gtx/type_aligned.hpp",
+        "ext.hpp"
+      ],
+      "note": "the aligned-gentypes headers #error unless GLM detects SIMD support, which needs arch flags; ext.hpp pulls them in"
     },
     {
       "name": "magic_enum",
       "repo": "https://github.com/Neargye/magic_enum",
       "ref": "v0.9.6",
       "headers": "include/magic_enum",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "magicenum_compat",
       "shape": "template",
       "expect": "unknown"
@@ -164,10 +201,14 @@
       "repo": "https://github.com/doctest/doctest",
       "ref": "v2.4.11",
       "headers": "doctest",
-      "include_dirs": ["."],
+      "include_dirs": [
+        "."
+      ],
       "module": "doctest_compat",
       "shape": "template",
-      "exclude": ["extensions/*"],
+      "exclude": [
+        "extensions/*"
+      ],
       "expect": "unknown"
     },
     {
@@ -175,7 +216,9 @@
       "repo": "https://github.com/skypjack/entt",
       "ref": "v3.13.2",
       "headers": "src/entt/entity",
-      "include_dirs": ["src"],
+      "include_dirs": [
+        "src"
+      ],
       "module": "entt_compat",
       "shape": "template",
       "expect": "unknown"
@@ -185,12 +228,129 @@
       "repo": "https://github.com/erincatto/box2d",
       "ref": "v2.4.1",
       "headers": "include/box2d",
-      "include_dirs": ["include"],
+      "include_dirs": [
+        "include"
+      ],
       "module": "box2d_compat",
       "shape": "oo",
       "build": "for f in @CHECKOUT@/src/*/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -I@CHECKOUT@/src -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
       "link_args": "@BUILD@/*.o",
       "expect": "bind"
+    },
+    {
+      "name": "simdjson",
+      "repo": "https://github.com/simdjson/simdjson",
+      "ref": "v3.10.1",
+      "headers": "include/simdjson",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "simdjson_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "rapidjson",
+      "repo": "https://github.com/Tencent/rapidjson",
+      "ref": "v1.1.0",
+      "headers": "include/rapidjson",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "rapidjson_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "tinyobjloader",
+      "repo": "https://github.com/tinyobjloader/tinyobjloader",
+      "ref": "v2.0.0rc13",
+      "headers": ".",
+      "include_dirs": [
+        "."
+      ],
+      "module": "tinyobj_compat",
+      "shape": "oo",
+      "expect": "bind",
+      "exclude": [
+        "experimental/*",
+        "examples/*",
+        "tests/*",
+        "mapbox/*",
+        "deps/*"
+      ],
+      "note": "the library is the single root tiny_obj_loader.h; the rest is samples and vendored deps. TINYOBJLOADER_IMPLEMENTATION puts the definitions in the binding TU, which is how a single-header library is meant to be used",
+      "defines": [
+        "TINYOBJLOADER_IMPLEMENTATION"
+      ]
+    },
+    {
+      "name": "nanoflann",
+      "repo": "https://github.com/jlblancoc/nanoflann",
+      "ref": "v1.6.2",
+      "headers": "include",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "nanoflann_compat",
+      "shape": "template",
+      "expect": "unknown"
+    },
+    {
+      "name": "toml11",
+      "repo": "https://github.com/ToruNiina/toml11",
+      "ref": "v3.8.1",
+      "headers": "toml",
+      "include_dirs": [
+        "."
+      ],
+      "module": "toml11_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "fast_float",
+      "repo": "https://github.com/fastfloat/fast_float",
+      "ref": "v6.1.6",
+      "headers": "include/fast_float",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "fastfloat_compat",
+      "shape": "oo",
+      "expect": "unknown"
+    },
+    {
+      "name": "SQLiteCpp",
+      "repo": "https://github.com/SRombauts/SQLiteCpp",
+      "ref": "3.3.2",
+      "headers": "include/SQLiteCpp",
+      "include_dirs": [
+        "include",
+        "sqlite3"
+      ],
+      "module": "sqlitecpp_compat",
+      "shape": "oo",
+      "expect": "bind",
+      "build": "cc -O1 -fPIC -c @CHECKOUT@/sqlite3/sqlite3.c -o @BUILD@/sqlite3.o && for f in @CHECKOUT@/src/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -I@CHECKOUT@/sqlite3 -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
+      "link_args": "@BUILD@/*.o -lpthread -ldl"
+    },
+    {
+      "name": "cpp-httplib",
+      "repo": "https://github.com/yhirose/cpp-httplib",
+      "ref": "v0.18.1",
+      "headers": ".",
+      "include_dirs": [
+        "."
+      ],
+      "module": "httplib_compat",
+      "shape": "oo",
+      "expect": "unknown",
+      "exclude": [
+        "benchmark/*",
+        "test/*"
+      ],
+      "note": "the library is the single root httplib.h; benchmark/ vendors a copy of crow"
     }
   ]
 }

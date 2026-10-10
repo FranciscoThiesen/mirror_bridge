@@ -11,10 +11,12 @@ Writes one JSON object to --out. compatibility/format_matrix.py renders it.
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
 import shutil
+import tempfile
 import subprocess
 import sys
 import time
@@ -52,6 +54,13 @@ FAILURE_SIGNATURES = [
      r"'\w+' is a private member of",
      "the generated binding names a private nested type",
      0),
+    # The compiler itself fell over. Not a binding problem and not fixable
+    # here; it wants reporting upstream. yaml-cpp does this once the roots and
+    # the unnamed-template guard are right.
+    ("compiler-crash",
+     r"clang frontend command failed due to signal|internal compiler error|Segmentation fault",
+     "the compiler crashed on these headers",
+     re.I),
     ("no-converter-for-parameter",
      r"no matching function for call to 'from_python'",
      "a method parameter has no conversion from Python",
@@ -112,6 +121,114 @@ def classify_failure(cli_json, stderr):
     tail = [l.strip() for l in blob.splitlines() if l.strip()]
     return ("unknown", "no recognisable error in the output",
             tail[-1][:220] if tail else "")
+
+
+# Reflection toolchains, most specific first. MB_CXX wins if it is set, which
+# is the same override the CLI honours.
+BARE_TOOLCHAINS = [
+    ("clang++", ["-std=c++2c", "-freflection", "-freflection-latest", "-stdlib=libc++"]),
+    ("g++", ["-std=c++26", "-freflection"]),
+]
+
+
+def header_is_excluded(rel, patterns):
+    """Same semantics as the CLI's --exclude: a pattern with no leading slash
+    matches at any depth, the way .gitignore does."""
+    for pattern in patterns:
+        if not pattern:
+            continue
+        if fnmatch.fnmatchcase(rel, pattern):
+            return True
+        if not pattern.startswith("/") and fnmatch.fnmatchcase(rel, "*/" + pattern):
+            return True
+    return False
+
+
+def detect_reflection_compiler():
+    override = os.environ.get("MB_CXX")
+    candidates = BARE_TOOLCHAINS
+    if override:
+        base = os.path.basename(override)
+        flags = next((f for n, f in BARE_TOOLCHAINS if n in base), BARE_TOOLCHAINS[0][1])
+        candidates = [(override, flags)] + BARE_TOOLCHAINS
+    for binary, flags in candidates:
+        if not shutil.which(binary) and not os.path.isfile(binary):
+            continue
+        probe = "#include <meta>\nint main() { return 0; }\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+            f.write(probe)
+            path = f.name
+        try:
+            r = subprocess.run([binary] + flags + ["-fsyntax-only", path],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                return binary, flags
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            os.unlink(path)
+    return None, None
+
+
+def compiles_bare(lib, checkout, headers, work_dir, timeout):
+    """Whether the library's own headers compile with no mirror_bridge at all.
+
+    This is the question that decides whose bug a discovery failure is, and
+    guessing it wrong sends five libraries into the work queue that do not
+    belong there. One translation unit including the library's headers and
+    nothing else, same compiler and flags the reflection pass uses:
+
+        spdlog, fmt   fmt's own consteval format strings
+        CLI11         std::wstring_convert, which C++26 removed
+
+    None of those is reachable from here. Returns (ok, first error line), or
+    (None, reason) when the probe itself could not run -- which must not be
+    reported as the library's fault.
+    """
+    binary, flags = detect_reflection_compiler()
+    if not binary:
+        return None, "no reflection compiler found for the bare probe"
+
+    tu = os.path.join(work_dir, lib["name"] + "-bare.cpp")
+    includes = []
+    with open(tu, "w") as f:
+        for root, _dirs, files in os.walk(headers):
+            for name in sorted(files):
+                if not name.endswith((".h", ".hpp")):
+                    continue
+                rel = os.path.relpath(os.path.join(root, name), headers)
+                # The probe has to skip exactly what `generate --exclude` skips.
+                # Including a header the real run never sees makes the library
+                # look broken for a file we deliberately do not bind: doctest's
+                # `extensions/*` needs an MPI installation, and probing it
+                # reported doctest as uncompilable on a machine without MPI.
+                if header_is_excluded(rel, lib.get("exclude") or []):
+                    continue
+                includes.append(rel)
+                f.write('#include "%s"\n' % rel)
+        f.write("int main() { return 0; }\n")
+    if not includes:
+        return None, "no headers to probe"
+
+    cmd = [binary] + flags + ["-w", "-fsyntax-only", "-I" + headers]
+    if "clang" in os.path.basename(binary):
+        cmd.append("-ferror-limit=1")
+    for inc in lib.get("include_dirs", []):
+        cmd.append("-I" + os.path.normpath(os.path.join(checkout, inc)))
+    for macro in lib.get("defines", []):
+        cmd.append("-D" + macro)
+    cmd.append(tu)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "the bare probe timed out"
+    if "error: no input files" in r.stderr:
+        return None, "the bare probe built no translation unit"
+    if r.returncode == 0:
+        return True, ""
+    err = strip_ansi(r.stderr)
+    first = next((l.strip() for l in err.splitlines() if "error:" in l), "")
+    return False, first[:220]
 
 
 def fetch(lib, cache_dir):
@@ -270,6 +387,18 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
             # column already says `text-scan`, and the page explains what that
             # means once instead of sixteen times in a table.
             reason = "reflection could not read these headers"
+            # Before blaming the reflection pass, check whether the headers
+            # compile at all. Only here, because this is the one category
+            # where whose bug it is is in question, and the probe costs a
+            # compile.
+            bare_ok, bare_err = compiles_bare(lib, checkout, headers, work_dir, timeout)
+            if bare_ok is False:
+                category = "library-needs-newer-compiler"
+                reason = ("these headers do not compile under this reflection "
+                          "compiler at all, with no mirror_bridge involved")
+                row["bare_error"] = bare_err
+            elif bare_ok is None:
+                row["bare_probe"] = bare_err
         row.update(status="failed", category=category, reason=reason, detail=line)
         return row
 

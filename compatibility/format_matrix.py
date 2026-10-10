@@ -17,7 +17,8 @@ CATEGORY_ORDER = [
     "ok", "needs-linking", "imports-failed", "export-macro-discovery",
     "duplicate-binding-name", "reflection-tu-failed",
     "unsupported-container", "inaccessible-destructor",
-    "private-nested-type", "no-converter-for-parameter", "incomplete-type",
+    "private-nested-type", "no-converter-for-parameter",
+    "compiler-crash", "library-needs-newer-compiler", "incomplete-type",
     "template-depth", "constexpr-limit", "no-classes-found",
     "header-needs-flags", "manifest-wrong", "compile-error", "timeout",
     "fetch-failed", "unknown",
@@ -92,6 +93,8 @@ def main():
         else:
             module = mark
             why = r.get("reason", "") or r.get("category", "")
+            if r.get("bare_error"):
+                why += " \u2014 `" + r["bare_error"].split("error:")[-1].strip()[:70] + "`"
             if r.get("category") in ("compile-error", "unknown"):
                 why = "**%s** — %s" % (r.get("category"), why)
         w("| [%s](%s) | `%s` | %s | %s | %s | %s | %ss | %s |" % (
