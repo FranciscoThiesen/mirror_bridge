@@ -37,7 +37,9 @@
       "include_dirs": ["."],
       "module": "tinyxml2_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@ -c @CHECKOUT@/tinyxml2.cpp -o @BUILD@/tinyxml2.o",
+      "link_args": "@BUILD@/tinyxml2.o",
+      "expect": "bind"
     },
     {
       "name": "pugixml",
@@ -47,7 +49,9 @@
       "include_dirs": ["src"],
       "module": "pugixml_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -c @CHECKOUT@/src/pugixml.cpp -o @BUILD@/pugixml.o",
+      "link_args": "@BUILD@/pugixml.o",
+      "expect": "bind"
     },
     {
       "name": "yaml-cpp",
@@ -142,6 +146,7 @@
       "include_dirs": ["."],
       "module": "glm_compat",
       "shape": "template",
+      "defines": ["GLM_FORCE_ALIGNED_GENTYPES", "GLM_ENABLE_EXPERIMENTAL"],
       "expect": "unknown"
     },
     {
@@ -162,6 +167,7 @@
       "include_dirs": ["."],
       "module": "doctest_compat",
       "shape": "template",
+      "exclude": ["extensions/*"],
       "expect": "unknown"
     },
     {
@@ -182,7 +188,9 @@
       "include_dirs": ["include"],
       "module": "box2d_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "build": "for f in @CHECKOUT@/src/*/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -I@CHECKOUT@/src -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
+      "link_args": "@BUILD@/*.o",
+      "expect": "bind"
     }
   ]
 }
