@@ -59,4 +59,36 @@ struct Consumer {
     std::size_t takes_nodefault(const NoDefaultBag& b) const { return b.size(); }
 };
 
+// box2d: a variadic function has no FunctionTraits specialization, so
+// reaching one is a hard error rather than a declined binding.
+inline int sum_of(int count, ...) { return count; }
+
+// box2d's b2BlockAllocator::Free(void*, int). void* was allowed through the
+// parameter gate as an "opaque handle" and no from_python was ever written
+// for it, so the gate said yes and the conversion had no overload.
+struct Allocator {
+    int freed = 0;
+    void release(void* block, int size) { (void)block; freed += size; }
+    int usable(int n) const { return n + freed; }
+};
+
+// tinyxml2: a nested class the enclosing class keeps private still reaches
+// the template planner through signature closure, and the generated binding
+// cannot name it.
+template <int N>
+class Pool {
+public:
+    int capacity = N;
+private:
+    struct Block { int tag = 0; };
+    Block* head_ = nullptr;
+public:
+    Block* raw() { return head_; }
+};
+
+struct UsesPool {
+    Pool<16> pool;
+    int cap() const { return pool.capacity; }
+};
+
 }  // namespace decl

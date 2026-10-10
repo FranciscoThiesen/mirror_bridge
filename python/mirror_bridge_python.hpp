@@ -4855,6 +4855,16 @@ struct ConversionOverloadGenerator {
                 constexpr auto member = get_nested_member<T, Is>();
 
                 const auto& value = obj.[:member:];
+
+                // A member with no to_python is left out of the snapshot
+                // rather than failing the module. box2d has members this walk
+                // cannot convert -- function pointers among them -- and
+                // reaching one cost it all 81 classes. A dict missing one key
+                // is a far better answer than no module.
+                if constexpr (!requires { to_python(value); }) {
+                    return;
+                } else {
+
                 PyObject* py_value = to_python(value);
 
                 // Use interned string key for O(1) identity-based dict lookup
@@ -4864,6 +4874,8 @@ struct ConversionOverloadGenerator {
                 } else {
                     Py_DECREF(py_value);
                 }
+
+                }  // close the convertible-member branch
             }(), ...);
         }(std::make_index_sequence<member_count>{});
 
@@ -4913,6 +4925,14 @@ struct ConversionOverloadGenerator {
                                      !std::is_move_assignable_v<MemberType>) {
                     // Abstract or non-assignable member: can't reconstruct from
                     // dict. Silently skip — user should populate via setters.
+                    return;
+                } else if constexpr (!requires (MemberType& v) {
+                                         from_python(py_value, v); }) {
+                    // No conversion for this member's type, so it cannot be
+                    // restored from a dict. Skipped for the same reason the
+                    // abstract and non-assignable cases above are: the
+                    // alternative is a hard error that costs the module every
+                    // class, which is what box2d's members did.
                     return;
                 } else {
                     MemberType cpp_value;

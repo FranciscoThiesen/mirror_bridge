@@ -484,14 +484,28 @@ consteval bool is_value_bindable() {
     if constexpr (std::is_void_v<U>) return true;
     if constexpr (std::is_arithmetic_v<U>) return true;
     if constexpr (std::is_enum_v<U>) return true;
-    // Raw pointers only if pointing at simple types (char* for C-strings,
-    // void* opaque handle). Pointers to containers/classes in parameter
-    // positions are typically output parameters and not safely auto-bindable.
+    // Raw pointers only where a conversion actually exists, which means a
+    // char pointer carrying a C string and nothing else.
+    //
+    // void* was allowed here as an "opaque handle" and an arithmetic pointer
+    // as a buffer, but no from_python was ever written for either, so the
+    // gate said yes and the conversion then had no overload -- a hard error
+    // rather than a declined method. b2BlockAllocator::Free(void*, int) is
+    // the case: one such parameter cost box2d all 81 of its classes.
+    //
+    // The comment this replaces said pointers in parameter positions are
+    // "typically output parameters and not safely auto-bindable" and then
+    // allowed three kinds of them. Declining is what it meant.
     if constexpr (std::is_pointer_v<U>) {
-        using Pointee = std::remove_cv_t<std::remove_pointer_t<U>>;
-        return std::is_same_v<Pointee, char> ||
-               std::is_same_v<Pointee, void> ||
-               std::is_arithmetic_v<Pointee>;
+        using Pointee = std::remove_pointer_t<U>;
+        // const char* only. A mutable char* reaches a conversion that assigns
+        // the const char* from PyUnicode_AsUTF8 into it and does not compile;
+        // pugixml uses char_t* throughout and lost its module to that. The
+        // const has to be tested before remove_cv, which erases the very
+        // thing being asked about -- the previous version stripped it first
+        // and so could not tell the two apart.
+        return std::is_same_v<std::remove_cv_t<Pointee>, char> &&
+               std::is_const_v<Pointee>;
     }
     if constexpr (requires { sizeof(U); }) {
         // Classes with user-declared virtuals must NOT be value-bindable:
@@ -6732,6 +6746,16 @@ struct ConversionOverloadGenerator {
                 constexpr auto member = get_nested_member<T, Is>();
 
                 const auto& value = obj.[:member:];
+
+                // A member with no to_python is left out of the snapshot
+                // rather than failing the module. box2d has members this walk
+                // cannot convert -- function pointers among them -- and
+                // reaching one cost it all 81 classes. A dict missing one key
+                // is a far better answer than no module.
+                if constexpr (!requires { to_python(value); }) {
+                    return;
+                } else {
+
                 PyObject* py_value = to_python(value);
 
                 // Use interned string key for O(1) identity-based dict lookup
@@ -6741,6 +6765,8 @@ struct ConversionOverloadGenerator {
                 } else {
                     Py_DECREF(py_value);
                 }
+
+                }  // close the convertible-member branch
             }(), ...);
         }(std::make_index_sequence<member_count>{});
 
@@ -6790,6 +6816,14 @@ struct ConversionOverloadGenerator {
                                      !std::is_move_assignable_v<MemberType>) {
                     // Abstract or non-assignable member: can't reconstruct from
                     // dict. Silently skip — user should populate via setters.
+                    return;
+                } else if constexpr (!requires (MemberType& v) {
+                                         from_python(py_value, v); }) {
+                    // No conversion for this member's type, so it cannot be
+                    // restored from a dict. Skipped for the same reason the
+                    // abstract and non-assignable cases above are: the
+                    // alternative is a hard error that costs the module every
+                    // class, which is what box2d's members did.
                     return;
                 } else {
                     MemberType cpp_value;

@@ -54,6 +54,7 @@ DISCOVERED_LINES=()
 TEMPLATE_CAP=64
 INSTANTIATE=()
 EXCLUDE_PATTERNS=()
+EXTRA_DEFINES=()
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -190,6 +191,11 @@ ${YELLOW}Options:${NC}
                       names (no runtime parsing; stubs can't drift)
   --link-args ARGS    Extra link inputs for non-header-only libraries
                       (e.g. --link-args "/path/to/libFoo.a -lz")
+  -D, --define M[=V]  Define a preprocessor macro for both the reflection
+                      pass and the module compile. A library configured by
+                      macros needs it for both or neither: glm will not
+                      parse without GLM_FORCE_ALIGNED_GENTYPES on a compiler
+                      whose language extensions it cannot detect (repeatable)
   --exclude GLOB      Skip headers matching this shell glob. Matched against
                       the path as an include spells it, and -- like
                       .gitignore -- a pattern without a leading / matches at
@@ -875,7 +881,12 @@ planner_setup() {
     done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
     printf '%s\n' "${ps_classes[@]:-}" > "$PLANNER_WORK/classes.txt"
 
-    PLANNER_ARGS=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS" --project-root "$PROJECT_ROOT"
+    # The defines ride on --cxx-flags so the discovery unit is preprocessed
+    # exactly as the module is. A library configured by macros needs both or
+    # neither: glm parses only with GLM_FORCE_ALIGNED_GENTYPES, and a
+    # discovery unit without it reports a different library from the one the
+    # module compiles.
+    PLANNER_ARGS=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS ${EXTRA_DEFINES[*]:-}" --project-root "$PROJECT_ROOT"
                   --src-dir "$src_dir" --module "$module_name" --work "$PLANNER_WORK"
                   --headers-file "$PLANNER_WORK/headers.txt" --classes-file "$PLANNER_WORK/classes.txt"
                   --classes-out "$PLANNER_WORK/declared.tsv")
@@ -1089,7 +1100,7 @@ compile_binding() {
     # PyMODINIT_FUNC and Node's NAPI_MODULE already carry the attribute, and
     # the Lua one is marked with MIRROR_BRIDGE_EXPORT.
     local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
-        -I. -I$src_dir -I$PROJECT_ROOT \
+        -I. -I$src_dir -I$PROJECT_ROOT ${EXTRA_DEFINES[*]:-} \
         -fPIC -shared -O3 -DNDEBUG \
         -fvisibility=hidden -fvisibility-inlines-hidden \
         -Wno-deprecated-declarations"
@@ -1190,6 +1201,7 @@ cmd_generate() {
             --link-args) LINK_ARGS="$2"; shift 2 ;;
             --instantiate) INSTANTIATE+=("$2"); shift 2 ;;
             --exclude) EXCLUDE_PATTERNS+=("$2"); shift 2 ;;
+            -D|--define) EXTRA_DEFINES+=("-D$2"); shift 2 ;;
             --template-cap) TEMPLATE_CAP="$2"; shift 2 ;;
             --no-templates) NO_TEMPLATES=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;

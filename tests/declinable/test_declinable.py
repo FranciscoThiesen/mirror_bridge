@@ -59,4 +59,26 @@ for name in ("takes_unfillable", "takes_nodefault"):
     except TypeError:
         print(f"  ✓ {name} raises TypeError on a value it cannot convert")
 
+print("Test 6: a void* parameter is declined, the class keeps its other methods...")
+# box2d's b2BlockAllocator::Free(void*, int). void* was waved through the
+# parameter gate as an "opaque handle" with no conversion behind it.
+a = d.Allocator()
+assert a.usable(5) == 5, a.usable(5)
+rel = getattr(a, "release", None)
+if rel is None:
+    print("  ✓ release(void*, int) declined at bind time")
+else:
+    try:
+        rel(0, 1)
+        raise AssertionError("release accepted a value it cannot convert")
+    except TypeError:
+        print("  ✓ release raises rather than failing the build")
+
+print("Test 7: a private nested type does not cost the class that holds it...")
+# The planner reaches Pool<16>::Block through signature closure and cannot
+# name it in the generated binding. That must not take UsesPool with it.
+u = d.UsesPool()
+assert u.cap() == 16, u.cap()
+print("  ✓ UsesPool binds with a private nested type in its reach")
+
 print("\nAll declinable-shape tests passed!")
