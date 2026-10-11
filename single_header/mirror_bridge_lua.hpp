@@ -225,15 +225,33 @@ public:
 // ============================================================================
 
 // Data Member utilities
+//
+// Unnamed members are filtered out. An anonymous union is a nonstatic data
+// member with no name -- ImGuiStoragePair declares
+// `union { int val_i; float val_f; void* val_p; }` -- and identifier_of has a
+// precondition rather than a fallback, so every accessor downstream of here
+// stopped being a constant expression and the module failed to compile. The
+// Python backend filters in its own DataMemberCache; doing it here as well
+// keeps Lua and JavaScript, which use these accessors directly, from meeting
+// the same wall. It also declines to hand a caller three aliased attributes
+// where reading the one that was not written is undefined.
+template<typename T>
+consteval std::vector<std::meta::info> named_data_members() {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())) {
+        if (std::meta::has_identifier(m)) out.push_back(m);
+    }
+    return out;
+}
+
 template<typename T, std::size_t I>
 consteval auto get_data_member() {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
-    return members[I];
+    return named_data_members<T>()[I];
 }
 
 template<typename T>
 consteval std::size_t get_data_member_count() {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+    return named_data_members<T>().size();
 }
 
 // Member Function Cache — includes methods inherited from base classes.

@@ -225,15 +225,33 @@ public:
 // ============================================================================
 
 // Data Member utilities
+//
+// Unnamed members are filtered out. An anonymous union is a nonstatic data
+// member with no name -- ImGuiStoragePair declares
+// `union { int val_i; float val_f; void* val_p; }` -- and identifier_of has a
+// precondition rather than a fallback, so every accessor downstream of here
+// stopped being a constant expression and the module failed to compile. The
+// Python backend filters in its own DataMemberCache; doing it here as well
+// keeps Lua and JavaScript, which use these accessors directly, from meeting
+// the same wall. It also declines to hand a caller three aliased attributes
+// where reading the one that was not written is undefined.
+template<typename T>
+consteval std::vector<std::meta::info> named_data_members() {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())) {
+        if (std::meta::has_identifier(m)) out.push_back(m);
+    }
+    return out;
+}
+
 template<typename T, std::size_t I>
 consteval auto get_data_member() {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
-    return members[I];
+    return named_data_members<T>()[I];
 }
 
 template<typename T>
 consteval std::size_t get_data_member_count() {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+    return named_data_members<T>().size();
 }
 
 // Member Function Cache — includes methods inherited from base classes.
@@ -1126,6 +1144,7 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
+#include <vector>
 
 // ============================================================================
 // P3394 Feature Detection
@@ -1203,6 +1222,22 @@ namespace annotations {
 #if defined(__clang__)
 // Clang with P3394 support - use annotation_of_type
 
+// An anonymous union is a nonstatic data member with no name. identifier_of
+// has a precondition rather than a fallback, so letting one through made
+// get_visible_member_name ill-formed and the enclosing consteval call stopped
+// being a constant expression -- the module failed to compile over
+// ImGuiStoragePair's `union { int val_i; float val_f; void* val_p; }`. Both
+// variants below filter through here so the index space, the count and the
+// names cannot disagree.
+template<typename T>
+consteval std::vector<std::meta::info> named_members_of() {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())) {
+        if (std::meta::has_identifier(m)) out.push_back(m);
+    }
+    return out;
+}
+
 // Check if a member has the 'exclude' annotation
 template<std::meta::info Member>
 consteval bool is_excluded() {
@@ -1218,7 +1253,7 @@ consteval bool is_readonly() {
 // Count the number of non-excluded data members for a type
 template<typename T>
 consteval std::size_t count_visible_members() {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    auto members = named_members_of<T>();
     std::size_t count = 0;
     for (auto member : members) {
         if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
@@ -1231,7 +1266,7 @@ consteval std::size_t count_visible_members() {
 // Get the Nth visible (non-excluded) member
 template<typename T>
 consteval std::meta::info get_visible_member(std::size_t visible_index) {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    auto members = named_members_of<T>();
     std::size_t visible_count = 0;
     for (auto member : members) {
         if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
@@ -1277,13 +1312,13 @@ consteval bool is_readonly() {
 // Count the number of non-excluded data members - all members are visible
 template<typename T>
 consteval std::size_t count_visible_members() {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+    return named_members_of<T>().size();
 }
 
 // Get the Nth visible member - just return the Nth member directly
 template<typename T>
 consteval std::meta::info get_visible_member(std::size_t index) {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())[index];
+    return named_members_of<T>()[index];
 }
 
 // Check if the Nth visible member is readonly - always false without P3394
@@ -4278,6 +4313,16 @@ struct DataMemberCache {
 
             for (auto cls : layer) {
                 for (auto f : std::meta::nonstatic_data_members_of(cls, ctx)) {
+                    // An anonymous union is a nonstatic data member with no
+                    // name, and identifier_of has a precondition rather than a
+                    // fallback: asking it here stopped the whole cache being a
+                    // constant expression, which failed the module.
+                    // ImGuiStoragePair is the case -- `union { int val_i; float
+                    // val_f; void* val_p; }` -- and the shape is everywhere in
+                    // C APIs. Skipping it also declines to hand Python three
+                    // aliased attributes where reading the one that was not
+                    // written is undefined.
+                    if (!std::meta::has_identifier(f)) continue;
                     auto name = std::meta::identifier_of(f);
 
                     bool hidden = false;
@@ -5479,13 +5524,23 @@ PyObject* py_getter(PyObject* self, void* closure) {
 
     // Direct member access via reflection - zero runtime overhead
     // Dereference pointer first to work around compiler bug with -> operator
-    auto& value = (*wrapper->cpp_object).[:member:];
-
-    // Type conversion to Python uses overload resolution:
-    // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
-    // - String → PyUnicode_FromStringAndSize (direct C API)
-    // - Container → Recursive to_python for elements
-    return to_python(value);
+    // A reference cannot bind to a bit-field, so a packed member is read by
+    // value. ImGui's ImFontGlyph declares `unsigned int Codepoint : 30` and
+    // that alone failed the whole module: "non-const reference cannot bind to
+    // bit-field 'Codepoint'". std::meta::is_bit_field answers this in both
+    // clang-p2996 and GCC 16.2 (probed before use). The setter needs no such
+    // branch -- it converts into a local and assigns, which a bit-field allows.
+    if constexpr (std::meta::is_bit_field(member)) {
+        auto value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    } else {
+        // Type conversion to Python uses overload resolution:
+        // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
+        // - String → PyUnicode_FromStringAndSize (direct C API)
+        // - Container → Recursive to_python for elements
+        auto& value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    }
 }
 
 // Setter for class members using reflection
@@ -5556,8 +5611,16 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
     constexpr auto member = get_visible_member_info<T, VisibleIndex>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    auto& value = (*wrapper->cpp_object).[:member:];
-    return to_python(value);
+    // Read by value: a reference cannot bind to a bit-field (see py_getter).
+    // The else matters: an `if constexpr` with a return does not discard what
+    // follows it, so a trailing `auto&` would still be instantiated.
+    if constexpr (std::meta::is_bit_field(member)) {
+        auto value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    } else {
+        auto& value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    }
 }
 
 // Setter for visible class members (same logic as py_setter but uses visible index).
@@ -7118,13 +7181,26 @@ namespace {
     // Look up a type from the Python-based global registry
     template<typename T>
     PyTypeObject* lookup_type_in_python() {
-        PyObject* registry = get_python_type_registry();
-        if (!registry) return nullptr;
+        // typeid on an incomplete type is ill-formed, not merely useless, and
+        // this function is reached with whatever types the headers name: the
+        // member-template planner walks the type universe through keys_of().
+        // Open3D forward-declares camera::PinholeCameraParameters,
+        // camera::PinholeCameraIntrinsic and nanoflann's metric_L2 -- ordinary
+        // legal C++, used only behind a unique_ptr or by reference -- and each
+        // one failed the whole module with "'typeid' of incomplete type".
+        // An incomplete type cannot have been registered: registering one
+        // requires having bound it, and binding requires a definition.
+        if constexpr (!requires { sizeof(T); }) {
+            return nullptr;
+        } else {
+            PyObject* registry = get_python_type_registry();
+            if (!registry) return nullptr;
 
-        const char* type_name = typeid(T).name();
-        PyObject* py_type = PyDict_GetItemString(registry, type_name);
+            const char* type_name = typeid(T).name();
+            PyObject* py_type = PyDict_GetItemString(registry, type_name);
 
-        return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
+            return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
+        }
     }
 }
 

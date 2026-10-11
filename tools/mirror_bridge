@@ -73,8 +73,17 @@ else
 fi
 
 case "$CXX_BIN" in
-    *clang*) CXX_REFLECT_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++" ;;
-    *)       CXX_REFLECT_FLAGS="-std=c++26 -freflection" ;;
+    *clang*) CXX_REFLECT_FLAGS="-std=c++2c -freflection -freflection-latest -stdlib=libc++"
+             # A reflection walk over a real struct is a long constant
+             # evaluation, and the default budget is sized for ordinary
+             # constexpr code. ImGuiStyle -- 55 members, several arrays -- hit
+             # "constexpr evaluation hit maximum step limit; possible infinite
+             # loop?" and failed the module. The planner's own discovery unit
+             # has raised this since it was written; the module compile had
+             # not, so a class could survive planning and then fail to build.
+             CXX_CONSTEXPR_BUDGET="-fconstexpr-steps=100000000" ;;
+    *)       CXX_REFLECT_FLAGS="-std=c++26 -freflection"
+             CXX_CONSTEXPR_BUDGET="-fconstexpr-ops-limit=1000000000" ;;
 esac
 
 # JSON output support (--json on generate/diff/doctor). Contract: in JSON
@@ -111,7 +120,12 @@ suggest_fix() {
         echo "A member type has no converter. Mark it [[=exclude{}]] or add a custom converter. See docs/reference/type-conversion.md"
     elif echo "$log" | grep -qE "'meta' file not found|freflection"; then
         echo "Compiler lacks C++26 reflection support. Run inside the mirror_bridge container (./start_dev_container.sh)"
-    elif echo "$log" | grep -q "Eigen"; then
+    elif echo "$log" | grep -qE "fatal error: '(Eigen/[^']*|eigen3/[^']*|Eigen)' file not found"; then
+        # Match the diagnostic, not the word. Any library that uses Eigen
+        # mentions it in paths and deprecation warnings, so grepping for
+        # "Eigen" told an Open3D user to install libeigen3-dev when the real
+        # error was mirror_bridge calling typeid on an incomplete type. A
+        # suggestion that sends the reader somewhere else is worse than none.
         echo "Eigen headers not found. Install libeigen3-dev or pass -I /path/to/eigen3"
     elif echo "$log" | grep -q "Python.h"; then
         echo "Python dev headers missing. Install python3-dev"
@@ -1129,7 +1143,7 @@ compile_binding() {
     # itself through the PLT. The entry points stay visible: CPython's
     # PyMODINIT_FUNC and Node's NAPI_MODULE already carry the attribute, and
     # the Lua one is marked with MIRROR_BRIDGE_EXPORT.
-    local cmd="$CXX_BIN $CXX_REFLECT_FLAGS \
+    local cmd="$CXX_BIN $CXX_REFLECT_FLAGS $CXX_CONSTEXPR_BUDGET \
         -I. -I$src_dir -I$PROJECT_ROOT ${EXTRA_DEFINES[*]:-} \
         -fPIC -shared -O3 -DNDEBUG \
         -fvisibility=hidden -fvisibility-inlines-hidden \

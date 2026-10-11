@@ -2357,6 +2357,16 @@ struct DataMemberCache {
 
             for (auto cls : layer) {
                 for (auto f : std::meta::nonstatic_data_members_of(cls, ctx)) {
+                    // An anonymous union is a nonstatic data member with no
+                    // name, and identifier_of has a precondition rather than a
+                    // fallback: asking it here stopped the whole cache being a
+                    // constant expression, which failed the module.
+                    // ImGuiStoragePair is the case -- `union { int val_i; float
+                    // val_f; void* val_p; }` -- and the shape is everywhere in
+                    // C APIs. Skipping it also declines to hand Python three
+                    // aliased attributes where reading the one that was not
+                    // written is undefined.
+                    if (!std::meta::has_identifier(f)) continue;
                     auto name = std::meta::identifier_of(f);
 
                     bool hidden = false;
@@ -3558,13 +3568,23 @@ PyObject* py_getter(PyObject* self, void* closure) {
 
     // Direct member access via reflection - zero runtime overhead
     // Dereference pointer first to work around compiler bug with -> operator
-    auto& value = (*wrapper->cpp_object).[:member:];
-
-    // Type conversion to Python uses overload resolution:
-    // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
-    // - String → PyUnicode_FromStringAndSize (direct C API)
-    // - Container → Recursive to_python for elements
-    return to_python(value);
+    // A reference cannot bind to a bit-field, so a packed member is read by
+    // value. ImGui's ImFontGlyph declares `unsigned int Codepoint : 30` and
+    // that alone failed the whole module: "non-const reference cannot bind to
+    // bit-field 'Codepoint'". std::meta::is_bit_field answers this in both
+    // clang-p2996 and GCC 16.2 (probed before use). The setter needs no such
+    // branch -- it converts into a local and assigns, which a bit-field allows.
+    if constexpr (std::meta::is_bit_field(member)) {
+        auto value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    } else {
+        // Type conversion to Python uses overload resolution:
+        // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
+        // - String → PyUnicode_FromStringAndSize (direct C API)
+        // - Container → Recursive to_python for elements
+        auto& value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    }
 }
 
 // Setter for class members using reflection
@@ -3635,8 +3655,16 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
     constexpr auto member = get_visible_member_info<T, VisibleIndex>();
     using MemberType = typename [:std::meta::type_of(member):];
 
-    auto& value = (*wrapper->cpp_object).[:member:];
-    return to_python(value);
+    // Read by value: a reference cannot bind to a bit-field (see py_getter).
+    // The else matters: an `if constexpr` with a return does not discard what
+    // follows it, so a trailing `auto&` would still be instantiated.
+    if constexpr (std::meta::is_bit_field(member)) {
+        auto value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    } else {
+        auto& value = (*wrapper->cpp_object).[:member:];
+        return to_python(value);
+    }
 }
 
 // Setter for visible class members (same logic as py_setter but uses visible index).
@@ -5197,13 +5225,26 @@ namespace {
     // Look up a type from the Python-based global registry
     template<typename T>
     PyTypeObject* lookup_type_in_python() {
-        PyObject* registry = get_python_type_registry();
-        if (!registry) return nullptr;
+        // typeid on an incomplete type is ill-formed, not merely useless, and
+        // this function is reached with whatever types the headers name: the
+        // member-template planner walks the type universe through keys_of().
+        // Open3D forward-declares camera::PinholeCameraParameters,
+        // camera::PinholeCameraIntrinsic and nanoflann's metric_L2 -- ordinary
+        // legal C++, used only behind a unique_ptr or by reference -- and each
+        // one failed the whole module with "'typeid' of incomplete type".
+        // An incomplete type cannot have been registered: registering one
+        // requires having bound it, and binding requires a definition.
+        if constexpr (!requires { sizeof(T); }) {
+            return nullptr;
+        } else {
+            PyObject* registry = get_python_type_registry();
+            if (!registry) return nullptr;
 
-        const char* type_name = typeid(T).name();
-        PyObject* py_type = PyDict_GetItemString(registry, type_name);
+            const char* type_name = typeid(T).name();
+            PyObject* py_type = PyDict_GetItemString(registry, type_name);
 
-        return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
+            return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
+        }
     }
 }
 
