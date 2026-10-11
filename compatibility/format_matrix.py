@@ -14,7 +14,8 @@ import sys
 # Rows are ordered by how actionable they are, not alphabetically: a category
 # with a known cause belongs above one that is still a mystery.
 CATEGORY_ORDER = [
-    "ok", "needs-linking", "imports-failed", "export-macro-discovery",
+    "ok", "partial-binding", "token-binding",
+    "needs-linking", "imports-failed", "export-macro-discovery",
     "duplicate-binding-name", "reflection-tu-failed",
     "unsupported-container", "inaccessible-destructor",
     "private-nested-type", "no-converter-for-parameter",
@@ -26,6 +27,8 @@ CATEGORY_ORDER = [
 
 STATUS_MARK = {
     "ok": "binds",
+    "partial-binding": "binds, missing core API",
+    "token-binding": "binds nothing usable",
     "needs-linking": "builds, needs the library linked",
     "imports-failed": "builds, will not import",
     "failed": "no module",
@@ -59,6 +62,8 @@ def main():
     rows.sort(key=lambda r: (rank.get(r.get("category", "unknown"), 99), r["name"].lower()))
 
     ok = [r for r in rows if r["status"] == "ok"]
+    partial = [r for r in rows if r["status"] == "partial-binding"]
+    token = [r for r in rows if r["status"] == "token-binding"]
     oo = [r for r in rows if r.get("shape") == "oo"]
     tpl = [r for r in rows if r.get("shape") == "template"]
     oo_ok = [r for r in oo if r["status"] == "ok"]
@@ -70,11 +75,26 @@ def main():
 
     w("_Generated %s at commit `%s` on %s._" % (when, args.commit[:12], args.env))
     w("")
-    w("**%d of %d libraries bind end to end** — %d of %d class-based, %d of %d "
+    w("**%d of %d libraries bind usefully** — %d of %d class-based, %d of %d "
       "header-only generic. Every library is pinned to the tag shown and nothing "
       "here is written or patched by us: the command is `mirror_bridge generate "
       "<include dir> --module <name> --lang python`, run against an unmodified "
       "checkout." % (len(ok), len(rows), len(oo_ok), len(oo), len(tpl_ok), len(tpl)))
+    w("")
+    w("\"Usefully\" is a measured bar, not a judgement call. Each entry in the "
+      "corpus manifest carries a `must_export` list: the handful of names a caller "
+      "of that library reaches for first, taken from its own README. A module that "
+      "imports but exposes none of them is **binds nothing usable**, and one "
+      "missing some of them is **binds, missing core API** — both are failures "
+      "here. Without that bar, a module exporting entt's three internal tag types "
+      "counted the same as one exporting jsoncpp's `Value`, `Reader` and "
+      "`StreamWriterBuilder`.")
+    if partial or token:
+        w("")
+        w("Right now **%d of the modules that build are not usable**: %s." % (
+            len(partial) + len(token),
+            "; ".join("%s is missing %s" % (r["name"], ", ".join(r.get("must_export_missing") or []))
+                      for r in partial + token)))
     w("")
     refl = [r for r in rows if r.get("discovery") == "reflection"]
     w("Discovery ran through reflection on **%d of %d**; the rest fell back to the "
