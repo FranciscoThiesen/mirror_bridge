@@ -445,6 +445,236 @@
         "Server",
         "Client"
       ]
+    },
+    {
+      "name": "open3d",
+      "repo": "https://github.com/isl-org/Open3D",
+      "ref": "v0.20.0",
+      "headers": "cpp/open3d/geometry",
+      "include_dirs": [
+        "cpp",
+        "/usr/include/eigen3"
+      ],
+      "module": "open3d_compat",
+      "shape": "oo",
+      "defines": [
+        "FMT_HEADER_ONLY"
+      ],
+      "must_export": [
+        "PointCloud",
+        "TriangleMesh",
+        "LineSet",
+        "AxisAlignedBoundingBox"
+      ],
+      "expect": "unknown",
+      "note": "Unchanged from scouting; measured, not repaired. Scoped to the legacy geometry module, the subtree the README's 25,262-lines-of-pybind11 claim is about. The whole public header root (cpp/open3d) does not bare-compile here: core/ needs MKL and nvcc, io/ needs the Azure Kinect SDK and msgpack, ml/ needs CUDA, t/ and visualization/ need GLEW and filament. geometry/ bare-compiles in 1.6s under -std=c+"
+    },
+    {
+      "name": "eigen",
+      "repo": "https://gitlab.com/libeigen/eigen",
+      "ref": "3.4.0",
+      "headers": "Eigen",
+      "include_dirs": [
+        "."
+      ],
+      "module": "eigen_compat",
+      "shape": "template",
+      "exclude": [
+        "*Support",
+        "src/*Support/*",
+        "src/Core/arch/*",
+        "Sparse*",
+        "src/Sparse*",
+        "OrderingMethods",
+        "src/OrderingMethods/*",
+        "IterativeLinearSolvers",
+        "src/IterativeLinearSolvers/*",
+        "src/misc/*",
+        "src/plugins/*",
+        "src/misc/blas.h",
+        "src/misc/lapack.h",
+        "src/misc/lapacke.h",
+        "src/misc/lapacke_mangling.h",
+        "src/Core/util/NonMPL2.h",
+        "src/Core/ForceAlignedAccess.h",
+        "src/Core/Assign_MKL.h",
+        "*_LAPACKE.h",
+        "*_BLAS.h",
+        "*_MKL.h"
+      ],
+      "must_export": [
+        "MatrixXd",
+        "VectorXd",
+        "Matrix3d",
+        "Vector3d"
+      ],
+      "expect": "unknown",
+      "note": "The public interface is 30 extensionless files (Eigen/Core, Eigen/Dense). Its internal src/** headers are not self-contained and are only correct when pulled in by an umbrella, so they are included after the umbrellas and act as guarded no-ops. The excluded subtrees need external libraries (SuiteSparse, MKL, METIS) or x86 intrinsics that do not exist on this host."
+    },
+    {
+      "name": "abseil",
+      "repo": "https://github.com/abseil/abseil-cpp",
+      "ref": "20260817.0",
+      "headers": "absl",
+      "include_dirs": [
+        "."
+      ],
+      "module": "abseil_compat",
+      "shape": "oo",
+      "exclude": [
+        "*test*.h",
+        "*mock*.h",
+        "*status_matchers.h"
+      ],
+      "build": "find @CHECKOUT@/absl -name '*.cc' ! -name '*test*' ! -name '*mock*' ! -name '*benchmark*' ! -name '*matchers*' ! -name 'chi_square.cc' ! -name '*_win.cc' ! -name 'print_hash_of.cc' ! -name 'gaussian_distribution_gentables.cc' -print0 | xargs -0 -P4 -I{} sh -c 'o=$(echo \"${1#@CHECKOUT@/absl/}\" | tr / _); clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ -O1 -fPIC -w -I@CHECKOUT@ -c \"$1\" -o \"@BUILD@/${o%.cc}.o\"' _ {}",
+      "link_args": "@BUILD@/*.o -lpthread",
+      "must_export": [
+        "Status",
+        "Mutex",
+        "Time",
+        "Duration"
+      ],
+      "expect": "unknown",
+      "note": "headers is absl/, which is exactly what the root CMakeLists install(DIRECTORY absl ...) ships; include_dirs is the checkout root because abseil spells its own includes \"absl/...\". No defines needed. The excludes are the gtest/gmock-dependent test-support headers abseil's crude install rule ships anyway -- without them the bare probe dies on 'gmock/gmock.h' file not found, which is this container's"
+    },
+    {
+      "name": "imgui",
+      "repo": "https://github.com/ocornut/imgui",
+      "ref": "v1.92.9b",
+      "headers": ".",
+      "include_dirs": [
+        "."
+      ],
+      "module": "imgui_compat",
+      "shape": "oo",
+      "exclude": [
+        "backends/*",
+        "examples/*",
+        "misc/*",
+        "imstb_*.h",
+        "imgui_internal.h"
+      ],
+      "build": "for f in @CHECKOUT@/imgui*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@ -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
+      "link_args": "@BUILD@/*.o",
+      "must_export": [
+        "ImVec2",
+        "ImVec4",
+        "ImGuiIO",
+        "ImGuiStyle",
+        "ImDrawList"
+      ],
+      "expect": "unknown",
+      "note": "the library is the root folder (README: \"all the files in the root folder of the repository (imgui*.cpp, imgui*.h)\"); backends/ need platform SDKs, examples/ vendors GLFW, misc/ needs freetype or includes the .cpp files, imstb_*.h are vendored stb copies, imgui_internal.h is the explicitly-unguaranteed internal API. Measured 2026-10-11: entry is correct as scouted and needs no change; bare compile"
+    },
+    {
+      "name": "googletest",
+      "repo": "https://github.com/google/googletest",
+      "ref": "v1.18.0",
+      "headers": "googletest/include/gtest",
+      "include_dirs": [
+        "googletest/include"
+      ],
+      "module": "googletest_compat",
+      "shape": "oo",
+      "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/googletest/include -I@CHECKOUT@/googletest -c @CHECKOUT@/googletest/src/gtest-all.cc -o @BUILD@/gtest-all.o",
+      "link_args": "@BUILD@/gtest-all.o -lpthread",
+      "must_export": [
+        "Test",
+        "UnitTest",
+        "TestInfo",
+        "AssertionResult",
+        "TestEventListener"
+      ],
+      "expect": "unknown"
+    },
+    {
+      "name": "range-v3",
+      "repo": "https://github.com/ericniebler/range-v3",
+      "ref": "0.12.0",
+      "headers": "include",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "rangev3_compat",
+      "shape": "template",
+      "exclude": [
+        "std/detail/associated_types.hpp",
+        "range/v3/detail/prologue.hpp",
+        "range/v3/detail/epilogue.hpp"
+      ],
+      "must_export": [
+        "transform_view",
+        "filter_view",
+        "iota_view",
+        "subrange",
+        "any_view"
+      ],
+      "expect": "unknown",
+      "note": "no module: range-v3 0.12.0 reopens namespace std and writes unqualified meta::_t (move_iterators.hpp:444 and 8 more headers), which resolves to C++26 std::meta once <meta> is in the TU. Reproduces in 3 lines with no mirror_bridge. Separately, the reflection TU blows -fconstexpr-steps in core/mirror_bridge_plan.hpp:102, so discovery falls back to a text scan that binds macro names. All 5 must_expor"
+    },
+    {
+      "name": "asio",
+      "repo": "https://github.com/chriskohlhoff/asio",
+      "ref": "asio-1-38-2",
+      "headers": "include/asio",
+      "include_dirs": [
+        "include"
+      ],
+      "module": "asio_compat",
+      "shape": "template",
+      "exclude": [
+        "spawn.hpp",
+        "impl/*",
+        "yield.hpp",
+        "unyield.hpp",
+        "detail/push_options.hpp",
+        "detail/pop_options.hpp",
+        "detail/io_uring_null_buffers_op.hpp",
+        "detail/io_uring_wait_op.hpp",
+        "windows/*"
+      ],
+      "link_args": "-lssl -lcrypto -lpthread",
+      "must_export": [
+        "io_context",
+        "tcp",
+        "udp",
+        "address",
+        "thread_pool"
+      ],
+      "expect": "unknown"
+    },
+    {
+      "name": "opencv",
+      "repo": "https://github.com/opencv/opencv",
+      "ref": "4.14.0",
+      "headers": "modules/core/include",
+      "include_dirs": [
+        "modules/core/include",
+        "mb_generated"
+      ],
+      "module": "opencv_compat",
+      "shape": "oo",
+      "exclude": [
+        "*private*",
+        "cuda/*",
+        "cuda_stream_accessor.hpp",
+        "opencl/*",
+        "openvx/*",
+        "hal/intrin*",
+        "hal/simd_utils.impl.hpp",
+        "parallel/backend/*",
+        "eigen.hpp"
+      ],
+      "build": "mkdir -p @CHECKOUT@/mb_generated/opencv2 && printf '#define HAVE_OPENCV_CORE\\n' > @CHECKOUT@/mb_generated/opencv2/opencv_modules.hpp",
+      "must_export": [
+        "Mat",
+        "Scalar",
+        "Point",
+        "Rect",
+        "FileStorage"
+      ],
+      "expect": "unknown",
+      "note": "Only the core module. opencv2/core/base.hpp includes opencv2/opencv_modules.hpp, which CMake generates and the install tree ships; the build step writes the core-only version of it into the checkout so the headers parse without a configure. No -D is needed and __OPENCV_BUILD must NOT be defined, or cvdef.h pulls in the generated cvconfig.h too. No link_args: libopencv_core is not built here, so th"
     }
   ]
 }
