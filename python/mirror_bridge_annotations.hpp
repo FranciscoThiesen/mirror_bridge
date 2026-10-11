@@ -26,6 +26,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
+#include <vector>
 
 // ============================================================================
 // P3394 Feature Detection
@@ -103,6 +104,22 @@ namespace annotations {
 #if defined(__clang__)
 // Clang with P3394 support - use annotation_of_type
 
+// An anonymous union is a nonstatic data member with no name. identifier_of
+// has a precondition rather than a fallback, so letting one through made
+// get_visible_member_name ill-formed and the enclosing consteval call stopped
+// being a constant expression -- the module failed to compile over
+// ImGuiStoragePair's `union { int val_i; float val_f; void* val_p; }`. Both
+// variants below filter through here so the index space, the count and the
+// names cannot disagree.
+template<typename T>
+consteval std::vector<std::meta::info> named_members_of() {
+    std::vector<std::meta::info> out;
+    for (auto m : std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())) {
+        if (std::meta::has_identifier(m)) out.push_back(m);
+    }
+    return out;
+}
+
 // Check if a member has the 'exclude' annotation
 template<std::meta::info Member>
 consteval bool is_excluded() {
@@ -118,7 +135,7 @@ consteval bool is_readonly() {
 // Count the number of non-excluded data members for a type
 template<typename T>
 consteval std::size_t count_visible_members() {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    auto members = named_members_of<T>();
     std::size_t count = 0;
     for (auto member : members) {
         if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
@@ -131,7 +148,7 @@ consteval std::size_t count_visible_members() {
 // Get the Nth visible (non-excluded) member
 template<typename T>
 consteval std::meta::info get_visible_member(std::size_t visible_index) {
-    auto members = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    auto members = named_members_of<T>();
     std::size_t visible_count = 0;
     for (auto member : members) {
         if (!std::meta::annotation_of_type<exclude>(member).has_value()) {
@@ -177,13 +194,13 @@ consteval bool is_readonly() {
 // Count the number of non-excluded data members - all members are visible
 template<typename T>
 consteval std::size_t count_visible_members() {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+    return named_members_of<T>().size();
 }
 
 // Get the Nth visible member - just return the Nth member directly
 template<typename T>
 consteval std::meta::info get_visible_member(std::size_t index) {
-    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current())[index];
+    return named_members_of<T>()[index];
 }
 
 // Check if the Nth visible member is readonly - always false without P3394

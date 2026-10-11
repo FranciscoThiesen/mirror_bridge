@@ -197,6 +197,15 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # Shapes a C-style API has: bit-fields, anonymous unions, and a
+    # forward-declared type reached through the member-template universe
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/c_api_shapes)
+        mirror_bridge_python_module(c_api_shapes
+            c_api_shapes/c_api_shapes_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/c_api_shapes
+        )
+    endif()
+
     # Integer and float arguments are range-checked, and a refused
     # conversion leaves no Python error set behind
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/numeric_conversion)
@@ -402,6 +411,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extensionless_headers)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/extensionless_headers/build_and_test.sh
     )
     set_tests_properties(cli_extensionless_headers PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
+# Bit-fields, anonymous unions and forward declarations, driven through the
+# CLI because the planner is what carries a forward-declared type into the
+# registry lookup.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/c_api_shapes)
+    add_test(NAME cli_c_api_shapes
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/c_api_shapes/build_and_test.sh
+    )
+    set_tests_properties(cli_c_api_shapes PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
     )
 endif()
