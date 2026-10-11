@@ -327,13 +327,43 @@ detect_eigen_dir() {
 # with ::), so it can be referenced from binding code without needing the
 # original class body. Namespaces are NOT joined — they're handled by the
 # `using namespace` directives emitted elsewhere.
+# Public headers are not always *.h or *.hpp. Eigen's entire public interface is
+# 30 extensionless files -- Eigen/Core, Eigen/Dense, Eigen/LU -- and Qt's is the
+# same shape (<QString>, <QWidget>). Matching only the two extensions made those
+# libraries invisible, and `generate` then reached their INTERNAL headers
+# directly. Those are not self-contained: Eigen/src/Cholesky/LDLT.h is meant to
+# be pulled in by Eigen/Cholesky and on its own gives "use of undeclared
+# identifier 'LDLT'". The module then failed on errors from inside the library,
+# which read as the library's fault and was ours. Included the documented way,
+# Eigen compiles clean under clang-p2996.
+#
+# An extensionless file only counts if it looks like a header. A C++ header opens
+# with a guard, an include, or a declaration; COPYING, AUTHORS and Makefile do
+# not. -I skips binaries and -m1 stops at the first match.
+header_looks_like_cxx() {
+    grep -qIm1 -E '^[[:space:]]*(#[[:space:]]*(include|pragma|ifndef|define|if)|namespace[[:space:]]|template[[:space:]]*<|class[[:space:]]|struct[[:space:]]|using[[:space:]])' "$1" 2>/dev/null
+}
+
+# Header enumeration, used everywhere a header set is needed so the extensions
+# and the sniff cannot drift apart. Extra find predicates (e.g. -maxdepth 1) are
+# passed through. Output is unsorted; callers sort.
+find_header_files() {
+    local dir="$1"
+    shift
+    find "$dir" "$@" -type f \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        header_looks_like_cxx "$candidate" && printf '%s\n' "$candidate"
+    done < <(find "$dir" "$@" -type f ! -name "*.*" 2>/dev/null)
+}
+
 discover_classes() {
     local src_dir="$1"
     local -n classes_ref=$2
     local -n headers_ref=$3
 
     local header_files
-    header_files=$(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
+    header_files=$(find_header_files "$src_dir" | sort)
 
     if [ -z "$header_files" ]; then
         echo -e "${RED}Error: No header files found in $src_dir${NC}"
@@ -878,7 +908,7 @@ planner_setup() {
         rel=$(header_include_spelling "$header_file" "$src_dir")
         header_is_excluded "$rel" && continue
         printf '%s\t%s\n' "$rel" "${already["$rel"]:-0}" >> "$PLANNER_WORK/headers.txt"
-    done < <(find "$src_dir" -type f \( -name "*.hpp" -o -name "*.h" \) | sort)
+    done < <(find_header_files "$src_dir" | sort)
     printf '%s\n' "${ps_classes[@]:-}" > "$PLANNER_WORK/classes.txt"
 
     # The defines ride on --cxx-flags so the discovery unit is preprocessed
@@ -1757,7 +1787,7 @@ cmd_diff() {
     if [ -z "$(printf '%s' "$current_sig" | tr -d '[:space:]')" ]; then
         local n_sub=0 n_skip=0
         if [ -d "$src_dir" ]; then
-            n_sub=$(find "$src_dir" -mindepth 2 -type f \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null | wc -l | tr -d ' ')
+            n_sub=$(find_header_files "$src_dir" -mindepth 2 | wc -l | tr -d ' ')
             n_skip=$(grep -rl "MIRROR_BRIDGE_SKIP" "$src_dir" --include="*.hpp" --include="*.h" 2>/dev/null | wc -l | tr -d ' ')
         fi
         echo -e "${RED}Error: 'mirror_bridge diff' found no headers to snapshot in $src_dir${NC}"
@@ -1857,7 +1887,7 @@ scan_binding_signatures() {
     local src_dir="$1"
 
     # Find headers and sort for deterministic output across platforms
-    find "$src_dir" -maxdepth 1 \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null | sort | while read -r header; do
+    find_header_files "$src_dir" -maxdepth 1 | sort | while read -r header; do
         [ -f "$header" ] || continue
         local basename
         basename=$(basename "$header")
@@ -1998,7 +2028,7 @@ cmd_watch() {
 # Compute checksums of all header files in a directory
 compute_header_checksums() {
     local dir="$1"
-    find "$dir" -maxdepth 3 \( -name "*.hpp" -o -name "*.h" \) -exec md5sum {} \; 2>/dev/null | sort
+    find_header_files "$dir" -maxdepth 3 | xargs -r md5sum 2>/dev/null | sort
 }
 
 show_watch_help() {

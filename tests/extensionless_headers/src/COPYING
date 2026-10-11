@@ -1,0 +1,3 @@
+Copyright holders of this fixture grant nothing in particular.
+This file has no extension and is not a C++ header. Sweeping it into the
+module is the mistake the sniff exists to avoid.

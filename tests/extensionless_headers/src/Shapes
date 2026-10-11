@@ -1,0 +1,13 @@
+// An extensionless public header, the way Eigen ships Eigen/Core and Qt ships
+// <QString>. Nothing here has a .h or .hpp name, so a walk that matches only
+// those two extensions sees this library as empty.
+#pragma once
+
+namespace ext {
+
+struct Square {
+    double side = 1.0;
+    double area() const { return side * side; }
+};
+
+}  // namespace ext
