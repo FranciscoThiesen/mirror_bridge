@@ -9,7 +9,7 @@
 # library's fault and was ours.
 #
 # The other half of the contract: an extensionless file is only a header if it
-# looks like one. COPYING and Makefile must stay out.
+# looks like one. AUTHORS and INSTALL must stay out.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,14 +37,14 @@ s.side = 3.0
 assert s.area() == 9.0, s.area()
 " 2>/dev/null || fail "the bound class does not work"
 
-echo "3. COPYING and Makefile are not treated as headers"
+echo "3. AUTHORS and INSTALL are not treated as headers"
 # They are extensionless too. A walk that took every extensionless file would
 # hand the compiler a licence notice. The headers list the planner was given is
 # the authoritative record of what the walk picked up.
 hdrs="$OUT/a/.mirror_bridge/plan/ext_shapes/headers.txt"
 [ -f "$hdrs" ] || fail "no header list was written; cannot check what was swept in"
 grep -q 'Shapes' "$hdrs" || fail "the extensionless header is not in the header list"
-for junk in COPYING Makefile; do
+for junk in AUTHORS INSTALL; do
     if grep -q "$junk" "$hdrs"; then
         fail "$junk was listed as a header"
     fi

@@ -1,0 +1,5 @@
+all:
+	@echo "also extensionless, also not a header"
+(Named INSTALL rather than Makefile: the repo's .gitignore ignores Makefile, so
+a committed fixture file by that name would not exist in a fresh clone and the
+check below would pass without checking anything.)
