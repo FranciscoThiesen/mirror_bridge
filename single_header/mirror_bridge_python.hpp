@@ -2285,6 +2285,13 @@ PyObject* to_python(const T& value) {
     } else if constexpr (std::is_same_v<BaseType, std::string_view>) {
         return PyUnicode_FromStringAndSize(value.data(), value.size());
     } else {
+        // A null `const char*` is how a C API says "absent", and
+        // PyUnicode_FromString(nullptr) does not fail -- it dereferences and
+        // takes the interpreter with it. Reading a `const char* name =
+        // nullptr;` member segfaulted Python outright (exit 139), with no
+        // traceback and nothing to catch. None is the honest answer, and it
+        // is what a caller can test.
+        if (value == nullptr) Py_RETURN_NONE;
         return PyUnicode_FromString(value);
     }
 }

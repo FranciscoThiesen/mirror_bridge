@@ -33,6 +33,14 @@ def main():
     assert not hasattr(cs, "HoldsOpaque")
     assert not hasattr(cs, "Opaque")
 
+    # A null `const char*` reads as None rather than taking the interpreter
+    # with it. Setting and reading back still works.
+    lab = cs.Label()
+    assert lab.id == 1
+    assert lab.text is None, repr(lab.text)
+    lab.text = "hello"
+    assert lab.text == "hello"
+
     print("c_api_shapes: all assertions passed")
     return 0
 

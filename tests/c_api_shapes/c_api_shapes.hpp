@@ -43,4 +43,12 @@ struct HoldsOpaque {
     int count_of() const { return size; }
 };
 
+// A C API says "absent" with a null pointer. PyUnicode_FromString(nullptr)
+// does not fail, it dereferences: reading this member took the whole
+// interpreter down with SIGSEGV, no traceback, nothing to catch.
+struct Label {
+    const char* text = nullptr;
+    int id = 1;
+};
+
 }  // namespace capi
