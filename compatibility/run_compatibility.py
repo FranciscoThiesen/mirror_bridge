@@ -131,6 +131,35 @@ BARE_TOOLCHAINS = [
 ]
 
 
+HEADER_SNIFF = re.compile(
+    r"^[ \t]*(#[ \t]*(include|pragma|ifndef|define|if)|namespace[ \t]|template[ \t]*<"
+    r"|class[ \t]|struct[ \t]|using[ \t])", re.MULTILINE)
+
+
+def looks_like_cxx_header(path):
+    """Same question the CLI's find_header_files asks of an extensionless file.
+
+    A public header is not always *.h or *.hpp: Eigen's whole interface is 30
+    extensionless files and Qt's is the same shape. The CLI learned to see them;
+    this probe had not, so it kept including Eigen's non-self-contained
+    internals directly and reporting that Eigen does not compile -- which is
+    the exact false accusation the probe exists to prevent. The two have to
+    agree about what a header is.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        return False
+    if b"\0" in head:
+        return False
+    try:
+        text = head.decode("utf-8", "ignore")
+    except ValueError:
+        return False
+    return bool(HEADER_SNIFF.search(text))
+
+
 def header_is_excluded(rel, patterns):
     """Same semantics as the CLI's --exclude: a pattern with no leading slash
     matches at any depth, the way .gitignore does."""
@@ -194,9 +223,12 @@ def compiles_bare(lib, checkout, headers, work_dir, timeout):
     with open(tu, "w") as f:
         for root, _dirs, files in os.walk(headers):
             for name in sorted(files):
+                full = os.path.join(root, name)
                 if not name.endswith((".h", ".hpp")):
-                    continue
-                rel = os.path.relpath(os.path.join(root, name), headers)
+                    # Extensionless only, and only when the contents say header.
+                    if "." in name or not looks_like_cxx_header(full):
+                        continue
+                rel = os.path.relpath(full, headers)
                 # The probe has to skip exactly what `generate --exclude` skips.
                 # Including a header the real run never sees makes the library
                 # look broken for a file we deliberately do not bind: doctest's
@@ -575,9 +607,18 @@ def main():
                 missing.append("must_export is empty")
             if not os.path.isdir(os.path.normpath(os.path.join(checkout, lib["headers"]))):
                 missing.append("headers=" + lib["headers"])
+            build = lib.get("build") or ""
             for inc in lib.get("include_dirs", []):
-                if not os.path.isdir(os.path.normpath(os.path.join(checkout, inc))):
-                    missing.append("include_dirs=" + inc)
+                if os.path.isdir(os.path.normpath(os.path.join(checkout, inc))):
+                    continue
+                # A directory the build step creates is not missing, it is not
+                # there yet. OpenCV's entry writes the opencv_modules.hpp that
+                # CMake would generate into `mb_generated` before anything is
+                # compiled, and validating ahead of the build called that a
+                # broken manifest.
+                if inc in build:
+                    continue
+                missing.append("include_dirs=" + inc)
             print("%-16s %s" % (lib["name"], "ok" if not missing else "MISSING " + ", ".join(missing)))
             bad += bool(missing)
         return 1 if bad else 0
