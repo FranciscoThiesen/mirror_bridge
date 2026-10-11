@@ -231,6 +231,42 @@ def compiles_bare(lib, checkout, headers, work_dir, timeout):
     return False, first[:220]
 
 
+def classify_exports(wanted, exported):
+    """Judge a module that imports by what it actually exposes.
+
+    Building and importing is not the bar. entt produced a module exporting
+    `group_descriptor`, `null_t` and `tombstone_t` -- three internal tag types
+    -- and nanoflann one exporting a single comparison functor, and both
+    counted as successes beside jsoncpp. `must_export` is what the manifest
+    says a usable binding has to expose, taken from the library's own README
+    rather than from what happens to bind.
+
+    Returns the fields to merge into the result row.
+    """
+    out = {"must_export_present": [], "must_export_missing": []}
+    if not wanted:
+        out.update(status="ok", category="ok", reason="", detail="")
+        return out
+    have = set(exported)
+    present = [n for n in wanted if n in have]
+    missing = [n for n in wanted if n not in have]
+    out["must_export_present"] = present
+    out["must_export_missing"] = missing
+    if not present:
+        out.update(status="token-binding", category="token-binding",
+                   reason="the module imports but exposes none of the API a "
+                          "caller needs: " + ", ".join(wanted),
+                   detail="exports " + ", ".join(exported[:8]))
+    elif missing:
+        out.update(status="partial-binding", category="partial-binding",
+                   reason="the module is missing API a caller needs: "
+                          + ", ".join(missing),
+                   detail="has " + ", ".join(present))
+    else:
+        out.update(status="ok", category="ok", reason="", detail="")
+    return out
+
+
 def fetch(lib, cache_dir):
     """Shallow-clone at the pinned ref. Returns (path, error)."""
     dest = os.path.join(cache_dir, lib["name"])
@@ -403,11 +439,13 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
         return row
 
     # Built is not the bar: a module that will not import is not usable.
+    # The names come back too, not just the count, because `must_export` below
+    # has to be checked against them.
     probe = subprocess.run(
         [sys.executable, "-c",
          "import sys; sys.path.insert(0, sys.argv[1]); "
          "m = __import__(sys.argv[2]); "
-         "print(len([n for n in dir(m) if not n.startswith('_')]))",
+         "print('\\n'.join(sorted(n for n in dir(m) if not n.startswith('_'))))",
          out, lib["module"]],
         capture_output=True, text=True, timeout=120)
     if probe.returncode != 0:
@@ -428,9 +466,44 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
                        detail=last)
         return row
 
-    row.update(status="ok", category="ok", reason="", detail="",
-               exported_names=int(probe.stdout.strip() or 0))
+    exported = [n for n in probe.stdout.split("\n") if n.strip()]
+    row["exported_names"] = len(exported)
+    row["exported_sample"] = exported[:40]
+
+    # A module that imports is not the bar either. entt produced one exporting
+    # `group_descriptor`, `null_t` and `tombstone_t` -- three internal tag types
+    # -- and nanoflann one exporting a single comparison functor, and both
+    # counted as successes beside jsoncpp. `must_export` is what the manifest
+    # says a usable binding of this library has to expose, chosen from the
+    # library's own documentation rather than from what happens to bind.
+    verdict = classify_exports(lib.get("must_export") or [], exported)
+    row.update(verdict)
     return row
+
+
+# How good an outcome is, for comparing against the manifest's `expect`. The
+# ladder exists because `must_export` RAISED the bar: tinyxml2 binds a module
+# and always did, but without XMLElement, and calling that a regression would
+# be wrong -- nothing got worse, the measurement got honest. A library may not
+# do worse than its recorded expectation; doing better is fine and the run says
+# so rather than failing.
+OUTCOME_RANK = {
+    "ok": 3,
+    "partial-binding": 2,
+    "token-binding": 1,
+}
+
+
+def outcome_rank(status):
+    return OUTCOME_RANK.get(status, 0)
+
+
+EXPECT_RANK = {
+    "bind": 3,
+    "partial": 2,
+    "token": 1,
+    "unknown": 0,
+}
 
 
 def write_results(path, rows):
@@ -440,6 +513,8 @@ def write_results(path, rows):
         "summary": {
             "total": len(rows),
             "ok": sum(1 for r in rows if r["status"] == "ok"),
+            "partial": sum(1 for r in rows if r["status"] == "partial-binding"),
+            "token": sum(1 for r in rows if r["status"] == "token-binding"),
             "by_category": {},
         },
     }
@@ -494,6 +569,10 @@ def main():
                 bad += 1
                 continue
             missing = []
+            # A manifest entry with no must_export silently skips the usability
+            # bar, which is exactly the hole this field closes.
+            if not lib.get("must_export"):
+                missing.append("must_export is empty")
             if not os.path.isdir(os.path.normpath(os.path.join(checkout, lib["headers"]))):
                 missing.append("headers=" + lib["headers"])
             for inc in lib.get("include_dirs", []):
@@ -520,14 +599,25 @@ def main():
         write_results(args.out, rows)
 
     payload = write_results(args.out, rows)
-    sys.stderr.write("\n%d/%d bind end to end -> %s\n" % (
-        payload["summary"]["ok"], len(rows), args.out))
+    sys.stderr.write("\n%d/%d bind usefully (%d partial, %d token) -> %s\n" % (
+        payload["summary"]["ok"], len(rows), payload["summary"]["partial"],
+        payload["summary"]["token"], args.out))
 
-    # Only an expected-to-bind library regressing is a failure. A library that
-    # has never bound is data, not a broken build.
-    regressed = [r["name"] for r in rows if r.get("expect") == "bind" and r["status"] != "ok"]
+    # A library doing WORSE than its recorded expectation is a failure. A
+    # library that has never bound is data, not a broken build, and one that
+    # does better than expected is news rather than an error.
+    regressed, improved = [], []
+    for r in rows:
+        want = EXPECT_RANK.get(r.get("expect", "unknown"), 0)
+        got = outcome_rank(r["status"])
+        if got < want:
+            regressed.append("%s (expected %s, got %s)" % (r["name"], r.get("expect"), r["status"]))
+        elif got > want and want > 0:
+            improved.append("%s (expected %s, got %s)" % (r["name"], r.get("expect"), r["status"]))
+    if improved:
+        sys.stderr.write("IMPROVED: %s\n" % ", ".join(improved))
     if regressed:
-        sys.stderr.write("REGRESSED (expected to bind): %s\n" % ", ".join(regressed))
+        sys.stderr.write("REGRESSED: %s\n" % ", ".join(regressed))
         return 1
     return 0
 

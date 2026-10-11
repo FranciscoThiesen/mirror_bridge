@@ -29,7 +29,12 @@
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -c @CHECKOUT@/src/lib_json/json_reader.cpp @CHECKOUT@/src/lib_json/json_value.cpp @CHECKOUT@/src/lib_json/json_writer.cpp",
       "link_args": "@BUILD@/json_reader.o @BUILD@/json_value.o @BUILD@/json_writer.o",
-      "expect": "bind"
+      "expect": "bind",
+      "must_export": [
+        "Value",
+        "Reader",
+        "StreamWriterBuilder"
+      ]
     },
     {
       "name": "tinyxml2",
@@ -43,7 +48,12 @@
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@ -c @CHECKOUT@/tinyxml2.cpp -o @BUILD@/tinyxml2.o",
       "link_args": "@BUILD@/tinyxml2.o",
-      "expect": "bind"
+      "expect": "partial",
+      "must_export": [
+        "XMLDocument",
+        "XMLElement"
+      ],
+      "note": "XMLElement and the whole XMLNode hierarchy are missing: you can load a document and not walk it. Meanwhile MemPoolT_104 and DynArray_anon_10 bind."
     },
     {
       "name": "pugixml",
@@ -57,7 +67,11 @@
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -c @CHECKOUT@/src/pugixml.cpp -o @BUILD@/pugixml.o",
       "link_args": "@BUILD@/pugixml.o",
-      "expect": "bind"
+      "expect": "bind",
+      "must_export": [
+        "xml_document",
+        "xml_node"
+      ]
     },
     {
       "name": "yaml-cpp",
@@ -69,7 +83,10 @@
       ],
       "module": "yamlcpp_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "Node"
+      ]
     },
     {
       "name": "clipper2",
@@ -83,7 +100,11 @@
       "shape": "oo",
       "build": "clang++ -std=c++17 -stdlib=libc++ -O2 -fPIC -I@CHECKOUT@/CPP/Clipper2Lib/include -c @CHECKOUT@/CPP/Clipper2Lib/src/clipper.engine.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.offset.cpp @CHECKOUT@/CPP/Clipper2Lib/src/clipper.rectclip.cpp",
       "link_args": "@BUILD@/clipper.engine.o @BUILD@/clipper.offset.o @BUILD@/clipper.rectclip.o",
-      "expect": "bind"
+      "expect": "bind",
+      "must_export": [
+        "Clipper64",
+        "ClipperOffset"
+      ]
     },
     {
       "name": "pmp-library",
@@ -101,7 +122,12 @@
       ],
       "build": "for f in @CHECKOUT@/src/pmp/surface_mesh.cpp @CHECKOUT@/src/pmp/algorithms/*.cpp @CHECKOUT@/src/pmp/io/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/src -I@CHECKOUT@/external/eigen-3.4.0 -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
       "link_args": "@BUILD@/*.o",
-      "expect": "bind"
+      "expect": "partial",
+      "must_export": [
+        "SurfaceMesh",
+        "Vertex"
+      ],
+      "note": "SurfaceMesh is missing -- the class the library exists for. The property and handle types around it all bind."
     },
     {
       "name": "cxxopts",
@@ -113,7 +139,11 @@
       ],
       "module": "cxxopts_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "bind",
+      "must_export": [
+        "Options",
+        "ParseResult"
+      ]
     },
     {
       "name": "CLI11",
@@ -125,7 +155,10 @@
       ],
       "module": "cli11_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "App"
+      ]
     },
     {
       "name": "spdlog",
@@ -137,7 +170,10 @@
       ],
       "module": "spdlog_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "logger"
+      ]
     },
     {
       "name": "nlohmann-json",
@@ -149,7 +185,10 @@
       ],
       "module": "nlohmannjson_compat",
       "shape": "template",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "json"
+      ]
     },
     {
       "name": "fmt",
@@ -161,7 +200,10 @@
       ],
       "module": "fmt_compat",
       "shape": "template",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "format"
+      ]
     },
     {
       "name": "glm",
@@ -182,7 +224,11 @@
         "gtx/type_aligned.hpp",
         "ext.hpp"
       ],
-      "note": "the aligned-gentypes headers #error unless GLM detects SIMD support, which needs arch flags; ext.hpp pulls them in"
+      "note": "the aligned-gentypes headers #error unless GLM detects SIMD support, which needs arch flags; ext.hpp pulls them in",
+      "must_export": [
+        "vec3",
+        "mat4"
+      ]
     },
     {
       "name": "magic_enum",
@@ -194,7 +240,10 @@
       ],
       "module": "magicenum_compat",
       "shape": "template",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "enum_name"
+      ]
     },
     {
       "name": "doctest",
@@ -209,7 +258,11 @@
       "exclude": [
         "extensions/*"
       ],
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "Context",
+        "Approx"
+      ]
     },
     {
       "name": "entt",
@@ -221,7 +274,11 @@
       ],
       "module": "entt_compat",
       "shape": "template",
-      "expect": "unknown"
+      "expect": "token",
+      "must_export": [
+        "registry"
+      ],
+      "note": "exports group_descriptor, null_t and tombstone_t: three internal tag types and nothing a caller can use."
     },
     {
       "name": "box2d",
@@ -235,7 +292,12 @@
       "shape": "oo",
       "build": "for f in @CHECKOUT@/src/*/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -I@CHECKOUT@/src -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
       "link_args": "@BUILD@/*.o",
-      "expect": "bind"
+      "expect": "partial",
+      "must_export": [
+        "b2World",
+        "b2Body"
+      ],
+      "note": "b2World binds but b2Body does not, so a world can be created and nothing can move in it. ~b2Body() is private -- b2World is its only friend."
     },
     {
       "name": "simdjson",
@@ -247,7 +309,11 @@
       ],
       "module": "simdjson_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "parser",
+        "document"
+      ]
     },
     {
       "name": "rapidjson",
@@ -259,7 +325,10 @@
       ],
       "module": "rapidjson_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "Document"
+      ]
     },
     {
       "name": "tinyobjloader",
@@ -282,6 +351,11 @@
       "note": "the library is the single root tiny_obj_loader.h; the rest is samples and vendored deps. TINYOBJLOADER_IMPLEMENTATION puts the definitions in the binding TU, which is how a single-header library is meant to be used",
       "defines": [
         "TINYOBJLOADER_IMPLEMENTATION"
+      ],
+      "must_export": [
+        "ObjReader",
+        "attrib_t",
+        "shape_t"
       ]
     },
     {
@@ -294,7 +368,11 @@
       ],
       "module": "nanoflann_compat",
       "shape": "template",
-      "expect": "unknown"
+      "expect": "token",
+      "must_export": [
+        "KDTreeSingleIndexAdaptor"
+      ],
+      "note": "exports one comparison functor, IndexDist_Sorter. The KD-tree itself is a template and is never instantiated."
     },
     {
       "name": "toml11",
@@ -306,7 +384,11 @@
       ],
       "module": "toml11_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "value",
+        "parse"
+      ]
     },
     {
       "name": "fast_float",
@@ -318,7 +400,10 @@
       ],
       "module": "fastfloat_compat",
       "shape": "oo",
-      "expect": "unknown"
+      "expect": "unknown",
+      "must_export": [
+        "from_chars"
+      ]
     },
     {
       "name": "SQLiteCpp",
@@ -333,7 +418,12 @@
       "shape": "oo",
       "expect": "bind",
       "build": "cc -O1 -fPIC -c @CHECKOUT@/sqlite3/sqlite3.c -o @BUILD@/sqlite3.o && for f in @CHECKOUT@/src/*.cpp; do clang++ -std=c++17 -stdlib=libc++ -O1 -fPIC -I@CHECKOUT@/include -I@CHECKOUT@/sqlite3 -c \"$f\" -o \"@BUILD@/$(basename \"$f\" .cpp).o\" || exit 1; done",
-      "link_args": "@BUILD@/*.o -lpthread -ldl"
+      "link_args": "@BUILD@/*.o -lpthread -ldl",
+      "must_export": [
+        "Database",
+        "Statement",
+        "Column"
+      ]
     },
     {
       "name": "cpp-httplib",
@@ -350,7 +440,11 @@
         "benchmark/*",
         "test/*"
       ],
-      "note": "the library is the single root httplib.h; benchmark/ vendors a copy of crow"
+      "note": "the library is the single root httplib.h; benchmark/ vendors a copy of crow",
+      "must_export": [
+        "Server",
+        "Client"
+      ]
     }
   ]
 }

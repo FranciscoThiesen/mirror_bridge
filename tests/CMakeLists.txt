@@ -435,6 +435,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
     )
     set_tests_properties(cli_friend_declared PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+
+# The compatibility corpus decides what the project claims about real
+# libraries, and its usability bar (must_export) and regression ladder are the
+# two pieces of judgement in it. Pure Python, so this runs with no reflection
+# toolchain and no clones.
+if(Python3_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py)
+    add_test(NAME compat_classify
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py
     )
 endif()
 
