@@ -395,6 +395,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/exclude_headers)
     )
 endif()
 
+# A library's public headers are not always *.h or *.hpp: Eigen's entire public
+# interface is 30 extensionless files, and Qt's is the same shape.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extensionless_headers)
+    add_test(NAME cli_extensionless_headers
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/extensionless_headers/build_and_test.sh
+    )
+    set_tests_properties(cli_extensionless_headers PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")
 

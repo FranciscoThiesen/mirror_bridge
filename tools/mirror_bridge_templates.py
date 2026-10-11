@@ -681,12 +681,24 @@ def main():
         notes.append(e)
 
     result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log, found)
-    if result is None and len(headers) > len(included):
-        # A header without classes may not be self-contained; retry with the
-        # ones the module already includes.
+    reduced = [h for h in headers if h in included]
+    # A header without classes may not be self-contained; retry with the ones
+    # the module already includes. Only when there ARE some: when the text scan
+    # found no classes at all, `included` is empty, and retrying with it
+    # compiled a translation unit that includes nothing. That unit then failed
+    # on "use of undeclared identifier 'Eigen'" -- the namespace root spliced
+    # with no header to declare it -- and that error replaced the real one from
+    # the full attempt. Eigen is the case: the reported failure described the
+    # retry, not the library.
+    if result is None and reduced and len(reduced) < len(headers):
         log.append("retrying with the module's own headers only")
-        headers = [h for h in headers if h in included]
+        first_err = err
+        headers = reduced
         result, err = plan_module(args, cc, work, headers, hints, namespaces, requested, log, found)
+        if result is None:
+            # The full attempt is the informative one; the reduced retry fails
+            # for a narrower reason that is rarely what the user needs to see.
+            err = first_err
     if found and args.classes_out:
         write_discovered(args.classes_out, found)
     if result is None:
