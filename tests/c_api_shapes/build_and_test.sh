@@ -36,6 +36,10 @@ assert (p.key, p.tag) == (11, 12)
 for aliased in ('val_i', 'val_f', 'val_p'):
     assert not hasattr(p, aliased), aliased
 assert not hasattr(cs, 'HoldsOpaque')
+lab = cs.Label()
+assert lab.text is None, repr(lab.text)
+lab.text = 'hello'
+assert lab.text == 'hello'
 " 2>/dev/null || fail "the bound shapes do not behave"
 
 echo "PASS: bit-fields, anonymous unions and forward declarations each cost only themselves"
