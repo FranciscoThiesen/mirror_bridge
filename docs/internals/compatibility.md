@@ -25,6 +25,27 @@ their user writes by hand.
 module imported. Discovery succeeding and the module failing is the common
 case, and the reason is in the last column.
 
+**Importing is not the bar.** A module can build, import, and still be useless.
+entt produced one exporting `group_descriptor`, `null_t` and `tombstone_t` —
+three internal tag types — and it sat in the table beside jsoncpp as an equal.
+So each manifest entry declares `must_export`: the handful of names a caller of
+that library reaches for first, taken from the library's own README and written
+down before the module was measured, so the bar is not fitted to the result.
+
+    "name": "box2d",
+    "must_export": ["b2World", "b2Body"],
+
+A module exposing none of them is `token-binding`. One missing some of them is
+`partial-binding` — box2d exports `b2World` but not `b2Body`, so a world can be
+created and nothing can move in it. Both count as failures, and both are more
+useful rows than a green tick would have been, because they name the missing
+class.
+
+`expect` records what each library does today on a ladder — `bind` > `partial` >
+`token` > nothing — and a run fails only when a library does *worse* than its
+record. Raising the bar is not a regression: tinyxml2 builds exactly the module
+it always built.
+
 **"Why not, if not"** is the point of the table. A pass rate says how we are
 doing. The cause says what to do next, and the `What is in the way` summary
 below the matrix groups the corpus into a work queue — the next thing worth
