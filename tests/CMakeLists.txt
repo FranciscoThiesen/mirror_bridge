@@ -435,6 +435,8 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
     )
     set_tests_properties(cli_friend_declared PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
 
 # The compatibility corpus decides what the project claims about real
 # libraries, and its usability bar (must_export) and regression ladder are the
