@@ -426,6 +426,7 @@ consteval std::string site(info r) {
 }
 
 consteval void declare_type(Declared& d, info m);
+consteval void declare_from_signatures(Declared& d, info scope);
 
 consteval void declare_members_of(Declared& d, info cls) {
     for (info m : members_of(cls, access_context::unchecked())) {
@@ -439,6 +440,9 @@ consteval void declare_members_of(Declared& d, info cls) {
         if (!is_public(m)) continue;
         declare_type(d, m);
     }
+    // A class reached only as the return type or parameter of a method, for
+    // the same reason as above.
+    declare_from_signatures(d, cls);
 }
 
 consteval void declare_type(Declared& d, info m) {
@@ -453,6 +457,42 @@ consteval void declare_type(Declared& d, info m) {
     if (holds(d.classes, m)) return;
     d.classes.push_back(m);
     declare_members_of(d, m);
+}
+
+// A class the library's own functions hand back or take in is part of its API,
+// and sometimes a signature is the ONLY place reflection can reach it.
+// pmp::SurfaceMesh -- the class the whole library exists for -- is absent from
+// members_of(^^pmp): pmp introduces the name with `friend class SurfaceMesh;`
+// inside PropertyContainer before declaring the class, and clang-p2996 does
+// not report a name introduced that way as a member of the namespace even
+// after the real definition appears. Measured: members_of(^^pmp) has 86 named
+// members and SurfaceMesh is not one of them, while ^^pmp::SurfaceMesh itself
+// resolves and is_complete_type says yes. Three of pmp's seven free functions
+// take `SurfaceMesh&`, so the signatures find what the member list cannot.
+// Sixteen of pmp's thirty-two classes were lost to that one omission.
+consteval void declare_from_signatures(Declared& d, info scope) {
+    for (info m : members_of(scope, access_context::unchecked())) {
+        if (!is_function(m)) continue;
+        // return_type_of has no meaning for these two, and asking is an error
+        // rather than an empty answer.
+        if (is_constructor(m) || is_destructor(m)) continue;
+        // A private method cannot be named from the generated module, and its
+        // parameter types are not part of the public surface either.
+        if (is_class_member(m) && !is_public(m)) continue;
+        std::vector<info> named;
+        named.push_back(return_type_of(m));
+        for (info prm : parameters_of(m)) named.push_back(type_of(prm));
+        for (info t : named) {
+            t = remove_cvref(t);
+            while (is_pointer_type(t)) t = remove_cvref(remove_pointer(t));
+            t = dealias(t);
+            if (!is_type(t) || !is_class_type(t)) continue;
+            // declare_type re-checks in_source, completeness and whether this
+            // class is already known, so the mutual recursion with
+            // declare_members_of terminates on the first repeat.
+            declare_type(d, t);
+        }
+    }
 }
 
 consteval void declare_namespace(Declared& d, info ns) {
@@ -471,6 +511,7 @@ consteval void declare_namespace(Declared& d, info ns) {
             declare_type(d, m);
         }
     }
+    declare_from_signatures(d, ns);
 }
 
 consteval Declared declared() {

@@ -427,6 +427,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/c_api_shapes)
     )
 endif()
 
+# A class whose name is first introduced by a `friend` declaration is missing
+# from members_of() of its namespace; the library's own signatures recover it.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
+    add_test(NAME cli_friend_declared
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared/build_and_test.sh
+    )
+    set_tests_properties(cli_friend_declared PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Find all Python test files and add them as CTest tests
 file(GLOB_RECURSE PYTHON_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/**/test_*.py")
 
