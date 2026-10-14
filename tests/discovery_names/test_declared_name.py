@@ -211,6 +211,61 @@ class TestNameBetweenKeywordAndBrace(unittest.TestCase):
         self.assertNames(text, ["Real"])
 
 
+class TestNamespaceErrorGate(unittest.TestCase):
+    """Whether a failed discovery unit is worth re-checking the namespaces for.
+
+    Validating them costs a parse of every header, so it only runs when the
+    compiler complained about a name that is actually in the guessed list.
+    The error strings below are the real ones from the corpus.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import mirror_bridge_templates
+        cls.gate = staticmethod(mirror_bridge_templates.names_a_guessed_namespace)
+
+    def test_a_guessed_namespace_is_worth_checking(self):
+        # fast_float: brace depth does not balance across an #if, so the scan
+        # reported a namespace nested inside itself.
+        err = ("/workspace/core/mirror_bridge_plan.hpp:413:21: error: use of "
+               "undeclared identifier 'fast_float'")
+        self.assertTrue(self.gate(err, ["fast_float", "fast_float::fast_float"]))
+
+    def test_a_namespace_opened_in_a_macro_body(self):
+        err = ("error: use of undeclared identifier "
+               "'gtest_do_not_use_outside_namespace_scope'")
+        self.assertTrue(self.gate(
+            err, ["testing", "testing::gtest_do_not_use_outside_namespace_scope"]))
+
+    def test_headers_that_simply_do_not_compile_are_not_worth_it(self):
+        # simdjson's first error is an undeclared compiler builtin. Matching
+        # "use of undeclared identifier" alone bought it an extra parse of
+        # every header that could not have helped.
+        err = ("/usr/local/lib/clang/21/include/ia32intrin.h:312:10: error: use of "
+               "undeclared identifier '__builtin_ia32_readeflags_u32'")
+        self.assertFalse(self.gate(err, ["simdjson", "simdjson::internal"]))
+
+    def test_an_unrelated_compile_error_is_not_worth_it(self):
+        err = ("/proto/compat-cache/rapidjson/include/rapidjson/document.h:319:82: "
+               "error: cannot assign to non-static data member 'length'")
+        self.assertFalse(self.gate(err, ["rapidjson"]))
+
+    def test_a_component_of_a_nested_guess_counts(self):
+        # The compiler names the component it could not find, not the whole
+        # scope, so each component has to be matched.
+        err = "error: no namespace named 'detail' in namespace 'lib'"
+        self.assertTrue(self.gate(err, ["lib", "lib::detail"]))
+
+    def test_global_scope_is_never_a_candidate(self):
+        # `::` always exists and has no components to match.
+        self.assertFalse(self.gate("error: use of undeclared identifier 'x'", ["::"]))
+
+    def test_no_error_text_is_not_worth_it(self):
+        self.assertFalse(self.gate("", ["lib"]))
+        self.assertFalse(self.gate(None, ["lib"]))
+
+
 class TestTemplateHintKeys(unittest.TestCase):
     """The planner keys template parameter shapes by name, and the same macro
     sat between the keyword and that name. A hint filed under CV_EXPORTS is a

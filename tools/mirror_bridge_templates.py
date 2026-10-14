@@ -251,12 +251,25 @@ int main() { std::fputs(mb_plan.data(), stdout); }
 
 NS_CHECK_RE = re.compile(r"ns_check\.cpp:(\d+)(?::\d+)?:\s*(?:fatal )?error:")
 
-# A link failure, as opposed to a compile failure. Matched on the linker's own
-# wording so a compile error that happens to contain the word "undefined" is
-# not mistaken for one.
-LINK_FAILURE_RE = re.compile(
-    r"linker command failed|undefined reference to|undefined symbol|"
-    r"ld: symbol\(s\) not found|ld returned \d+ exit status")
+UNDECLARED_RE = re.compile(r"use of undeclared identifier '([^']+)'"
+                           r"|no namespace named '([^']+)'"
+                           r"|no member named '([^']+)'")
+
+
+def names_a_guessed_namespace(err, namespaces):
+    """Whether the discovery unit failed on a name from the namespace list.
+
+    Pruning the namespace list can only help when the compiler complained
+    about a name that is in it. simdjson's headers do not compile under this
+    compiler at all -- its first error is an undeclared `__builtin_...` -- so
+    matching "use of undeclared identifier" alone bought every such library an
+    extra parse of every header that could not possibly have helped it.
+    """
+    parts = {p for ns in namespaces if ns != "::" for p in ns.split("::") if p}
+    for m in UNDECLARED_RE.finditer(err or ""):
+        if (m.group(1) or m.group(2) or m.group(3)) in parts:
+            return True
+    return False
 
 
 def validate_namespaces(work, cc, headers, namespaces):
@@ -328,23 +341,29 @@ def discover(work, cc, headers):
     exe = work / "discover"
     plan = {"cands": [], "notes": [], "universe": "", "needs": [], "plain": [], "enums": [], "free": [],
             "fntemplates": [], "unbindable": []}
-    r = cc.run(["-I" + str(work), str(src), "-o", str(exe)])
-    # The discovery program prints one compile-time string and never calls
-    # anything the headers declare, so it does not need their definitions. A
-    # header-only library that declares without defining unless you ask --
-    # doctest without DOCTEST_CONFIG_IMPLEMENT is the case -- made the link
-    # fail anyway, and a failed link was read as "reflection cannot read these
-    # headers", which sent the CLI to a scan of the header text for a reason
-    # that had nothing to do with reflection.
-    #
-    # Retried rather than always passed, so a platform whose linker does not
-    # take the flag is no worse off, and a link failure that is really a
-    # compile problem still reports as one.
-    if r.returncode and LINK_FAILURE_RE.search(r.stderr or ""):
-        r = cc.run(["-I" + str(work), str(src), "-o", str(exe),
-                    "-Wl,--unresolved-symbols=ignore-all"])
+    # Compiled to an object and linked separately, which costs nothing extra
+    # and makes the two failures distinguishable: all the expensive work --
+    # the parse and the whole constexpr evaluation that produces the plan --
+    # happens in the compile, so a retried LINK is a link and not a second
+    # evaluation of everything.
+    obj = work / "discover.o"
+    r = cc.run(["-I" + str(work), "-c", str(src), "-o", str(obj)])
     if r.returncode:
         return plan, r.stderr or "discover compile failed without diagnostics"
+
+    r = cc.run([str(obj), "-o", str(exe)])
+    if r.returncode:
+        # The discovery program prints one compile-time string and calls
+        # nothing the headers declare, so it does not need their definitions.
+        # doctest declares without defining unless you ask for
+        # DOCTEST_CONFIG_IMPLEMENT, and its link failure was being read as
+        # "reflection cannot read these headers" -- sending the CLI to a scan
+        # of the header text for a reason that had nothing to do with
+        # reflection. Retried rather than passed up front, so a linker that
+        # does not take the flag is no worse off than before.
+        r = cc.run([str(obj), "-o", str(exe), "-Wl,--unresolved-symbols=ignore-all"])
+    if r.returncode:
+        return plan, r.stderr or "discover link failed without diagnostics"
     out = subprocess.run([str(exe)], capture_output=True, text=True).stdout
     for line in out.splitlines():
         kind, py, spelling, args, origin, owner = line.split("\t")
@@ -501,7 +520,7 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
         # which has the same blind spot that produced the bad guess -- ask the
         # compiler which names are real and try once more without them. Only
         # on failure, so a correct guess costs nothing.
-        if err and not namespaces_checked:
+        if err and not namespaces_checked and names_a_guessed_namespace(err, namespaces):
             namespaces_checked = True
             kept, bad = validate_namespaces(work, cc, headers, namespaces)
             if bad:
@@ -804,7 +823,7 @@ def main():
             # in-language guard can catch, so the unit fails to compile and
             # the caller falls back to a scan of the header text. Ask the
             # compiler which names are real and try again without the rest.
-            if err and not namespaces_checked:
+            if err and not namespaces_checked and names_a_guessed_namespace(err, namespaces):
                 namespaces_checked = True
                 kept, bad = validate_namespaces(work, cc, attempt_headers, namespaces)
                 if bad:

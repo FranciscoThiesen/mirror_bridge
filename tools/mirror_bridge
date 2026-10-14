@@ -1096,7 +1096,11 @@ resolve_binding_name_collisions() {
         name="${names_ref[$i]}"
         simple="${name##*::}"
         # Scope depth: how many :: separate the simple name from global scope.
-        depth=$(awk -F'::' '{print NF-1}' <<< "$name")
+        # Scope depth without a subprocess per class: removing every :: and
+        # halving the length difference counts them. abseil discovers 378
+        # classes, and that was 378 awk processes.
+        local bare="${name//::/}"
+        depth=$(( (${#name} - ${#bare}) / 2 ))
         best_depth="${best_depth_of[$simple]:-}"
         if [ -z "$best_depth" ] || [ "$depth" -lt "$best_depth" ]; then
             best_depth_of["$simple"]=$depth
