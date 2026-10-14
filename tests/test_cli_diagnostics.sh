@@ -133,8 +133,14 @@ check "the collision is named" "$out" "'Config' is the binding name of 2 classes
 check "both declaration sites are shown" "$out" "shapes.hpp:3"
 check "the second site too" "$out" "shapes.hpp:5"
 check "it explains the unqualified-name rule" "$out" "unqualified name"
-check "it says which one survives" "$out" "the last one bound replaces the rest"
+# It used to say "the last one bound replaces the rest", which was true and
+# was the bug: the last one bound is whichever the header declared second, so
+# lib::detail::Config took the name and the public class was unreachable.
+# The choice is made before codegen now, and the message names it.
+check "it names the class that takes the name" "$out" "lib::Config is bound"
+check "and says the others are not bound" "$out" "the rest are not bound at all"
 check "it offers the opt-out marker" "$out" "MIRROR_BRIDGE_SKIP"
+check "the loser is listed in the unbound report" "$out" "lib::detail::Config"
 
 # --------------------------------------------------------------------------
 echo "diff refuses to record a baseline that would pass forever"

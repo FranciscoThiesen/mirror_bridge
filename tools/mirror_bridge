@@ -417,6 +417,17 @@ content = re.sub(r'//[^\n]*', '', content)
 content = re.sub(r'"(?:[^"\\]|\\.)*"', '""', content)
 content = re.sub(r"'(?:[^'\\]|\\.)*'", "''", content)
 
+# A class declared inside a macro definition is not a declaration until the
+# macro is expanded, and a scan of the text cannot expand it. range-v3 has
+#
+#   #define RANGES_STRUCT_WITH_ADL_BARRIER(NAME, ...) struct NAME { ... }
+#
+# and the scan reported NAME -- the macro's own parameter -- as a class to
+# bind, four times over. Directive lines are blanked out, line continuations
+# included, and the newlines are kept so line numbers still point at the
+# right source line.
+content = re.sub(r'^[ \t]*#(?:[^\n\\]|\\\n|\\.)*', keep_newlines, content, flags=re.M)
+
 # A library's own headers rarely put the name straight after the keyword:
 #
 #   class CV_EXPORTS Mat {               OpenCV, 70 classes
@@ -834,6 +845,12 @@ PYSCRIPT
     echo "$module_macro($module_name," >> "$output_file"
     for class_name in "${classes[@]}"; do
         local simple_name="${class_name##*::}"
+        # Another class won this name. Binding both emitted two calls with the
+        # same string, and the second quietly replaced the first.
+        if [ -n "${BINDING_NAME_WINNER[$simple_name]:-}" ] && \
+           [ "${BINDING_NAME_WINNER[$simple_name]}" != "$class_name" ]; then
+            continue
+        fi
         if [ "$lang" = "js" ] || [ "$lang" = "javascript" ]; then
             echo "    $bind_func<$class_name>(env, m, \"$simple_name\");" >> "$output_file"
         elif [ "$lang" = "lua" ]; then
@@ -959,7 +976,8 @@ report_unbound() {
     fi
 
     local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#DISCOVERED_ENUMS[@]}
-                    + ${#VERIFY_SKIPPED_CLASSES[@]} + ${#VERIFY_SKIPPED_FUNCS[@]} ))
+                    + ${#VERIFY_SKIPPED_CLASSES[@]} + ${#VERIFY_SKIPPED_FUNCS[@]}
+                    + ${#COLLIDED_CLASSES[@]} ))
     [ "$total" -eq 0 ] && return 0
 
     local noun="names were" ; local pronoun="them"
@@ -999,6 +1017,11 @@ report_unbound() {
         done
     }
 
+    if [ ${#COLLIDED_CLASSES[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#COLLIDED_CLASSES[@]} class(es) that lost their unqualified name to another class"
+        print_reasoned COLLIDED_CLASSES
+    fi
     if [ ${#VERIFY_SKIPPED_CLASSES[@]} -gt 0 ]; then
         echo ""
         echo "    ${#VERIFY_SKIPPED_CLASSES[@]} class(es) the module declined"
@@ -1032,40 +1055,80 @@ report_unbound() {
 }
 
 # A module exposes every class under its UNQUALIFIED name, so two discovered
-# classes that share a simple name cannot share a module: whichever is bound
-# last is the only one the target language can reach. Nothing downstream says
-# so — the C++ side is unambiguous, because the generated file names each
-# class in full — so the collision would otherwise show up as a class that
-# silently has the wrong members at runtime.
-warn_duplicate_binding_names() {
+# classes that share a simple name cannot share a module. Only one can answer
+# to it.
+#
+# That used to be whichever was bound last, in silence. Pointed at a header
+# with `lib::Config` and `lib::detail::Config`, the module bound both as
+# "Config" and the implementation detail won:
+#
+#     >>> dup.Config().marker()
+#     999
+#
+# The public class was unreachable and the module looked fine. A warning was
+# printed, and a warning does not make a wrong module right.
+#
+# The winner is now chosen here, before anything is generated: the class with
+# the fewest scope components, which is the one in the shallowest namespace and
+# so the one a library means as public. Ties go to the first in discovery
+# order, which is sorted by header path, so the answer is the same on every
+# run. The rest are not bound, and are reported by name with the one that took
+# the name instead.
+declare -A BINDING_NAME_WINNER=()
+declare -a COLLIDED_CLASSES=()
+
+resolve_binding_name_collisions() {
     local -n names_ref=$1
     local -n files_ref=$2
-    local i j name
+    BINDING_NAME_WINNER=(); COLLIDED_CLASSES=()
+    [ ${#names_ref[@]} -eq 0 ] && return 0
 
-    local -a reported=()
+    local i name simple depth best_depth
+    declare -A best_depth_of=()
     for (( i = 0; i < ${#names_ref[@]}; i++ )); do
-        # The binding name is the last scope component: lib::Config and
-        # lib::detail::Config are both bound as Config.
-        name="${names_ref[$i]##*::}"
-        local already=0 r
-        for r in "${reported[@]:-}"; do [ "$r" = "$name" ] && already=1; done
+        name="${names_ref[$i]}"
+        simple="${name##*::}"
+        # Scope depth: how many :: separate the simple name from global scope.
+        depth=$(awk -F'::' '{print NF-1}' <<< "$name")
+        best_depth="${best_depth_of[$simple]:-}"
+        if [ -z "$best_depth" ] || [ "$depth" -lt "$best_depth" ]; then
+            best_depth_of["$simple"]=$depth
+            BINDING_NAME_WINNER["$simple"]="$name"
+        fi
+    done
+
+    # Report every name that more than one class wanted.
+    local -a reported=()
+    local j r already winner
+    for (( i = 0; i < ${#names_ref[@]}; i++ )); do
+        simple="${names_ref[$i]##*::}"
+        already=0
+        for r in "${reported[@]:-}"; do [ "$r" = "$simple" ] && already=1; done
         [ "$already" -eq 1 ] && continue
 
         local -a where=()
         for (( j = 0; j < ${#names_ref[@]}; j++ )); do
-            [ "${names_ref[$j]##*::}" = "$name" ] && \
-                where+=("${files_ref[$j]}:${DISCOVERED_LINES[$j]:-?}")
+            [ "${names_ref[$j]##*::}" = "$simple" ] && \
+                where+=("${names_ref[$j]} (${files_ref[$j]}:${DISCOVERED_LINES[$j]:-?})")
         done
         [ ${#where[@]} -lt 2 ] && continue
 
-        reported+=("$name")
+        reported+=("$simple")
+        winner="${BINDING_NAME_WINNER[$simple]}"
+        for (( j = 0; j < ${#names_ref[@]}; j++ )); do
+            [ "${names_ref[$j]##*::}" = "$simple" ] || continue
+            [ "${names_ref[$j]}" = "$winner" ] && continue
+            COLLIDED_CLASSES+=("${names_ref[$j]} — '$simple' is bound to $winner instead")
+        done
+
         echo ""
-        echo -e "${YELLOW}⚠ '$name' is the binding name of ${#where[@]} classes:${NC}"
+        echo -e "${YELLOW}⚠ '$simple' is the binding name of ${#where[@]} classes:${NC}"
         local f
         for f in "${where[@]}"; do echo "      $f"; done
         echo "  A module exposes every class under its unqualified name, so only one"
-        echo "  of these can answer to '$name': the last one bound replaces the rest."
-        echo "  Fix: bind one of them in a module of its own, rename one class, or put"
+        echo "  of these can answer to '$simple'. $winner is bound, being the"
+        echo "  one in the shallowest namespace; the rest are not bound at all."
+        echo "  Fix: bind the others in a module of their own, rename one class, or put"
         echo "  // MIRROR_BRIDGE_SKIP on the line above the one this module does not need."
         echo "  See docs/reference/errors.md#two-bound-classes-with-the-same-unqualified-name"
     done
@@ -1550,7 +1613,7 @@ cmd_generate() {
 
     echo ""
     echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC} (${DISCOVERY_SOURCE})"
-    warn_duplicate_binding_names CLASSES HEADERS
+    resolve_binding_name_collisions CLASSES HEADERS
     echo ""
 
     if [ $plans_templates -eq 1 ]; then

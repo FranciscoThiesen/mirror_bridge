@@ -378,6 +378,19 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/export_macro)
     )
 endif()
 
+# Two classes cannot share one unqualified name in a flat module namespace.
+# Which one answers to it used to be whichever was bound last, in silence --
+# and six of the seven libraries whose discovery was poisoned by export macros
+# have this underneath, so it is the next thing in the way.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/name_collision)
+    add_test(NAME cli_name_collision
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/name_collision/build_and_test.sh
+    )
+    set_tests_properties(cli_name_collision PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # "Built" and "works" are different claims. generate imports the Python
 # module it just produced, because that is what catches a library whose
 # definitions live in its compiled sources (Open3D: 39 classes, a .so, a green

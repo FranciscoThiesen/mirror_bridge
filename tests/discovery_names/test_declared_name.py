@@ -64,6 +64,26 @@ def scan(header_text):
     return out
 
 
+def scan_lines(header_text):
+    """{name: declaration line number} for one header's worth of text."""
+    with tempfile.TemporaryDirectory() as d:
+        script = os.path.join(d, "scan.py")
+        with open(script, "w") as f:
+            f.write(SCANNER)
+        header = os.path.join(d, "probe.hpp")
+        with open(header, "w") as f:
+            f.write(header_text)
+        r = subprocess.run([sys.executable, script, header],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    out = {}
+    for line in r.stdout.splitlines():
+        if line.strip():
+            parts = line.split("\t")
+            out[parts[0]] = int(parts[1])
+    return out
+
+
 class TestNameBetweenKeywordAndBrace(unittest.TestCase):
     def assertNames(self, text, expected):
         found = sorted(n for n, kind in scan(text).items() if kind == "class")
@@ -151,6 +171,38 @@ class TestNameBetweenKeywordAndBrace(unittest.TestCase):
         # reports nothing for it -- including when a macro follows the head.
         self.assertNames("template <class T> class CV_EXPORTS Mat_ { public: T v; };\n"
                          "struct Plain { int v; };", ["Plain"])
+
+    def test_a_class_inside_a_macro_definition_is_not_a_class(self):
+        # range-v3 defines
+        #   #define RANGES_STRUCT_WITH_ADL_BARRIER(NAME, ...) struct NAME {...}
+        # A class declared in a macro body is not a declaration until the
+        # macro is expanded, and this scan cannot expand it. Reading the
+        # macro's own parameter as a class to bind is how four classes called
+        # NAME reached the module. mirror_bridge's own headers did it too:
+        # MIRROR_BRIDGE_REGISTER(ClassName) contributed a phantom ClassName to
+        # every scan of them.
+        self.assertNames("#define MAKE_STRUCT(NAME) struct NAME { int v; }\n"
+                         "struct Real { int v; };\n", ["Real"])
+        self.assertNames("#define MAKE_TAG(T) \\\n"
+                         "    struct T##_tag { \\\n"
+                         "        int id; \\\n"
+                         "    }\n"
+                         "struct Real { int v; };\n", ["Real"])
+
+    def test_a_guarded_class_is_still_found(self):
+        # Blanking directive lines must not take the declarations between
+        # them: #if/#endif carry no declaration of their own.
+        self.assertNames("#if defined(SOMETHING)\n"
+                         "struct Guarded { int v; };\n"
+                         "#endif\n", ["Guarded"])
+
+    def test_line_numbers_survive_directive_blanking(self):
+        # The line number is what MIRROR_BRIDGE_SKIP is looked up against, so
+        # blanking a multi-line directive has to keep its newlines.
+        text = ("#define TWO_LINES(x) \\\n"
+                "    int x\n"
+                "struct OnThree { int v; };\n")
+        self.assertEqual(scan_lines(text), {"OnThree": 3})
 
     def test_macro_name_inside_a_comment_or_string_is_ignored(self):
         text = ('// class CV_EXPORTS Commented { };\n'
