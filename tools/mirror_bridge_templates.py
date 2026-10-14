@@ -38,9 +38,22 @@ import time
 # fact taken from text is the *shape* of each parameter list:
 #   T = type parameter, V = non-type parameter, D = defaulted, P = pack,
 #   X = template template parameter
+# An export macro, an attribute or an alignment specifier can stand between
+# the keyword and the name (`template <class T> class CV_EXPORTS Mat_`), and
+# taking the first identifier keys the hint under the macro, so the planner
+# never finds the shape of the template it was scanned for. Consumed here in
+# the same order the class scan in the CLI resolves it. The repetition is
+# greedy and the name group needs one identifier, so a genuinely upper-case
+# class name backtracks out of the noise and is still captured.
+HEAD_NOISE = (r"(?:(?:\[\[[^\]]*\]\]"
+              r"|__attribute__\s*\(\(.*?\)\)"
+              r"|(?:__declspec|alignas)\s*\([^()]*\)"
+              r"|[A-Za-z_]\w*\s*\([^()]*\)"
+              r"|[A-Z_][A-Z0-9_]*)\s+)*")
+
 TEMPLATE_RE = re.compile(
     r"template\s*<((?:[^<>]|<[^<>]*>)*)>\s*"
-    r"(?:(?:struct|class|union)\s+(?:\[\[[^\]]*\]\]\s*)?(\w+)"          # class template
+    r"(?:(?:struct|class|union)\s+" + HEAD_NOISE + r"(\w+)"     # class template
     r"|(?:\[\[[^\]]*\]\]\s*)?[\w:<>,\s\*&]+?\b(\w+)\s*\()", re.S)        # function template
 
 NONTYPE_RE = re.compile(
