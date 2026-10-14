@@ -13,6 +13,7 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 - **[First Binding](getting-started/first-binding.md)** - Create your first C++ binding
 
 ### Guides
+- **[Replacing a hot Python function with C++](guides/accelerating-python.md)** - Measured workflow for taking one slow function out of a Python program, and which shapes pay
 - **[Workflow Guide](guides/workflow.md)** - Recommended development workflow with PCH
 - **[PCH Optimization](guides/pch-optimization.md)** - 3-6x faster compilation with precompiled headers
 - **[Multi-Language Support](guides/multi-language.md)** - Python, Lua, JavaScript, and Rust bindings
