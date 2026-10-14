@@ -133,9 +133,55 @@ mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); /
       Fix: give one overload a distinct name, or bind a single non-overloaded wrapper
 ```
 
-**Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind.
+Further groups come from the module itself, which decides at compile time
+whether each class and function can bind and reports it when it is loaded.
+`generate` imports the Python module it just built, so those land here too
+rather than in your first import:
 
-**Fix** Each group states its own. An enum's values still cross correctly as plain `int`, so the usual answer is to mirror the enum on the Python side; the generated stub annotates those parameters as `int`. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. The full list is also in `<output>/<module>_plan.txt`.
+```
+    1 class(es) the module declined
+      Node — a member type has no converter; mark it [[=exclude{}]] or add a custom converter
+
+    2 free function(s) the module declined
+      out_param — a non-const reference parameter, whose writes cannot reach the caller:
+      Python would pass a copy and the result would be lost. Return the value instead
+      label — the return type has no converter
+
+    1 class(es) that lost their unqualified name to another class
+      lib::detail::Config — 'Config' is bound to lib::Config instead
+```
+
+**Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind. A class or function the module declined is one whose parameters or return type have no conversion, and the reason given is the specific gate that refused.
+
+**Fix** Each group states its own. An enum's values still cross correctly as plain `int`, so the usual answer is to mirror the enum on the Python side; the generated stub annotates those parameters as `int`. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
+
+### The module built but does not import
+
+**Symptom**
+
+```
+✓ Built: build/open3d_compat.so
+
+✗ Built, but the module does not import — it is not usable yet:
+    ImportError: build/open3d_compat.so: undefined symbol: _ZTIN6open3d8geometry10PointCloudE
+
+  These headers are not header-only: the definitions live in the library's
+  compiled sources. Build it and pass the result to --link-args, e.g.
+  --link-args "/path/to/libFoo.a"
+```
+
+`generate` exits non-zero and does not print the success banner.
+
+**Cause** The headers declare more than they define. Everything compiled, because a declaration is all a compile needs, and the missing definitions only show up when the dynamic loader resolves them. This is the normal shape of a library that ships a compiled `.a` or `.so` alongside its headers.
+
+**Fix** Build the library and pass the result to `--link-args`:
+
+```bash
+mirror_bridge generate include/foo --module foo --lang python \
+    --link-args "/path/to/libfoo.a"
+```
+
+Several inputs can go in one string, and `-l` flags work too: `--link-args "build/libfoo.a -lpthread -lz"`. If the library is a shared object resolved at load time instead, its directory has to be on `LD_LIBRARY_PATH` when the module is imported. `--no-verify` skips the import check altogether, for when you are building a module you cannot load on this machine.
 
 ### Two bound classes with the same unqualified name
 
@@ -147,11 +193,15 @@ mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); /
       shapes.hpp:5
 ```
 
-The module still builds. Importing it, only one `Config` exists, and it is the one bound last.
+The module still builds, and exactly one of them answers to `Config`: the one
+in the shallowest namespace. The others are not bound at all, and are listed
+again under [Names missing from the module](#names-missing-from-the-module).
 
-**Cause** A module exposes every class under its *unqualified* name, because Python, Lua and JavaScript identifiers are flat. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in; the C++ side is unambiguous (the generated file names each class in full), so nothing downstream reports it.
+**Cause** A module exposes every class under its *unqualified* name, because Python, Lua and JavaScript identifiers are flat. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in. The C++ side is unambiguous, because the generated file names each class in full, so nothing downstream reports it.
 
-**Fix** Bind one of them in a module of its own, rename one class, or put `// MIRROR_BRIDGE_SKIP` on the line above the one this module does not need.
+Which one wins used to be whichever was bound last, which is whichever the header declared second. That is how `lib::detail::Config` took the name and the public `lib::Config` became unreachable while the build reported success. The choice is made before codegen now: fewest scope components wins, ties going to the first in discovery order, which is sorted by header path, so the answer is the same on every run.
+
+**Fix** If the one you want is not the one chosen, bind it in a module of its own, rename one class, or put `// MIRROR_BRIDGE_SKIP` on the line above the one this module does not need.
 
 ### Unsupported container shape
 

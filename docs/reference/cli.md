@@ -37,6 +37,12 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `-f, --force` | Force rebuild even if sources haven't changed |
 | `-I DIR` | Add include directory |
 | `--json` | Emit one JSON result object on stdout (see [Machine-readable output](#machine-readable-output)) |
+| `--no-verify` | Skip the import check. Python modules are imported once after the build, because "built" and "works" are different claims: the import is what catches a library that is not header-only, and it is where the module reports the names it declined to bind |
+| `--link-args ARGS` | Extra link inputs for a library that is not header-only, e.g. `--link-args "build/libfoo.a -lz"` |
+| `--stubs` | Python: write `<module>.pyi` beside the module, with reflection-exact signatures and real C++ parameter names |
+| `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
+| `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
+| `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |
 | `--instantiate SPEC` | Python: also bind this template specialization, e.g. `"geom::Vector3<short>"` or `"geom::clamp<float>"` (repeatable) |
 | `--template-cap N` | Python: max argument combinations tried per function template before falling back to Python scalars (default 64) |
 | `--no-templates` | Python: skip template and free-function planning, bind classes only |
@@ -479,11 +485,28 @@ scraping log text.
     "rounds": 4,
     "report": "/path/to/build/my_module_plan.txt"
   },
-  "errors": []
+  "errors": [],
+  "imported": {"ok": true, "reason": "", "suggestion": ""},
+  "declined": [
+    {"kind": "function", "name": "out_param",
+     "reason": "a non-const reference parameter, whose writes cannot reach the caller: Python would pass a copy and the result would be lost. Return the value instead"}
+  ]
 }
 ```
 
 `templates` is `null` for non-Python modules and with `--no-templates`.
+
+`imported` is the end-to-end check: the built Python module is loaded once,
+because a `.so` that raises `ImportError` is not a result. `ok` is `false` when
+it does not load, `status` is then `error`, and `suggestion` says what to do
+about it, which for an undefined symbol is to pass the built library to
+`--link-args`. The field is `null` for non-Python modules and with
+`--no-verify`.
+
+`declined` is every class and free function that did not make it into the
+module, each with the reason the module gave. An empty array is the only
+evidence that everything you wrote crossed, so it is the field to branch on
+when nothing is reading the terminal.
 
 On failure, each entry in `errors` carries the first compiler error plus an
 actionable suggestion:
