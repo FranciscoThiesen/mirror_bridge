@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,22 @@ public:
 struct UsesPool {
     Pool<16> pool;
     int cap() const { return pool.capacity; }
+};
+
+// A std::span<const double> parameter. Indexing a span compiles; assigning
+// through it does not. The fill loop guarded `container[i] = item` on whether
+// `container[i]` was merely reachable, so the body was instantiated and the
+// error surfaced inside mirror_bridge_python.hpp -- naming neither the
+// parameter, nor the method, nor the class, and costing the whole module.
+// A span is the shape an agent writing a hot path reaches for first.
+struct SpanTaker {
+    double offset = 1.0;
+    double usable(double v) const { return v + offset; }
+    double total(std::span<const double> xs) const {
+        double s = offset;
+        for (double x : xs) s += x;
+        return s;
+    }
 };
 
 }  // namespace decl

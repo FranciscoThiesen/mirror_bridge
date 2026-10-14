@@ -4129,11 +4129,19 @@ bool from_python(PyObject* obj, T& container) {
         ValueType cpp_item;
         if (!convert_at(i, cpp_item)) return false;
 
-        if constexpr (requires { container[i]; }) {
+        // Each guard tests the statement it guards, not a weaker question.
+        // `requires { container[i]; }` holds for std::span<const double> --
+        // indexing a span is fine, it is the assignment that is not -- so the
+        // body was instantiated and the whole module failed to compile on an
+        // error inside this file, naming neither the parameter nor the
+        // function that asked for it. A span parameter now declines the
+        // conversion here and becomes a TypeError at the call, which is the
+        // trade the comment below describes.
+        if constexpr (requires { container[i] = std::move(cpp_item); }) {
             container[i] = std::move(cpp_item);
-        } else if constexpr (requires { container.push_back(cpp_item); }) {
+        } else if constexpr (requires { container.push_back(std::move(cpp_item)); }) {
             container.push_back(std::move(cpp_item));
-        } else if constexpr (requires { container.insert(cpp_item); }) {
+        } else if constexpr (requires { container.insert(std::move(cpp_item)); }) {
             container.insert(std::move(cpp_item));
         } else {
             // A type can satisfy is_container -- value_type, begin(), size()

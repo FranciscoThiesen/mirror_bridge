@@ -81,4 +81,22 @@ u = d.UsesPool()
 assert u.cap() == 16, u.cap()
 print("  ✓ UsesPool binds with a private nested type in its reach")
 
+print("Test 8: a span parameter costs itself and nothing else...")
+# Indexing a std::span<const double> compiles and assigning through it does
+# not, so a guard that asked only whether the element was reachable
+# instantiated the assignment and failed the build inside the conversion
+# layer. The module is the evidence: it exists, and SpanTaker kept the method
+# that does convert.
+st = d.SpanTaker()
+assert st.usable(2.0) == 3.0, st.usable(2.0)
+total = getattr(st, "total", None)
+if total is None:
+    print("  ✓ the span method was declined at bind time")
+else:
+    try:
+        total([1.0, 2.0, 3.0])
+        raise AssertionError("total accepted a span it cannot fill")
+    except TypeError:
+        print("  ✓ total raises TypeError rather than failing the build")
+
 print("\nAll declinable-shape tests passed!")
