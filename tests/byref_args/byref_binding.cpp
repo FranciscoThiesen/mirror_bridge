@@ -4,4 +4,5 @@
 MIRROR_BRIDGE_MODULE(byref,
     mirror_bridge::bind_class<Tracked>(m, "Tracked");
     mirror_bridge::bind_class<Mutator>(m, "Mutator");
+    mirror_bridge::bind_class<LostWrites>(m, "LostWrites");
 )

@@ -2865,6 +2865,47 @@ struct py_param_storage {
 template<typename ParamType>
 using py_param_storage_t = typename py_param_storage<ParamType>::type;
 
+// A non-const lvalue reference parameter is a promise: the callee writes
+// through it and the caller sees the result. The promise is kept only when
+// the argument is stored as a pointer into the object Python already holds,
+// which is what py_param_storage does for a wrapper-backed class and what
+// core::param_storage does for a type too abstract or too non-copyable to
+// hold by value. Every other parameter is stored BY VALUE: the callee writes
+// to that copy, the copy dies when the call returns, and the function hands
+// back None having done nothing the caller can observe.
+//
+// These bound and lost the answer in silence:
+//
+//   void sum_into(const std::vector<double>&, double& total)
+//   void bump(int& n)
+//   void append_to(std::string& s)
+//   void fill_vector(std::vector<double>& out, int n)
+//
+// Each one accepted its arguments, returned None, and left the caller's value
+// exactly as it was. A missing method is a name error the caller sees at
+// once; this is a wrong answer they may never see, and it is the one failure
+// mode worth more than a dropped name.
+//
+// Python has nothing better to offer for most of these. An int, a float, a
+// str and a tuple are immutable, so there is no object to write into. A list
+// does arrive as a std::vector, but as a copy whose address the caller never
+// had, so writing back would mean copying the whole container out again after
+// the call -- worth doing, and a change of call semantics rather than a bug
+// fix, so it is not done here.
+//
+// Constructors are deliberately left alone. A constructor that writes through
+// a parameter is not a shape worth refusing a whole class over, and refusing
+// one leaves the class with no way to be built.
+template<typename ParamType>
+consteval bool param_writes_reach_caller() {
+    if constexpr (!std::is_lvalue_reference_v<ParamType> ||
+                  std::is_const_v<std::remove_reference_t<ParamType>>) {
+        return true;    // nothing is written through it
+    } else {
+        return std::is_pointer_v<py_param_storage_t<ParamType>>;
+    }
+}
+
 // Dispatcher: value storage vs pointer storage.
 // Called in method dispatch to populate the tuple of stored args.
 template<typename ParamType, typename Storage>
@@ -3970,10 +4011,32 @@ consteval bool return_type_convertible() {
     }
 }
 
-// Bindable = every parameter storable AND the return convertible.
+// Every out-parameter of a method writes somewhere the caller can see it.
+template<typename T, std::size_t Index>
+consteval bool method_out_params_reach_caller() {
+    constexpr std::size_t n = mirror_bridge::core::get_method_param_count<T, Index>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (param_writes_reach_caller<
+                    mirror_bridge::core::method_param_t<T, Index, Is>>() && ...);
+    }(std::make_index_sequence<n>{});
+}
+
+template<typename T, std::size_t Index>
+consteval bool static_method_out_params_reach_caller() {
+    constexpr std::size_t n = mirror_bridge::core::get_static_method_param_count<T, Index>();
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (param_writes_reach_caller<
+                    mirror_bridge::core::static_method_param_t<T, Index, Is>>() && ...);
+    }(std::make_index_sequence<n>{});
+}
+
+// Bindable = every parameter storable, every write observable, and the return
+// convertible.
 template<typename T, std::size_t Index>
 consteval bool method_fully_bindable() {
     if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+        return false;
+    } else if constexpr (!method_out_params_reach_caller<T, Index>()) {
         return false;
     } else {
         return return_type_convertible<typename [:get_method_return_type<T, Index>():]>();
@@ -3983,6 +4046,8 @@ consteval bool method_fully_bindable() {
 template<typename T, std::size_t Index>
 consteval bool static_method_fully_bindable() {
     if constexpr (!mirror_bridge::core::static_method_params_all_bindable<T, Index>()) {
+        return false;
+    } else if constexpr (!static_method_out_params_reach_caller<T, Index>()) {
         return false;
     } else {
         return return_type_convertible<typename [:get_static_method_return_type<T, Index>():]>();
@@ -6080,11 +6145,40 @@ struct FreeParamsBindable<std::tuple<Args...>> {
     static constexpr bool value = (free_param_bindable<Args>() && ...);
 };
 
+template<typename Tuple>
+struct FreeParamsWritesReach;
+
+template<typename... Args>
+struct FreeParamsWritesReach<std::tuple<Args...>> {
+    static constexpr bool value = (param_writes_reach_caller<Args>() && ...);
+};
+
 template<auto FuncPtr>
 consteval bool free_function_bindable() {
     using Traits = FunctionTraits<decltype(FuncPtr)>;
     return FreeParamsBindable<typename Traits::ArgsTuple>::value &&
+           FreeParamsWritesReach<typename Traits::ArgsTuple>::value &&
            return_type_convertible<typename Traits::ReturnType>();
+}
+
+// Which of the three gates said no. The old message named the only reason
+// there used to be, and a caller reading "has no converter" about
+// `void fill(std::vector<double>&)` would go looking for a converter that is
+// already there. The reason has to be the one that fired, because the fix
+// differs: write a converter, change the return type, or stop writing
+// through a parameter.
+template<auto FuncPtr>
+consteval const char* free_function_skip_reason() {
+    using Traits = FunctionTraits<decltype(FuncPtr)>;
+    if constexpr (!FreeParamsWritesReach<typename Traits::ArgsTuple>::value) {
+        return "a non-const reference parameter, whose writes cannot reach the "
+               "caller: Python would pass a copy and the result would be lost. "
+               "Return the value instead";
+    } else if constexpr (!return_type_convertible<typename Traits::ReturnType>()) {
+        return "the return type has no converter";
+    } else {
+        return "a parameter has no converter";
+    }
 }
 
 // The free-function counterpart of bind_class_when_bindable: CLI-generated
@@ -6096,9 +6190,8 @@ bool bind_function_when_bindable(PyObject* module, const char* name) {
     if constexpr (free_function_bindable<FuncPtr>()) {
         return bind_function<FuncPtr>(module, name);
     } else {
-        std::fprintf(stderr,
-            "mirror_bridge: skipped function '%s' (a parameter or the return "
-            "type has no converter)\n", name);
+        std::fprintf(stderr, "mirror_bridge: skipped function '%s' (%s)\n",
+                     name, free_function_skip_reason<FuncPtr>());
         return false;
     }
 }

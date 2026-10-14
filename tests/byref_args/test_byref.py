@@ -47,4 +47,19 @@ try:
 except TypeError:
     print("  ✓ TypeError raised instead of silent default-construction")
 
+print("Test 6: a non-const reference whose writes cannot reach the caller is refused...")
+# The promise a non-const reference makes is that the caller sees the write.
+# It is kept for Tracked& (Test 2) because the argument aliases the Python
+# object. For an int, a float, a str or a list there is nothing to alias, so
+# the callee writes to a copy that dies with the call. Binding these anyway
+# produced a call that returned None and changed nothing -- so they are not
+# bound, and the caller gets an AttributeError they can see.
+lw = byref.LostWrites()
+assert lw.usable(21) == 42, lw.usable(21)
+for name in ("sum_into", "bump_int", "append_to", "fill", "static_bump"):
+    assert not hasattr(lw, name), (
+        f"{name} takes a non-const reference whose writes are discarded; "
+        f"binding it reports success and loses the answer")
+print("  ✓ five out-parameter methods refused, the class keeps the rest")
+
 print("\nAll by-reference argument tests passed!")
