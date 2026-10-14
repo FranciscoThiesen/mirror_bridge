@@ -779,6 +779,13 @@ for path in sys.argv[1:]:
         continue
     text = re.sub(r'//[^\n]*', '', text)
     text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    # A namespace opened inside a macro body does not exist until the macro is
+    # expanded, and this scan cannot expand it. googletest's
+    # GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST opens an empty
+    # `gtest_do_not_use_outside_namespace_scope`, and emitting a using
+    # directive for it put `error: expected namespace name` at the top of the
+    # generated binding.
+    text = re.sub(r'^[ \t]*#(?:[^\n\\]|\\\n|\\.)*', '', text, flags=re.M)
     depth = 0
     ns_stack = []
     i = 0

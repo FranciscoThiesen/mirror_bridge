@@ -65,9 +65,30 @@ NONTYPE_RE = re.compile(
 PRIVATE_NS = {"std", "detail", "details", "internal", "impl", "__detail"}
 
 
-def strip_comments(text):
+def strip_noncode(text):
+    """Comments and preprocessor directives out, line count preserved.
+
+    A declaration inside a macro body is not a declaration until the macro is
+    expanded, and nothing here can expand it. googletest declares
+
+        #define GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(T)  \\
+          namespace gtest_do_not_use_outside_namespace_scope {}    \\
+          ...
+
+    and the namespace scan took that for a namespace the headers open. It went
+    into the discovery unit's namespace list, which then failed to compile on
+
+        error: use of undeclared identifier
+               'gtest_do_not_use_outside_namespace_scope'
+
+    so reflection could not read googletest's headers at all and discovery
+    fell back to a scan of the text. One empty namespace in one macro, and the
+    whole library dropped to the weaker path.
+    """
     text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"//[^\n]*", "", text)
+    return re.sub(r"^[ \t]*#(?:[^\n\\]|\\\n|\\.)*",
+                  lambda m: "\n" * m.group(0).count("\n"), text, flags=re.M)
 
 
 def kind_of(param):
@@ -650,7 +671,7 @@ def main():
         for base in [args.src_dir] + args.include_dir:
             p = pathlib.Path(base) / h
             if p.is_file():
-                text += strip_comments(p.read_text(encoding="utf-8", errors="ignore")) + "\n"
+                text += strip_noncode(p.read_text(encoding="utf-8", errors="ignore")) + "\n"
                 break
     hints = scan_hints(text)
     namespaces = scan_namespaces(text)
