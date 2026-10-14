@@ -334,18 +334,39 @@ candidate, so `TypeError` is raised only when no overload matches.
 
 ## Limitations
 
-### Not Currently Supported
+### Shapes at the edge
 
-| Type | Status |
-|------|--------|
-| Raw pointers (T*) | Not supported |
-| References as parameters | Partial support |
-| Function pointers | Not supported |
-| `weak_ptr` | Not supported |
+Every row below was measured against a built module, not reasoned about. The
+ones that are refused are refused by name at build time, so a signature that
+cannot cross is something you hear about from `generate` rather than from an
+`AttributeError` later.
+
+| Shape | Status | What to write instead |
+|-------|--------|-----------------------|
+| `T*` as a parameter or return | Not bound | A pointer says nothing about who owns the thing. Return by value, or use `shared_ptr`/`unique_ptr`, which do |
+| `const char*` as a parameter or return | Bound, crosses as `str` | Nothing. The caller borrows it and the value is copied into a Python `str` before the call returns. A null crosses as `None`, which is how a C API says "absent" |
+| `char*` as a return | Not bound | By convention that one is the caller's to free, so copying it would leak. Return `std::string` |
+| `const T&` as a parameter | Bound, no copy | Nothing |
+| `T&` as a parameter, `T` a bound class | Bound, aliases the Python object, writes are visible | Nothing |
+| `T&` as a parameter, `T` anything else | Not bound | The argument would be a copy and the write would be lost, so this is refused rather than silently doing nothing. Return the value: `double sum(const std::vector<double>&)`, not `void sum(const std::vector<double>&, double&)` |
+| `std::span<T>` as a parameter | Not bound | A span does not own its storage. Take `const std::vector<T>&` |
+| Overloaded free functions | Not bound | Give one overload a distinct name, or bind a single non-overloaded wrapper |
+| Function pointers | Not bound | Take `std::function<R(Args...)>`, which does cross and can be called with any Python callable |
+| `weak_ptr` | Not bound | Pass `shared_ptr` |
+
+Every one of these is reported by `mirror_bridge generate`, by name and with
+the reason, and carried in `--json` under `declined`. Nothing is dropped in
+silence.
 
 ### Template Classes
 
-Template classes must be explicitly instantiated before binding:
+`mirror_bridge generate` plans template instantiations itself: it reads the
+parameter list from the headers, tries combinations against the compiler, and
+binds the ones that compile. `--instantiate "geom::Vector3<short>"` names one
+explicitly and `--no-templates` turns the pass off.
+
+Writing a binding by hand, there is no planner, so the specialization has to
+exist before it can be bound:
 
 ```cpp
 template<typename T>

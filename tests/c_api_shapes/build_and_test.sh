@@ -8,6 +8,9 @@
 #   bit-field          ImGui's ImFontGlyph    "non-const reference cannot bind"
 #   anonymous union    ImGuiStoragePair       member cache stopped being constant
 #   forward decl       Open3D's camera types  "'typeid' of incomplete type"
+#
+# And what a C API hands back: a `const char*` return, which 1,282 functions
+# in the compatibility corpus have and none of which could be bound.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +43,11 @@ lab = cs.Label()
 assert lab.text is None, repr(lab.text)
 lab.text = 'hello'
 assert lab.text == 'hello'
+at = cs.Attributes()
+assert at.c_str() == 'text', repr(at.c_str())
+assert at.attribute('tag') == 'node', repr(at.attribute('tag'))
+assert at.attribute('missing') is None, repr(at.attribute('missing'))
+assert not hasattr(at, 'owned'), 'a char* return belongs to the caller'
 " 2>/dev/null || fail "the bound shapes do not behave"
 
 echo "PASS: bit-fields, anonymous unions and forward declarations each cost only themselves"

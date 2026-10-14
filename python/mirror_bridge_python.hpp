@@ -3996,7 +3996,21 @@ consteval bool return_type_convertible() {
     } else {
         using Clean = std::remove_cvref_t<Ret>;
         if constexpr (std::is_pointer_v<Clean>) {
-            return false;
+            // A returned pointer says nothing about who owns the thing, which
+            // is why they are refused -- with one exception. `const char*` is
+            // the one pointer whose convention is settled: the caller borrows
+            // it and does not free it. to_python copies it into a Python str
+            // before anything else can run, and answers None for the null a C
+            // API uses to mean absent, so nothing of it outlives the call.
+            //
+            // The parameter gate has drawn this line since Clipper2's
+            // exception constructor needed it. The return gate had not, and it
+            // cost more: 1,282 functions in the compatibility corpus are
+            // declared to return `const char*`, among them every `what()`,
+            // SQLiteCpp's 83 (getColumnName, getErrorMsg) and tinyxml2's
+            // Attribute(). `char*` stays refused: by convention that one is
+            // the caller's to free, and copying it would leak.
+            return std::is_same_v<Clean, const char*>;
         } else if constexpr (is_std_optional<Clean>::value || is_std_expected<Clean>::value ||
                              is_std_future<Clean>::value || is_std_function<Clean>::value ||
                              is_std_tuple_like<Clean>::value || is_std_variant<Clean>::value) {

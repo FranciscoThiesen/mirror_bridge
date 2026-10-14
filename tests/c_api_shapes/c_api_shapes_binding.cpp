@@ -6,4 +6,5 @@ MIRROR_BRIDGE_MODULE(c_api_shapes,
     mirror_bridge::bind_class<capi::StoragePair>(m, "StoragePair");
     mirror_bridge::bind_class_when_bindable<capi::HoldsOpaque>(m, "HoldsOpaque");
     mirror_bridge::bind_class<capi::Label>(m, "Label");
+    mirror_bridge::bind_class<capi::Attributes>(m, "Attributes");
 )

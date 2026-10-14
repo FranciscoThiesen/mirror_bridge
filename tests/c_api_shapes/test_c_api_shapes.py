@@ -41,6 +41,18 @@ def main():
     lab.text = "hello"
     assert lab.text == "hello"
 
+    # A `const char*` return crosses as a str, and the null a C API uses for
+    # "absent" crosses as None. This is tinyxml2's Attribute() shape.
+    at = cs.Attributes()
+    assert at.c_str() == "text", repr(at.c_str())
+    assert at.attribute("tag") == "node", repr(at.attribute("tag"))
+    assert at.attribute("missing") is None, repr(at.attribute("missing"))
+    assert at.tag == "node", repr(at.tag)
+
+    # `char*` is the caller's to free, so it is not bound: copying it and
+    # walking away would leak, and the class keeps its other methods.
+    assert not hasattr(at, "owned"), "a char* return should not be bound"
+
     print("c_api_shapes: all assertions passed")
     return 0
 
