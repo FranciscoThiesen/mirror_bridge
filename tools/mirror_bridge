@@ -196,6 +196,11 @@ ${YELLOW}Options:${NC}
   -f, --force         Force rebuild even if sources haven't changed
   -I DIR              Add include directory
   --json              Emit one JSON result object on stdout (progress -> stderr)
+  --no-verify         Skip the import check. Python modules are imported once
+                      after the build, because '✓ Built' and '✓ works' are
+                      different claims: the import is what catches a library
+                      that is not header-only, and it is where the module
+                      reports the classes and functions it declined to bind
   --release-gil       Python: drop the GIL while C++ method bodies run, so
                       long-running native calls stop blocking other threads
                       (argument/result conversion still holds the GIL; safe
@@ -853,6 +858,84 @@ PYSCRIPT
     echo ")" >> "$output_file"
 }
 
+# Does the module the compiler just produced actually load?
+#
+# `✓ Built` is not the same claim as `✓ works`, and the gap between them is
+# where two whole failure modes were living:
+#
+#   open3d   built, then raised ImportError on an undefined symbol the first
+#            time anyone imported it. The library is not header-only, and
+#            nothing said so until the caller's own test run.
+#   Node,    declined to bind at compile time and said so at module init --
+#   label    which is to say, on stderr, in the caller's first import, long
+#            after `generate` had printed a green banner. The decision was
+#            made during this build; the report belonged in it.
+#
+# One import answers both, so it happens here instead of in the caller's
+# first test run. Python only: the module is loaded by the same interpreter
+# whose headers compiled it, since compile_binding takes its include flags
+# from `python3-config`.
+VERIFY_IMPORT=1
+VERIFY_OK=1
+VERIFY_REASON=""
+VERIFY_NOTE=""
+declare -a VERIFY_SKIPPED_CLASSES=()
+declare -a VERIFY_SKIPPED_FUNCS=()
+
+verify_python_module() {
+    local module_name="$1" out_dir="$2"
+    VERIFY_OK=1; VERIFY_REASON=""; VERIFY_NOTE=""
+    VERIFY_SKIPPED_CLASSES=(); VERIFY_SKIPPED_FUNCS=()
+
+    [ "$VERIFY_IMPORT" -eq 1 ] || return 0
+    [ -f "$out_dir/$module_name.so" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    local log rc=0
+    # Loaded from the output directory so a module that shares types with a
+    # sibling built beside it finds that sibling, the way the caller will.
+    log=$(cd "$out_dir" && python3 -c "import sys; sys.path.insert(0, '.'); import $module_name" 2>&1) || rc=$?
+
+    # Every line the module printed about a name it declined. The reason text
+    # comes from the module, which is the only place that knows which gate
+    # refused and why.
+    # A single quote kept in a variable. Inside ${param#word} bash still
+    # processes quotes, so ${line#*skipped '} opens a quoted string at the
+    # quote and swallows the closing brace -- the strip then matched nothing
+    # and the whole line went where the name belongs.
+    local q="'"
+    local line name reason
+    while IFS= read -r line; do
+        case "$line" in
+            "mirror_bridge: skipped function $q"*)
+                name="${line#*skipped function $q}"; name="${name%%$q*}"
+                reason="${line#*(}"; reason="${reason%)}"
+                VERIFY_SKIPPED_FUNCS+=("$name — $reason") ;;
+            "mirror_bridge: skipped $q"*)
+                name="${line#*skipped $q}"; name="${name%%$q*}"
+                reason="${line#*(}"; reason="${reason%)}"
+                VERIFY_SKIPPED_CLASSES+=("$name — $reason") ;;
+        esac
+    done <<< "$log"
+
+    [ "$rc" -eq 0 ] && return 0
+
+    VERIFY_OK=0
+    VERIFY_REASON=$(echo "$log" | grep -m1 -E "Error|error" || echo "import failed")
+    case "$VERIFY_REASON" in
+        *"undefined symbol"*)
+            # The symbol is in the library's compiled sources, not its
+            # headers, so there is nothing to bind differently -- the built
+            # library has to be handed to the link.
+            VERIFY_NOTE="These headers are not header-only: the definitions live in the library's compiled sources. Build it and pass the result to --link-args, e.g. --link-args \"/path/to/libFoo.a\"" ;;
+        *"ImportError"*|*"ModuleNotFoundError"*)
+            VERIFY_NOTE="A shared library the module needs was not found at load time. Add its directory to LD_LIBRARY_PATH, or link it statically through --link-args" ;;
+        *)
+            VERIFY_NOTE="Run the import by hand to see the whole traceback: (cd $out_dir && python3 -c 'import $module_name')" ;;
+    esac
+    return 0
+}
+
 # Names the user wrote that are absent from the finished module. These facts
 # already existed — a dropped overload set was one stderr line printed eight
 # lines before a green success banner, and an enum said nothing at all — so
@@ -875,7 +958,8 @@ report_unbound() {
         done < "$TEMPLATE_UNBOUND_FILE"
     fi
 
-    local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#DISCOVERED_ENUMS[@]} ))
+    local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#DISCOVERED_ENUMS[@]}
+                    + ${#VERIFY_SKIPPED_CLASSES[@]} + ${#VERIFY_SKIPPED_FUNCS[@]} ))
     [ "$total" -eq 0 ] && return 0
 
     local noun="names were" ; local pronoun="them"
@@ -900,6 +984,31 @@ report_unbound() {
         echo "$line" | fold -s -w 78
     }
 
+    # One line per name, because each carries the reason the module gave for
+    # it and the reasons differ. Capped the same way the grouped lists are.
+    print_reasoned() {
+        local -n items=$1
+        local shown=0 item
+        for item in "${items[@]}"; do
+            if [ "$shown" -ge 8 ]; then
+                echo "      ... (+$(( ${#items[@]} - 8 )) more)"
+                break
+            fi
+            echo "      $item" | fold -s -w 78
+            shown=$(( shown + 1 ))
+        done
+    }
+
+    if [ ${#VERIFY_SKIPPED_CLASSES[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#VERIFY_SKIPPED_CLASSES[@]} class(es) the module declined"
+        print_reasoned VERIFY_SKIPPED_CLASSES
+    fi
+    if [ ${#VERIFY_SKIPPED_FUNCS[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#VERIFY_SKIPPED_FUNCS[@]} free function(s) the module declined"
+        print_reasoned VERIFY_SKIPPED_FUNCS
+    fi
     if [ ${#DISCOVERED_ENUMS[@]} -gt 0 ]; then
         echo ""
         echo "    ${#DISCOVERED_ENUMS[@]} enum type(s) — values still cross as plain int, unchecked"
@@ -1312,6 +1421,7 @@ cmd_generate() {
             -k|--keep-generated) KEEP_GENERATED=1; shift ;;
             -v|--verbose) VERBOSE=1; shift ;;
             -f|--force) FORCE_REBUILD=1; shift ;;
+            --no-verify) VERIFY_IMPORT=0; shift ;;
             --json) JSON_MODE=1; shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
@@ -1503,6 +1613,14 @@ cmd_generate() {
         fi
     done
 
+    local verified_lang=0
+    for lang in "${languages[@]}"; do
+        if [ "$lang" = "python" ] && [ ${#failed_langs[@]} -eq 0 ]; then
+            verify_python_module "$module_name" "$OUTPUT_DIR"
+            verified_lang=1
+        fi
+    done
+
     if [ $JSON_MODE -eq 1 ]; then
         local classes_json="" langs_json="" outputs_json="" i
         for i in "${!CLASSES[@]}"; do
@@ -1522,14 +1640,41 @@ cmd_generate() {
         if [ -n "$TEMPLATE_JSON_FILE" ] && [ -s "$TEMPLATE_JSON_FILE" ]; then
             templates_json=$(cat "$TEMPLATE_JSON_FILE")
         fi
-        printf '{"status":"%s","module":"%s","languages":[%s],"classes":[%s],"outputs":[%s],"errors":[%s],"templates":%s}\n' \
+        # "imported": whether the built module loads, and every name it
+        # declined with the reason it gave. A caller that reads only the JSON
+        # gets the same picture the banner shows, which is the whole point of
+        # the flag.
+        local import_json="null" declined_json=""
+        if [ "$verified_lang" -eq 1 ] && [ "$VERIFY_IMPORT" -eq 1 ]; then
+            local ok_lit="true"
+            [ "$VERIFY_OK" -eq 1 ] || ok_lit="false"
+            import_json=$(printf '{"ok":%s,"reason":"%s","suggestion":"%s"}' \
+                "$ok_lit" "$(json_escape "$VERIFY_REASON")" "$(json_escape "$VERIFY_NOTE")")
+            for i in "${VERIFY_SKIPPED_CLASSES[@]:-}"; do
+                [ -n "$i" ] && declined_json+="{\"kind\":\"class\",\"name\":\"$(json_escape "${i%% — *}")\",\"reason\":\"$(json_escape "${i#* — }")\"},"
+            done
+            for i in "${VERIFY_SKIPPED_FUNCS[@]:-}"; do
+                [ -n "$i" ] && declined_json+="{\"kind\":\"function\",\"name\":\"$(json_escape "${i%% — *}")\",\"reason\":\"$(json_escape "${i#* — }")\"},"
+            done
+        fi
+        [ "$VERIFY_OK" -eq 1 ] || status="error"
+        printf '{"status":"%s","module":"%s","languages":[%s],"classes":[%s],"outputs":[%s],"errors":[%s],"templates":%s,"imported":%s,"declined":[%s]}\n' \
             "$status" "$(json_escape "$module_name")" "${langs_json%,}" \
-            "${classes_json%,}" "${outputs_json%,}" "${errors_json%,}" "$templates_json" >&3
+            "${classes_json%,}" "${outputs_json%,}" "${errors_json%,}" "$templates_json" \
+            "$import_json" "${declined_json%,}" >&3
     fi
 
     echo ""
     if [ ${#failed_langs[@]} -gt 0 ]; then
         echo -e "${RED}✗ Failed languages: ${failed_langs[*]}${NC}"
+        report_unbound "$module_name"
+        exit 1
+    fi
+    if [ "$VERIFY_OK" -eq 0 ]; then
+        echo -e "${RED}✗ Built, but the module does not import — it is not usable yet:${NC}"
+        echo "    $VERIFY_REASON"
+        echo ""
+        echo "  $VERIFY_NOTE" | fold -s -w 78
         report_unbound "$module_name"
         exit 1
     fi

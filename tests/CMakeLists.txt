@@ -378,6 +378,20 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/export_macro)
     )
 endif()
 
+# "Built" and "works" are different claims. generate imports the Python
+# module it just produced, because that is what catches a library whose
+# definitions live in its compiled sources (Open3D: 39 classes, a .so, a green
+# banner, then ImportError) and it is the only place the build can hear which
+# names the module declined to bind.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/import_check)
+    add_test(NAME cli_import_check
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/import_check/build_and_test.sh
+    )
+    set_tests_properties(cli_import_check PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Reading the headers through reflection means reading the whole translation
 # unit, so what the walk is allowed to report needs a test of its own: a
 # third-party header the project includes must not contribute classes to the
