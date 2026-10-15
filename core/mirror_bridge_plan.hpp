@@ -265,9 +265,6 @@ consteval std::vector<info> scalar_baseline() {
     return v;
 }
 
-// Named only where the owner is spelled out, so an operator template reaching
-// here would already have returned from plan_function_template. The guard is
-// the caller's; this records the assumption.
 consteval std::string spec_spelling(info tmpl, const std::vector<info>& args, const std::string& owner_spelling) {
     std::string qname = owner_spelling.empty() ? qualified(tmpl) : owner_spelling + "::" + std::string(identifier_of(tmpl));
     return qname + "<" + spell_args(args) + ">";
@@ -297,22 +294,6 @@ consteval void note_signature(Plan& p, info inst, const std::string& sp) {
 // left to the probe. Approved instantiations from an earlier round may be
 // substituted here: their signatures extend the closure.
 consteval void plan_function_template(Plan& p, info ft, const std::string& owner_spelling) {
-    // An operator template has no identifier, and asking for one is not merely
-    // false but ill-formed: it ends the whole consteval evaluation, so the
-    // discovery unit fails to compile and the CLI falls back to a scan of the
-    // header text. inventory_namespace has guarded this for namespace-scope
-    // operators since box2d's `operator<<`; the member loops that call in here
-    // had not, and googletest declares `template <class T> bool operator==`
-    // inside a class. One of those, and the compiler said
-    //
-    //   error: non-type template argument is not a constant expression
-    //   note: names of operator templates are not identifiers
-    //
-    // which cost googletest every class, every free function and every
-    // instantiation in the module. Guarded here rather than at the three call
-    // sites, so a fourth cannot reintroduce it. Nothing nameless is bindable:
-    // the binding names each function by its identifier.
-    if (!has_identifier(ft)) return;
     std::string_view kinds = kind_hint(ft);
     std::string qname = owner_spelling.empty() ? qualified(ft) : owner_spelling + "::" + std::string(identifier_of(ft));
     if (kinds.empty()) { p.notes.push_back("skip " + qname + ": no template-parameter hint"); return; }
@@ -658,7 +639,11 @@ consteval std::string render() {
         for (auto& n : needs_of(f)) out += "needs\t" + qualified(f) + "\t" + n + "\t\t\t\n";
     }
     for (info ft : inv.fn_templates) {
-        if (!has_identifier(ft)) continue;   // operator templates, as above
+        // An operator template has no identifier, and identifier_of on one is
+        // ill-formed rather than empty: it ends the whole consteval
+        // evaluation. The `free` loop above has guarded this since box2d; this
+        // one, and plan_function_template, had not.
+        if (!has_identifier(ft)) continue;
         out += "fntemplate\t" + std::string(identifier_of(ft)) + "\t" + qualified(ft) + "\t\t\t\n";
     }
     for (auto& c : p.cands)

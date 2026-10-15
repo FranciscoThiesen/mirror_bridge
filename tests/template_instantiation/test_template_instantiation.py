@@ -150,17 +150,6 @@ def test_abstract_and_rvalue_members():
     print("✓ abstract classes refuse construction, awkward member templates cost themselves")
 
 
-def test_member_operator_template_costs_nothing():
-    # The guard's whole point: an operator template is skipped and the class
-    # keeps the member template beside it. If the guard were missing there
-    # would be no module to import at all, so reaching this line is half the
-    # assertion.
-    tg = geom.Tagged()
-    assert tg.tag == 3, tg.tag
-    assert tg.scaled(4) == 12, tg.scaled(4)
-    print("✓ a member operator template does not cost the module")
-
-
 def test_stubs():
     pyi = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "geom.pyi")
     text = open(pyi).read()

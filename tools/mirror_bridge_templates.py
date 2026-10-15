@@ -249,91 +249,6 @@ int main() { std::fputs(mb_plan.data(), stdout); }
 """
 
 
-NS_CHECK_RE = re.compile(r"ns_check\.cpp:(\d+)(?::\d+)?:\s*(?:fatal )?error:")
-
-UNDECLARED_RE = re.compile(r"use of undeclared identifier '([^']+)'"
-                           r"|no namespace named '([^']+)'"
-                           r"|no member named '([^']+)'")
-
-
-def names_a_guessed_namespace(err, namespaces):
-    """Whether the discovery unit failed on a name from the namespace list.
-
-    Pruning the namespace list can only help when the compiler complained
-    about a name that is in it. simdjson's headers do not compile under this
-    compiler at all -- its first error is an undeclared `__builtin_...` -- so
-    matching "use of undeclared identifier" alone bought every such library an
-    extra parse of every header that could not possibly have helped it.
-    """
-    parts = {p for ns in namespaces if ns != "::" for p in ns.split("::") if p}
-    for m in UNDECLARED_RE.finditer(err or ""):
-        if (m.group(1) or m.group(2) or m.group(3)) in parts:
-            return True
-    return False
-
-
-def validate_namespaces(work, cc, headers, namespaces):
-    """Which of the guessed namespaces the headers actually declare.
-
-    The namespace list is guessed by tracking braces through the header text,
-    and that cannot be made right: brace depth is not balanced across the arms
-    of an #if, because only one arm is ever compiled. fast_float has
-
-        #ifdef FASTFLOAT_ALLOWS_LEADING_PLUS
-          if (...) {
-        #else
-          if (...) {
-        #endif
-          ...
-        }
-
-    which is two opens and one close to anything that does not run the
-    preprocessor. Two of those in one header and the scan reports
-    `fast_float::fast_float`, a namespace nested inside itself.
-
-    One such guess used to cost everything. The discovery unit splices every
-    name in the list, a splice of a name that does not exist is a hard error,
-    and the error cannot be guarded in-language, so the unit failed to compile
-    and the CLI fell back to a scan of the header text -- which does not see
-    the preprocessor either, and so reports classes from #if arms that are not
-    compiled. Four libraries in the compatibility corpus lost reflection to
-    exactly this: fast_float, doctest, Eigen (`doxygen`, declared only under
-    #ifdef EIGEN_PARSED_BY_DOXYGEN) and OpenCV (`debug_build_guard`).
-
-    So the compiler is asked instead. One name per line, -ferror-limit=0 so it
-    reports all of them, and the line number says which name is bad: that
-    attribution is the reason for one per line rather than one list. Only run
-    when discovery has already failed, so a correct guess costs nothing.
-
-    Returns (kept, dropped).
-    """
-    # One include per entry, because the line number is the whole mechanism:
-    # holding the include block as a single multi-line string made len(lines)
-    # undercount by the number of includes, and every candidate was then
-    # attributed to the wrong line -- so the check compiled, reported the bad
-    # namespace, and matched none of them.
-    lines = ["#include <meta>"]
-    lines += [l for l in include_lines(headers).split("\n") if l]
-    index = {}
-    for i, ns in enumerate(namespaces):
-        if ns == "::":
-            continue            # global scope always exists
-        index[len(lines) + 1] = ns
-        lines.append(f"constexpr std::meta::info mb_ns_{i} = ^^{ns};")
-    src = work / "ns_check.cpp"
-    src.write_text("\n".join(lines) + "\n")
-    if not index:
-        return namespaces, []
-
-    r = cc.run(["-I" + str(work), "-fsyntax-only", str(src)])
-    if not r.returncode:
-        return namespaces, []
-    bad = {index[int(m.group(1))] for m in NS_CHECK_RE.finditer(r.stderr) if int(m.group(1)) in index}
-    if not bad:
-        return namespaces, []
-    return [ns for ns in namespaces if ns not in bad], sorted(bad)
-
-
 def discover(work, cc, headers):
     src = work / "discover.cpp"
     src.write_text("#include <array>\n#include <cstdio>\n#include <string>\n" + include_lines(headers)
@@ -510,26 +425,9 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
     approved_spellings, rejected_ever, unbindable_ever, rounds, seen_spellings = set(), {}, {}, [], set()
     plan, approved, rejected, unbindable, dropped = {"free": [], "needs": [], "cands": []}, [], [], [], []
     before = set()
-    namespaces_checked = False
     for rnd in range(1, max(1, args.max_rounds) + 1):
         write_inputs(work, headers, hints, approved_spellings, namespaces, args.template_cap, requested, args.src_dir)
         plan, err = discover(work, cc, headers)
-        # A namespace the headers do not declare makes the discovery unit
-        # fail to compile, and the splice that names it cannot be guarded
-        # in-language. Rather than fall back to a scan of the header text --
-        # which has the same blind spot that produced the bad guess -- ask the
-        # compiler which names are real and try once more without them. Only
-        # on failure, so a correct guess costs nothing.
-        if err and not namespaces_checked and names_a_guessed_namespace(err, namespaces):
-            namespaces_checked = True
-            kept, bad = validate_namespaces(work, cc, headers, namespaces)
-            if bad:
-                for ns in bad:
-                    log.append(f"namespace {ns} is not declared by these headers: dropped")
-                namespaces = kept
-                write_inputs(work, headers, hints, approved_spellings, namespaces,
-                             args.template_cap, requested, args.src_dir)
-                plan, err = discover(work, cc, headers)
         if err:
             return None, "discovery failed:\n" + err
         # The declared classes do not depend on what the probe approved, so
@@ -812,27 +710,11 @@ def main():
         attempts, reduced, err = [headers], [h for h in headers if h in included], ""
         if reduced and len(reduced) < len(headers):
             attempts.append(reduced)
-        namespaces_checked = False
         for i, attempt_headers in enumerate(attempts):
             if i:
                 log.append("retrying with the module's own headers only")
             write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [], args.src_dir)
             plan, err = discover(work, cc, attempt_headers)
-            # Same recovery as plan_module: a namespace the headers do not
-            # declare is a splice of a name that does not exist, which no
-            # in-language guard can catch, so the unit fails to compile and
-            # the caller falls back to a scan of the header text. Ask the
-            # compiler which names are real and try again without the rest.
-            if err and not namespaces_checked and names_a_guessed_namespace(err, namespaces):
-                namespaces_checked = True
-                kept, bad = validate_namespaces(work, cc, attempt_headers, namespaces)
-                if bad:
-                    for ns in bad:
-                        log.append(f"namespace {ns} is not declared by these headers: dropped")
-                    namespaces = kept
-                    write_inputs(work, attempt_headers, hints, set(), namespaces,
-                                 args.template_cap, [], args.src_dir)
-                    plan, err = discover(work, cc, attempt_headers)
             if not err:
                 found = {"plain": plan["plain"], "enums": plan["enums"]}
                 break
