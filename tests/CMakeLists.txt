@@ -231,7 +231,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
-    # By-reference argument semantics (zero-copy const T&, visible T& mutation)
+    # A write through a nested data member reaches the owner, not a copy
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/member_views)
+        mirror_bridge_python_module(member_views
+            member_views/member_views_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/member_views
+        )
+    endif()
+
     # P3394 annotations, which both supported toolchains implement under
     # different names. The runtime behaviour is what matters and had no test:
     # a compile-only check cannot tell an honoured [[=exclude{}]] from an
