@@ -1,5 +1,6 @@
 """Auto-trampoline: vtable-swap driven by reflection lets Python subclasses
 override C++ virtuals without any hand-written trampoline class."""
+import gc
 import sys
 sys.path.append("build")
 
@@ -72,6 +73,27 @@ check(d.LegCount() == 4, f"non-virtual still works: {d.LegCount()}")
 # touch the vtable — Python finds them by name lookup).
 check(d.Sound() == "Woof!", "direct Python call still works")
 check(a.Sound() == "generic", "direct Python call on non-subclass also works")
+
+# An owned object handed back from C++ has to be released the way it was
+# allocated. When the payload is small enough to live inside the Python
+# object it was placement-constructed, and a plain `delete` on it aborts the
+# process rather than failing a check -- so the assertion is that the
+# interpreter is still here afterwards.
+clone = mod.clone_animal(a)
+check(clone.Sound() == "generic", f"a returned Animal is usable: {clone.Sound()}")
+del clone
+gc.collect()
+check(True, "releasing a returned Animal does not abort")
+
+# Copying out of an object whose vptr was swapped. The copy is a plain
+# Animal, so it must answer the C++ default rather than inherit the override,
+# and the registry entry that the swap created belongs to d and not to it.
+clone_sub = mod.clone_animal(d)
+check(clone_sub.Sound() == "generic",
+      f"a copy taken from a subclass is sliced, as C++ slices it: {clone_sub.Sound()}")
+del clone_sub
+gc.collect()
+check(d.Sound() == "Woof!", "and the original still dispatches to Python")
 
 print()
 if fail == 0:

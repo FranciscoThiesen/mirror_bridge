@@ -51,6 +51,7 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <new>
 #include <unordered_map>
 #include <set>
 #include <unordered_set>
@@ -2092,10 +2093,65 @@ PyObject* to_python(const T& container) {
     return list;
 }
 
-// Forward declare PyWrapper for use in from_python (will be fully defined later)
-template<typename T> struct PyWrapper;
+// Python object wrapper for C++ classes
+template<typename T>
+struct PyWrapper {
+    PyObject_HEAD
+    T* cpp_object;  // Pointer to the actual C++ object
+    bool owns;      // Whether this wrapper owns the object (for cleanup)
+    PyObject* parent;  // Owner of the storage, when this wrapper is a view
+};
 
-template<typename T> struct TypeRegistry;
+// Whether the C++ object can live inside the Python object instead of behind
+// a second allocation.
+//
+// An abstract class has nothing to place. An over-aligned one cannot rely on
+// what the object allocator returns. A trampoline is excluded at the call
+// site rather than here: it is a different, larger type than the one
+// tp_basicsize was computed for.
+template<typename T>
+inline constexpr bool payload_fits_inline_v =
+    !std::is_abstract_v<T> &&
+    std::is_destructible_v<T> &&
+    alignof(T) <= alignof(std::max_align_t);
+
+template<typename T>
+inline constexpr std::size_t inline_payload_offset =
+    (sizeof(PyWrapper<T>) + alignof(T) - 1) / alignof(T) * alignof(T);
+
+template<typename T>
+inline constexpr std::size_t wrapper_basicsize =
+    payload_fits_inline_v<T> ? inline_payload_offset<T> + sizeof(T)
+                             : sizeof(PyWrapper<T>);
+
+// Incomplete types reach these templates: the member-template planner walks
+// whatever the headers name, and Open3D forward-declares classes it only ever
+// uses behind a pointer. sizeof is ill-formed on one, so the layout of a type
+// that has none is 0, which is a value no real wrapper has.
+template<typename T>
+consteval std::size_t wrapper_layout_id() {
+    if constexpr (requires { sizeof(T); }) {
+        return wrapper_basicsize<T>;
+    } else {
+        return 0;
+    }
+}
+
+// Type-based registry for looking up PyTypeObject* by C++ type.
+//
+// Layout is defaulted and never passed: it is here so that two modules which
+// disagree about sizeof(T) instantiate two different TypeRegistrys. The
+// member is a static of a template, so with default visibility the dynamic
+// linker hands every module in the process the first copy, and a module that
+// never bound T at all would read the type object of a module that built it
+// from a different revision of the header. Naming the layout in the type
+// makes the symbols differ, so there is nothing to merge and the miss falls
+// through to the registry dict, whose key carries the same number. The cost
+// is nothing at runtime: it is the same static reached by a longer name.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
+struct TypeRegistry {
+    static inline PyTypeObject* py_type = nullptr;
+};
 
 // The part of PyWrapper<X> that does not depend on X. Every wrapper starts
 // this way, which is what makes a generic read possible — and why the read
@@ -2453,13 +2509,6 @@ public:
 private:
     Registry() = default;
     std::unordered_map<std::string, ClassMetadata> classes_;
-};
-
-// Type-based registry for looking up PyTypeObject* by C++ type
-// Uses a static variable per type T to store the registered PyTypeObject*
-template<typename T>
-struct TypeRegistry {
-    static inline PyTypeObject* py_type = nullptr;
 };
 
 // ============================================================================
@@ -3103,14 +3152,54 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
     return sig;
 }
 
-// Python object wrapper for C++ classes
+// Where the payload sits for this wrapper. A constant offset, so the address
+// is one add; a Python subclass only ever extends the tail, which leaves it
+// where it is.
 template<typename T>
-struct PyWrapper {
-    PyObject_HEAD
-    T* cpp_object;  // Pointer to the actual C++ object
-    bool owns;      // Whether this wrapper owns the object (for cleanup)
-    PyObject* parent;  // Owner of the storage, when this wrapper is a view
-};
+T* inline_payload(PyWrapper<T>* w) {
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(w) + inline_payload_offset<T>);
+}
+
+// Destroy whatever this wrapper owns and leave it holding nothing.
+//
+// Shared by tp_dealloc and by py_init, which can be reached a second time on
+// an object that is already built: Python lets __init__ be called directly.
+// Clearing cpp_object is the part that matters for an inline payload. A
+// constructor that throws part way has already had its built sub-objects
+// destroyed by unwinding, so leaving the pointer in place would let
+// tp_dealloc destroy them a second time.
+template<typename T>
+void release_held_object(PyWrapper<T>* wrapper) {
+    if (wrapper->owns && wrapper->cpp_object) {
+        // An inline payload is distinguishable without a flag: it is the only
+        // object that can sit at exactly this address.
+        if constexpr (payload_fits_inline_v<T>) {
+            if (wrapper->cpp_object == inline_payload(wrapper)) {
+                wrapper->cpp_object->~T();
+                wrapper->cpp_object = nullptr;
+                wrapper->owns = false;
+                return;
+            }
+        }
+        delete wrapper->cpp_object;
+    }
+    wrapper->cpp_object = nullptr;
+    wrapper->owns = false;
+}
+
+// Storage for a default construction: the inline slot when the exact type
+// the wrapper was sized for is what is being built, the heap otherwise. A
+// trampoline is a larger type than tp_basicsize accounts for, so it takes
+// the heap path.
+template<typename T, typename Alloc>
+void* payload_storage_for(PyWrapper<T>* wrapper) {
+    if constexpr (payload_fits_inline_v<T> && std::is_same_v<T, Alloc>) {
+        return static_cast<void*>(inline_payload(wrapper));
+    } else {
+        (void)wrapper;
+        return nullptr;
+    }
+}
 
 // ============================================================================
 // Trampoline support — let Python subclasses override C++ virtual methods
@@ -3278,9 +3367,7 @@ public:
 template<typename T>
 void py_dealloc(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
-    if (wrapper->owns && wrapper->cpp_object) {
-        delete wrapper->cpp_object;
-    }
+    release_held_object(wrapper);
     // A view owns nothing but the reference that keeps the storage alive.
     Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
@@ -3444,7 +3531,8 @@ consteval std::string_view constructor_param_name() {
 // constructor. Alloc must inherit from T and expose T's constructors (the
 // canonical idiom is `using T::T;` in the trampoline).
 template<typename T, typename Alloc, std::size_t CtorIndex, std::size_t... Is>
-Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>) {
+Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>,
+                                   void* storage) {
     if constexpr (std::is_abstract_v<T>) {
         PyErr_SetString(PyExc_TypeError,
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
@@ -3474,6 +3562,11 @@ Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is
         // exception unwinds past the interpreter and std::terminate aborts
         // the process, giving the caller no traceback and nothing to catch.
         try {
+            if (storage) {
+                return ::new (storage) Alloc(
+                    forward_arg<constructor_param_t<T, CtorIndex, Is>>(
+                        std::get<Is>(cpp_args))...);
+            }
             return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
                 std::get<Is>(cpp_args))...);
         } catch (const std::exception& e) {
@@ -3519,11 +3612,20 @@ inline bool match_ctor_keyword(std::string_view name, PyObject* value,
 template<typename T, typename Trampoline, std::size_t CtorIndex, std::size_t MIN,
          std::size_t... Ns>
 Trampoline* construct_with_supplied(PyObject* const* resolved, std::size_t n_used,
-                                    std::index_sequence<Ns...>) {
+                                    std::index_sequence<Ns...>, void* storage) {
+    // storage is where the payload lives when it fits inside the Python
+    // object, and null when it does not. It has to be threaded through here
+    // rather than passed at the call site: this layer chooses which arity to
+    // construct with, so it is the only place that knows which
+    // call_constructor_impl_alloc actually runs. Dropping it stays correct,
+    // because release_held_object tells the two apart by address, which is
+    // exactly why nothing would report it: the one constructor shape that
+    // takes default arguments would quietly keep allocating twice while
+    // every other shape places inline.
     Trampoline* obj = nullptr;
     ((n_used == Ns + MIN
         ? (obj = call_constructor_impl_alloc<T, Trampoline, CtorIndex>(
-               resolved, std::make_index_sequence<Ns + MIN>{}), void())
+               resolved, std::make_index_sequence<Ns + MIN>{}, storage), void())
         : void()), ...);
     return obj;
 }
@@ -3535,6 +3637,28 @@ template<typename T, typename Trampoline = T>
 int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
 
+    // Re-initialising an object that already holds one is refused rather than
+    // attempted, because there is no safe way to do it.
+    //
+    // Constructing over live storage skips the old object's destructor, and
+    // with an inline payload a constructor that throws part way leaves the
+    // slot already unwound for tp_dealloc to destroy a second time. Freeing
+    // the old object first fixes both of those and introduces something
+    // worse: a member view (py_getter) holds a raw pointer into the owner's
+    // storage, kept alive by a reference to the wrapper rather than to the
+    // C++ object, so freeing it leaves the view reading freed memory. There
+    // is no view count to consult. Refusing costs nothing real -- the first
+    // __init__ after tp_new still has a null pointer here -- and replaces a
+    // leak, a double free and a dangling read with one clear error.
+    if (wrapper->cpp_object) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s is already initialised; calling __init__ again is "
+                     "refused because anything holding a reference into this "
+                     "object would be left dangling. Construct a new one.",
+                     Py_TYPE(self)->tp_name);
+        return -1;
+    }
+
     const Py_ssize_t nargs = args ? PyTuple_GET_SIZE(args) : 0;
     const Py_ssize_t nkw = kwds ? PyDict_GET_SIZE(kwds) : 0;
 
@@ -3545,7 +3669,8 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     if (nargs == 0 && nkw == 0) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
             try {
-                auto* obj = new Trampoline();
+                void* storage = payload_storage_for<T, Trampoline>(wrapper);
+                auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
                 wrapper->cpp_object = obj;
                 wrapper->owns = true;
                 wrapper->parent = nullptr;
@@ -3617,9 +3742,12 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                 }
 
                 // Dispatch to the variant for the count actually supplied;
-                // params [n_used, P) take their C++ default arguments.
+                // params [n_used, P) take their C++ default arguments. The
+                // storage pointer rides along so the chosen arity still
+                // places the payload inside the Python object.
                 Trampoline* obj = construct_with_supplied<T, Trampoline, Is, MIN>(
-                    resolved, n_used, std::make_index_sequence<P - MIN + 1>{});
+                    resolved, n_used, std::make_index_sequence<P - MIN + 1>{},
+                    payload_storage_for<T, Trampoline>(wrapper));
 
                 if (obj) {
                     wrapper->cpp_object = obj;
@@ -3710,7 +3838,8 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
     if (self) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
-            auto* obj = new Trampoline();
+            void* storage = payload_storage_for<T, Trampoline>(self);
+            auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
             self->cpp_object = obj;
             self->owns = true;
             self->parent = nullptr;
@@ -3758,7 +3887,9 @@ template<typename T, std::size_t Index>
 PyObject* py_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3807,7 +3938,9 @@ template<typename T, std::size_t Index>
 int py_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -3863,7 +3996,9 @@ template<typename T, std::size_t VisibleIndex>
 PyObject* py_visible_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3895,7 +4030,9 @@ template<typename T, std::size_t VisibleIndex>
 int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -4015,7 +4152,9 @@ template<typename T, std::size_t Index>
 PyObject* py_method(PyObject* self, PyObject* args) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -4707,7 +4846,9 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* const* args,
                                    std::index_sequence<AllIndices...>) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -5643,7 +5784,9 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
     if (!resolve_wrapper_object<T>(self, self_raw)) {
         PyTypeObject* mine = TypeRegistry<T>::py_type;
         if (mine && PyObject_TypeCheck(self, mine)) {
-            PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+            PyErr_SetString(PyExc_RuntimeError,
+                            "this object holds no C++ value: its constructor "
+                            "raised, or __init__ was called again and failed");
             return nullptr;
         }
         // Not our left operand: let Python try the reflected operation and
@@ -5700,7 +5843,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* unary_op_wrapper(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
     using Ret = typename [:std::meta::return_type_of(OperatorCache<T>::at(OpIndex)):];
@@ -5742,7 +5887,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* call_wrapper(PyObject* self, PyObject* args, PyObject* /*kwds*/) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -6136,8 +6283,23 @@ inline PyObject* get_python_named_registry(const char* registry_name) {
     return registry;
 }
 
+// The three registries live in sys.modules for the life of the process, so
+// re-finding them is pure overhead after the first call: PyDict_GetItemString
+// builds and discards a str, hashes it, and probes sys.modules every time,
+// and the outbound conversion path did that twice per returned object. The
+// cache changes nothing about what is returned -- it is the same dict every
+// later lookup would find -- and the strong reference keeps it that way.
+inline PyObject* cached_named_registry(PyObject*& slot, const char* name) {
+    if (!slot) {
+        slot = get_python_named_registry(name);
+        Py_XINCREF(slot);
+    }
+    return slot;
+}
+
 inline PyObject* get_python_type_registry() {
-    return get_python_named_registry("_mirror_bridge_types");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_types");
 }
 
 // ============================================================================
@@ -6174,20 +6336,48 @@ using UpcastThunk = void* (*)(void*);
 // means a mismatched pair simply does not recognise each other's objects, so
 // the failure is a clean TypeError at the boundary. Matching builds are
 // unaffected and still share types as before.
-inline constexpr const char* kWrapperAbiTag = "#mbabi2";
+inline constexpr const char* kWrapperAbiTag = "#mbabi3";
 
-template<typename T>
+// Layout is defaulted and never passed, for the same reason TypeRegistry
+// takes it: the static below is a local of a function template, so without
+// hidden visibility the first module to call it computes the key for every
+// module, size included. Two modules that disagree about T would then share
+// one key that names one of their sizes, which is the whole thing the size
+// was added to prevent. Naming the layout in the function makes the two
+// statics different symbols.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
 const std::string& wrapper_abi_typeid() {
-    static const std::string name = std::string(typeid(T).name()) + kWrapperAbiTag;
+    // The tag catches a change to *this* header's wrapper layout. It cannot
+    // catch two modules disagreeing about the user's own class: tp_basicsize
+    // is now inline_payload_offset + sizeof(T), so a module built against an
+    // 8-byte Thing and one built against a 48-byte Thing produce wrappers of
+    // different sizes under the same tag, share one PyTypeObject through the
+    // registry, and the larger one then writes past the end of what the
+    // smaller one allocated. Appending the size makes them simply not
+    // recognise each other, which is a TypeError at the boundary instead.
+    static const std::string name = std::string(typeid(T).name()) + kWrapperAbiTag +
+                                    '.' + std::to_string(Layout);
     return name;
 }
 
+// The same key as a str, interned once per type. PyDict_GetItemString builds
+// and throws away a str on every call; an interned one also carries its hash
+// already computed, which is the rest of what that probe was costing.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
+PyObject* wrapper_abi_typeid_key() {
+    static PyObject* key =
+        PyUnicode_InternFromString(wrapper_abi_typeid<T, Layout>().c_str());
+    return key;
+}
+
 inline PyObject* get_python_typename_registry() {
-    return get_python_named_registry("_mirror_bridge_type_names");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_type_names");
 }
 
 inline PyObject* get_python_upcast_registry() {
-    return get_python_named_registry("_mirror_bridge_upcasts");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_upcasts");
 }
 
 // The C++ type behind a Python type object, or nullptr when it is not a
@@ -6315,17 +6505,15 @@ namespace {
 
         // Use typeid name as the key (unique per type across all modules),
         // qualified by the wrapper layout this module was built against.
-        const char* type_name = wrapper_abi_typeid<T>().c_str();
-        PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
+        PyObject* key = wrapper_abi_typeid_key<T>();
+        if (!key) { PyErr_Clear(); return; }
+        PyDict_SetItem(registry, key, reinterpret_cast<PyObject*>(py_type));
 
         // And the reverse, so an object arriving from Python whose type we
         // were not expecting can still be identified (see WrapperView).
         PyObject* names = get_python_typename_registry();
         if (!names) return;
-        PyObject* value = PyUnicode_FromString(type_name);
-        if (!value) { PyErr_Clear(); return; }
-        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), value);
-        Py_DECREF(value);
+        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), key);
     }
 
     // Look up a type from the Python-based global registry
@@ -6346,12 +6534,15 @@ namespace {
             PyObject* registry = get_python_type_registry();
             if (!registry) return nullptr;
 
-            // The key carries the wrapper's ABI tag, so two modules built
-            // against different wrapper layouts do not find each other's
-            // types. It still goes through typeid, so it stays inside the
+            // The key carries the wrapper's ABI tag and its size, so two
+            // modules built against different wrapper layouts do not find
+            // each other's types. Interned once per T rather than rebuilt and
+            // re-hashed on every lookup, which is most of what this costs.
+            // It still goes through typeid, so it stays inside the
             // completeness guard above.
-            const char* type_name = wrapper_abi_typeid<T>().c_str();
-            PyObject* py_type = PyDict_GetItemString(registry, type_name);
+            PyObject* key = wrapper_abi_typeid_key<T>();
+            if (!key) { PyErr_Clear(); return nullptr; }
+            PyObject* py_type = PyDict_GetItem(registry, key);
 
             return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
         }
@@ -6488,8 +6679,8 @@ void unregister_type() {
     PyObject* registry = get_python_type_registry();
     if (!registry) return;
 
-    const char* type_name = wrapper_abi_typeid<T>().c_str();
-    PyDict_DelItemString(registry, type_name);
+    PyObject* key = wrapper_abi_typeid_key<T>();
+    if (key) PyDict_DelItem(registry, key);
     PyErr_Clear();  // Ignore KeyError if type wasn't registered
 }
 
@@ -6543,7 +6734,17 @@ to_python(const T& obj) {
             if (!wrapper) {
                 return nullptr;
             }
-            wrapper->cpp_object = new CleanT(obj);  // Copy the object
+            // tp_alloc sized this object for an inline payload, so the copy
+            // goes in it rather than behind a second allocation. The type
+            // object comes from the shared registry, and the layout tag in
+            // its key is what guarantees it was sized by a build that agrees
+            // with this one.
+            if constexpr (payload_fits_inline_v<CleanT>) {
+                wrapper->cpp_object = ::new (static_cast<void*>(inline_payload(wrapper)))
+                    CleanT(obj);
+            } else {
+                wrapper->cpp_object = new CleanT(obj);
+            }
             wrapper->owns = true;
             wrapper->parent = nullptr;
             return reinterpret_cast<PyObject*>(wrapper);
@@ -6903,7 +7104,7 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     static PyTypeObject type_object = {
         .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
         .tp_name = qualified_name.c_str(),
-        .tp_basicsize = sizeof(PyWrapper<T>),
+        .tp_basicsize = static_cast<Py_ssize_t>(wrapper_basicsize<T>),
         .tp_itemsize = 0,
         .tp_dealloc = py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,
@@ -6924,6 +7125,31 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     if constexpr (datamodel::is_iterable<T>()) {
         datamodel::IterTypeSlot<T>::ptr =
             datamodel::make_iter_type<T>(qualified_name.c_str());
+    }
+
+    // type_object is a static local of a function template, so it is one
+    // weak symbol and the dynamic linker gives every module that loaded it
+    // the first copy, running only that module's initialiser. If that module
+    // was built against a different revision of T, tp_basicsize is not ours,
+    // and tp_alloc would hand this module an allocation sized for the other
+    // one to construct its own payload into. Measured on GCC 16 at 176 bytes
+    // into a 48-byte object, which segfaults with nothing to catch.
+    //
+    // The CLI, the CMake helper and the test harness all compile with
+    // -fvisibility=hidden, which keeps the copies apart and makes the shared
+    // dict in sys.modules the single cross-module channel it is documented to
+    // be. This is for a build that does none of the three, where refusing the
+    // import is the only honest answer left.
+    if (type_object.tp_basicsize != static_cast<Py_ssize_t>(wrapper_basicsize<T>)) {
+        PyErr_Format(PyExc_ImportError,
+                     "mirror_bridge: '%s' was already bound in this process by a "
+                     "module built against a different definition of it (its wrapper "
+                     "is %zd bytes, this one needs %zd). Rebuild both modules against "
+                     "the same header, or compile them with -fvisibility=hidden so "
+                     "each keeps its own type.",
+                     name, type_object.tp_basicsize,
+                     static_cast<Py_ssize_t>(wrapper_basicsize<T>));
+        return {nullptr};
     }
 
     // Initialize and register the type with Python
@@ -7010,9 +7236,11 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // Register type in TypeRegistry for type-based lookup in to_python
     TypeRegistry<T>::py_type = &type_object;
 
-    // Register in Python-based global registry for cross-module type sharing
-    // This allows types bound in one .so file to be properly returned
-    // from methods in another .so file (C++ static variables are per-.so)
+    // Register in Python-based global registry for cross-module type sharing.
+    // This allows types bound in one .so file to be properly returned from
+    // methods in another. A C++ static is per-.so only when the module was
+    // compiled with hidden visibility, which the check above is about; the
+    // dict is per-process either way, which is why it is the channel.
     register_type_in_python<T>(&type_object);
 
     // Record how to reach each base subobject from a T. Done by the derived

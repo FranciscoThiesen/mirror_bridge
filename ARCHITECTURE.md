@@ -202,7 +202,13 @@ Cross-module type sharing uses Python's `sys.modules`:
 ```python
 sys.modules['_mirror_bridge_types'][typeid_name] = PyTypeObject*
 ```
-This works around C++ static variable per-.so limitations.
+A C++ static cannot be counted on either way. A module compiled with
+`-fvisibility=hidden`, which the CLI and the CMake helper both do, keeps its own
+copy and cannot see another module's types without the dict. A module compiled
+without it shares whichever copy the dynamic linker binds first, which is worse:
+two modules built against different revisions of a class then agree on a wrapper
+size only one of them meant. The dict is per-process in both cases, and its key
+carries the wrapper's layout so a disagreement misses rather than overflows.
 
 ### Splicers for Zero-Overhead Access
 Member access via `obj.[:member:]` compiles to direct offset access:

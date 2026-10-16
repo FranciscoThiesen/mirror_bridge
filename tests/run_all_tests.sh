@@ -144,8 +144,15 @@ while IFS= read -r -d '' binding_file; do
     # Use || true to prevent set -e from exiting on compile failure
     # -Ipython lets bindings include language-backend headers directly
     # (e.g. auto_trampoline's mirror_bridge_auto_trampoline.hpp).
+    # -fvisibility=hidden matches what the CLI and the CMake helper compile
+    # with, and the agreement is load-bearing, not cosmetic: bind_class's
+    # PyTypeObject is a static of a template, so with default visibility two
+    # modules in one process share whichever copy loaded first. abi_skew
+    # builds two modules that disagree about one class, and without this it
+    # is the shared type object that decides, not the registry key.
     compile_output=$(cd "$binding_dir" && $CXX_COMPILER $CXX_FLAGS \
         -I"$PROJECT_ROOT" -I"$PROJECT_ROOT/python" -I. -fPIC -shared \
+        -fvisibility=hidden -fvisibility-inlines-hidden \
         $includes \
         "$(basename "$binding_file")" -o "$BUILD_DIR/${output_name}${output_ext}" 2>&1) || true
 

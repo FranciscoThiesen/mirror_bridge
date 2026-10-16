@@ -21,6 +21,12 @@ public:
     int LegCount() const { return 4; }  // non-virtual, exposed via reflection
 };
 
+// Returns by value, so the binding owns the result. An auto-trampoline class
+// whose payload fits inside the Python object is constructed in place, and
+// freeing that as a heap pointer aborts the process. This is the only shape
+// in the suite that reaches that dealloc with an owned object.
+inline Animal CloneAnimal(const Animal& a) { return Animal(a); }
+
 // Exercises Animal through virtual dispatch. This is the path the auto
 // trampoline intercepts — without vtable swap, C++ code here would call
 // the base defaults unconditionally.

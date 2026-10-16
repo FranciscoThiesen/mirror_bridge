@@ -20,6 +20,31 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/cross_module_test
     )
 
+    # Two modules whose headers disagree about the size of the same class.
+    # Each includes its own revision, so the skew exists without a compile
+    # flag and the bash harness's generic build reproduces it too.
+    mirror_bridge_python_module(skew_small
+        abi_skew/skew_small_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    mirror_bridge_python_module(skew_big
+        abi_skew/skew_big_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    # The same skew, but with both modules binding the class rather than one
+    # of them only returning it.
+    mirror_bridge_python_module(both_small
+        abi_skew/both_small_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    mirror_bridge_python_module(both_big
+        abi_skew/both_big_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
     # Static method test (Vec3)
     mirror_bridge_python_module(vec3_test
         static_method_test/vec3_binding.cpp
@@ -228,6 +253,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         mirror_bridge_python_module(pyi_keywords
             pyi_keywords/pyi_keywords_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/pyi_keywords
+        )
+    endif()
+
+    # The C++ object lives inside the Python object (one allocation)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc)
+        mirror_bridge_python_module(wrapper_alloc
+            wrapper_alloc/wrapper_alloc_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc
         )
     endif()
 

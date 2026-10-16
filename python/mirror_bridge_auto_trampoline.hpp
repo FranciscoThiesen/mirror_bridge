@@ -256,15 +256,22 @@ template<typename T>
 inline void py_dealloc_auto(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (wrapper->owns && wrapper->cpp_object) {
-        // Restore original vptr before deletion so T's real destructor runs
-        // through the correct vtable.
+        // Restore original vptr before destruction so T's real destructor
+        // runs through the correct vtable.
         auto* entry = AutoTrampolineRegistry<T>::lookup(wrapper->cpp_object);
         if (entry) {
             *(void***)wrapper->cpp_object = entry->orig_vptr;
             AutoTrampolineRegistry<T>::unregister(wrapper->cpp_object);
         }
-        delete wrapper->cpp_object;
+        // Not `delete`: the payload may sit inside this Python object, in
+        // which case it was placement-constructed and freeing it as a heap
+        // pointer aborts the process. release_held_object is the one place
+        // that knows which it is, and py_dealloc uses it for the same reason.
+        release_held_object(wrapper);
     }
+    // A member view owns nothing but the reference that keeps its storage
+    // alive, and this dealloc never released it.
+    Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
 }
 
