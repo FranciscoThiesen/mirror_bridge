@@ -66,7 +66,6 @@ def main():
 
     with open(args.results) as f:
         data = json.load(f)
-    bootstrapped = False
     fresh = ratios(data)
     if not fresh:
         sys.exit("no usable mirror_bridge numbers in %s" % args.results)
@@ -74,7 +73,7 @@ def main():
     try:
         with open(args.floors) as f:
             floors = json.load(f)["floors"]
-    except IOError:
+    except (OSError, ValueError, KeyError) as why:
         # Bootstrap rather than fail. The first real run on the real machine is
         # where a floor should come from; a hand-written one would just be a
         # guess that either never fires or fires for no reason.
@@ -83,19 +82,19 @@ def main():
         # the same as a passing gate. The floors only reach the repository when
         # the refresh PR is merged, so an unmerged PR leaves every later run
         # bootstrapping and green. Say so where it cannot be missed.
-        print("no baseline at %s — establishing it from this run" % args.floors)
+        print("no usable baseline at %s (%s: %s) — establishing it from "
+              "this run" % (args.floors, type(why).__name__, why))
         unarmed = (
-            "no ratio was gated: %s is not in the repository, so this run "
-            "measured the floors instead of checking against them. They are "
-            "written now and travel in the benchmark refresh PR; merging it "
-            "arms the gate for every run after." % os.path.basename(args.floors)
+            "no ratio was gated: there is no usable %s to compare against, so "
+            "this run measured the floors instead. They are written now and "
+            "travel in the benchmark refresh PR; merging it arms the gate for "
+            "every run after." % os.path.basename(args.floors)
         )
         print(unarmed)
         if os.environ.get("GITHUB_ACTIONS") == "true":
             print("::warning title=Ratio gate unarmed::%s" % unarmed)
         args.update = True
         floors = None
-        bootstrapped = True
 
     if args.update or floors is None:
         payload = {
@@ -110,7 +109,10 @@ def main():
             json.dump(payload, f, indent=2, sort_keys=True)
             f.write("\n")
         print("wrote %d operations to %s" % (len(fresh), args.floors))
-        if bootstrapped and args.require_floors:
+        # floors is None covers both ways of arriving here with nothing to
+        # compare against: no file at all, and a file whose "floors" value is
+        # null. Keying on which exception fired missed the second.
+        if args.require_floors and floors is None:
             return 1
         return 0
 
@@ -130,6 +132,21 @@ def main():
                 behind.append((op, fw, got))
 
     print("compared %d operation/framework ratios against %s" % (checked, os.path.basename(args.floors)))
+
+    # Zero comparisons is the same hole as a missing baseline, reached by a
+    # different route: floors that parse but name operations this run does not
+    # measure. A renamed operation key disarms the gate without emptying the
+    # file, so the count is what has to be checked, not the file's existence.
+    if checked == 0:
+        print("\nno ratio was gated: nothing in %s names an operation this run "
+              "measured. Floors are keyed by operation, so a renamed key leaves "
+              "a file that parses and compares nothing. Refresh with --update."
+              % os.path.basename(args.floors))
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::warning title=Ratio gate compared nothing::%s has no "
+                  "operation in common with this run" % os.path.basename(args.floors))
+        if args.require_floors:
+            return 1
 
     if behind:
         print("\nSlower than a competitor (reported, not a failure):")

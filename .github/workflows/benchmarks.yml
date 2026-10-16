@@ -30,13 +30,34 @@ jobs:
       - name: Run benchmark suite
         run: ./benchmarks/run_all_benchmarks.sh
 
+      # Ratios are the stable signal across machines, so the comparison is
+      # against committed floors rather than absolute ns/op. Where a competitor
+      # is faster the output says so without failing: that is a fact to see,
+      # not a regression.
+      #
+      # This step records its result rather than acting on it. It has to run
+      # before the PR step, because it is what writes ratio_floors.json and
+      # `git add` stages nothing at all -- not even the paths that do exist --
+      # if one of its pathspecs matches no file. A glob is no more lenient. The
+      # failing is done by a later step. This relies on the benchmark suite
+      # above having produced mirror_bridge numbers, which it must have for the
+      # job to have got this far, since check_ratios.py refuses without them.
+      - name: Gate the runtime ratios against the committed floors
+        id: gate
+        run: |
+          set +e
+          python3 benchmarks/check_ratios.py \
+            benchmarks/runtime/python/runtime_results.json \
+            --require-floors
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
       - name: Splice regenerated runtime table into the benchmarks page
         run: |
           python3 benchmarks/format_results.py \
             benchmarks/runtime/python/runtime_results.json \
             --commit "$GITHUB_SHA" \
             --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
-            --fragment --strict > /tmp/runtime_fragment.md
+            --fragment > /tmp/runtime_fragment.md
           awk '
             /<!-- RUNTIME:BEGIN/ { print; system("cat /tmp/runtime_fragment.md"); skip=1; next }
             /<!-- RUNTIME:END/   { skip=0 }
@@ -81,16 +102,21 @@ jobs:
           branch: bot/benchmarks-refresh
           delete-branch: true
 
-      # Last, because on the run that establishes the floors this step fails,
-      # and the PR above is what carries them into the repository. Failing
-      # before it would mean the gate could never become armed.
-      #
-      # Ratios are the stable signal across machines, so the comparison is
-      # against committed floors rather than absolute ns/op. Where a
-      # competitor is faster the output says so without failing: that is a
-      # fact to see, not a regression.
-      - name: Gate the runtime ratios against the committed floors
+      # The two checks that can fail run last, after the PR exists. Neither one
+      # may stop the refresh from being published: a month's numbers are worth
+      # more than the promptness of a red build, and on the run that first
+      # establishes the ratio floors the gate fails by design -- the PR above is
+      # what carries them into the repository, so failing before it would mean
+      # the gate could never become armed.
+      - name: Fail if a measured operation never reached the page
         run: |
-          python3 benchmarks/check_ratios.py \
+          python3 benchmarks/format_results.py \
             benchmarks/runtime/python/runtime_results.json \
-            --require-floors
+            --fragment --strict > /dev/null
+
+      - name: Fail if a ratio regressed, or if nothing was gated
+        run: |
+          if [ "${{ steps.gate.outputs.rc }}" != "0" ]; then
+            echo "See the 'Gate the runtime ratios' step above for which."
+            exit 1
+          fi

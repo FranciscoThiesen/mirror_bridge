@@ -18,8 +18,15 @@ and one was the whole list-in direction, which is the direction the project's
 headline buffer claim is about.
 
 Nothing here runs a benchmark or needs a compiler. It reads the two files that
-have to agree and compares them, so the next operation added to the runner
-either appears on the page or fails this test.
+have to agree and compares them, so an operation added to the runner either
+appears on the page or fails this test.
+
+That comparison is only as good as its reading of the runners, which is
+textual: it recognises `results['k'] =` and `results.k =` and nothing else. A
+runner that started writing its results some other way -- results.update({...}),
+Object.assign(results, {...}), a computed key -- would be read as measuring
+fewer operations than it does, and this would pass while the page lost rows
+again. So the shapes it cannot read are rejected outright rather than ignored.
 """
 import json
 import os
@@ -63,7 +70,23 @@ def published_keys():
     return re.findall(r"\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", block.group(1))
 
 
-FRAMEWORKS = ["mirror_bridge", "pybind11", "nanobind", "swig"]
+def framework_names():
+    """The framework list, read out of the formatter rather than copied.
+
+    Copying it is the mistake this whole test exists because of.
+    """
+    with open(FORMATTER, encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r"FRAMEWORKS = \[(.*?)\]", src, re.S)
+    assert m, "FRAMEWORKS is no longer a list literal in format_results.py"
+    return re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", m.group(1))
+
+
+FRAMEWORKS = framework_names()
+
+# An all-zero column is dropped by the formatter as noise, so a framework can
+# only appear in a payload with real numbers in it.
+assert "mirror_bridge" in FRAMEWORKS and "pybind11" in FRAMEWORKS
 
 
 def payload(keys, ns=100.0):
@@ -94,6 +117,30 @@ class PublishedRows(unittest.TestCase):
         measured = measured_keys(RUNNERS["python"])
         phantom = sorted(set(published_keys()) - measured)
         self.assertEqual(phantom, [], "the page asks for operations nobody measures")
+
+    def test_the_runners_only_write_results_in_shapes_this_test_can_read(self):
+        """Reject a write shape rather than silently reading past it.
+
+        measured_keys matches two assignment forms. Anything else is invisible
+        to it, which would make every comparison here weaker without saying so.
+        """
+        unreadable = [
+            (r"results\.update\s*\(", "results.update(...)"),
+            (r"Object\.assign\s*\(\s*results", "Object.assign(results, ...)"),
+            (r"setattr\s*\(\s*results", "setattr(results, ...)"),
+            (r"results\[\s*[A-Za-z_]", "results[variable]"),
+            (r"results\[\s*f['\"]", "results[f-string]"),
+        ]
+        for lang, path in RUNNERS.items():
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            for pattern, shape in unreadable:
+                self.assertIsNone(
+                    re.search(pattern, src),
+                    f"the {lang} runner writes results as {shape}, which this "
+                    f"test cannot read; teach measured_keys that shape before "
+                    f"using it",
+                )
 
     def test_the_row_list_has_no_duplicates(self):
         keys = published_keys()

@@ -13,14 +13,11 @@ import datetime
 import json
 import sys
 
-# Display order + labels. The keys must be the keys
-# benchmarks/runtime/python/run_runtime_benchmarks.py actually writes into its
-# results dict: a key that does not match is a row that silently vanishes from
-# the published page, which is how "Attribute read", "Attribute write" and the
-# whole list-in direction went missing while still being measured on every run
-# (they were spelled attribute_get/attribute_set/vector_sum here and
-# attr_get/attr_set/vector_set there). tests/benchmark_table/ pins the two
-# lists together so it cannot drift again.
+# Display order + labels. Every key must be one that
+# benchmarks/runtime/python/run_runtime_benchmarks.py writes into its results
+# dict: a key that does not match is a row that vanishes from the published
+# page. tests/benchmark_table/ pins the two lists together, and its docstring
+# records what that cost the last time they drifted.
 OPERATIONS = [
     ("null_call", "Null call (method dispatch)"),
     ("arithmetic_int", "Arithmetic: add_int(42)"),
@@ -95,10 +92,8 @@ def main():
     out.append("| " + " | ".join(header) + " |")
     out.append("|" + "---|" * len(header))
 
-    # A row silently disappears when a framework lacks the key, so account for
-    # every drop out loud. Rendering fewer rows than were measured reads as
-    # "this is what we measure", which is the failure mode that hid attribute
-    # access for two months.
+    # Rendering fewer rows than were measured reads as "this is what we
+    # measure", so account for every drop out loud rather than skipping it.
     dropped = []
     for key, label in OPERATIONS:
         absent = [fw for fw in present if key not in data[fw]]
@@ -122,6 +117,9 @@ def main():
     )
     out.append("")
 
+    # Asymmetric on purpose: an operation only a competitor measured is not
+    # something this project can publish a ratio for, so only mirror_bridge's
+    # keys are checked for having somewhere to go.
     published = {key for key, _ in OPERATIONS}
     unpublished = [
         key for key in data["mirror_bridge"]
@@ -132,7 +130,7 @@ def main():
     for key in sorted(unpublished):
         print(f"warning: '{key}' was measured but no row in OPERATIONS "
               f"publishes it", file=sys.stderr)
-    if (dropped or unpublished):
+    if dropped or unpublished:
         print(f"warning: the page shows {len(OPERATIONS) - len(dropped)} of "
               f"{len(data['mirror_bridge'])} measured operations",
               file=sys.stderr)
