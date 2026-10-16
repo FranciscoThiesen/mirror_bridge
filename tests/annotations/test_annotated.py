@@ -86,4 +86,19 @@ assert {n for n in dir(plain) if not n.startswith("_")} == {"user_id", "username
     sorted(n for n in dir(plain) if not n.startswith("_"))
 print("  ✓ four of six fields on UserProfile, two of two on PlainProfile")
 
+print("Test 9: the .pyi says what the module actually does...")
+# The stub walked every data member and asked only whether it was const, so
+# it promised password_hash and internal_flag -- which raise AttributeError
+# -- and described created_at and version as writable. A type checker then
+# approves exactly the access [[=exclude{}]] exists to prevent.
+stubs = annotated.__mirror_bridge_stubs__()
+for hidden in ("password_hash", "internal_flag"):
+    assert hidden not in stubs, f"{hidden} is excluded but appears in the stub"
+assert "user_id: int" in stubs, stubs
+assert "username: str" in stubs, stubs
+for ro in ("created_at", "version"):
+    assert f"def {ro}(self)" in stubs, f"{ro} is readonly but the stub says writable"
+assert "@property" in stubs
+print("  ✓ excluded fields absent, readonly fields are properties")
+
 print("\n✅ annotations behave the same on every supported compiler")

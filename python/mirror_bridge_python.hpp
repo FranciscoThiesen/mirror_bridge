@@ -3849,6 +3849,15 @@ int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
             PyErr_SetString(PyExc_TypeError, "Type conversion failed");
             return -1;
         }
+    } else if constexpr (!std::is_default_constructible_v<MemberType>) {
+        // Registration points these at py_readonly_setter, so this is
+        // unreachable; it exists so the template still instantiates, as the
+        // const branch above does. Without it the member's type having no
+        // default constructor is a compile error for the whole module.
+        PyErr_SetString(PyExc_AttributeError,
+                        "Attribute cannot be assigned: its C++ type has no "
+                        "default constructor");
+        return -1;
     } else {
         MemberType cpp_value;
         if (!from_python(value, cpp_value)) {
@@ -4704,6 +4713,45 @@ consteval bool is_visible_member_const() {
         typename [:std::meta::type_of(get_visible_member_info<T, VisibleIndex>()):]>;
 }
 
+// A member the setter cannot build a temporary of is readable and not
+// assignable, which is the same answer as const and arrived at for a
+// different reason: the setter converts into a local and then moves it into
+// place, and that local needs a default constructor.
+//
+// nlohmann-json is the case. nlohmann::detail::dtoa_impl::diyfp declares only
+// diyfp(uint64_t, int), and one member of that type inside a bound class took
+// the whole module down with "no matching constructor for initialization of
+// 'MemberType'" -- not the class holding it, the module. Reading it is fine;
+// only assignment needs the temporary.
+template<typename T, std::size_t VisibleIndex>
+consteval bool is_visible_member_unassignable() {
+    using MemberType =
+        typename [:std::meta::type_of(get_visible_member_info<T, VisibleIndex>()):];
+    if constexpr (std::is_array_v<MemberType>) {
+        // from_python writes into an array in place, so it never needs one.
+        return false;
+    } else if constexpr (!requires { sizeof(MemberType); }) {
+        // is_default_constructible_v on an incomplete type is undefined
+        // rather than diagnosed, and a forward-declared member type does
+        // reach here -- Open3D's camera types are why c_api_shapes exists.
+        // Say unassignable: the setter could not have built one either.
+        return true;
+    } else {
+        return !std::is_default_constructible_v<MemberType>;
+    }
+}
+
+// Whether Python may assign to this member. The getset table and the .pyi
+// both ask this, because they used to ask different questions: registration
+// weighed the annotation, constness and assignability, while the stub looked
+// at constness alone and so described a [[=readonly{}]] field as writable.
+template<typename T, std::size_t VisibleIndex>
+consteval bool visible_member_is_readonly() {
+    return annotations::is_visible_member_readonly<T, VisibleIndex>() ||
+           is_visible_member_const<T, VisibleIndex>() ||
+           is_visible_member_unassignable<T, VisibleIndex>();
+}
+
 // Generate Python getters/setters for all members of a class
 template<typename T, std::size_t... Indices>
 consteval auto generate_getsetters(std::index_sequence<Indices...>) {
@@ -4742,8 +4790,7 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
         .name = annotations::get_visible_member_name<T, VisibleIndices>(),
         .get = py_visible_getter<T, VisibleIndices>,
         // Read-only when annotated [[=readonly{}]] or const-qualified in C++
-        .set = (annotations::is_visible_member_readonly<T, VisibleIndices>() ||
-                is_visible_member_const<T, VisibleIndices>())
+        .set = visible_member_is_readonly<T, VisibleIndices>()
             ? py_readonly_setter<T, VisibleIndices>
             : py_visible_setter<T, VisibleIndices>,
         .doc = nullptr,
@@ -5885,17 +5932,24 @@ template<typename T>
 void collect_stub_info(const char* class_name) {
     stubgen::register_class_stub<T>(class_name);
 
-    // Data members -> annotated attributes
-    constexpr std::size_t member_count = get_data_member_count<T>();
-    if constexpr (member_count > 0) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    // Data members -> annotated attributes.
+    //
+    // The visible members, which is what bind_class binds. This walked every
+    // data member instead, so a [[=exclude{}]] field appeared in the .pyi
+    // while raising AttributeError at runtime -- on the project's own example
+    // the stub promised password_hash and internal_flag, which is the
+    // opposite of what the annotation is for.
+    constexpr std::size_t visible_count = annotations::count_visible_members<T>();
+    if constexpr (visible_count > 0) {
+        [&]<std::size_t... Vs>(std::index_sequence<Vs...>) {
             ([&] {
-                using MemberType = typename [:std::meta::type_of(get_data_member<T, Is>()):];
+                using MemberType =
+                    typename [:std::meta::type_of(get_visible_member_info<T, Vs>()):];
                 stubgen::register_property_stub<T, MemberType>(
-                    class_name, get_data_member_name<T, Is>(),
-                    /*readonly=*/std::is_const_v<MemberType>);
+                    class_name, annotations::get_visible_member_name<T, Vs>(),
+                    /*readonly=*/visible_member_is_readonly<T, Vs>());
             }(), ...);
-        }(std::make_index_sequence<member_count>{});
+        }(std::make_index_sequence<visible_count>{});
     }
 
     // Constructors (bindable overloads only — what Python can actually call)
