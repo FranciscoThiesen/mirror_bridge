@@ -1,0 +1,65 @@
+{
+  "_comment": "Measured ratios (competitor ns / mirror_bridge ns), committed as the floor a later run must not fall below. Refresh deliberately with check_ratios.py --update when an improvement lands, never to make a red build green.",
+  "floors": {
+    "arithmetic_double": {
+      "nanobind": 1.02,
+      "pybind11": 2.358,
+      "swig": 2.361
+    },
+    "arithmetic_int": {
+      "nanobind": 1.034,
+      "pybind11": 2.472,
+      "swig": 2.406
+    },
+    "attr_get": {
+      "nanobind": 1.147,
+      "pybind11": 2.915,
+      "swig": 1.502
+    },
+    "attr_set": {
+      "nanobind": 1.182,
+      "pybind11": 2.194,
+      "swig": 1.53
+    },
+    "construction": {
+      "nanobind": 1.616,
+      "pybind11": 5.348,
+      "swig": 10.84
+    },
+    "null_call": {
+      "nanobind": 1.02,
+      "pybind11": 2.333,
+      "swig": 2.144
+    },
+    "string_concat": {
+      "nanobind": 0.982,
+      "pybind11": 1.991,
+      "swig": 2.384
+    },
+    "string_get": {
+      "nanobind": 0.957,
+      "pybind11": 2.389,
+      "swig": 2.027
+    },
+    "string_set": {
+      "nanobind": 0.981,
+      "pybind11": 2.265,
+      "swig": 3.03
+    },
+    "vector_append": {
+      "nanobind": 0.962,
+      "pybind11": 2.3,
+      "swig": 2.186
+    },
+    "vector_get": {
+      "nanobind": 2.406,
+      "pybind11": 3.106,
+      "swig": 3.671
+    },
+    "vector_set": {
+      "nanobind": 0.987,
+      "pybind11": 3.551,
+      "swig": 7.244
+    }
+  }
+}
