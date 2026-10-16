@@ -4249,11 +4249,27 @@ PyObject* to_python(const T& container) {
         // converting the proxy itself walks its members and produces an empty
         // dict. Where the dereference type is not the element type, convert
         // through the element type.
+        //
+        // Only where the cast exists, though. A class can declare a value_type
+        // that has nothing to do with what iterating it yields: Json::Value
+        // says `std::string` and hands back a Json::Value, and casting one to
+        // the other is a hard error that failed the whole jsoncpp module, not
+        // just that one conversion. Converting the dereferenced item is the
+        // right answer for a case like that and is what this did before the
+        // proxy branch arrived.
+        //
+        // is_constructible_v and not is_convertible_v: a proxy's conversion
+        // operator is usually explicit, which is exactly what the second trait
+        // reports false for, so asking it would send every proxy down the
+        // branch this exists to keep it out of.
+        using DerefT = std::remove_cvref_t<decltype(item)>;
         PyObject* py_item;
-        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(item)>, ValueType>) {
+        if constexpr (std::is_same_v<DerefT, ValueType>) {
             py_item = to_python(item);
-        } else {
+        } else if constexpr (std::is_constructible_v<ValueType, decltype(item)>) {
             py_item = to_python(static_cast<ValueType>(item));
+        } else {
+            py_item = to_python(item);
         }
         if (!py_item) {
             Py_DECREF(list);

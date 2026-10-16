@@ -324,4 +324,24 @@ assert bool(empty_stream) is True, "no size() means no length slot, so still tru
 assert bool(data_model.Bag()) is False
 print("  ✓ the asymmetry the reference documents is the one that holds")
 
+print("Test 24: a value_type unrelated to what iteration yields still binds...")
+# Flags, above, has a dereference type that converts to value_type, and the
+# conversion has to happen or the proxy reaches Python as a dict. Nested has
+# one that does not convert at all. The cast that serves Flags is a hard
+# error for Nested, and a hard error in a conversion template takes the whole
+# module with it rather than that one conversion: jsoncpp's Json::Value is
+# this shape and it cost jsoncpp its binding entirely.
+#
+# So what is pinned here is that the class is reachable at all. The nesting
+# converting as a list of lists is what a self-recursive container gets and
+# is not what this test is about.
+nested = data_model.Nested()
+nested.add_leaf(3)
+nested.add_leaf(4)
+assert len(nested) == 2, len(nested)
+assert list(nested) == [[], []], list(nested)
+assert nested.leaf == 0
+assert bool(nested) is True
+print("  ✓ the module built and the class is usable")
+
 print("\nAll Python data model tests passed!")

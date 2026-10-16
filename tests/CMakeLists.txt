@@ -633,9 +633,13 @@ endif()
 # libraries, and its usability bar (must_export) and regression ladder are the
 # two pieces of judgement in it. Pure Python, so this runs with no reflection
 # toolchain and no clones.
-if(Python3_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py)
+# It lives under tests/ rather than beside the module because the bash
+# harness, which is the only thing CI runs, discovers tests/**/test_*.py and
+# nothing else. The glob below picks it up; this entry is what puts it in
+# ctest too.
+if(Python3_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/compatibility_matrix/test_classify.py)
     add_test(NAME compat_classify
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/compatibility_matrix/test_classify.py
     )
 endif()
 

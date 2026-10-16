@@ -18,5 +18,6 @@ MIRROR_BRIDGE_MODULE(data_model,
     mirror_bridge::bind_class<Derived>(m, "Derived");
     mirror_bridge::bind_class<Underflowed>(m, "Underflowed");
     mirror_bridge::bind_class<Sneaky>(m, "Sneaky");
+    mirror_bridge::bind_class<Nested>(m, "Nested");
     mirror_bridge::bind_class<Point>(m, "Point");
 )

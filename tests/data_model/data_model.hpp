@@ -192,6 +192,24 @@ struct Sneaky {
     std::vector<int>::const_iterator end() const { return items.end(); }
 };
 
+// The other side of Flags. A class is free to declare a value_type that has
+// nothing to do with what iterating it yields, with no conversion between
+// the two. jsoncpp's Json::Value is the real one: it says std::string and
+// hands back a Json::Value. Casting the dereferenced item to value_type is
+// then a hard error, and a hard error inside a conversion template fails the
+// whole module, not just that one conversion -- it cost jsoncpp its binding.
+struct Nested {
+    using value_type = std::string;
+
+    std::vector<Nested> kids;
+    int leaf = 0;
+
+    void add_leaf(int v) { kids.push_back(Nested{{}, v}); }
+    std::size_t size() const { return kids.size(); }
+    std::vector<Nested>::const_iterator begin() const { return kids.begin(); }
+    std::vector<Nested>::const_iterator end() const { return kids.end(); }
+};
+
 // operator== without a hash: CPython's slot inheritance leaves tp_hash null,
 // so the type is unhashable rather than equal-but-differently-hashed.
 struct Point {
