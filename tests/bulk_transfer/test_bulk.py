@@ -8,6 +8,7 @@ Python list construction.
 import sys
 import os
 import array
+import re
 
 sys.path.insert(0, os.path.dirname(__file__))
 import bulk_test
@@ -84,13 +85,25 @@ def test_large_array_correctness():
     assert abs(result[9999] - 9999.0 * 0.5) < 1e-3
     print("  PASS: large array correctness")
 
-# MIRROR_BRIDGE_ARRAY_BORROW_BYTES in python/mirror_bridge_python.hpp. A return
-# smaller than this copies through an intermediate bytes object; one at least
-# this big borrows the container's storage into a memoryview and lets
+# A return smaller than this copies through an intermediate bytes object; one
+# at least this big borrows the container's storage into a memoryview and lets
 # array.frombytes copy once. Two code paths, so every typecode has to be
 # exercised on both sides of the line -- every test above this point happens to
 # sit on the small side.
-BORROW_BYTES = 1024
+#
+# Read out of the header rather than written here: a copy would keep passing if
+# the threshold moved, while quietly testing one path twice.
+def _borrow_bytes():
+    import pathlib
+    hdr = (pathlib.Path(__file__).resolve().parents[2]
+           / "python" / "mirror_bridge_python.hpp")
+    m = re.search(r"define\s+MIRROR_BRIDGE_ARRAY_BORROW_BYTES\s+(\d+)",
+                  hdr.read_text(encoding="utf-8"))
+    assert m, "MIRROR_BRIDGE_ARRAY_BORROW_BYTES is no longer a plain #define"
+    return int(m.group(1))
+
+
+BORROW_BYTES = _borrow_bytes()
 
 ACCESSORS = [
     # name, typecode, bytes per element, expected value at index i

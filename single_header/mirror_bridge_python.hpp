@@ -3838,7 +3838,7 @@ PyObject* to_python(const T& container) {
             }
         });
 
-        if (array_type && frombytes_name) {
+        if (array_type) {
             // Map C++ type to Python array typecode
             const char* typecode = nullptr;
             if constexpr (std::is_same_v<ValueType, float>) typecode = "f";
@@ -3854,7 +3854,13 @@ PyObject* to_python(const T& container) {
                 // The typecode is a compile-time constant per element type, so
                 // intern it once instead of building a str on every return.
                 static PyObject* typecode_obj = PyUnicode_InternFromString(typecode);
-                if (!typecode_obj) return nullptr;
+                if (!typecode_obj) {
+                    // The static caches the failure, so every later call would
+                    // return null with a clean error indicator and surface as
+                    // SystemError rather than as the allocation failure it is.
+                    PyErr_NoMemory();
+                    return nullptr;
+                }
 
                 const std::size_t nbytes = container.size() * sizeof(ValueType);
 
@@ -3870,26 +3876,49 @@ PyObject* to_python(const T& container) {
                 // once. That costs a second interpreter call, which is exactly
                 // why it does not pay for small returns.
                 //
-                // Measured, ns per return of std::vector<double>, clang -O2,
-                // CPython 3.10, best of five (bytes path / borrow path):
+                // One run, best of nine, ns per return of std::vector<double>,
+                // clang -O2 against CPython 3.10:
                 //
-                //     n=100     800 B      121 /    134   0.95x
-                //     n=128    1024 B      138 /    138   1.01x  <- crossover
-                //     n=512    4096 B      191 /    165   1.22x
-                //     n=10k     80 KB     6917 /   1067   6.66x
-                //     n=100k   800 KB    79041 /  10222   7.62x
-                //     n=1M       8 MB   301427 / 148493   2.10x
-                //
-                // The 7x in the middle is the intermediate bytes object
-                // crossing malloc's mmap threshold and taking page faults for a
-                // copy that is discarded immediately afterwards.
+                //     n      bytes   bytes path   borrow
+                //     64       512 B      113      127   0.89x
+                //     100      800 B      121      130   0.93x
+                //     128     1024 B      138      135   1.02x  <- crossover
+                //     256     2048 B      156      143   1.09x
+                //     512     4096 B      191      162   1.18x
+                //     1024    8192 B      291      218   1.33x
+                //     4096     32 KB     1093      788   1.39x
+                //     10000    80 KB     7293     1030   7.08x
+                //     100000  800 KB    82071    10649   7.71x
+                //     1000000   8 MB   300374   148929   2.02x
                 //
                 // The threshold is in bytes rather than elements because
                 // neither side has per-element work: both are a memcpy of the
                 // whole buffer, and the only fixed cost is the extra
                 // interpreter call. Equal bytes cost the same whatever the
                 // element type.
-                if (nbytes < MIRROR_BRIDGE_ARRAY_BORROW_BYTES) {
+                //
+                // The 7x in the middle is page faults, not copying. The bytes
+                // object is freed immediately after being copied from, glibc
+                // hands those pages back to the OS, and the next call faults
+                // them in again. Running the same loop with
+                // MALLOC_TRIM_THRESHOLD_=128MB, so the chunk is kept instead
+                // of returned, takes the 80 KB bytes path from 6420 ns to
+                // 3611 ns; MALLOC_MMAP_THRESHOLD_ changes nothing at that
+                // size. Above the mmap threshold neither tunable helps, which
+                // is why the ratio falls back to 2x at 8 MB: both paths are
+                // paying for fresh pages by then.
+                //
+                // Caching array.array.frombytes as an unbound descriptor to
+                // skip the per-call attribute lookup was measured and dropped:
+                // 1.04x against 1.02x at the crossover, inside the noise, and
+                // it trades a clear call for an obscure one.
+                // nbytes == 0 is its own case rather than a consequence of
+                // the threshold: an empty vector has no storage to borrow and
+                // data() may be null, which PyMemoryView_FromMemory asserts
+                // against on a debug build. Only reachable when the threshold
+                // is overridden to 0, which the comment above invites.
+                if (nbytes == 0 || nbytes < MIRROR_BRIDGE_ARRAY_BORROW_BYTES ||
+                    !frombytes_name) {
                     PyObject* raw_bytes = PyBytes_FromStringAndSize(
                         reinterpret_cast<const char*>(container.data()),
                         static_cast<Py_ssize_t>(nbytes));

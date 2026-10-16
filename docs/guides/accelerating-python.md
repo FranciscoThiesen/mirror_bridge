@@ -118,9 +118,12 @@ than silently misbehaving:
 ## Two results that will surprise you
 
 **A numeric vector comes back as `array.array`, not a `list`.** This is
-deliberate: the conversion is a single `memcpy` rather than building a list of
-boxed floats, which is where a good part of the speedup above comes from. It
-indexes, iterates and measures like a list, but it is not one:
+deliberate: the conversion is a bulk copy of the buffer rather than building a
+list of boxed floats, which is where a good part of the speedup above comes
+from. From 1 KB up it is one copy, straight out of the C++ container; below
+that it goes through an intermediate `bytes` object, because at that size the
+extra call into the interpreter costs more than the extra copy. It indexes,
+iterates and measures like a list, but it is not one:
 
 ```python
 >>> hot.normalize([3.0, 4.0])
