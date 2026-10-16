@@ -226,6 +226,9 @@ SKIP_TESTS=(
     # export_macro proves discovery sees past an export macro, which only the
     # CLI's generate pipeline can show
     "export_macro/test_export_macro.py:Run via test_export_macro_cli.sh (module built by CLI generate)"
+    # columnar's module exists only when built with
+    # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its script builds
+    "columnar/test_columnar_runtime.py:Run via columnar/test_columnar.sh (module needs the flag)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)
