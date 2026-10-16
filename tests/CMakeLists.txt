@@ -45,6 +45,18 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
     )
 
+    # Two modules binding the same class at the same layout, so each has its
+    # own type object and the shared registry holds whichever registered last.
+    mirror_bridge_python_module(ident_a
+        type_identity/ident_a_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
+    )
+
+    mirror_bridge_python_module(ident_b
+        type_identity/ident_b_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
+    )
+
     # Static method test (Vec3)
     mirror_bridge_python_module(vec3_test
         static_method_test/vec3_binding.cpp

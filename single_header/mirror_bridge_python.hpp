@@ -8718,6 +8718,33 @@ namespace {
             return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
         }
     }
+
+    // Which PyTypeObject represents T in this module.
+    //
+    // This module's own comes first, and that order is what makes the answer
+    // stable. tp_new always produces this module's type, so when the outbound
+    // conversions asked the shared dict first they could label a returned
+    // object with a different type than a construction of the same class in
+    // the same module, and which one depended on module import order: the
+    // dict holds whichever module registered last. `isinstance(m.Maker().make(),
+    // m.Part)` was False, and flipped with the order of the imports above it.
+    //
+    // The shared dict is the fallback, for a class this module returns but
+    // never bound -- bind_class does not recurse into member types, so that is
+    // the ordinary cross-module case and it still resolves. A hit is written
+    // back into the static, which puts every later conversion of that class on
+    // a load and a compare instead of a dict probe. Only a hit is stored,
+    // because the module that binds T may not be imported yet, and storing is
+    // safe because the forward registry holds a reference to that type object
+    // and this module's own bind_class has already run at import.
+    template<typename T>
+    PyTypeObject* type_object_for() {
+        PyTypeObject* mine = TypeRegistry<T>::py_type;
+        if (mine) return mine;
+        PyTypeObject* shared = lookup_type_in_python<T>();
+        if (shared) TypeRegistry<T>::py_type = shared;
+        return shared;
+    }
 }
 
 // What an object of some other Python type has to do to become an Expected.
@@ -8770,19 +8797,7 @@ template<typename Expected>
 bool resolve_wrapper_slow(PyObject* obj, void*& raw) {
     if (!obj || obj == Py_None) return false;
 
-    // A class this module did not bind itself is absent from its static
-    // registry, so finding it costs a hash of the mangled typeid name. Back
-    // -filling the static puts every later argument of that type on the
-    // one-compare fast path instead, which is what the cross-module case
-    // was paying for on every call. Safe: the forward registry holds a
-    // reference to that type object, and this module's own bind_class runs
-    // at import, before any conversion can get here. Only a hit is stored,
-    // because the module that binds Expected may not be imported yet.
-    PyTypeObject* want = TypeRegistry<Expected>::py_type;
-    if (!want) {
-        want = lookup_type_in_python<Expected>();
-        if (want) TypeRegistry<Expected>::py_type = want;
-    }
+    PyTypeObject* want = type_object_for<Expected>();
 
     // The expected type itself, or a Python subclass of it (a trampoline).
     // Subclasses extend the wrapper at the tail, so cpp_object stays put and
@@ -8884,8 +8899,7 @@ to_python(const T& obj) {
     // the only honest answer for a copy; a wrapper that really holds the
     // derived object (bind_class on the derived type, or pointer storage)
     // reports it correctly because the object itself is a derived one.
-    PyTypeObject* py_type = lookup_type_in_python<CleanT>();
-    if (!py_type) py_type = TypeRegistry<CleanT>::py_type;
+    PyTypeObject* py_type = type_object_for<CleanT>();
 
     if (py_type) {
         // Create a wrapper object.
@@ -8933,8 +8947,7 @@ template<typename Member>
 PyObject* to_python_member_view(Member& ref, PyObject* parent) {
     using CleanM = std::remove_cv_t<Member>;
 
-    PyTypeObject* py_type = lookup_type_in_python<CleanM>();
-    if (!py_type) py_type = TypeRegistry<CleanM>::py_type;
+    PyTypeObject* py_type = type_object_for<CleanM>();
     if (!py_type) {
         // The member's class was never bound anywhere, so there is no wrapper
         // type to view it through. The dict snapshot is what this returned
