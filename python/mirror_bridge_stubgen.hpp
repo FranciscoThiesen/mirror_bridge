@@ -134,7 +134,13 @@ private:
 
         // Imports
         ss << "from __future__ import annotations\n";
-        ss << "from typing import Any, List, Tuple, Optional, Union, overload\n\n";
+        ss << "from typing import Any, List, Tuple, Optional, Union, overload\n";
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+        // --columnar returns a ColumnView for a vector of plain structs, and
+        // the stub names it Sequence, so the name has to be importable.
+        ss << "from collections.abc import Sequence\n";
+#endif
+        ss << "\n";
 
         // Classes
         for (const auto& [name, info] : classes_) {
@@ -339,6 +345,15 @@ std::string type_hint() {
         }
         // Other containers -> list[T]
         if constexpr (requires { std::declval<CleanT>().begin(); std::declval<CleanT>().end(); }) {
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+            // Under --columnar a vector of plain structs returns a ColumnView,
+            // not a list. Saying list[T] would let a type checker approve
+            // .append, + and json.dumps, every one of which fails at runtime,
+            // which is the drift the .pyi gate exists to prevent.
+            if constexpr (columnar::ColumnarReturn<CleanT>) {
+                return "Sequence[" + type_hint<ValueT>() + "]";
+            }
+#endif
             return "list[" + type_hint<ValueT>() + "]";
         }
     }

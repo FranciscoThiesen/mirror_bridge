@@ -14,6 +14,7 @@ Welcome to the Mirror Bridge documentation. This guide covers everything from ge
 
 ### Guides
 - **[Replacing a hot Python function with C++](guides/accelerating-python.md)** - Measured workflow for taking one slow function out of a Python program, and which shapes pay
+- **[Returning a vector of structs without building a list](guides/columnar-returns.md)** - `--columnar`: numpy reads a vector of plain structs in place, with the dtype read off the type
 - **[Workflow Guide](guides/workflow.md)** - Recommended development workflow with PCH
 - **[PCH Optimization](guides/pch-optimization.md)** - 3-6x faster compilation with precompiled headers
 - **[Multi-Language Support](guides/multi-language.md)** - Python, Lua, JavaScript, and Rust bindings

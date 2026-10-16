@@ -9,6 +9,7 @@
 - [Your First Binding](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/getting-started/first-binding.md): Step-by-step first C++ to Python binding
 - [Development Workflow](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/workflow.md): Recommended day-to-day workflow
 - [Replacing a hot Python function with C++](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/accelerating-python.md): Measured workflow for taking one slow function out of a Python program, which shapes pay and which do not, and how to read the build report
+- [Returning a vector of structs without building a list](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/columnar-returns.md): `--columnar` returns a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying; about 200x on the return above a thousand elements, 500x end to end
 - [Multi-Language Support](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/multi-language.md): Generate Python, Lua, and JavaScript from one source
 - [Packaging](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/packaging.md): Distribute bindings as installable packages
 - [Single-Header](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/single-header.md): Integrate via amalgamated single-header builds

@@ -175,6 +175,15 @@ while IFS= read -r -d '' binding_file; do
 # Exclude v8/ directory - V8 tests are built separately in Step 2d.
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
+# Exclude columnar_binding.cpp - a binding, but one that only means anything
+# built with -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which test_columnar.sh does.
+# Exclude columnar_layout_check.cpp - a standalone program, not a binding. It
+# asks numpy what it made of a reflected struct layout, which needs no module.
+# tests/columnar/test_columnar.sh compiles and runs it in Step 3.
+# Exclude buffer_shape_check.cpp - a standalone program, not a binding: the
+# buffer-protocol behaviour it checks cannot be reached from Python, because
+# memoryview copies shape out of the Py_buffer and numpy holds only one at a
+# time. tests/buffer_views/test_buffer_shape.sh compiles and runs it in Step 3.
 # P3394 annotation tests used to be skipped here on GCC, on the belief that
 # P3394 was a clang-p2996 extension. GCC 16 has it, spelled
 # annotations_of_with_type rather than annotation_of_type; the annotations
@@ -192,7 +201,10 @@ while IFS= read -r -d '' binding_file; do
 done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_bridge/*" \
               -not -path "*/build/*" -not -path "*/build_ci/*" -not -path "*/build_ctest/*" \
               -not -path "*/.worktrees/*" \
-              -not -name "test_validation.cpp" -print0)
+              -not -name "test_validation.cpp" \
+              -not -name "buffer_shape_check.cpp" \
+              -not -name "columnar_layout_check.cpp" \
+              -not -name "columnar_binding.cpp" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"
