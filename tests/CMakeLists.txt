@@ -491,6 +491,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_methods)
     )
 endif()
 
+# A header whose namespaces come from a macro: the text scan cannot see them,
+# so the using-directives derived from it are nonsense and used to fail the
+# whole module.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace)
+    add_test(NAME cli_macro_namespace
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace/build_and_test.sh
+    )
+    set_tests_properties(cli_macro_namespace PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Buffer views describe themselves per view, which only a consumer holding two
 # Py_buffers at once can tell. Not a binding, so it has its own compile.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/buffer_views)

@@ -774,7 +774,29 @@ EOF
 
     # Detect namespaces and emit using directives, using a Python helper that
     # tracks brace depth properly. Collect all files in one invocation.
+    #
+    # Only for the text scan. The directives exist so that an unqualified
+    # class name from the scan resolves; reflection reports names in full
+    # (nlohmann::json_abi_v3_11_3::detail2::end_tag), so they buy nothing
+    # there and they are read off the header text, which cannot see a
+    # namespace a macro opens.
+    #
+    # nlohmann-json is the case that showed it. Its namespaces come from
+    # NLOHMANN_JSON_NAMESPACE_BEGIN, so the scan never sees `namespace
+    # nlohmann {` or its closing brace: names stack instead of popping and the
+    # enclosing namespace is missing entirely, giving
+    #
+    #     using namespace detail;
+    #     using namespace detail::detail;
+    #     using namespace detail::detail::detail;
+    #
+    # none of which name anything. Seventeen errors before the first line of
+    # real binding code. With them gone the same module gets as far as three
+    # errors about one member type, which is an ordinary declined-class
+    # problem rather than a module-killing one.
     declare -A ns_seen
+    local emit_using_directives=1
+    [ "${DISCOVERY_SOURCE:-text scan}" = "reflection" ] && emit_using_directives=0
     local ns_script
     ns_script=$(cat <<'PYSCRIPT'
 import re, sys
@@ -842,7 +864,7 @@ PYSCRIPT
         [ -n "$full_path" ] && ns_paths+=("$full_path")
     done
 
-    if [ ${#ns_paths[@]} -gt 0 ]; then
+    if [ $emit_using_directives -eq 1 ] && [ ${#ns_paths[@]} -gt 0 ]; then
         while IFS= read -r fqn; do
             if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
                 echo "using namespace $fqn;" >> "$output_file"
