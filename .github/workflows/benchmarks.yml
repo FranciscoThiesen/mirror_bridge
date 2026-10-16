@@ -46,7 +46,7 @@ jobs:
             benchmarks/runtime/python/runtime_results.json \
             --commit "$GITHUB_SHA" \
             --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
-            --fragment > /tmp/runtime_fragment.md
+            --fragment --strict > /tmp/runtime_fragment.md
           awk '
             /<!-- RUNTIME:BEGIN/ { print; system("cat /tmp/runtime_fragment.md"); skip=1; next }
             /<!-- RUNTIME:END/   { skip=0 }

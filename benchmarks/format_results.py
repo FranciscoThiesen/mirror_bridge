@@ -13,18 +13,26 @@ import datetime
 import json
 import sys
 
-# Display order + labels for the operations measured by
-# runtime/python/run_runtime_benchmarks.py
+# Display order + labels. The keys must be the keys
+# benchmarks/runtime/python/run_runtime_benchmarks.py actually writes into its
+# results dict: a key that does not match is a row that silently vanishes from
+# the published page, which is how "Attribute read", "Attribute write" and the
+# whole list-in direction went missing while still being measured on every run
+# (they were spelled attribute_get/attribute_set/vector_sum here and
+# attr_get/attr_set/vector_set there). tests/benchmark_table/ pins the two
+# lists together so it cannot drift again.
 OPERATIONS = [
     ("null_call", "Null call (method dispatch)"),
     ("arithmetic_int", "Arithmetic: add_int(42)"),
-    ("arithmetic_double", "Arithmetic: add_double(3.14)"),
+    ("arithmetic_double", "Arithmetic: multiply_double(3.14)"),
     ("string_concat", "String concat"),
-    ("string_get", "String return"),
-    ("vector_sum", "Vector sum (list in)"),
-    ("vector_get", "Vector return"),
-    ("attribute_get", "Attribute read"),
-    ("attribute_set", "Attribute write"),
+    ("string_get", "String return (str out)"),
+    ("string_set", "String argument (str in)"),
+    ("vector_append", "Vector append (one double in)"),
+    ("vector_get", "Vector return (list out)"),
+    ("vector_set", "Vector argument (list in)"),
+    ("attr_get", "Attribute read"),
+    ("attr_set", "Attribute write"),
     ("construction", "Object construction"),
 ]
 
@@ -44,6 +52,11 @@ def main():
         "--fragment", action="store_true",
         help="omit the H1 so the output can be spliced between the "
              "RUNTIME markers in docs/internals/benchmarks.md",
+    )
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="exit non-zero if any measured operation would not reach the "
+             "page, instead of quietly rendering a shorter table",
     )
     args = ap.parse_args()
 
@@ -82,8 +95,15 @@ def main():
     out.append("| " + " | ".join(header) + " |")
     out.append("|" + "---|" * len(header))
 
+    # A row silently disappears when a framework lacks the key, so account for
+    # every drop out loud. Rendering fewer rows than were measured reads as
+    # "this is what we measure", which is the failure mode that hid attribute
+    # access for two months.
+    dropped = []
     for key, label in OPERATIONS:
-        if not all(key in data[fw] for fw in present):
+        absent = [fw for fw in present if key not in data[fw]]
+        if absent:
+            dropped.append((key, "not measured by " + ", ".join(absent)))
             continue
         mb = data["mirror_bridge"][key]
         row = [label] + [fmt_ns(data[fw][key]) for fw in present]
@@ -101,8 +121,28 @@ def main():
         "[`run_runtime_benchmarks.py`](../../benchmarks/runtime/python/run_runtime_benchmarks.py)."
     )
     out.append("")
+
+    published = {key for key, _ in OPERATIONS}
+    unpublished = [
+        key for key in data["mirror_bridge"]
+        if key not in published and data["mirror_bridge"][key] > 0
+    ]
+    for key, why in dropped:
+        print(f"warning: '{key}' is not in the table: {why}", file=sys.stderr)
+    for key in sorted(unpublished):
+        print(f"warning: '{key}' was measured but no row in OPERATIONS "
+              f"publishes it", file=sys.stderr)
+    if (dropped or unpublished):
+        print(f"warning: the page shows {len(OPERATIONS) - len(dropped)} of "
+              f"{len(data['mirror_bridge'])} measured operations",
+              file=sys.stderr)
+
     print("\n".join(out))
+
+    if args.strict and (dropped or unpublished):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
