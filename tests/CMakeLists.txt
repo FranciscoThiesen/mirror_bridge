@@ -181,6 +181,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A standard-library base contributes no methods to the bound surface
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/std_bases)
+        mirror_bridge_python_module(std_bases
+            std_bases/std_bases_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/std_bases
+        )
+    endif()
+
     # C++ default arguments on constructors, not just on methods
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ctor_defaults)
         mirror_bridge_python_module(ctor_defaults

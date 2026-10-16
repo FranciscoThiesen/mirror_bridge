@@ -242,6 +242,44 @@ consteval std::size_t get_data_member_count() {
 // when we splice the base method onto a derived object (P2996 allows
 // `derived.[:base_method_info:](args)` — we verified this compiles and
 // respects overriding).
+// Whether a class is a standard-library *template specialization*, by looking
+// for `::std` among its enclosing namespaces (libc++'s `std::__1` is reached
+// the same way).
+//
+// Methods inherited from such a base are not the API anyone asked to bind,
+// and they are reliably the ones that do not compile. magic_enum::customize_t
+// derives from std::pair, so the method walk picked up std::pair::swap, whose
+// const overload is ill-formed for those members -- "no matching function for
+// call to 'swap'" inside libc++, costing the whole module. The parent_of
+// guards matter: the metafunction has a precondition, and calling it on a
+// non-member is a hard error rather than an empty answer.
+//
+// Two narrowings, each for a case the broad version got wrong:
+//
+// Only a specialization. The reason these bases break is that standard-library
+// templates are written against constraints a reflected call does not satisfy,
+// which is a statement about templates. Skipping every std base as well took
+// `what()` off any class deriving from std::runtime_error -- real API, bound
+// and working today, and removing it is not what this is for.
+//
+// Only `::std`. Just the one namespace is reserved; `namespace mylib {
+// namespace std { ... } }` is legal, and an unanchored name match silently
+// took a user class's inherited methods away. Anchoring to the global
+// namespace costs one comparison.
+consteval bool is_std_library_type(std::meta::info cls) {
+    if (!std::meta::has_template_arguments(cls)) return false;
+    std::meta::info scope = cls;
+    while (std::meta::is_class_member(scope) || std::meta::is_namespace_member(scope)) {
+        scope = std::meta::parent_of(scope);
+        if (std::meta::is_namespace(scope) && std::meta::has_identifier(scope) &&
+            std::meta::identifier_of(scope) == "std" &&
+            std::meta::parent_of(scope) == ^^::) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
@@ -296,7 +334,9 @@ struct MemberFunctionCache {
                     layer_new_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    if (is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
