@@ -1896,12 +1896,6 @@ PyObject* vector_to_numpy_view(std::vector<T>& vec, PyObject* owner) {
     return create_buffer_view(vec, owner);
 }
 
-// Trait to detect std::vector specifically (for bulk transfer optimization)
-template<typename T>
-struct is_std_vector : std::false_type {};
-template<typename T, typename A>
-struct is_std_vector<std::vector<T, A>> : std::true_type {};
-
 // How many bytes a numeric vector has to be before its return borrows the
 // container's storage instead of copying it into an intermediate bytes object.
 // Measured crossover, not a guess; the table inside to_python below has the
@@ -1925,11 +1919,12 @@ PyObject* to_python(const T& container) {
 
     // Bulk transfer fast path for numeric vectors.
     // Excluded: unsigned char (already handled as bytes above), bool (the
-    // std::vector<bool> specialization has no .data() and is proxy-based).
-    if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
-                  std::is_arithmetic_v<ValueType> &&
-                  !std::is_same_v<ValueType, unsigned char> &&
-                  !std::is_same_v<ValueType, bool>) {
+    // std::vector<bool> specialization has no .data() and is proxy-based),
+    // and anything the array module has no typecode for. The condition lives
+    // in mirror_bridge_stubgen.hpp because the .pyi has to say the same
+    // thing, and saying it twice is how the stub came to claim list[float]
+    // for a return that is an array('d').
+    if constexpr (crosses_as_array_v<T>) {
         // Use Python's array module for typed numeric arrays, so the buffer
         // crosses as a bulk copy instead of N Python object allocations.
         // Initialization is thread-safe via std::call_once (GIL must be held
@@ -1947,16 +1942,7 @@ PyObject* to_python(const T& container) {
         });
 
         if (array_type) {
-            // Map C++ type to Python array typecode
-            const char* typecode = nullptr;
-            if constexpr (std::is_same_v<ValueType, float>) typecode = "f";
-            else if constexpr (std::is_same_v<ValueType, double>) typecode = "d";
-            else if constexpr (std::is_same_v<ValueType, int32_t> || (std::is_same_v<ValueType, int> && sizeof(int) == 4)) typecode = "i";
-            else if constexpr (std::is_same_v<ValueType, int64_t> || (std::is_same_v<ValueType, long long>)) typecode = "q";
-            else if constexpr (std::is_same_v<ValueType, uint32_t> || (std::is_same_v<ValueType, unsigned int> && sizeof(unsigned int) == 4)) typecode = "I";
-            else if constexpr (std::is_same_v<ValueType, uint64_t> || (std::is_same_v<ValueType, unsigned long long>)) typecode = "Q";
-            else if constexpr (std::is_same_v<ValueType, int16_t> || std::is_same_v<ValueType, short>) typecode = "h";
-            else if constexpr (std::is_same_v<ValueType, uint16_t> || std::is_same_v<ValueType, unsigned short>) typecode = "H";
+            constexpr const char* typecode = array_typecode_for<ValueType>();
 
             if (typecode) {
                 // The typecode is a compile-time constant per element type, so
@@ -6966,7 +6952,7 @@ void collect_stub_info(const char* class_name) {
     if constexpr (datamodel::is_iterable<T>()) {
         stubgen::register_dunder_stub(
             class_name, "__iter__",
-            "Iterator[" + stubgen::type_hint<datamodel::iter_element_t<T>>() + "]");
+            "Iterator[" + stubgen::return_hint<datamodel::iter_element_t<T>>() + "]");
     }
     if constexpr (datamodel::is_sized<T>()) {
         stubgen::register_dunder_stub(class_name, "__len__", "int");

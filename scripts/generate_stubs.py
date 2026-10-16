@@ -401,7 +401,27 @@ def generate_enum_stub(enum_cls: type, enum_name: str, indent: str = "") -> List
 
 
 def generate_module_stub(module: Any, module_name: str) -> str:
-    """Generate complete .pyi stub content for a module."""
+    """Generate complete .pyi stub content for a module.
+
+    A module built by mirror_bridge carries its own stubs, written from the
+    same reflection the binding was written from, and asking it is strictly
+    better than reading them back off the finished object: it knows the real
+    C++ parameter names, the exact member types, and that a numeric vector
+    comes back as an array.array rather than a list. The reconstruction
+    below cannot know any of that, and when the two disagreed it was always
+    this one that was wrong.
+
+    So this is a fallback, for a module that does not carry stubs.
+    """
+    carried = getattr(module, "__mirror_bridge_stubs__", None)
+    if callable(carried):
+        try:
+            text = carried()
+        except Exception:
+            text = None
+        if isinstance(text, str) and text.strip():
+            return text
+
     lines = []
 
     # Header

@@ -54,7 +54,7 @@ struct Container {
 c = Container()
 c.numbers = [1, 2, 3, 4, 5]
 c.names = ["Alice", "Bob"]
-print(c.numbers)  # [1, 2, 3, 4, 5]
+print(c.numbers)  # array('i', [1, 2, 3, 4, 5])  -- see the note above
 ```
 
 **Lua:**

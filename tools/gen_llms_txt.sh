@@ -9,8 +9,12 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
 BASE="https://github.com/FranciscoThiesen/mirror_bridge/blob/main"
-INDEX="$ROOT/llms.txt"
-FULL="$ROOT/llms-full.txt"
+# Writes beside the docs it reads. MB_LLMS_OUT sends the two files somewhere
+# else instead, which is how tests/llms_sync/ checks the committed pair
+# against a fresh run without writing into the working tree.
+OUT="${MB_LLMS_OUT:-$ROOT}"
+INDEX="$OUT/llms.txt"
+FULL="$OUT/llms-full.txt"
 
 # Emit a curated "- [title](url): desc" line, but only if the file exists.
 # Skipping (and warning) on missing files keeps llms.txt free of dead links.
@@ -38,6 +42,7 @@ link "docs/getting-started/installation.md" "Installation"       "Set up the C++
 link "docs/getting-started/quickstart.md"   "Quick Start"        "Get bindings working in five minutes"
 link "docs/getting-started/first-binding.md" "Your First Binding" "Step-by-step first C++ to Python binding"
 link "docs/guides/workflow.md"            "Development Workflow"  "Recommended day-to-day workflow"
+link "docs/guides/accelerating-python.md" "Replacing a hot Python function with C++" "Measured workflow for taking one slow function out of a Python program, which shapes pay and which do not, and how to read the build report"
 link "docs/guides/multi-language.md"      "Multi-Language Support" "Generate Python, Lua, and JavaScript from one source"
 link "docs/guides/packaging.md"           "Packaging"            "Distribute bindings as installable packages"
 link "docs/guides/single-header.md"       "Single-Header"        "Integrate via amalgamated single-header builds"

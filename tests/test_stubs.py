@@ -16,6 +16,7 @@ from generate_stubs import (
     split_template_args,
     infer_type_from_value,
     clean_signature_types,
+    generate_module_stub,
 )
 
 
@@ -131,6 +132,55 @@ class TestSignatureCleaning(unittest.TestCase):
         """Test vector type cleaning."""
         result = clean_signature_types('(items: std::vector<int>)')
         self.assertNotIn('std::', result)
+
+
+class TestTheModuleAnswersForItself(unittest.TestCase):
+    """A mirror_bridge module carries its own stubs, and those win.
+
+    This script reconstructs a stub by importing the finished .so and
+    reading docstrings off it. The module built by mirror_bridge already
+    holds one written from the reflection the binding was written from,
+    which knows the real C++ parameter names, the exact member types, and
+    that a numeric vector comes back as an array.array. Two generators, two
+    answers, and the reconstruction was the wrong one every time they
+    differed. It is now the fallback.
+    """
+
+    class Carrier:
+        __name__ = "carrier"
+
+        @staticmethod
+        def __mirror_bridge_stubs__():
+            return "class Shapes:\n    def doubles(self) -> _array[float]: ...\n"
+
+    class Bare:
+        __name__ = "bare"
+
+    def test_a_module_with_stubs_is_quoted_verbatim(self):
+        out = generate_module_stub(self.Carrier, "carrier")
+        self.assertEqual(out, self.Carrier.__mirror_bridge_stubs__())
+        self.assertIn("_array[float]", out)
+
+    def test_a_module_without_them_still_gets_the_reconstruction(self):
+        out = generate_module_stub(self.Bare, "bare")
+        self.assertIn("Type stubs for bare", out)
+
+    def test_a_carrier_that_raises_falls_back_rather_than_failing(self):
+        class Broken:
+            @staticmethod
+            def __mirror_bridge_stubs__():
+                raise RuntimeError("no")
+
+        out = generate_module_stub(Broken, "broken")
+        self.assertIn("Type stubs for broken", out)
+
+    def test_an_empty_answer_is_not_taken_for_a_stub(self):
+        class Empty:
+            @staticmethod
+            def __mirror_bridge_stubs__():
+                return "   "
+
+        self.assertIn("Type stubs for empty", generate_module_stub(Empty, "empty"))
 
 
 if __name__ == '__main__':

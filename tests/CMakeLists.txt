@@ -57,6 +57,13 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
     )
 
+    # Every shape the array.array decision can land on, so the stub has to
+    # mirror the typecode table rather than approximate it.
+    mirror_bridge_python_module(stub_container_types
+        stub_container_types/stub_container_types_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/stub_container_types
+    )
+
     # Static method test (Vec3)
     mirror_bridge_python_module(vec3_test
         static_method_test/vec3_binding.cpp

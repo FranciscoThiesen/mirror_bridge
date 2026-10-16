@@ -1455,12 +1455,90 @@ consteval const char* get_visible_member_name() {
 #include <map>
 #include <set>
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <fstream>
+#include <type_traits>
 #include <typeinfo>
 #include <cxxabi.h>
 
 namespace mirror_bridge {
+
+// ============================================================================
+// What a numeric vector actually becomes on the way out
+// ============================================================================
+//
+// Lives here, above stubgen, because two things have to agree about it and
+// they are in different headers: to_python, which builds the array.array,
+// and type_hint, which has to say so in the .pyi. The stub said list[float]
+// for years while the runtime handed back array('d'), which a type checker
+// then approved every misuse of.
+//
+// There are two more encodings of a nearly identical mapping in
+// mirror_bridge_python.hpp -- get_buffer_format, for the buffer protocol,
+// and buffer_format_matches, for the way back in. They cover different
+// element sets for different reasons. Do not add a fourth.
+//
+// tests/bulk_transfer/test_bulk.py holds the Python-side table of which
+// accessor gets which typecode, so a new element type added here wants a row
+// there as well.
+
+template<typename T>
+struct is_std_vector : std::false_type {};
+template<typename T, typename A>
+struct is_std_vector<std::vector<T, A>> : std::true_type {};
+
+// The array module's typecode for an element type, or nullptr where it has
+// none. An element type absent from this table is not a bug: it falls
+// through to the per-element list path, which is correct and slower. long
+// double, int8_t and the character types are all in that position.
+template<typename T>
+constexpr const char* array_typecode_for() {
+    if constexpr (std::is_same_v<T, float>) return "f";
+    else if constexpr (std::is_same_v<T, double>) return "d";
+    else if constexpr (std::is_same_v<T, std::int32_t> ||
+                       (std::is_same_v<T, int> && sizeof(int) == 4)) return "i";
+    else if constexpr (std::is_same_v<T, std::int64_t> ||
+                       std::is_same_v<T, long long>) return "q";
+    else if constexpr (std::is_same_v<T, std::uint32_t> ||
+                       (std::is_same_v<T, unsigned int> && sizeof(unsigned int) == 4)) return "I";
+    else if constexpr (std::is_same_v<T, std::uint64_t> ||
+                       std::is_same_v<T, unsigned long long>) return "Q";
+    else if constexpr (std::is_same_v<T, std::int16_t> || std::is_same_v<T, short>) return "h";
+    else if constexpr (std::is_same_v<T, std::uint16_t> ||
+                       std::is_same_v<T, unsigned short>) return "H";
+    else return nullptr;
+}
+
+// Whether a container crosses as an array.array rather than as a list.
+//
+// A class template rather than a variable template on purpose: `&&` in a
+// variable template's initialiser short-circuits evaluation, not
+// substitution, so naming C::value_type there is a hard error for every C
+// that has no value_type rather than a false.
+template<typename C, typename = void>
+struct crosses_as_array : std::false_type {};
+
+template<typename C>
+struct crosses_as_array<C, std::void_t<typename C::value_type>>
+    : std::bool_constant<
+          is_std_vector<C>::value &&
+          std::is_arithmetic_v<typename C::value_type> &&
+          !std::is_same_v<typename C::value_type, unsigned char> &&
+          !std::is_same_v<typename C::value_type, bool> &&
+          array_typecode_for<typename C::value_type>() != nullptr> {};
+
+template<typename C>
+inline constexpr bool crosses_as_array_v = crosses_as_array<std::remove_cvref_t<C>>::value;
+
+// bytes has exactly one producer, the non-template to_python(const
+// std::vector<unsigned char>&). std::vector<char>, std::vector<std::byte>
+// and std::array<unsigned char, N> all come back as lists of int, whatever
+// the stub used to claim.
+template<typename C>
+inline constexpr bool crosses_as_bytes_v =
+    std::is_same_v<std::remove_cvref_t<C>, std::vector<unsigned char>>;
+
 namespace stubgen {
 
 // ============================================================================
@@ -1491,7 +1569,8 @@ struct MethodInfo {
 
 struct PropertyInfo {
     std::string name;
-    std::string type_hint;
+    std::string type_hint;   // what reading it gives
+    std::string setter_hint; // what assigning to it takes, where that differs
     bool readonly = false;
 };
 
@@ -1564,6 +1643,13 @@ private:
     StubRegistry() = default;
 
     std::string generate_raw(const std::string& module_name) const {
+        // The body is rendered first so the import line can be chosen from
+        // what it actually contains. An import a module does not use would
+        // move every committed baseline for no change in surface.
+        std::ostringstream body;
+        render_body(body);
+        const std::string rendered = body.str();
+
         std::ostringstream ss;
 
         // Module docstring
@@ -1576,10 +1662,23 @@ private:
         // had — a committed baseline should move when the surface does and
         // not before.
         ss << "from __future__ import annotations\n";
+        // Aliased: the stub drops C++ class names into this same namespace,
+        // and a class called `array` would otherwise silently shadow the
+        // import and change what every annotation under it means. The
+        // unaliased typing names on the next line have the same hazard and
+        // predate this.
+        if (rendered.find("_array[") != std::string::npos) {
+            ss << "from array import array as _array\n";
+        }
         ss << "from typing import Any, List, Tuple, Optional, Union, overload";
         if (any_class_iterates()) ss << ", Iterator";
         ss << "\n\n";
 
+        ss << rendered;
+        return ss.str();
+    }
+
+    void render_body(std::ostringstream& ss) const {
         // Classes
         for (const auto& [name, info] : classes_) {
             ss << generate_class_stub(info) << "\n";
@@ -1595,8 +1694,6 @@ private:
                << render_parameters(func.parameters, false, false)
                << ") -> " << func.return_type << ": ...\n";
         }
-
-        return ss.str();
     }
 
     // Replace every "\x01<typeid name>\x02" with the Python name of that class.
@@ -1760,8 +1857,20 @@ private:
             if (prop.readonly) {
                 ss << "    @property\n";
                 ss << "    def " << prop.name << "(self) -> " << prop.type_hint << ": ...\n";
-            } else {
+            } else if (prop.setter_hint.empty() || prop.setter_hint == prop.type_hint) {
                 ss << "    " << prop.name << ": " << prop.type_hint << "\n";
+            } else {
+                // Reading and assigning genuinely differ here, which a bare
+                // annotation cannot say: a std::vector<double> member reads
+                // back as an array.array and accepts a list on the way in.
+                // Only written out where they differ, so an ordinary member
+                // stays an ordinary annotation and `mirror_bridge api` does
+                // not report every class in every baseline as changed.
+                ss << "    @property\n";
+                ss << "    def " << prop.name << "(self) -> " << prop.type_hint << ": ...\n";
+                ss << "    @" << prop.name << ".setter\n";
+                ss << "    def " << prop.name << "(self, value: " << prop.setter_hint
+                   << ") -> None: ...\n";
             }
         }
 
@@ -1820,8 +1929,15 @@ inline std::string demangle(const char* mangled) {
     return mangled;
 }
 
+// Where in a signature a hint is going. Returns and parameters do not have
+// the same answer: a std::vector<double> comes back as an array.array and
+// goes in as a list, a tuple, an array.array or anything else with the
+// sequence protocol. One string cannot be true in both places, and asking it
+// to be is how the stub came to promise list[float] for an array('d').
+enum class Position { Return, Param };
+
 // Convert C++ type to Python type hint
-template<typename T>
+template<typename T, Position P = Position::Return>
 std::string type_hint() {
     using CleanT = std::remove_cvref_t<T>;
 
@@ -1829,7 +1945,11 @@ std::string type_hint() {
     if constexpr (std::is_same_v<CleanT, bool>) {
         return "bool";
     } else if constexpr (std::is_same_v<CleanT, char>) {
-        return "str";
+        // char is arithmetic and signed, so to_python sends it through
+        // PyLong_FromLong and from_python reads it with PyLong_AsLong. It
+        // crosses as an int in both directions, whatever it looks like in
+        // C++, and docs/reference/type-conversion.md has always said so.
+        return "int";
     } else if constexpr (std::is_integral_v<CleanT>) {
         return "int";
     } else if constexpr (std::is_enum_v<CleanT>) {
@@ -1864,43 +1984,55 @@ std::string type_hint() {
 
     // Maps -> dict[K, V] (checked before generic containers: maps iterate too)
     if constexpr (requires { typename CleanT::key_type; typename CleanT::mapped_type; }) {
-        return "dict[" + type_hint<typename CleanT::key_type>() + ", " +
-               type_hint<typename CleanT::mapped_type>() + "]";
+        return "dict[" + type_hint<typename CleanT::key_type, P>() + ", " +
+               type_hint<typename CleanT::mapped_type, P>() + "]";
     }
 
     // Sets -> set[T]
     if constexpr (requires { typename CleanT::key_type; } &&
                   !requires { typename CleanT::mapped_type; }) {
-        return "set[" + type_hint<typename CleanT::key_type>() + "]";
+        return "set[" + type_hint<typename CleanT::key_type, P>() + "]";
     }
 
-    // Byte containers -> bytes
+    // bytes has exactly one producer and one consumer, both non-template
+    // overloads taking std::vector<unsigned char>, and the consumer also
+    // accepts a list. A std::vector<char>, a std::vector<std::byte> and a
+    // std::array<unsigned char, N> all come back as lists of int, which the
+    // old test here claimed otherwise about.
+    if constexpr (crosses_as_bytes_v<CleanT>) {
+        if constexpr (P == Position::Return) {
+            return "bytes";
+        } else {
+            return "bytes | list[int]";
+        }
+    }
+
     if constexpr (requires { typename CleanT::value_type; }) {
         using ValueT = typename CleanT::value_type;
-        if constexpr (std::is_same_v<ValueT, uint8_t> ||
-                      std::is_same_v<ValueT, char> ||
-                      std::is_same_v<ValueT, std::byte>) {
-            // Check if it's a contiguous container
-            if constexpr (requires(CleanT c) { c.data(); c.size(); }) {
-                return "bytes";
-            }
-        }
-        // Other containers -> list[T]
         if constexpr (requires { std::declval<CleanT>().begin(); std::declval<CleanT>().end(); }) {
-            return "list[" + type_hint<ValueT>() + "]";
+            // A numeric vector is returned as an array.array, so that is
+            // what a return says. A parameter keeps list[T]: the ingest side
+            // takes a list, a tuple, an array.array or any buffer, but there
+            // is no spelling for that which is not also a lie. Sequence[int]
+            // is the obvious candidate and admits bytes, which from_python
+            // rejects outright, so it would approve a call that fails.
+            if constexpr (P == Position::Return && crosses_as_array_v<CleanT>) {
+                return "_array[" + type_hint<ValueT, P>() + "]";
+            }
+            return "list[" + type_hint<ValueT, P>() + "]";
         }
     }
 
     // std::optional -> T | None
     if constexpr (requires { typename CleanT::value_type; std::declval<CleanT>().has_value(); }) {
-        return type_hint<typename CleanT::value_type>() + " | None";
+        return type_hint<typename CleanT::value_type, P>() + " | None";
     }
 
     // std::pair/tuple -> tuple[...]
     if constexpr (requires { typename std::tuple_size<CleanT>::type; }) {
         if constexpr (std::tuple_size_v<CleanT> == 2) {
-            return "tuple[" + type_hint<std::tuple_element_t<0, CleanT>>() + ", " +
-                   type_hint<std::tuple_element_t<1, CleanT>>() + "]";
+            return "tuple[" + type_hint<std::tuple_element_t<0, CleanT>, P>() + ", " +
+                   type_hint<std::tuple_element_t<1, CleanT>, P>() + "]";
         }
     }
 
@@ -1909,6 +2041,12 @@ std::string type_hint() {
     // placeholder for generate() to resolve.
     return StubRegistry::type_placeholder(typeid(CleanT).name());
 }
+
+template<typename T>
+std::string return_hint() { return type_hint<T, Position::Return>(); }
+
+template<typename T>
+std::string param_hint() { return type_hint<T, Position::Param>(); }
 
 inline std::string StubRegistry::fallback_class_name(const std::string& typeid_name) {
     std::string name = demangle(typeid_name.c_str());
@@ -1942,9 +2080,9 @@ template<typename ReturnT, typename... Args>
 void register_function_stub(const char* name, const std::vector<std::string>& param_names = {}) {
     MethodInfo func;
     func.name = name;
-    func.return_type = type_hint<ReturnT>();
+    func.return_type = return_hint<ReturnT>();
 
-    std::vector<std::string> type_hints = {type_hint<Args>()...};
+    std::vector<std::string> type_hints = {param_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
         std::string pname = i < param_names.size() ? param_names[i] : std::string();
         func.parameters.push_back({pname, type_hints[i]});
@@ -1957,7 +2095,8 @@ void register_function_stub(const char* name, const std::vector<std::string>& pa
 template<typename T, typename MemberT>
 void register_property_stub(const char* class_name, const char* prop_name, bool readonly = false) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
-    info.properties.push_back({prop_name, type_hint<MemberT>(), readonly});
+    info.properties.push_back({prop_name, return_hint<MemberT>(),
+                               param_hint<MemberT>(), readonly});
 }
 
 // Register a method. Parameter names may be empty strings (unnamed params
@@ -1972,12 +2111,12 @@ void register_method_stub(const char* class_name, const char* method_name,
 
     MethodInfo method;
     method.name = method_name;
-    method.return_type = type_hint<ReturnT>();
+    method.return_type = return_hint<ReturnT>();
     method.is_static = is_static;
     method.positional_only = positional_only;
 
     // Generate parameters
-    std::vector<std::string> type_hints = {type_hint<Args>()...};
+    std::vector<std::string> type_hints = {param_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
         std::string pname = i < param_names.size() ? param_names[i] : std::string();
         // The third field is has_default. render_parameters reads it; without
@@ -2018,7 +2157,7 @@ void register_constructor_stub(const char* class_name,
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
 
     ConstructorInfo ctor;
-    std::vector<std::string> type_hints = {type_hint<Args>()...};
+    std::vector<std::string> type_hints = {param_hint<Args>()...};
     for (size_t i = 0; i < type_hints.size(); ++i) {
         std::string pname = i < param_names.size() ? param_names[i] : std::string();
         ctor.parameters.push_back({pname, type_hints[i], i >= min_required});
@@ -4067,12 +4206,6 @@ PyObject* vector_to_numpy_view(std::vector<T>& vec, PyObject* owner) {
     return create_buffer_view(vec, owner);
 }
 
-// Trait to detect std::vector specifically (for bulk transfer optimization)
-template<typename T>
-struct is_std_vector : std::false_type {};
-template<typename T, typename A>
-struct is_std_vector<std::vector<T, A>> : std::true_type {};
-
 // How many bytes a numeric vector has to be before its return borrows the
 // container's storage instead of copying it into an intermediate bytes object.
 // Measured crossover, not a guess; the table inside to_python below has the
@@ -4096,11 +4229,12 @@ PyObject* to_python(const T& container) {
 
     // Bulk transfer fast path for numeric vectors.
     // Excluded: unsigned char (already handled as bytes above), bool (the
-    // std::vector<bool> specialization has no .data() and is proxy-based).
-    if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
-                  std::is_arithmetic_v<ValueType> &&
-                  !std::is_same_v<ValueType, unsigned char> &&
-                  !std::is_same_v<ValueType, bool>) {
+    // std::vector<bool> specialization has no .data() and is proxy-based),
+    // and anything the array module has no typecode for. The condition lives
+    // in mirror_bridge_stubgen.hpp because the .pyi has to say the same
+    // thing, and saying it twice is how the stub came to claim list[float]
+    // for a return that is an array('d').
+    if constexpr (crosses_as_array_v<T>) {
         // Use Python's array module for typed numeric arrays, so the buffer
         // crosses as a bulk copy instead of N Python object allocations.
         // Initialization is thread-safe via std::call_once (GIL must be held
@@ -4118,16 +4252,7 @@ PyObject* to_python(const T& container) {
         });
 
         if (array_type) {
-            // Map C++ type to Python array typecode
-            const char* typecode = nullptr;
-            if constexpr (std::is_same_v<ValueType, float>) typecode = "f";
-            else if constexpr (std::is_same_v<ValueType, double>) typecode = "d";
-            else if constexpr (std::is_same_v<ValueType, int32_t> || (std::is_same_v<ValueType, int> && sizeof(int) == 4)) typecode = "i";
-            else if constexpr (std::is_same_v<ValueType, int64_t> || (std::is_same_v<ValueType, long long>)) typecode = "q";
-            else if constexpr (std::is_same_v<ValueType, uint32_t> || (std::is_same_v<ValueType, unsigned int> && sizeof(unsigned int) == 4)) typecode = "I";
-            else if constexpr (std::is_same_v<ValueType, uint64_t> || (std::is_same_v<ValueType, unsigned long long>)) typecode = "Q";
-            else if constexpr (std::is_same_v<ValueType, int16_t> || std::is_same_v<ValueType, short>) typecode = "h";
-            else if constexpr (std::is_same_v<ValueType, uint16_t> || std::is_same_v<ValueType, unsigned short>) typecode = "H";
+            constexpr const char* typecode = array_typecode_for<ValueType>();
 
             if (typecode) {
                 // The typecode is a compile-time constant per element type, so
@@ -9137,7 +9262,7 @@ void collect_stub_info(const char* class_name) {
     if constexpr (datamodel::is_iterable<T>()) {
         stubgen::register_dunder_stub(
             class_name, "__iter__",
-            "Iterator[" + stubgen::type_hint<datamodel::iter_element_t<T>>() + "]");
+            "Iterator[" + stubgen::return_hint<datamodel::iter_element_t<T>>() + "]");
     }
     if constexpr (datamodel::is_sized<T>()) {
         stubgen::register_dunder_stub(class_name, "__len__", "int");
