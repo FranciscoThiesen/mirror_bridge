@@ -84,6 +84,98 @@ def test_large_array_correctness():
     assert abs(result[9999] - 9999.0 * 0.5) < 1e-3
     print("  PASS: large array correctness")
 
+# MIRROR_BRIDGE_ARRAY_BORROW_BYTES in python/mirror_bridge_python.hpp. A return
+# smaller than this copies through an intermediate bytes object; one at least
+# this big borrows the container's storage into a memoryview and lets
+# array.frombytes copy once. Two code paths, so every typecode has to be
+# exercised on both sides of the line -- every test above this point happens to
+# sit on the small side.
+BORROW_BYTES = 1024
+
+ACCESSORS = [
+    # name, typecode, bytes per element, expected value at index i
+    ("get_floats",  "f", 4, lambda i: i * 0.5),
+    ("get_doubles", "d", 8, lambda i: __import__("math").sin(i * 0.01)),
+    ("get_ints",    "i", 4, lambda i: i * i),
+    ("get_shorts",  "h", 2, lambda i: i % 1000),
+]
+
+
+def _check(gen, name, typecode, expect, n):
+    result = getattr(gen, name)()
+    assert isinstance(result, array.array), f"{name}({n}) gave {type(result)}"
+    assert result.typecode == typecode, f"{name}({n}) typecode {result.typecode}"
+    assert len(result) == n, f"{name}({n}) returned {len(result)} elements"
+    for i in (0, 1, n // 2, n - 1):
+        if i < 0 or i >= n:
+            continue
+        want = expect(i)
+        got = result[i]
+        if isinstance(want, float):
+            assert abs(got - want) < 1e-5, f"{name}({n})[{i}] = {got}, want {want}"
+        else:
+            assert got == want, f"{name}({n})[{i}] = {got}, want {want}"
+    return result
+
+
+def test_both_paths_agree_for_every_typecode():
+    """The small and large paths must produce the same values and typecode."""
+    gen = bulk_test.DataGenerator()
+    for name, typecode, width, expect in ACCESSORS:
+        below = max(1, (BORROW_BYTES // width) - 1)
+        at = BORROW_BYTES // width
+        above = (BORROW_BYTES // width) * 4
+
+        for n in (below, at, above):
+            gen.size = n
+            _check(gen, name, typecode, expect, n)
+
+        # Same length on both sides of nothing: a buffer exactly at the
+        # threshold takes the borrowing path, one byte under it does not, and
+        # the elements they share must match.
+        gen.size = at
+        borrowed = _check(gen, name, typecode, expect, at)
+        gen.size = below
+        copied = _check(gen, name, typecode, expect, below)
+        assert list(copied) == list(borrowed)[:below], \
+            f"{name} disagrees across the threshold"
+    print("  PASS: both conversion paths agree for f, d, i and h")
+
+
+def test_empty_and_single_element():
+    """A zero-length vector has no storage to borrow, and must not crash."""
+    gen = bulk_test.DataGenerator()
+    gen.size = 0
+    for name, typecode, _, _ in ACCESSORS:
+        result = getattr(gen, name)()
+        assert isinstance(result, array.array), f"empty {name} gave {type(result)}"
+        assert len(result) == 0, f"empty {name} returned {len(result)}"
+        assert result.typecode == typecode
+    gen.size = 1
+    assert len(gen.get_doubles()) == 1
+    print("  PASS: zero-length and single-element returns")
+
+
+def test_a_borrowed_return_outlives_the_call():
+    """The memoryview borrows C++ storage that dies when the call returns.
+
+    If the array ever held the view rather than copying out of it, this would
+    be reading freed memory. Force the C++ side to reuse that memory before
+    looking at the result.
+    """
+    import math
+    gen = bulk_test.DataGenerator()
+    gen.size = 4096
+    first = gen.get_doubles()
+    snapshot = list(first)
+    for _ in range(20):
+        gen.get_doubles()
+        gen.get_floats()
+    assert list(first) == snapshot, "a borrowed return changed after the fact"
+    assert abs(first[100] - math.sin(1.0)) < 1e-10
+    print("  PASS: a borrowed return is a copy, not a window")
+
+
 if __name__ == "__main__":
     print("Testing bulk array transfer:")
     test_float_array()
@@ -92,4 +184,7 @@ if __name__ == "__main__":
     test_short_array()
     test_string_list()
     test_large_array_correctness()
+    test_both_paths_agree_for_every_typecode()
+    test_empty_and_single_element()
+    test_a_borrowed_return_outlives_the_call()
     print("\nAll bulk transfer tests passed!")
