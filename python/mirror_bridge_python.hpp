@@ -46,6 +46,7 @@
 
 #include <meta>
 #include <Python.h>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -4372,6 +4373,36 @@ consteval bool method_fully_bindable() {
     }
 }
 
+// The declined-method lines are behind an environment variable because
+// generate_methods runs at import and a large library declines hundreds of
+// methods. The CLI sets it for its own verification import, so the tool and
+// anything driving it sees them while a user's program stays quiet.
+inline bool report_declined_methods() {
+    static const bool on = [] {
+        const char* v = std::getenv("MIRROR_BRIDGE_REPORT_DECLINED");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
+// Why method_fully_bindable said no. The three arms are the same three, in
+// the same order, so a gate that grows a fourth reason without a string here
+// says "declined" and names no cause -- which is the state this whole
+// diagnostic exists to end.
+template<typename T, std::size_t Index>
+consteval const char* method_decline_reason() {
+    if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+        return "a parameter type has no conversion from Python";
+    } else if constexpr (!method_out_params_reach_caller<T, Index>()) {
+        return "it writes through a parameter whose writes cannot reach the caller";
+    } else if constexpr (!return_type_convertible<
+                             typename [:get_method_return_type<T, Index>():]>()) {
+        return "its return type has no conversion to Python";
+    } else {
+        return "an overload of the same name was bound instead";
+    }
+}
+
 template<typename T, std::size_t Index>
 consteval bool static_method_fully_bindable() {
     if constexpr (!mirror_bridge::core::static_method_params_all_bindable<T, Index>()) {
@@ -5019,7 +5050,7 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
 // Generate Python methods for all member functions of a class
 // Uses dispatch system for overloading - one entry per unique name
 template<typename T, std::size_t... Indices>
-auto generate_methods(std::index_sequence<Indices...>) {
+auto generate_methods(const char* class_name, std::index_sequence<Indices...>) {
     // Count unique method names (canonical methods only), plus the batch
     // sibling generated for each method whose shape admits one.
     constexpr std::size_t unique_count = count_unique_method_names<T>();
@@ -5062,6 +5093,34 @@ auto generate_methods(std::index_sequence<Indices...>) {
                     .ml_doc = nullptr
                 };
                 method_idx++;
+            } else if constexpr (!method_fully_bindable<T, Indices>()) {
+                // A declined method was reported nowhere: not on stderr, not
+                // in --json, not in the stub, and dir() simply does not list
+                // it. docs/guides/accelerating-python.md promises that
+                // generate "reports every name you wrote that is not in the
+                // finished module, with the reason", and for a method that
+                // was never true -- a free function with the same problem is
+                // refused by name.
+                //
+                // Behind an environment variable because this runs at import
+                // and a large library declines hundreds of methods: the CLI
+                // sets it for its own verification import, so the tool sees
+                // them and a user's program does not. Same message shape as
+                // the class-level ones, so the CLI harvests them the same way
+                // rather than growing a second parser.
+                // Materialised into constexpr locals first. A consteval
+                // call left inline in the body makes the whole lambda an
+                // immediate function under P2564, and then calling it at
+                // runtime is "call to immediate function is not a constant
+                // expression". The canonical arm above does the same thing
+                // for the same reason.
+                constexpr const char* declined_name = get_member_function_name<T, Indices>();
+                constexpr const char* declined_why = method_decline_reason<T, Indices>();
+                if (report_declined_methods()) {
+                    std::fprintf(stderr,
+                        "mirror_bridge: skipped method '%s::%s' (%s)\n",
+                        class_name, declined_name, declined_why);
+                }
             }
         }(), ...);
 
@@ -7050,7 +7109,7 @@ BoundClass<T> bind_class(PyObject* module, const char* name,
 
     // Generate instance methods using reflection
     constexpr std::size_t method_count = get_member_function_count<T>();
-    static auto methods = generate_methods<T>(std::make_index_sequence<method_count>{});
+    static auto methods = generate_methods<T>(name, std::make_index_sequence<method_count>{});
 
     // Generate static methods using reflection (will be added separately to type dict)
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();

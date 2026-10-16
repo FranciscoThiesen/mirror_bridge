@@ -46,8 +46,9 @@ assert c.usable(4.0) == 8.0, c.usable(4.0)
 print("  ✓ Consumer.usable works alongside two unconvertible methods")
 
 print("Test 5: the unconvertible methods refuse at the call, not the build...")
-# They may be absent (declined at the gate) or present and raising. Either is
-# acceptable; what is not acceptable is the module failing to build.
+# Absent or present-and-raising are both acceptable outcomes; what is not
+# acceptable is the module failing to build. Which one happens is pinned by
+# Test 6, where the module says so out loud.
 for name in ("takes_unfillable", "takes_nodefault"):
     fn = getattr(c, name, None)
     if fn is None:
@@ -98,5 +99,43 @@ else:
         raise AssertionError("total accepted a span it cannot fill")
     except TypeError:
         print("  ✓ total raises TypeError rather than failing the build")
+
+print("Test 9: a declined method says so, when asked...")
+# A declined class and a declined free function were each refused by name on
+# stderr. A declined method was refused in silence: not on stderr, not in
+# --json, not in the stub, and dir() just does not list it, so a caller could
+# not tell "I wrote the C++ wrong" from "that method does not exist".
+#
+# Behind an environment variable because this runs at import and a large
+# library declines hundreds of methods. The CLI sets it for its own
+# verification import, which is how the names reach the unbound report and
+# the --json `declined` list.
+import os
+import subprocess
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+build = os.path.join(here, "..", "..", "build")
+code = "import sys; sys.path.insert(0, %r); import declinable" % build
+
+quiet = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items()
+                            if k != "MIRROR_BRIDGE_REPORT_DECLINED"})
+assert "skipped method" not in quiet.stderr, \
+    "a plain import should not wear the declined-method list:\n" + quiet.stderr
+
+loud = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                      env=dict(os.environ, MIRROR_BRIDGE_REPORT_DECLINED="1"))
+assert "skipped method" in loud.stderr, \
+    "MIRROR_BRIDGE_REPORT_DECLINED=1 reported no declined method:\n" + loud.stderr
+
+# Consumer's two unconvertible methods are the ones this fixture exists for.
+for name in ("takes_unfillable", "takes_nodefault"):
+    if getattr(d.Consumer(), name, None) is None:
+        assert "Consumer::%s" % name in loud.stderr, \
+            "%s was declined and not named:\n%s" % (name, loud.stderr)
+        assert "no conversion" in loud.stderr, \
+            "named the method and not the reason:\n" + loud.stderr
+print("  ✓ quiet by default, and names the method and the reason when asked")
 
 print("\nAll declinable-shape tests passed!")

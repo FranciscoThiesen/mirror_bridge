@@ -1015,12 +1015,13 @@ VERIFY_OK=1
 VERIFY_REASON=""
 VERIFY_NOTE=""
 declare -a VERIFY_SKIPPED_CLASSES=()
+declare -a VERIFY_SKIPPED_METHODS=()
 declare -a VERIFY_SKIPPED_FUNCS=()
 
 verify_python_module() {
     local module_name="$1" out_dir="$2"
     VERIFY_OK=1; VERIFY_REASON=""; VERIFY_NOTE=""
-    VERIFY_SKIPPED_CLASSES=(); VERIFY_SKIPPED_FUNCS=()
+    VERIFY_SKIPPED_CLASSES=(); VERIFY_SKIPPED_FUNCS=(); VERIFY_SKIPPED_METHODS=()
 
     [ "$VERIFY_IMPORT" -eq 1 ] || return 0
     [ -f "$out_dir/$module_name.so" ] || return 0
@@ -1029,7 +1030,11 @@ verify_python_module() {
     local log rc=0
     # Loaded from the output directory so a module that shares types with a
     # sibling built beside it finds that sibling, the way the caller will.
-    log=$(cd "$out_dir" && python3 -c "import sys; sys.path.insert(0, '.'); import $module_name" 2>&1) || rc=$?
+    # MIRROR_BRIDGE_REPORT_DECLINED makes the module name every method the
+    # gate refused. It is off for everyone else because a large library
+    # declines hundreds and this runs at import, so a user's program would
+    # wear the whole list every time.
+    log=$(cd "$out_dir" && MIRROR_BRIDGE_REPORT_DECLINED=1 python3 -c "import sys; sys.path.insert(0, '.'); import $module_name" 2>&1) || rc=$?
 
     # Every line the module printed about a name it declined. The reason text
     # comes from the module, which is the only place that knows which gate
@@ -1046,6 +1051,10 @@ verify_python_module() {
                 name="${line#*skipped function $q}"; name="${name%%$q*}"
                 reason="${line#*(}"; reason="${reason%)}"
                 VERIFY_SKIPPED_FUNCS+=("$name — $reason") ;;
+            "mirror_bridge: skipped method $q"*)
+                name="${line#*skipped method $q}"; name="${name%%$q*}"
+                reason="${line#*(}"; reason="${reason%)}"
+                VERIFY_SKIPPED_METHODS+=("$name — $reason") ;;
             "mirror_bridge: skipped $q"*)
                 name="${line#*skipped $q}"; name="${name%%$q*}"
                 reason="${line#*(}"; reason="${reason%)}"
@@ -1105,6 +1114,7 @@ report_unbound() {
 
     local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#unbound_enums[@]}
                     + ${#VERIFY_SKIPPED_CLASSES[@]} + ${#VERIFY_SKIPPED_FUNCS[@]}
+                    + ${#VERIFY_SKIPPED_METHODS[@]}
                     + ${#COLLIDED_CLASSES[@]} ))
     [ "$total" -eq 0 ] && return 0
 
@@ -1159,6 +1169,11 @@ report_unbound() {
         echo ""
         echo "    ${#VERIFY_SKIPPED_FUNCS[@]} free function(s) the module declined"
         print_reasoned VERIFY_SKIPPED_FUNCS
+    fi
+    if [ ${#VERIFY_SKIPPED_METHODS[@]} -gt 0 ]; then
+        echo ""
+        echo "    ${#VERIFY_SKIPPED_METHODS[@]} method(s) the module declined — the class is bound, these are not on it"
+        print_reasoned VERIFY_SKIPPED_METHODS
     fi
     if [ ${#unbound_enums[@]} -gt 0 ]; then
         echo ""
@@ -1908,6 +1923,9 @@ cmd_generate() {
             done
             for i in "${VERIFY_SKIPPED_FUNCS[@]:-}"; do
                 [ -n "$i" ] && declined_json+="{\"kind\":\"function\",\"name\":\"$(json_escape "${i%% — *}")\",\"reason\":\"$(json_escape "${i#* — }")\"},"
+            done
+            for i in "${VERIFY_SKIPPED_METHODS[@]:-}"; do
+                [ -n "$i" ] && declined_json+="{\"kind\":\"method\",\"name\":\"$(json_escape "${i%% — *}")\",\"reason\":\"$(json_escape "${i#* — }")\"},"
             done
         fi
         [ "$VERIFY_OK" -eq 1 ] || status="error"
