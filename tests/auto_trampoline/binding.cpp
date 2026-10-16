@@ -8,6 +8,7 @@ using namespace shapes;
 
 MIRROR_BRIDGE_MODULE(auto_trampoline_test,
     mirror_bridge::bind_class_auto<Animal>(m, "Animal");
+    mirror_bridge::bind_class_auto<Robot>(m, "Robot");
     mirror_bridge::bind_class<Zoo>(m, "Zoo");
     mirror_bridge::bind_function<&shapes::CloneAnimal>(m, "clone_animal");
 )

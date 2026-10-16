@@ -6979,6 +6979,27 @@ void register_base_upcasts() {
     }(std::make_index_sequence<BaseClosure<T>::types.size()>{});
 }
 
+// The slots bind_class_auto substitutes, handed to bind_class rather than
+// written over the type object afterwards.
+//
+// tp_init is the reason this exists. PyType_Ready builds the __init__ entry
+// in tp_dict from whatever tp_init holds at that moment and stores the
+// function pointer inside the descriptor, so a slot overwritten afterwards
+// is not the one `super().__init__()` reaches -- the object would be
+// constructed without its vtable swap and the Python overrides would
+// silently stop dispatching. tp_new has no such problem, because __new__
+// reads the live slot on every call, but it travels here too so there is one
+// rule instead of two.
+//
+// Declared here, filled in python/mirror_bridge_auto_trampoline.hpp: that
+// header is included after this one and needs bind_class, so the dependency
+// cannot run the other way.
+struct AutoTrampolineSlots {
+    newfunc tp_new = nullptr;
+    initproc tp_init = nullptr;
+    destructor tp_dealloc = nullptr;
+};
+
 // Main binding function — generates Python type object for a C++ class.
 //
 // Takes an optional `Trampoline` template parameter (defaulting to T). When
@@ -6987,7 +7008,9 @@ void register_base_upcasts() {
 // forwards each virtual call to the Python override if one exists.
 // The `mirror_bridge generate --trampolines` tool emits the trampoline class.
 template<Bindable T, typename Trampoline = T>
-BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_hash = nullptr) {
+BoundClass<T> bind_class(PyObject* module, const char* name,
+                         const char* file_hash = nullptr,
+                         const AutoTrampolineSlots* autos = nullptr) {
     static_assert(std::is_base_of_v<T, Trampoline> || std::is_same_v<T, Trampoline>,
         "Trampoline must derive from T (or be T itself)");
     // Compile-time validation: ensure all member types are convertible
@@ -7106,7 +7129,8 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
         .tp_name = qualified_name.c_str(),
         .tp_basicsize = static_cast<Py_ssize_t>(wrapper_basicsize<T>),
         .tp_itemsize = 0,
-        .tp_dealloc = py_dealloc<T>,
+        .tp_dealloc = (autos && autos->tp_dealloc) ? autos->tp_dealloc
+                                                   : (destructor)py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,
         .tp_as_number = num_slots,
         .tp_as_sequence = seq_slots,
@@ -7118,8 +7142,15 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
         .tp_iter = iter_slot,
         .tp_methods = methods.data(),
         .tp_getset = getsetters.data(),
-        .tp_init = (ctor_count > 0) ? (initproc)py_init<T, Trampoline> : nullptr,
-        .tp_new = (ctor_count > 0) ? py_new_with_init<T> : py_new<T, Trampoline>,
+        .tp_init = (ctor_count == 0) ? nullptr
+                 : (autos && autos->tp_init) ? autos->tp_init
+                 : (initproc)py_init<T, Trampoline>,
+        // With a parameterized constructor the object is built in tp_init, so
+        // that is where the auto slot has to go; with only a default one it is
+        // built here. Exactly one of the two is ever the auto variant.
+        .tp_new = (ctor_count > 0) ? py_new_with_init<T>
+                : (autos && autos->tp_new) ? autos->tp_new
+                : (newfunc)py_new<T, Trampoline>,
     };
 
     if constexpr (datamodel::is_iterable<T>()) {
