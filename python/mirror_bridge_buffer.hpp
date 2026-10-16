@@ -103,6 +103,15 @@ struct BufferViewObject {
     Container* container;      // Pointer to the C++ container
     PyObject* owner;           // Reference to the owner object (prevents deallocation)
     bool owns_data;            // True if we own the container and should delete it
+
+    // Per-view, because a Py_buffer points at this memory and the consumer may
+    // hold several at once. These were function-local statics shared by every
+    // view of the same container type, so acquiring a second buffer rewrote
+    // what the first one reported: a view of 3 doubles went on to describe
+    // itself as 1000 elements over its 24-byte allocation, and a consumer that
+    // trusts shape (which the protocol tells it to) reads 8000 bytes.
+    Py_ssize_t shape[1];
+    Py_ssize_t strides[1];
 };
 
 // Forward declarations
@@ -181,16 +190,17 @@ int buffer_getbuffer(PyObject* self, Py_buffer* view, int flags) {
     view->itemsize = sizeof(ValueT);
     view->readonly = 0;  // Allow writes
     view->ndim = 1;
-    view->format = const_cast<char*>(fmt);
 
-    // Allocate shape and strides
-    static Py_ssize_t shape_val;
-    static Py_ssize_t strides_val;
-    shape_val = static_cast<Py_ssize_t>(obj->container->size());
-    strides_val = sizeof(ValueT);
+    obj->shape[0] = static_cast<Py_ssize_t>(obj->container->size());
+    obj->strides[0] = sizeof(ValueT);
 
-    view->shape = &shape_val;
-    view->strides = &strides_val;
+    // The flags say what the consumer asked for, and the protocol requires
+    // the fields it did not ask for to be null rather than helpfully filled.
+    // Everything was filled unconditionally, which is a consumer-visible lie
+    // for a PyBUF_SIMPLE request.
+    view->format = (flags & PyBUF_FORMAT) ? const_cast<char*>(fmt) : nullptr;
+    view->shape = (flags & PyBUF_ND) ? obj->shape : nullptr;
+    view->strides = ((flags & PyBUF_STRIDES) == PyBUF_STRIDES) ? obj->strides : nullptr;
     view->suboffsets = nullptr;
     view->internal = nullptr;
 

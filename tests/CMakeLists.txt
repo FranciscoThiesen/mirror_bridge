@@ -476,6 +476,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
     )
 endif()
 
+# Buffer views describe themselves per view, which only a consumer holding two
+# Py_buffers at once can tell. Not a binding, so it has its own compile.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/buffer_views)
+    add_test(NAME buffer_views
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/buffer_views/test_buffer_shape.sh
+    )
+    set_tests_properties(buffer_views PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # The compatibility corpus decides what the project claims about real
 # libraries, and its usability bar (must_export) and regression ladder are the
 # two pieces of judgement in it. Pure Python, so this runs with no reflection
