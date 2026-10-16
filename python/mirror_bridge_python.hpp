@@ -5916,10 +5916,13 @@ void collect_method_stub(const char* class_name) {
     if constexpr (method_is_batchable<T, FuncIndex>()) {
         using Param = std::remove_cvref_t<method_param_t<T, FuncIndex, 0>>;
         using Ret = std::remove_cv_t<typename [:get_method_return_type<T, FuncIndex>():]>;
+        // METH_O: one positional argument, no keywords. The stub has to say
+        // so with a `/`, or a type checker approves obj.scale_batch(xs=...)
+        // and the call fails at runtime.
         stubgen::register_method_stub<std::vector<Ret>, const std::vector<Param>&>(
             class_name, batch_method_name<T, FuncIndex>(),
             {std::string(param_name<T, FuncIndex, 0>()) + "s"},
-            /*is_static=*/false, 1);
+            /*is_static=*/false, /*min_required=*/1, /*positional_only=*/true);
     }
 }
 

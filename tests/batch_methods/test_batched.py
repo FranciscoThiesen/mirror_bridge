@@ -103,6 +103,22 @@ for bad, what in (("not a sequence", "a string"), (5.0, "a bare number"),
     except TypeError:
         check(True, f"{what} raises TypeError")
 
+print("the stub says the sibling takes no keyword, because it cannot:")
+# METH_O accepts one positional argument and nothing else. Without a `/` in
+# the stub a type checker approves scale_batch(xs=[...]), which fails at
+# runtime, and the keyword-capability answer would be derived twice: once
+# from ml_flags here and once from is_static in the stub generator.
+stubs = batched.__mirror_bridge_stubs__()
+line = [l for l in stubs.splitlines() if "def scale_batch(" in l]
+check(bool(line), "the stub declares scale_batch")
+if line:
+    check("/" in line[0], f"and marks it positional-only: {line[0].strip()}")
+try:
+    b.scale_batch(xs=[1.0])
+    check(False, "a keyword call is refused at runtime")
+except TypeError:
+    check(True, "a keyword call is refused at runtime, as the stub says")
+
 print("the result is the type the conversion table promises:")
 out = b.scale_batch([1.0, 2.0])
 check(type(out).__name__ == "array" and out.typecode == "d",
