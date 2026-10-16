@@ -96,6 +96,15 @@ RUN echo '#include <meta>' > /tmp/test.cpp && \
     rm /tmp/test.cpp /tmp/test && \
     echo "SUCCESS: <meta> header is available"
 
+# numpy and scipy are measured competitors, not conveniences: the trading
+# suite compares a binding call against a vectorised baseline, and
+# scipy.signal.lfilter is the honest full-array EWMA to beat. Without them
+# run_trading_benchmarks.py records numpy as absent and
+# format_trading_results.py refuses to render a page that would claim a
+# comparison it never made, which failed the whole refresh. Last in the file
+# so it does not invalidate the cached clang-p2996 build above it.
+RUN pip3 install --no-cache-dir numpy scipy
+
 # Create workspace directory
 WORKDIR /workspace
 

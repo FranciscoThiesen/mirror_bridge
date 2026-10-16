@@ -65,12 +65,33 @@ jobs:
           ' docs/internals/benchmarks.md > /tmp/benchmarks.md
           mv /tmp/benchmarks.md docs/internals/benchmarks.md
 
+      # format_trading_results.py refuses to render when numpy was absent,
+      # because the page would then claim a vectorised comparison it never
+      # made. That refusal is right, but it used to be fatal here, and this
+      # step runs before the PR: one missing competitor threw away a runtime
+      # table that had already regenerated cleanly. The whole monthly refresh
+      # died that way, which is why the published page kept seven of the
+      # twelve measured operations and ratio_floors.json never landed.
+      #
+      # So record the refusal and leave the committed trading fragment where
+      # it is. It carries its own provenance line, so a page with a fresh
+      # runtime table and last month's trading table still says which is
+      # which. A later step does the failing, after the PR exists.
       - name: Splice regenerated trading table into the benchmarks page
+        id: trading
         run: |
+          set +e
           python3 benchmarks/format_trading_results.py \
             --commit "$GITHUB_SHA" \
             --env "GitHub Actions ubuntu-latest ($(nproc) cores, containerized)" \
             --fragment > /tmp/trading_fragment.md
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "the trading table did not render; keeping the committed one"
+            exit 0
+          fi
+          set -e
           awk '
             /<!-- TRADING:BEGIN/ { print; system("cat /tmp/trading_fragment.md"); skip=1; next }
             /<!-- TRADING:END/   { skip=0 }
@@ -113,6 +134,14 @@ jobs:
           python3 benchmarks/format_results.py \
             benchmarks/runtime/python/runtime_results.json \
             --fragment --strict > /dev/null
+
+      - name: Fail if the trading table could not be regenerated
+        run: |
+          if [ "${{ steps.trading.outputs.rc }}" != "0" ]; then
+            echo "See the 'Splice regenerated trading table' step above for why."
+            echo "The page kept its committed trading numbers; the runtime table is fresh."
+            exit 1
+          fi
 
       - name: Fail if a ratio regressed, or if nothing was gated
         run: |
