@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Mirror Bridge Doctor - Diagnose setup issues
 # Usage: mirror_bridge_doctor [--verbose] [--fix]
 

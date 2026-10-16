@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Mirror Bridge - Unified CLI Tool
 # Generates C++ bindings for Python, Lua, and JavaScript using C++26 reflection
 #
@@ -16,6 +16,22 @@
 #   init        Initialize a new Mirror Bridge project
 #   version     Show version information
 
+# Associative arrays and name references below need bash 4. macOS still ships
+# bash 3.2 from 2007 and will not ship a newer one, so without this check the
+# first `declare -A` fails with "declare: -A: invalid option" and that is the
+# entire output of every subcommand, `doctor` included. env rather than
+# /bin/bash in the shebang so a newer bash earlier in PATH is used when there
+# is one.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "mirror_bridge needs bash 4 or newer. This is ${BASH_VERSION:-not bash}." >&2
+    echo "" >&2
+    echo "macOS ships bash 3.2. Any newer bash on PATH is used automatically:" >&2
+    echo "    brew install bash" >&2
+    echo "" >&2
+    echo "Or run everything inside the container, which has one:" >&2
+    echo "    ./start_dev_container.sh" >&2
+    exit 1
+fi
 set -e
 
 # Colors
@@ -42,7 +58,12 @@ USE_PCH=""
 PCH_PATH=""
 LANG="python"
 RELEASE_GIL=0
-GEN_STUBS=0
+# The .pyi is how a reader, an IDE, a type checker and an agent all learn what
+# the module exposes, and emitting it costs one import of a module that was
+# just built. Off by default meant the artifact built for those consumers was
+# never written unless someone already knew to ask: --stubs and .pyi appear
+# nowhere in AGENTS.md, quickstart.md or workflow.md. --no-stubs opts out.
+GEN_STUBS=1
 NO_TEMPLATES=0
 # Enum types found while scanning. The Python backend binds them as
 # enum.IntEnum (an IntEnum member is an int, so no conversion changes); the
@@ -136,8 +157,20 @@ suggest_fix() {
         echo "Lua dev headers missing. Install liblua5.4-dev"
     elif echo "$log" | grep -q "node_api.h"; then
         echo "Node.js N-API headers missing. Headers normally ship with the Node.js installation"
+    elif echo "$log" | grep -q "no matching function for call to 'from_python'"; then
+        # The most common real failure in the corpus, and the one the error
+        # catalogue had no entry for. It is always a parameter type nothing
+        # converts, and the error names it two notes down.
+        echo "A parameter type has no conversion from Python. The failing type is named in the first 'note: candidate' line of the generated binding's error. Give that method a wrapper taking a supported type, or exclude it. See docs/reference/type-conversion.md"
+    elif echo "$log" | grep -qE "fatal error: '[^']+' file not found"; then
+        # Overwhelmingly a header the library includes by a prefix the caller
+        # did not pass, e.g. yaml-cpp's own <yaml-cpp/dll.h> when -I points at
+        # include/yaml-cpp rather than include.
+        local missing
+        missing=$(echo "$log" | grep -oE "fatal error: '[^']+' file not found" | head -1 | sed "s/.*'\(.*\)'.*/\1/")
+        echo "A header the library includes was not found: $missing. Point --include-dir (-I) at the directory that prefix is relative to, which is usually the include root rather than the subdirectory you are generating from"
     else
-        echo "Re-run with --verbose for the full compiler output"
+        echo "Re-run with --verbose for the full compiler output. The generated binding is kept on failure, and the line numbers in the errors refer to it"
     fi
 }
 
@@ -218,7 +251,9 @@ ${YELLOW}Options:${NC}
                       with callbacks and virtual overrides, which re-acquire)
   --stubs             Python: write <module>.pyi next to the built module —
                       reflection-exact signatures with real C++ parameter
-                      names (no runtime parsing; stubs can't drift)
+                      names (no runtime parsing; stubs can't drift). On by
+                      default; this flag is kept so existing commands work
+  --no-stubs          Skip the .pyi
   --link-args ARGS    Extra link inputs for non-header-only libraries
                       (e.g. --link-args "/path/to/libFoo.a -lz")
   -D, --define M[=V]  Define a preprocessor macro for both the reflection
@@ -1631,6 +1666,7 @@ cmd_generate() {
             --batch) EXTRA_DEFINES+=("-DMIRROR_BRIDGE_BATCH_METHODS"); shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
+            --no-stubs) GEN_STUBS=0; shift ;;
             --link-args) LINK_ARGS="$2"; shift 2 ;;
             --instantiate) INSTANTIATE+=("$2"); shift 2 ;;
             --exclude) EXCLUDE_PATTERNS+=("$2"); shift 2 ;;
@@ -1807,15 +1843,26 @@ cmd_generate() {
             if [ "$GEN_STUBS" -eq 1 ] && [ "$lang" = "python" ]; then
                 emit_stubs "$module_name" "$OUTPUT_DIR"
             fi
+            if [ $KEEP_GENERATED -eq 0 ]; then
+                rm -f "$binding_file"
+            fi
         else
             failed_langs+=("$lang")
             local first_err
             first_err=$(echo "$LAST_COMPILE_LOG" | grep -m1 -E "error" || echo "compilation failed")
-            errors_json+="{\"lang\":\"$(json_escape "$lang")\",\"reason\":\"$(json_escape "$first_err")\",\"suggestion\":\"$(json_escape "$(suggest_fix "$LAST_COMPILE_LOG")")\"},"
-        fi
+            # generated_binding is in the JSON as well as on the terminal:
+            # the MCP server returns this object and discards stderr, so
+            # without it an agent is told a line number with no file.
+            errors_json+="{\"lang\":\"$(json_escape "$lang")\",\"reason\":\"$(json_escape "$first_err")\",\"suggestion\":\"$(json_escape "$(suggest_fix "$LAST_COMPILE_LOG")")\",\"generated_binding\":\"$(json_escape "$binding_file")\"},"
 
-        if [ $KEEP_GENERATED -eq 0 ]; then
-            rm -f "$binding_file"
+            # Kept, deliberately, and only on this branch. The compiler error
+            # names a line in this file, and deleting it left the reader with
+            # one grepped line and nowhere to look it up. A generated binding
+            # is cheap to regenerate and useless to regenerate from memory.
+            echo ""
+            echo -e "${YELLOW}The generated binding is kept so the errors above can be read:${NC}"
+            echo "    $binding_file"
+            echo "  Line numbers in the compiler output refer to it."
         fi
     done
 

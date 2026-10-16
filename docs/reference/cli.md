@@ -361,23 +361,24 @@ mirror_bridge init [dir] [options]
 
 | Argument | Description |
 |----------|-------------|
-| `[dir]` | Project directory (default: current directory) |
+| `<project_name>` | Directory to create. Required; the module is named after it |
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--name NAME` | Module name |
-| `--lang LANG` | Target language(s) |
+| `--lang, -l LANG` | Target language: `python`, `lua`, `js`, or `all` (default: `python`) |
+| `--wheel` | Also scaffold pip packaging: `pyproject.toml` with scikit-build-core, a CMake build, and a wheel-building workflow |
+| `--no-ci` | Skip the GitHub Actions workflow |
 
 **Examples:**
 
 ```bash
-# Initialize in current directory
-mirror_bridge init --name my_module
+# Scaffold a Python project
+mirror_bridge init my_project
 
-# Initialize in new directory
-mirror_bridge init my_project --name my_module --lang all
+# All three backends, with pip packaging
+mirror_bridge init my_project --lang all --wheel
 ```
 
 ## Global Options

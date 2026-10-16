@@ -26,8 +26,7 @@ my_project/
 ├── build/
 │   ├── my_lib_binding.cpp     # Auto-generated binding
 │   └── my_lib.so              # Compiled shared library
-├── pyproject.toml              # Package metadata
-├── setup.py                    # Build configuration
+├── pyproject.toml              # Package metadata and build configuration
 └── my_lib/
     ├── __init__.py             # Python package init
     └── my_lib.so -> ../build/my_lib.so
@@ -167,14 +166,28 @@ mirror_bridge_python_module(my_lib
 install(TARGETS my_lib DESTINATION my_lib)
 ```
 
-## Example: Complete Distributable Project
+## Example: project layout
 
-See [examples/packaging/](../../examples/packaging/) for a complete working example with:
-- C++ source header
-- pyproject.toml configuration
-- setup.py with auto-build
-- __init__.py with proper imports
-- Tests with pytest
+[examples/packaging/](../../examples/packaging/) shows the shape of a
+distributable project: a C++ header, a `pyproject.toml`, an `__init__.py` that
+imports the built module, and a pytest file. It is a layout to copy, not a
+wheel that builds: it has no build step and does not install the `.so`, so
+building it produces a package whose `__init__.py` raises the ImportError it
+is written to raise.
+
+For a wheel that actually builds, use the scaffold instead:
+
+```bash
+mirror_bridge init my_project --wheel
+```
+
+which writes a `pyproject.toml` using scikit-build-core, a CMake build for the
+extension, and a workflow that builds the wheel in the reflection container.
+
+Either way, the resulting `.so` is linked against the toolchain that built it.
+With the default clang image that means it needs `libc++.so.1` on the machine
+that imports it, which a stock Linux box does not have. Build with GCC
+(`MB_CXX=g++`) for a module that links against the libstdc++ already there.
 
 ## Tips
 

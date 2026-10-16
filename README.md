@@ -64,7 +64,7 @@ mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/
 
 And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
 
-### And on sixteen libraries we didn't pick
+### And on thirty-one libraries we didn't pick
 
 Open3D is a case we worked, so on its own it proves only that it can be done.
 To make the claim falsifiable instead, CI runs the same one-line command every
@@ -146,10 +146,10 @@ python3 test_greeter.py
 | **Nested Objects** | ✅ | ✅ | ✅ |
 | **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ |
 | **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ |
-| **Enums** | ⚠️ | ⚠️ | ⚠️ |
+| **Enums** | ✅ | ⚠️ | ⚠️ |
 | **Inheritance** | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ |
-| **Smart Pointers** | ✅ | ✅ | ✅ |
+| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ |
 | **Exception Handling** | ✅ | ✅ | ✅ |
 | **Cross-Module Types** | ✅ | ❌ | ❌ |
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
@@ -178,11 +178,19 @@ objects remain two distinct keys. Hashing the member values instead would be
 worse: every non-`const` member is assignable from Python, and a hash that
 moves corrupts any set or dict already holding the object.
 
-⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
-enum *types* are not exported, so there is no Python, Lua or JavaScript object
-for them and an out-of-range integer is accepted rather than rejected.
-`generate` names every enum it skipped. Tracked in
-[#20](https://github.com/FranciscoThiesen/mirror_bridge/issues/20).
+⚠️ **Enums, outside Python**: Python gets the enum type as an `enum.IntEnum`
+carrying the C++ enumerator names and values, so `Color.Red` exists and
+`list(Color)` works. Nothing about the value conversion changed, because an
+`IntEnum` member is an `int`. Lua and JavaScript have no enum object to map
+onto and their values still cross as bare numbers; `generate` says which
+backend does which. An out-of-range integer is still accepted where an enum
+is expected, in every backend.
+
+⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
+`shared_ptr` return gives you a usable object. What does not cross is the
+shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
+parameter is refused. Tracked in
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ### Additional Features
 

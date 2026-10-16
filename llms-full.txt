@@ -68,7 +68,7 @@ mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/
 
 And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
 
-### And on sixteen libraries we didn't pick
+### And on thirty-one libraries we didn't pick
 
 Open3D is a case we worked, so on its own it proves only that it can be done.
 To make the claim falsifiable instead, CI runs the same one-line command every
@@ -150,10 +150,10 @@ python3 test_greeter.py
 | **Nested Objects** | ✅ | ✅ | ✅ |
 | **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ |
 | **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ |
-| **Enums** | ⚠️ | ⚠️ | ⚠️ |
+| **Enums** | ✅ | ⚠️ | ⚠️ |
 | **Inheritance** | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ |
-| **Smart Pointers** | ✅ | ✅ | ✅ |
+| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ |
 | **Exception Handling** | ✅ | ✅ | ✅ |
 | **Cross-Module Types** | ✅ | ❌ | ❌ |
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
@@ -182,11 +182,19 @@ objects remain two distinct keys. Hashing the member values instead would be
 worse: every non-`const` member is assignable from Python, and a hash that
 moves corrupts any set or dict already holding the object.
 
-⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
-enum *types* are not exported, so there is no Python, Lua or JavaScript object
-for them and an out-of-range integer is accepted rather than rejected.
-`generate` names every enum it skipped. Tracked in
-[#20](https://github.com/FranciscoThiesen/mirror_bridge/issues/20).
+⚠️ **Enums, outside Python**: Python gets the enum type as an `enum.IntEnum`
+carrying the C++ enumerator names and values, so `Color.Red` exists and
+`list(Color)` works. Nothing about the value conversion changed, because an
+`IntEnum` member is an `int`. Lua and JavaScript have no enum object to map
+onto and their values still cross as bare numbers; `generate` says which
+backend does which. An out-of-range integer is still accepted where an enum
+is expected, in every backend.
+
+⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
+`shared_ptr` return gives you a usable object. What does not cross is the
+shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
+parameter is refused. Tracked in
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ### Additional Features
 
@@ -1812,8 +1820,7 @@ my_project/
 ├── build/
 │   ├── my_lib_binding.cpp     # Auto-generated binding
 │   └── my_lib.so              # Compiled shared library
-├── pyproject.toml              # Package metadata
-├── setup.py                    # Build configuration
+├── pyproject.toml              # Package metadata and build configuration
 └── my_lib/
     ├── __init__.py             # Python package init
     └── my_lib.so -> ../build/my_lib.so
@@ -1953,14 +1960,28 @@ mirror_bridge_python_module(my_lib
 install(TARGETS my_lib DESTINATION my_lib)
 ```
 
-## Example: Complete Distributable Project
+## Example: project layout
 
-See [examples/packaging/](../../examples/packaging/) for a complete working example with:
-- C++ source header
-- pyproject.toml configuration
-- setup.py with auto-build
-- __init__.py with proper imports
-- Tests with pytest
+[examples/packaging/](../../examples/packaging/) shows the shape of a
+distributable project: a C++ header, a `pyproject.toml`, an `__init__.py` that
+imports the built module, and a pytest file. It is a layout to copy, not a
+wheel that builds: it has no build step and does not install the `.so`, so
+building it produces a package whose `__init__.py` raises the ImportError it
+is written to raise.
+
+For a wheel that actually builds, use the scaffold instead:
+
+```bash
+mirror_bridge init my_project --wheel
+```
+
+which writes a `pyproject.toml` using scikit-build-core, a CMake build for the
+extension, and a workflow that builds the wheel in the reflection container.
+
+Either way, the resulting `.so` is linked against the toolchain that built it.
+With the default clang image that means it needs `libc++.so.1` on the machine
+that imports it, which a stock Linux box does not have. Build with GCC
+(`MB_CXX=g++`) for a module that links against the libstdc++ already there.
 
 ## Tips
 
@@ -3353,23 +3374,24 @@ mirror_bridge init [dir] [options]
 
 | Argument | Description |
 |----------|-------------|
-| `[dir]` | Project directory (default: current directory) |
+| `<project_name>` | Directory to create. Required; the module is named after it |
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--name NAME` | Module name |
-| `--lang LANG` | Target language(s) |
+| `--lang, -l LANG` | Target language: `python`, `lua`, `js`, or `all` (default: `python`) |
+| `--wheel` | Also scaffold pip packaging: `pyproject.toml` with scikit-build-core, a CMake build, and a wheel-building workflow |
+| `--no-ci` | Skip the GitHub Actions workflow |
 
 **Examples:**
 
 ```bash
-# Initialize in current directory
-mirror_bridge init --name my_module
+# Scaffold a Python project
+mirror_bridge init my_project
 
-# Initialize in new directory
-mirror_bridge init my_project --name my_module --lang all
+# All three backends, with pip packaging
+mirror_bridge init my_project --lang all --wheel
 ```
 
 ## Global Options
@@ -6077,6 +6099,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The CLI runs on macOS.** Every script here uses associative arrays or name references, both bash 4, and all five carried `#!/bin/bash`. macOS ships bash 3.2 from 2007 and will not ship a newer one, so the entire output of every subcommand, `doctor` included, was `declare: -A: invalid option` and exit 2. `docs/README.md` lists macOS as supported and every page says `./tools/mirror_bridge`; all fifteen CI `runs-on` entries are `ubuntu-latest`, so nothing was going to catch it. The shebang is `env bash` now, so a newer bash on PATH is used, and a guard above the first bash-4 construct says what is wrong and what to do about it. `tests/shell_portability/` pins the rule rather than the instance: any script using bash-4 syntax checks `BASH_VERSINFO` before reaching it. It found two more CLIs while being written.
+- **A failed build keeps the file the compiler is complaining about.** The generated binding was deleted on the failure branch too, so the reader got one grepped line referring to line numbers in a file that no longer existed, plus "re-run with --verbose", whose output goes to stderr and which the MCP server discards. The `.cpp` now survives a failure, the terminal says where it is, and `--json` carries `generated_binding` so an agent gets a path rather than a bare line number. Two suggestions were added for errors that had none, including `no matching function for call to 'from_python'`, which is the most common real failure in the corpus and had no entry in the catalogue.
+- **Three documented things that were not true.** The README said enums do not work, hours after they started working, and pointed at a closed issue; it said smart pointers work, which #54 says they do not in either direction; and it counted sixteen corpus libraries where the matrix publishes thirty-two. `docs/reference/cli.md` documented `init --name`, which the CLI rejects. `docs/guides/packaging.md` promised a `setup.py with auto-build` in `examples/packaging/`, which has four files and no build step, so following it produces a package that can only raise the ImportError its own `__init__.py` is written to raise.
 - **Ten of the eleven numbered examples run again, and CI runs all of them.** Six were failing and had been for a long time, which nobody could see because the test harness globs `tests/` and the examples are not under it. That is the same blind spot that let `examples/open3d-comprehensive` ship with `o3d.PointCloud()` raising TypeError. Three asserted a `list` where a numeric vector has given an `array.array` for as long as the mapping has been documented, one called an overload under a mangled name the binder stopped emitting, one imported from the wrong directory, and one wanted enums, which now work. `tests/examples/test_examples.sh` builds and runs every one of them in 76 seconds, and takes its expectation from each example's own README: an example whose README carries a "not implemented" banner is expected to fail, and one that starts passing fails the test until the banner goes. `examples/10-smart-pointers` is the remaining failure and now says so, because `std::shared_ptr` is converted by value and the shared ownership does not cross the boundary either way (issue #54).
 - **The generated `.pyi` says `array[...]` where the runtime hands back an `array.array`.** A `std::vector<double>` crosses as `array('d')` and the stub said `list[float]`, which is worse than saying nothing: a type checker then approves `result + [1.0]` and `json.dumps(result)`, and an agent reading the stub to write the call has no way to find out. `type_hint` was one function serving three positions with three different right answers, so it now takes the position. Returns say what comes back. Parameters keep `list[T]`, deliberately: the ingest side takes a list, a tuple, an `array.array` or any buffer, and the obvious spelling for that, `Sequence[float]`, admits `bytes`, which `from_python` rejects outright, so it would approve a call that fails. A member whose read and write differ now renders as a property with a setter, and only where they differ, so an ordinary member stays an ordinary annotation. The decision itself moved next to the stub generator and `to_python` now reads it from there, because two copies of it is how the stub came to disagree with the runtime in the first place.
 - **Three smaller things the stub was wrong about.** `char` is arithmetic and signed, so it crosses as an `int` in both directions and the stub said `str`. `bytes` has exactly one producer, `std::vector<unsigned char>`, while the stub also claimed it for `std::vector<char>`, `std::vector<std::byte>` and `std::array<unsigned char, N>`, all of which come back as lists of `int`. And a numeric vector the `array` module has no typecode for, such as `std::vector<long double>` or `std::vector<signed char>`, is a list: the stub mirrors the typecode table rather than approximating it with "numeric".
@@ -6092,6 +6117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Namespaces a macro opens no longer poison the generated binding.** The `using namespace` lines are read from header text, which cannot expand a macro, so nlohmann-json's `NLOHMANN_JSON_NAMESPACE_BEGIN` produced `using namespace detail::detail::detail;` and seventeen errors before the first line of binding code. They exist only so unqualified names from the text scan resolve, and are now emitted only for it; reflection reports names in full.
 
 ### Added
+- **The `.pyi` is written by default.** `--stubs` was off, and `--stubs` and `.pyi` appear nowhere in `AGENTS.md`, `quickstart.md` or `workflow.md`, so the artifact that tells a reader, an IDE, a type checker and an agent what the module exposes was only written by someone who already knew to ask for it. It costs one import of a module that was just built, against a generate that takes seconds to minutes. `--no-stubs` opts out, and the default lives in the one place that decided it before.
 - **An enum reaches Python as an enum.** The values always crossed correctly, as plain `int`. The types did not, so a module with a `Color` parameter exposed 0, 1 and 2 with nothing in it saying which was which, and `book.add(99, ...)` was accepted. Each enum the CLI discovers is now bound as an `enum.IntEnum` carrying the C++ enumerator names and values, and the stub declares it and annotates members, returns and parameters with it instead of `int`. Nothing about the conversions changed, because an `IntEnum` member is an `int`: a function that took a bare int still takes one, and one that returns an enum still returns a bare int, which compares equal to the member. An enumerator whose name is a Python keyword gets a trailing underscore, because `Permission.None` is a syntax error rather than a failed attribute lookup, so there would be no spelling for a caller to find. Scoped, unscoped, nested and negative or non-contiguous values all work. Lua and JavaScript have no enum object to map onto, their values keep crossing as numbers, and the CLI's unbound report now says which backend does which. Closes #20, including its open question: enumerator values come out through an ordinary splice, where `display_string_of(constant_of(e))` had returned `(unsupported-reflection)`.
 - **`--batch`: a method you call in a Python loop gets a sibling that takes the whole sequence.** For each method taking and returning exactly one arithmetic value, `<name>_batch` is generated from reflection, so the boundary is crossed once instead of once per element. Measured over 100,000 elements: 6.8x from a list and 12.9x from an `array.array`, which is what another batch call returns. It carries state across the loop, which a list comprehension cannot be rewritten to do. Off by default because each sibling costs compile time -- +12% on a class with ten eligible methods, +55% with forty -- and because it is 1.0x when the method itself is the expensive part, the boundary having never been the cost. Generated rather than asked for: the header previously told the C++ author to write `process_batch` by hand, which is the team that owns the header doing work for the team that consumes it. Never generated over a `<name>_batch` the author wrote, and never for an overloaded name, a `bool`, a `void` return or anything non-arithmetic.
 
