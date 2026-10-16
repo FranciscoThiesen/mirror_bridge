@@ -26,7 +26,7 @@ OPERATIONS = [
     ("string_get", "String return (str out)"),
     ("string_set", "String argument (str in)"),
     ("vector_append", "Vector append (one double in)"),
-    ("vector_get", "Vector return (list out)"),
+    ("vector_get", "Vector return (100 doubles out)"),
     ("vector_set", "Vector argument (list in)"),
     ("attr_get", "Attribute read"),
     ("attr_set", "Attribute write"),
@@ -116,6 +116,25 @@ def main():
         "[`run_runtime_benchmarks.py`](../../benchmarks/runtime/python/run_runtime_benchmarks.py)."
     )
     out.append("")
+
+    floor = (data.get("_meta") or {}).get("harness_floor_ns") or {}
+    if floor.get("empty"):
+        empty = floor["empty"]
+        c_call = floor.get("c_call") or 0.0
+        out.append(
+            "**Read the ratios as bounds, not as the binding layer.** Every number above "
+            "is timed as `benchmark(name, lambda: ..., n)`, so each one carries a Python "
+            "loop iteration and a full Python function call on top of the operation. On "
+            "this run that floor is **%s** for an empty lambda and **%s** for the cheapest "
+            "real C method call CPython can make. The constant is the same for all four "
+            "frameworks, so it does not cancel in a ratio: it pulls every ratio toward "
+            "1.00. A ratio above 1.00x is therefore a **lower** bound on how much faster "
+            "mirror_bridge's binding layer is, and a ratio below 1.00x understates the gap "
+            "the other way. A row within a few percent of 1.00 is not a tie that has been "
+            "measured; it is a difference this instrument cannot resolve."
+            % (fmt_ns(empty), fmt_ns(c_call))
+        )
+        out.append("")
 
     # Asymmetric on purpose: an operation only a competitor measured is not
     # something this project can publish a ratio for, so only mirror_bridge's

@@ -35,6 +35,35 @@ def benchmark(name, func, iterations):
 
     return statistics.median(times)
 
+def measure_harness_floor():
+    """What benchmark() costs before any binding code runs.
+
+    Every number this suite publishes is `benchmark(name, lambda: ..., n)`,
+    and benchmark calls func() in a Python loop. So each one carries a loop
+    iteration plus a full Python function call on top of the operation. That
+    constant is the same for all four frameworks, which means it does not
+    cancel in a ratio -- it pushes every ratio toward 1.00. Publishing it is
+    what lets a reader tell a 2% tie from a measurement artifact.
+
+    Two floors, because one is not enough to correct with:
+      empty      an empty lambda: the loop and the call, nothing else.
+      c_call     the cheapest real C method call CPython can make, a
+                 METH_NOARGS builtin. The gap between this and `empty` is
+                 what any binding layer has to beat, and it is not zero.
+
+    Kept out of the per-framework results on purpose: `ratios()` in
+    check_ratios.py turns every key in there into a gated operation, and the
+    floor is a property of the harness and the machine rather than of any
+    framework.
+    """
+    one = 1
+    return {
+        "empty": benchmark("floor_empty", lambda: None, ITERATIONS["null_call"]),
+        "c_call": benchmark("floor_c_call", lambda: one.bit_length(),
+                            ITERATIONS["null_call"]),
+    }
+
+
 def run_benchmarks(module_name, obj_class):
     """Run all benchmarks on a module"""
     results = {}
@@ -124,10 +153,15 @@ def run_benchmarks(module_name, obj_class):
     )
 
     # 11. Attribute access - set
-    counter = [0]
+    #
+    # Assigns a constant. The previous version incremented a list element and
+    # read it back on every iteration -- `obj.counter = counter[0];
+    # counter[0] += 1` -- so a list subscript load, a subscript store and an
+    # int add were inside the number published as "Attribute write". Measured
+    # at roughly a third of it. The written value does not change what a
+    # setter costs: there is no caching on the way in.
     def set_attr():
-        obj.counter = counter[0]
-        counter[0] += 1
+        obj.counter = 1
     results['attr_set'] = benchmark(
         'attr_set',
         set_attr,
@@ -251,7 +285,13 @@ if __name__ == '__main__':
 
         # Save results
         import json
+        print("Measuring the harness floor...")
+        floor = measure_harness_floor()
+        print("  empty lambda: %.1f ns, cheapest C call: %.1f ns"
+              % (floor["empty"], floor["c_call"]))
+
         all_results = {
+            '_meta': {'harness_floor_ns': floor},
             'mirror_bridge': results_mb,
             'pybind11': results_pb,
             'nanobind': results_nb,
