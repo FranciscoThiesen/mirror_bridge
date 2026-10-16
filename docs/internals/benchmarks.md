@@ -180,6 +180,48 @@ project size; regenerating after a header change is one CLI invocation.
 ./benchmarks/run_all_benchmarks.sh
 ```
 
+## Measured and declined
+
+Things that look like they should pay and do not. Each was built far enough to
+measure, and the measurement is recorded here so it does not have to be
+re-litigated.
+
+### `tp_vectorcall` on the bound type
+
+CPython's specializing interpreter (3.11+) only emits `CALL_BUILTIN_CLASS` for
+a type that has a `tp_vectorcall` slot. Our generated types do not set one, so
+every construction stays on the generic `CALL` path. Confirmed with
+`dis.get_instructions(f, adaptive=True)` on 3.13: a type without the slot keeps
+`CALL`, and the same type with it specializes.
+
+Two types identical but for the slot, 1.5M constructions, best of seven:
+
+| | `tp_init` only | with `tp_vectorcall` | |
+|---|---|---|---|
+| 3.13, no arguments | 27.0 ns | 25.2 ns | 1.07x |
+| 3.13, three arguments | 29.7 ns | 28.1 ns | 1.06x |
+| 3.10, no arguments | 46.2 ns | 45.7 ns | 1.01x |
+| 3.10, three arguments | 48.4 ns | 50.0 ns | 0.97x |
+
+So it is worth 6-7% on 3.11+ and nothing before it, because the argument tuple
+it avoids costs about 2 ns from the tuple freelist, not the 20 ns it looks like
+it should.
+
+The cheap way to get it is also the wrong way. A slot that converts the
+arguments back into a tuple and dict and hands them to `type_call` keeps
+constructor resolution in one place, but it is **slower than having no slot at
+all** — 0.90x at no arguments and 0.73x at three on 3.13 — because it pays for
+a tuple that CPython's own fallback builds more cheaply. The only version that
+wins is one that resolves constructors directly from the vectorcall array,
+which means a second implementation of overload resolution with defaults,
+keywords and trampolines in it. Six percent is not worth two copies of that:
+every binding bug found in this codebase so far has come from one piece of
+logic having two implementations.
+
+Worth revisiting if construction ever dominates a real workload, or if
+constructor resolution is restructured for another reason and the flat-array
+shape falls out of it for free.
+
 ## Trade-offs
 
 **Advantages**: zero binding code, faster than pybind11 at runtime,
