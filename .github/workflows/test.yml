@@ -172,8 +172,8 @@ jobs:
   # ============================================================================
   # GCC-based tests (upstream GCC 16+ C++26 reflection)
   # mirror_bridge supports stock GCC's P2996 implementation: the test runner
-  # auto-detects the compiler, splices are hoisted out of pack expansions so
-  # GCC accepts them, and the clang-only P3394 annotation tests are skipped.
+  # auto-detects the compiler and splices are hoisted out of pack expansions so
+  # GCC accepts them. Nothing is skipped on GCC: P3394 annotations work there too.
   # Enforced: a red GCC job fails the workflow, same as the Clang jobs.
   # ============================================================================
   test-gcc-python:

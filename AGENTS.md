@@ -10,8 +10,9 @@ A pre-reflection distro compiler will fail with "no member named 'meta'" or an u
 project's Docker container (or a GitHub Codespace). The CLI auto-detects whichever compiler is
 present; override with `MB_CXX`. Editing, searching, and reading code on the host is always fine.
 
-Note: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) are currently clang-p2996 only.
-On GCC they are silently ignored (all members bound) until GCC implements P3394.
+Note: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work under both
+compilers, in the Python backend. The Lua and JavaScript backends do not read them yet:
+they enumerate every named member, so an annotated field is still bound there.
 
 ## Environment setup
 
@@ -131,7 +132,7 @@ Auto-discovery binds **every** struct/class found in the scanned headers by defa
 
 - `// MIRROR_BRIDGE_SKIP` on the line **immediately before** a class → skips that class.
 - `// MIRROR_BRIDGE_SKIP_FILE` anywhere in a header → skips the whole file.
-- P3394 field annotations (require `-freflection-latest`; ignored on compilers without P3394):
+- P3394 field annotations (clang-p2996 needs `-freflection-latest`; read by the Python backend only):
 
 ```cpp
 #include "python/mirror_bridge_annotations.hpp"

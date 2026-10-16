@@ -19,44 +19,13 @@
 //   };
 //
 // Both supported toolchains implement P3394: Bloomberg's clang-p2996 with
-// -freflection-latest, and stock GCC 16+ with -freflection. They spell the
-// lookup differently, which read_annotation below is the single place that
-// knows about.
+// -freflection-latest, and stock GCC 16+ with -freflection.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
 #include <vector>
 #include <type_traits>
-
-// ---------------------------------------------------------------------------
-// Which spelling of P3394 this standard library has
-// ---------------------------------------------------------------------------
-//
-// P3394 reached the two implementations under different names and nothing else
-// about it differs:
-//
-//   libc++  (clang-p2996)  std::meta::annotation_of_type<T>(info)
-//                              -> std::optional<T>
-//   libstdc++ (GCC 16+)    std::meta::annotations_of_with_type(info, info)
-//                              -> a range of reflections
-//
-// The name belongs to the standard library rather than to the compiler, so the
-// test keys on the library macro. Neither name can be probed with a requires
-// expression: `std::meta::` is not dependent, so a qualified name that does
-// not exist is a hard error at parse time rather than a substitution failure.
-// That leaves the preprocessor, and overriding it from the command line for a
-// toolchain that pairs differently:
-//
-//   -DMIRROR_BRIDGE_P3394_OPTIONAL_SPELLING=0
-//
-#if !defined(MIRROR_BRIDGE_P3394_OPTIONAL_SPELLING)
-  #if defined(_LIBCPP_VERSION)
-    #define MIRROR_BRIDGE_P3394_OPTIONAL_SPELLING 1
-  #else
-    #define MIRROR_BRIDGE_P3394_OPTIONAL_SPELLING 0
-  #endif
-#endif
 
 namespace mirror_bridge {
 
@@ -76,32 +45,46 @@ struct readonly {
     constexpr bool operator==(const readonly&) const = default;
 };
 
-namespace detail {
-
-// Both supported toolchains have P3394. Kept as a named constant because it is
-// what a diagnostic or a test should ask, rather than re-deriving the macro.
-inline constexpr bool p3394_available = true;
-
-} // namespace detail
-
 // ============================================================================
 // Annotation Detection Helpers
 // ============================================================================
 
 namespace annotations {
 
-// The one place the two spellings differ.
+// Is this member annotated with one of these?
+//
+// Written against std::meta::annotations_of, which is the only part of P3394
+// that both standard libraries spell the same way. The convenience overloads
+// are not portable: libc++ has annotation_of_type<T>(info) -> optional<T> and
+// no annotations_of_with_type, libstdc++ has annotations_of_with_type(info,
+// info) and no annotation_of_type. Neither name can be probed with a requires
+// expression either, because std::meta:: is not a dependent scope, so a
+// qualified name that does not exist is a parse error rather than a
+// substitution failure. Going through annotations_of avoids the question.
+//
+// remove_const is load-bearing. type_of on an annotation is `const T` in
+// libstdc++ and `T` in libc++, so without it the comparison silently answers
+// false on GCC and this function would report no annotations at all.
+//
+// Comparing types also avoids a divergence in the convenience overloads worth
+// not inheriting: given two annotations of the same type with different values
+// on one member, libc++'s annotation_of_type extracts every match and throws
+// "inconsistent annotations", which is a hard compile error, while libstdc++'s
+// annotations_of_with_type returns both. This returns true on either, since it
+// never extracts anything.
+//
+// The range annotations_of returns owns a heap allocation in libstdc++, so it
+// is consumed inside this evaluation. Returning it, or binding it to a
+// constexpr variable, makes the result "a result of operator new" and it stops
+// being a constant expression.
 template<typename Annotation>
 consteval bool has_annotation(std::meta::info member) {
-#if MIRROR_BRIDGE_P3394_OPTIONAL_SPELLING
-    return std::meta::annotation_of_type<Annotation>(member).has_value();
-#else
-    // The range libstdc++ returns owns a heap allocation, so it has to be
-    // consumed inside this evaluation. Returning it, or binding it to a
-    // constexpr variable, makes the result "a result of operator new" and it
-    // stops being a constant expression.
-    return !std::meta::annotations_of_with_type(member, ^^Annotation).empty();
-#endif
+    for (std::meta::info a : std::meta::annotations_of(member)) {
+        if (std::meta::remove_const(std::meta::type_of(a)) == ^^Annotation) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // An anonymous union is a nonstatic data member with no name. identifier_of

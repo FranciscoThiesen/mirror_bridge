@@ -12,7 +12,7 @@ one minor release, an entry in the CHANGELOG, and a migration note:
 |---|---|
 | Module macros | `MIRROR_BRIDGE_MODULE`, `MIRROR_BRIDGE_LUA_MODULE`, `MIRROR_BRIDGE_JS_MODULE` |
 | Binding entry points | `mirror_bridge::bind_class<T>(m, "Name")` and the Lua/JS equivalents |
-| Field annotations | `[[=exclude{}]]`, `[[=readonly{}]]` (P3394) |
+| Field annotations | `[[=exclude{}]]`, `[[=readonly{}]]` (P3394), read by the Python backend |
 | Discovery opt-outs | `// MIRROR_BRIDGE_SKIP`, `// MIRROR_BRIDGE_SKIP_FILE` |
 | CLI commands & flags | `generate`, `build`, `pch`, `diff`, `watch`, `doctor`, `version` and their documented options |
 | `--json` output | Existing fields keep their names and types; changes are additive only |

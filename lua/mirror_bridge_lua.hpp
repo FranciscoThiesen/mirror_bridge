@@ -1229,7 +1229,8 @@ template<Bindable T>
 void bind_class(lua_State* L, const char* name) {
     static_assert(core::validate_bindable_members<T>(),
         "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
-        "Mark unconvertible members with [[=exclude{}]] or add a custom type converter.");
+        "Add a custom type converter for them. [[=exclude{}]] will not help here: "
+        "this backend binds every named member and does not read annotations yet.");
 
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();
 

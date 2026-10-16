@@ -74,13 +74,16 @@ p.bump_version()
 assert p.version == 2, f"the getter returned a stale {p.version}"
 print("  ✓ the getter reads the live field")
 
-print("Test 8: the member count reflects the exclusions...")
-visible = [n for n in dir(p) if not n.startswith("_")]
-assert "user_id" in visible and "created_at" in visible
+print("Test 8: the module exposes exactly the expected names...")
+# Asserted as sets rather than counted: a count passes for the wrong reason as
+# soon as one name is swapped for another, and says nothing about which.
+assert {n for n in dir(p) if not n.startswith("_")} == {
+    "user_id", "username", "created_at", "version",
+    "set_password", "peek_password", "stamp", "bump_version",
+}, sorted(n for n in dir(p) if not n.startswith("_"))
 plain = annotated.PlainProfile()
-assert hasattr(plain, "user_id") and hasattr(plain, "username")
-assert len([n for n in dir(plain) if not n.startswith("_")]) == 2, \
-    "the unannotated class should expose exactly its two fields"
+assert {n for n in dir(plain) if not n.startswith("_")} == {"user_id", "username"}, \
+    sorted(n for n in dir(plain) if not n.startswith("_"))
 print("  ✓ four of six fields on UserProfile, two of two on PlainProfile")
 
 print("\n✅ annotations behave the same on every supported compiler")

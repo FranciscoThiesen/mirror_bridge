@@ -8,10 +8,9 @@ Mirror Bridge requires a C++26 compiler with reflection (P2996) support. Two com
 The CLI auto-detects whichever is installed (force a choice with the `MB_CXX` environment variable).
 The easiest way to get a working toolchain is Docker.
 
-> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work on both. The two standard
-> libraries spell the lookup differently -- `std::meta::annotation_of_type` in libc++,
-> `std::meta::annotations_of_with_type` in libstdc++ -- and the binding header carries that one
-> difference, so a header you annotate behaves the same under either compiler.
+> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work on both compilers, in the
+> Python backend. The Lua and JavaScript backends bind every named member and do not read
+> annotations yet, so an annotated field is still exposed there.
 
 ## Docker Setup (Recommended)
 

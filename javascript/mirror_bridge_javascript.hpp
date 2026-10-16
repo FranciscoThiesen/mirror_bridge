@@ -1407,7 +1407,8 @@ template<Bindable T>
 napi_value bind_class(napi_env env, napi_value exports, const char* name) {
     static_assert(core::validate_bindable_members<T>(),
         "bind_class<T>: T contains members with types that mirror_bridge cannot convert. "
-        "Mark unconvertible members with [[=exclude{}]] or add a custom type converter.");
+        "Add a custom type converter for them. [[=exclude{}]] will not help here: "
+        "this backend binds every named member and does not read annotations yet.");
 
     constexpr std::size_t member_count = get_data_member_count<T>();
     constexpr std::size_t method_count = get_member_function_count<T>();

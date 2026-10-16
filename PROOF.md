@@ -497,8 +497,8 @@ V8 Tests (non-blocking):  Total: 3  Passed: 0  Failed: 3
 EXIT=0
 ```
 
-(59 rather than 61 bindings: the two P3394 annotation tests are skipped on GCC, as the
-harness already does.)
+(The count was 59 rather than 61 because the harness skipped the two P3394 annotation
+tests on GCC. It no longer does: P3394 works on both compilers, so all 61 build.)
 
 ---
 

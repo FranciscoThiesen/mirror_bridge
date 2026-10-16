@@ -239,7 +239,7 @@ mirror_bridge/
 - **Compiler**: a C++26 reflection compiler — stock **GCC 16+** (`-freflection`) or **Bloomberg clang-p2996**. Both are provided via Docker; the CLI auto-detects which is installed (override with `MB_CXX`).
 - **Python**: 3.7+ | **Lua**: 5.4 | **Node.js**: 14+
 
-> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work under both compilers. The two standard libraries spell the lookup differently and the binding header carries that difference, so the same annotated header behaves the same either way.
+> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work under both compilers, in the Python backend. The Lua and JavaScript backends do not read them yet: they bind every named member, so an annotated field is still exposed there.
 
 ## Contributing
 
