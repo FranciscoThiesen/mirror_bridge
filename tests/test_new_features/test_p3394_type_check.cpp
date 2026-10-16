@@ -1,23 +1,19 @@
 // Test: P3394 Annotation Type Checking
 //
-// Uses annotation_of_type<T>() to check for specific annotation types
+// Checks for specific annotation types on specific members.
+//
+// The lookup goes through mirror_bridge::annotations::has_annotation rather
+// than straight to the standard function, because the two implementations
+// spell it differently -- std::meta::annotation_of_type<T>(info) in libc++,
+// std::meta::annotations_of_with_type(info, info) in libstdc++ -- and a test
+// written against one spelling is a test that can only run on one of the two
+// compilers this project supports. That is how annotations came to be silently
+// ignored on GCC for as long as they were.
 
-#include <meta>
+#include "../../python/mirror_bridge_annotations.hpp"
+
 #include <iostream>
 #include <string>
-
-// ============================================================================
-// Annotation Types
-// ============================================================================
-
-namespace mirror_bridge {
-    struct exclude {
-        constexpr bool operator==(const exclude&) const = default;
-    };
-    struct readonly {
-        constexpr bool operator==(const readonly&) const = default;
-    };
-}
 
 // Import for clean syntax
 using mirror_bridge::exclude;
@@ -63,16 +59,14 @@ consteval const char* get_member_name() {
 
 template<typename T, std::size_t Index>
 consteval bool is_excluded() {
-    constexpr auto member = get_member<T, Index>();
-    // annotation_of_type<T>(member) returns optional<T> if annotation exists
-    return std::meta::annotation_of_type<mirror_bridge::exclude>(member).has_value();
+    return mirror_bridge::annotations::has_annotation<mirror_bridge::exclude>(
+        get_member<T, Index>());
 }
 
 template<typename T, std::size_t Index>
 consteval bool is_readonly() {
-    constexpr auto member = get_member<T, Index>();
-    // annotation_of_type<T>(member) returns optional<T> if annotation exists
-    return std::meta::annotation_of_type<mirror_bridge::readonly>(member).has_value();
+    return mirror_bridge::annotations::has_annotation<mirror_bridge::readonly>(
+        get_member<T, Index>());
 }
 
 // ============================================================================
@@ -124,6 +118,12 @@ int main() {
     std::cout << "    [[=exclude{}]] std::string password_hash;  // Excluded\n";
     std::cout << "    [[=readonly{}]] std::string created_at;    // Read-only\n";
     std::cout << "};\n";
+
+    static_assert(count_visible<UserProfile>() == 4,
+                  "two of the six members are excluded");
+    static_assert(is_excluded<UserProfile, 2>() && is_excluded<UserProfile, 3>());
+    static_assert(is_readonly<UserProfile, 4>() && is_readonly<UserProfile, 5>());
+    static_assert(!is_excluded<UserProfile, 0>() && !is_readonly<UserProfile, 0>());
 
     return 0;
 }

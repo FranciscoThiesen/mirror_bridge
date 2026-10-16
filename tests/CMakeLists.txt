@@ -216,6 +216,17 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
     endif()
 
     # By-reference argument semantics (zero-copy const T&, visible T& mutation)
+    # P3394 annotations, which both supported toolchains implement under
+    # different names. The runtime behaviour is what matters and had no test:
+    # a compile-only check cannot tell an honoured [[=exclude{}]] from an
+    # ignored one.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/annotations)
+        mirror_bridge_python_module(annotated
+            annotations/annotations_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/annotations
+        )
+    endif()
+
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/byref_args)
         mirror_bridge_python_module(byref
             byref_args/byref_binding.cpp
