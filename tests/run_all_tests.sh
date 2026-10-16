@@ -223,6 +223,9 @@ SKIP_TESTS=(
     # export_macro proves discovery sees past an export macro, which only the
     # CLI's generate pipeline can show
     "export_macro/test_export_macro.py:Run via test_export_macro_cli.sh (module built by CLI generate)"
+    # batch_methods' module exists only when built with
+    # -DMIRROR_BRIDGE_BATCH_METHODS, and its script builds it both ways
+    "batch_methods/test_batched.py:Run via batch_methods/test_batch.sh (built twice, with the flag and without)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)
