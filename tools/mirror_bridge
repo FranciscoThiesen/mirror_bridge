@@ -42,6 +42,7 @@ USE_PCH=""
 PCH_PATH=""
 LANG="python"
 RELEASE_GIL=0
+COLUMNAR=0
 GEN_STUBS=0
 NO_TEMPLATES=0
 # Enum types found while scanning. They are not bound (Python has no object
@@ -204,8 +205,9 @@ ${YELLOW}Options:${NC}
   --columnar          Python: return a vector of plain structs as a sequence
                       that also describes its own memory, so numpy can read it
                       without copying, instead of building one Python object
-                      per element. Measured 32x to 135x on the return itself
-                      and 126x end to end into numpy. Off by default because
+                      per element. Measured 21x at ten elements rising to
+                      ~200x from a thousand up, and 540x end to end into
+                      numpy. Off by default because
                       it changes what a method returns: the result indexes,
                       iterates and len()s like the list it replaces, and
                       .tolist() gives the list back, but it is not a list.
@@ -1508,7 +1510,7 @@ cmd_generate() {
             -f|--force) FORCE_REBUILD=1; shift ;;
             --no-verify) VERIFY_IMPORT=0; shift ;;
             --json) JSON_MODE=1; shift ;;
-            --columnar) EXTRA_DEFINES+=("-DMIRROR_BRIDGE_COLUMNAR_VECTORS"); shift ;;
+            --columnar) COLUMNAR=1; EXTRA_DEFINES+=("-DMIRROR_BRIDGE_COLUMNAR_VECTORS"); shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
             --link-args) LINK_ARGS="$2"; shift 2 ;;
@@ -1584,6 +1586,19 @@ cmd_generate() {
         python|lua|js|javascript) languages=("$LANG") ;;
         *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, all" ;;
     esac
+
+    # Only the Python backend reads the flag, so say so rather than letting it
+    # look like it did something. Lua and JavaScript build their tables element
+    # by element and have nothing to hand a buffer to.
+    if [ "${COLUMNAR:-0}" -eq 1 ]; then
+        local has_python=0 l
+        for l in "${languages[@]}"; do
+            [ "$l" = "python" ] && has_python=1
+        done
+        if [ $has_python -eq 0 ]; then
+            echo -e "${YELLOW}Note: --columnar applies to the Python backend only; it does nothing for ${LANG}${NC}"
+        fi
+    fi
 
     # Python modules also get free functions and template instantiations,
     # so a header with no plain classes can still produce a module.

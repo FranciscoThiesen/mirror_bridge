@@ -40,4 +40,15 @@ echo "Compiling columnar_layout_check.cpp with $CXX..."
     "${PYLD[@]}" "-lpython$PYVER" || exit 1
 
 echo "Running..."
-"$OUT/columnar_layout_check"
+"$OUT/columnar_layout_check" || exit 1
+
+# The descriptor is only half of it: the rest is what the view does once it
+# reaches Python, which needs a module built with the flag on.
+echo
+echo "Building a binding with -DMIRROR_BRIDGE_COLUMNAR_VECTORS..."
+"$CXX" "${FLAGS[@]}" -O1 -shared -fPIC -DMIRROR_BRIDGE_COLUMNAR_VECTORS \
+    -I"$ROOT" -I"$HERE" "${PYINC[@]}" \
+    "$HERE/columnar_binding.cpp" -o "$OUT/colv.so" || exit 1
+
+echo "Running the runtime checks..."
+PYTHONPATH="$OUT" python3 "$HERE/test_columnar_runtime.py"

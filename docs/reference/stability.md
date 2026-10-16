@@ -29,6 +29,9 @@ These may change or be removed in any release; pin a tag if you depend on them:
 - Auto-trampoline internals (the vtable-swap mechanism; the *behavior* —
   Python subclasses overriding C++ virtuals — is intended to stay)
 - The `.mirror` config-file format
+- `--columnar` and the `ColumnView` type it returns: the dtype spelling, the
+  names of the padding fields, and which sequence operations the view supports
+  are all expected to move as adopters find shapes this does not handle yet
 - Any header or function not documented in [api.md](api.md)
 
 ## Versioning

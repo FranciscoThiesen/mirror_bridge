@@ -38,7 +38,7 @@ Mirror Bridge automatically converts types between C++ and target languages. Thi
 | `std::deque<T>` | `list` | `table` (array) | `Array` |
 | `std::list<T>` | `list` | `table` (array) | `Array` |
 
-**Vectors of plain structs**: `std::vector<Point3>` returns a list of `Point3` objects by default. With `--columnar` it returns a sequence that also describes its own memory, so `np.asarray` reads it without copying and the dtype is built from the struct's reflected layout. Measured 32x to 135x on the return itself. Off by default because it changes the return type; see [columnar-returns.md](../guides/columnar-returns.md).
+**Vectors of plain structs**: `std::vector<Point3>` returns a list of `Point3` objects by default. With `--columnar` it returns a sequence that also describes its own memory, so `np.asarray` reads it without copying and the dtype is built from the struct's reflected layout. Measured 21x at ten elements rising to about 200x from a thousand up. Off by default because it changes the return type; see [columnar-returns.md](../guides/columnar-returns.md).
 
 **Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings copy the buffer in bulk into an `array.array` object instead of converting element by element. This is ~10-50x faster for large arrays. At or above 1 KB the buffer is copied once, out of the C++ container through a borrowed `memoryview`; below that it goes through an intermediate `bytes` object, which is two copies but one fewer call into the interpreter and measurably cheaper at that size. The crossover is a measured one and can be moved with `-DMIRROR_BRIDGE_ARRAY_BORROW_BYTES=<n>`. The `from_python` direction accepts both `list` and `array.array` inputs.
 

@@ -175,6 +175,8 @@ while IFS= read -r -d '' binding_file; do
 # Exclude v8/ directory - V8 tests are built separately in Step 2d.
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
+# Exclude columnar_binding.cpp - a binding, but one that only means anything
+# built with -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which test_columnar.sh does.
 # Exclude columnar_layout_check.cpp - a standalone program, not a binding. It
 # asks numpy what it made of a reflected struct layout, which needs no module.
 # tests/columnar/test_columnar.sh compiles and runs it in Step 3.
@@ -201,7 +203,8 @@ done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_
               -not -path "*/.worktrees/*" \
               -not -name "test_validation.cpp" \
               -not -name "buffer_shape_check.cpp" \
-              -not -name "columnar_layout_check.cpp" -print0)
+              -not -name "columnar_layout_check.cpp" \
+              -not -name "columnar_binding.cpp" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"

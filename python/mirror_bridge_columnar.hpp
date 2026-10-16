@@ -77,10 +77,15 @@ consteval const char* typestr() {
     } else if constexpr (std::is_same_v<C, unsigned int>) {
         return sizeof(unsigned int) == 4 ? (le ? "<u4" : ">u4") : nullptr;
     } else if constexpr (std::is_same_v<C, long> || std::is_same_v<C, long long>) {
-        return sizeof(C) == 8 ? (le ? "<i8" : ">i8") : (le ? "<i4" : ">i4");
+        // LP64 gives 8 and LLP64/ILP32 give 4. Anything else is a target this
+        // does not know, and naming a width it does not have would shift every
+        // column after it.
+        if (sizeof(C) == 8) return le ? "<i8" : ">i8";
+        return sizeof(C) == 4 ? (le ? "<i4" : ">i4") : nullptr;
     } else if constexpr (std::is_same_v<C, unsigned long> ||
                          std::is_same_v<C, unsigned long long>) {
-        return sizeof(C) == 8 ? (le ? "<u8" : ">u8") : (le ? "<u4" : ">u4");
+        if (sizeof(C) == 8) return le ? "<u8" : ">u8";
+        return sizeof(C) == 4 ? (le ? "<u4" : ">u4") : nullptr;
     } else if constexpr (std::is_same_v<C, float>) {
         return sizeof(float) == 4 ? (le ? "<f4" : ">f4") : nullptr;
     } else if constexpr (std::is_same_v<C, double>) {
@@ -165,8 +170,24 @@ concept ColumnarElement =
     std::is_trivially_copyable_v<S> &&
     std::is_standard_layout_v<S> &&
     (detail::field_count<S>() > 0) &&
-    (std::meta::size_of(^^S) > 0) &&
     detail::all_fields_describable<S>();
+
+namespace detail {
+
+template<typename T>
+struct is_vector : std::false_type {};
+template<typename T, typename A>
+struct is_vector<std::vector<T, A>> : std::true_type {};
+
+}  // namespace detail
+
+// Exactly the condition under which a return comes back as a ColumnView. Both
+// the conversion and the stub generator ask this one question, so a stub
+// cannot claim a type the runtime does not produce.
+template<typename T>
+concept ColumnarReturn =
+    detail::is_vector<std::remove_cvref_t<T>>::value &&
+    ColumnarElement<typename std::remove_cvref_t<T>::value_type>;
 
 // ============================================================================
 // __array_interface__
@@ -200,8 +221,15 @@ inline PyObject* build_descr() {
     auto pad_to = [&](std::size_t upto) {
         if (upto <= covered) return;
         char fmt[24];
+        char name[24];
         std::snprintf(fmt, sizeof(fmt), "|V%zu", upto - covered);
-        add("", fmt);
+        // Leaving the pad unnamed is not an option: numpy names an unnamed
+        // entry f<index>, so a struct with a member actually called f1 gets
+        // "field 'f1' occurs more than once" and np.asarray raises, a long way
+        // from the cause. A leading space cannot begin a C++ identifier, so no
+        // member name can collide with this one.
+        std::snprintf(name, sizeof(name), " pad%zu", covered);
+        add(name, fmt);
         covered = upto;
     };
 
@@ -239,10 +267,16 @@ inline PyObject* build_array_interface(const S* data, std::size_t count) {
     if (!descr) return nullptr;
 
     PyObject* shape = Py_BuildValue("(n)", static_cast<Py_ssize_t>(count));
+    // An empty vector has no storage and data() is null, which numpy rejects:
+    // it falls back to the sequence protocol and raises rather than returning
+    // an empty array. It never dereferences the pointer for a zero-length
+    // shape, so any non-null address will do, and the type's alignment is one
+    // that cannot be mistaken for a real allocation.
+    const auto address_bits =
+        count ? reinterpret_cast<std::uintptr_t>(data)
+              : static_cast<std::uintptr_t>(alignof(S));
     PyObject* address = Py_BuildValue(
-        "(KO)",
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(data)),
-        Py_True);
+        "(KO)", static_cast<unsigned long long>(address_bits), Py_True);
 
     PyObject* dict = nullptr;
     if (shape && address) {
@@ -325,6 +359,50 @@ PyObject* columnview_array_interface(PyObject* self, void*) {
     return build_array_interface<S>(view->data->data(), view->data->size());
 }
 
+// A list supports pts[0:2], and sq_item cannot: it only ever sees an integer.
+// Without this a slice is a TypeError, which is one of the things that made
+// the view not quite a drop-in.
+template<typename S>
+PyObject* columnview_subscript(PyObject* self, PyObject* key) {
+    auto* view = reinterpret_cast<ColumnViewObject<S>*>(self);
+    const auto count = static_cast<Py_ssize_t>(view->data->size());
+
+    if (PySlice_Check(key)) {
+        Py_ssize_t start = 0, stop = 0, step = 0, length = 0;
+        if (PySlice_GetIndicesEx(key, count, &start, &stop, &step, &length) < 0) {
+            return nullptr;
+        }
+        PyObject* out = PyList_New(length);
+        if (!out) return nullptr;
+        for (Py_ssize_t i = 0, at = start; i < length; ++i, at += step) {
+            PyObject* item =
+                view->element_to_python((*view->data)[static_cast<std::size_t>(at)]);
+            if (!item) {
+                Py_DECREF(out);
+                return nullptr;
+            }
+            PyList_SET_ITEM(out, i, item);
+        }
+        return out;
+    }
+
+    Py_ssize_t index = PyNumber_AsSsize_t(key, PyExc_IndexError);
+    if (index == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        PyErr_Format(PyExc_TypeError,
+                     "indices must be integers or slices, not %s",
+                     Py_TYPE(key)->tp_name);
+        return nullptr;
+    }
+    return columnview_item<S>(self, index);
+}
+
+// Copy and pickle both go through __reduce__, and reconstructing as a list is
+// the honest answer: a view is a window onto storage a C++ object owns, and a
+// copy of it cannot be.
+template<typename S>
+PyObject* columnview_reduce(PyObject* self, PyObject*);
+
 template<typename S>
 PyObject* columnview_tolist(PyObject* self, PyObject*) {
     auto* view = reinterpret_cast<ColumnViewObject<S>*>(self);
@@ -352,15 +430,35 @@ PyObject* columnview_repr(PyObject* self) {
 }
 
 template<typename S>
+PyObject* columnview_reduce(PyObject* self, PyObject*) {
+    PyObject* items = columnview_tolist<S>(self, nullptr);
+    if (!items) return nullptr;
+    PyObject* args = PyTuple_Pack(1, items);
+    Py_DECREF(items);
+    if (!args) return nullptr;
+    PyObject* result = Py_BuildValue("(OO)", reinterpret_cast<PyObject*>(&PyList_Type), args);
+    Py_DECREF(args);
+    return result;
+}
+
+template<typename S>
 PySequenceMethods columnview_as_sequence = {
     .sq_length = columnview_length<S>,
     .sq_item = columnview_item<S>,
 };
 
 template<typename S>
+PyMappingMethods columnview_as_mapping = {
+    .mp_length = columnview_length<S>,
+    .mp_subscript = columnview_subscript<S>,
+};
+
+template<typename S>
 PyMethodDef columnview_methods[] = {
     {"tolist", columnview_tolist<S>, METH_NOARGS,
      "Return the elements as a list, which is what this used to be."},
+    {"__reduce__", columnview_reduce<S>, METH_NOARGS,
+     "Reconstruct as a list, so copy and pickle work."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -388,7 +486,11 @@ PyTypeObject* get_columnview_type() {
         .tp_dealloc = columnview_dealloc<S>,
         .tp_repr = columnview_repr<S>,
         .tp_as_sequence = &columnview_as_sequence<S>,
-        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_as_mapping = &columnview_as_mapping<S>,
+        // SEQUENCE is what lets `match pts: case [a, b, c]` match. Without it
+        // a structural pattern silently takes a different branch, which is a
+        // worse failure than the TypeError a missing slice gives.
+        .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_SEQUENCE,
         .tp_doc = "A sequence of C++ structs that also describes its own "
                   "memory, so numpy can read it without copying.",
         .tp_methods = columnview_methods<S>,
@@ -398,6 +500,23 @@ PyTypeObject* get_columnview_type() {
     static bool ready = false;
     if (!ready) {
         if (PyType_Ready(&type_object) < 0) return nullptr;
+
+        // Py_TPFLAGS_SEQUENCE makes `match` work but says nothing to
+        // collections.abc, and isinstance(pts, Sequence) is the ordinary way
+        // to ask "can I index and iterate this". Registering is the only way
+        // to answer it truthfully for a type that is not a list subclass.
+        // A failure here costs the isinstance answer and nothing else, so it
+        // is cleared rather than propagated.
+        if (PyObject* abc = PyImport_ImportModule("collections.abc")) {
+            if (PyObject* seq = PyObject_GetAttrString(abc, "Sequence")) {
+                PyObject* reg = PyObject_CallMethod(
+                    seq, "register", "O", reinterpret_cast<PyObject*>(&type_object));
+                Py_XDECREF(reg);
+                Py_DECREF(seq);
+            }
+            Py_DECREF(abc);
+        }
+        PyErr_Clear();
         ready = true;
     }
     return &type_object;
