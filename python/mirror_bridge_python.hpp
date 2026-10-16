@@ -79,6 +79,7 @@
 // Include P3394 annotations support for field-level binding control
 // Requires -freflection-latest with Bloomberg's clang-p2996
 #include "python/mirror_bridge_annotations.hpp"
+#include "python/mirror_bridge_columnar.hpp"
 #include "python/mirror_bridge_stubgen.hpp"
 
 // ============================================================================
@@ -2065,6 +2066,21 @@ PyObject* to_python(const T& container) {
         }
         // Fall through to element-by-element if array module unavailable
     }
+
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+    // A vector of plain structs can be handed over as the bytes it already is,
+    // with the layout read off the type, instead of becoming one Python object
+    // and one `new` per element. Opt-in, because it changes what the caller
+    // gets: a sequence that indexes and iterates like the list it replaces,
+    // but not a list. See python/mirror_bridge_columnar.hpp.
+    if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
+                  columnar::ColumnarElement<ValueType>) {
+        return columnar::to_columnar<ValueType>(
+            container, +[](const ValueType& element) {
+                return to_python(element);
+            });
+    }
+#endif
 
     // General path: element-by-element conversion
     PyObject* list = PyList_New(container.size());

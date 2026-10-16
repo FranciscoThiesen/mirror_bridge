@@ -476,6 +476,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
     )
 endif()
 
+# A struct's layout read off the type, checked against what numpy makes of it.
+# Not a binding, and it needs numpy, which the test skips itself without.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/columnar)
+    add_test(NAME columnar_layout
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/columnar/test_columnar.sh
+    )
+    set_tests_properties(columnar_layout PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # Buffer views describe themselves per view, which only a consumer holding two
 # Py_buffers at once can tell. Not a binding, so it has its own compile.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/buffer_views)

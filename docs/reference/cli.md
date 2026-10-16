@@ -40,6 +40,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `--no-verify` | Skip the import check. Python modules are imported once after the build, because "built" and "works" are different claims: the import is what catches a library that is not header-only, and it is where the module reports the names it declined to bind |
 | `--link-args ARGS` | Extra link inputs for a library that is not header-only, e.g. `--link-args "build/libfoo.a -lz"` |
 | `--stubs` | Python: write `<module>.pyi` beside the module, with reflection-exact signatures and real C++ parameter names |
+| `--columnar` | Python: return a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying. Changes the return type, so off by default — see [columnar-returns.md](../guides/columnar-returns.md) |
 | `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
 | `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
 | `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |
