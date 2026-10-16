@@ -206,7 +206,7 @@ ${YELLOW}Options:${NC}
                       that also describes its own memory, so numpy can read it
                       without copying, instead of building one Python object
                       per element. Measured 21x at ten elements rising to
-                      ~200x from a thousand up, and 540x end to end into
+                      ~200x from a thousand up, and 500x end to end into
                       numpy. Off by default because
                       it changes what a method returns: the result indexes,
                       iterates and len()s like the list it replaces, and

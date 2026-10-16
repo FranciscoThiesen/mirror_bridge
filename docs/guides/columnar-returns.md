@@ -10,11 +10,11 @@ Measured, returning a `std::vector<Point3>` of n elements:
 
 | n | list of objects | columnar view | |
 |---|---|---|---|
-| 10 | 833 ns | 40 ns | 21x |
-| 100 | 9.0 µs | 0.07 µs | 122x |
-| 1,000 | 87 µs | 0.36 µs | 243x |
-| 10,000 | 878 µs | 4.6 µs | 192x |
-| 100,000 | 9.0 ms | 45 µs | 201x |
+| 10 | 833 ns | 43 ns | 19x |
+| 100 | 9.0 µs | 0.08 µs | 120x |
+| 1,000 | 87 µs | 0.35 µs | 247x |
+| 10,000 | 878 µs | 5.0 µs | 174x |
+| 100,000 | 9.0 ms | 47 µs | 192x |
 
 The per-element cost is flat at 0.4 to 0.7 ns above n = 100, because what is
 left is one `memcpy`. The list path is 83 to 90 ns per element at every size,
@@ -29,9 +29,9 @@ arr = np.array([(p.x, p.y, p.z) for p in pts])        # 2351 µs
                                                       # 3229 µs total
 
 # with --columnar
-pts = cloud.get_points()                              #    4.6 µs
+pts = cloud.get_points()                              #    5.0 µs
 arr = np.asarray(pts)                                 #    1.4 µs, no copy
-                                                      #    6 µs total, 540x
+                                                      #    6 µs total, 500x
 ```
 
 ## Turning it on
