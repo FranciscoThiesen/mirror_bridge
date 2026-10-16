@@ -349,7 +349,11 @@ endif()
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
 set(MB_PYTHON_BASH_ONLY_PATTERN
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro"
+    # columnar's module only exists when built with
+    # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its own script does; the glob
+    # below would otherwise register the .py as a standalone test with nothing
+    # to import.
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^columnar"
 )
 
 # The same contract for the other two backends. These were spelled out at
