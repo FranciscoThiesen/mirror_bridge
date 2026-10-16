@@ -7301,6 +7301,89 @@ BoundClass<T> bind_class(PyObject* module, const char* name,
     return {&type_object};
 }
 
+// ============================================================================
+// Enums
+// ============================================================================
+//
+// An enum value already crosses as a plain int in both directions: to_python
+// sends it through PyLong_FromLong and from_python reads it with
+// PyLong_Check. What was missing was the names. A module with a Color
+// parameter exposed 0, 1 and 2 with nothing in it saying which was which,
+// and the caller had to read the C++ header to find out.
+//
+// Exporting the enum as enum.IntEnum adds the names and changes no
+// conversion, because an IntEnum member IS an int: it goes in wherever a
+// bare int went in, and a function that returns one still returns a bare
+// int, which compares equal to the member.
+
+// Export E as a Python enum.IntEnum named `name`. Returns the new class, or
+// nullptr with the error set.
+template<typename E>
+    requires std::is_enum_v<std::remove_cvref_t<E>>
+PyObject* bind_enum(PyObject* module, const char* name) {
+    using CleanE = std::remove_cvref_t<E>;
+
+    const auto pairs = enum_members<CleanE>();
+    PyObject* members = PyList_New(static_cast<Py_ssize_t>(pairs.size()));
+    if (!members) return nullptr;
+
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+        // Built by hand rather than with Py_BuildValue's "s#": that format
+        // needs PY_SSIZE_T_CLEAN, which this header does not define, and
+        // without it CPython raises a SystemError from inside module init.
+        PyObject* key = PyUnicode_FromStringAndSize(
+            pairs[i].first.data(), static_cast<Py_ssize_t>(pairs[i].first.size()));
+        PyObject* val = key ? PyLong_FromLongLong(pairs[i].second) : nullptr;
+        PyObject* pair = val ? PyTuple_New(2) : nullptr;
+        if (!pair) {
+            Py_XDECREF(key);
+            Py_XDECREF(val);
+            Py_DECREF(members);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(pair, 0, key);
+        PyTuple_SET_ITEM(pair, 1, val);
+        PyList_SET_ITEM(members, static_cast<Py_ssize_t>(i), pair);
+    }
+
+    PyObject* enum_module = PyImport_ImportModule("enum");
+    if (!enum_module) { Py_DECREF(members); return nullptr; }
+    PyObject* int_enum = PyObject_GetAttrString(enum_module, "IntEnum");
+    Py_DECREF(enum_module);
+    if (!int_enum) { Py_DECREF(members); return nullptr; }
+
+    // IntEnum(name, [(member, value), ...]) is the functional API, which is
+    // the only way to build one from values known at runtime.
+    PyObject* cls = PyObject_CallFunction(int_enum, "sO", name, members);
+    Py_DECREF(int_enum);
+    Py_DECREF(members);
+    if (!cls) return nullptr;
+
+    // The functional API stamps the class with the caller's module, which it
+    // guesses from the stack and gets wrong for a C extension. Pickling and
+    // repr both read it.
+    PyObject* module_name = PyModule_GetNameObject(module);
+    if (module_name) {
+        if (PyObject_SetAttrString(cls, "__module__", module_name) < 0) PyErr_Clear();
+        Py_DECREF(module_name);
+    } else {
+        PyErr_Clear();
+    }
+
+    // PyModule_AddObject steals on success only, so this is the shape that
+    // does not leak on failure.
+    Py_INCREF(cls);
+    if (PyModule_AddObject(module, name, cls) < 0) {
+        Py_DECREF(cls);
+        Py_DECREF(cls);
+        return nullptr;
+    }
+    Py_DECREF(cls);
+
+    stubgen::register_enum_stub<CleanE>(name);
+    return cls;
+}
+
 // Auto-discovery-friendly binder. The CLI points mirror_bridge at arbitrary
 // real-world headers, where some discovered classes legitimately can't be
 // bound (unconvertible member types, nothing reflectable). Hand-written

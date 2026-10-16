@@ -47,8 +47,8 @@ def create_binary_system(m1, m2, separation, g=G):
     v1 = math.sqrt(g * m2 * m2 / (total_mass * separation))
     v2 = math.sqrt(g * m1 * m1 / (total_mass * separation))
 
-    sim.add_body_constBody(make_body("Body1", m1, nbody.Vec3(-r1, 0, 0), nbody.Vec3(0, -v1, 0)))
-    sim.add_body_constBody(make_body("Body2", m2, nbody.Vec3(r2, 0, 0), nbody.Vec3(0, v2, 0)))
+    sim.add_body(make_body("Body1", m1, nbody.Vec3(-r1, 0, 0), nbody.Vec3(0, -v1, 0)))
+    sim.add_body(make_body("Body2", m2, nbody.Vec3(r2, 0, 0), nbody.Vec3(0, v2, 0)))
 
     return sim
 
@@ -198,14 +198,14 @@ def test_two_body_simulation():
     body1.mass = m1
     body1.position = nbody.Vec3(-r1, 0, 0)
     body1.velocity = nbody.Vec3(0, -v1, 0)
-    sim.add_body_constBody(body1)
+    sim.add_body(body1)
 
     body2 = nbody.Body()
     body2.name = "Body2"
     body2.mass = m2
     body2.position = nbody.Vec3(r2, 0, 0)
     body2.velocity = nbody.Vec3(0, v2, 0)
-    sim.add_body_constBody(body2)
+    sim.add_body(body2)
 
     print(f"Created binary system with {sim.body_count()} bodies")
 
@@ -237,27 +237,27 @@ def test_solar_system():
     sim.set_gravitational_constant(G)
 
     # Sun at origin (fixed)
-    sim.add_body_constBody(make_body("Sun", SOLAR_MASS, nbody.Vec3.zero(), nbody.Vec3.zero(), fixed=True))
+    sim.add_body(make_body("Sun", SOLAR_MASS, nbody.Vec3.zero(), nbody.Vec3.zero(), fixed=True))
 
     # Mercury
     mercury_dist = 0.387 * AU
     mercury_vel = math.sqrt(G * SOLAR_MASS / mercury_dist)
-    sim.add_body_constBody(make_body("Mercury", 3.285e23, nbody.Vec3(mercury_dist, 0, 0), nbody.Vec3(0, mercury_vel, 0)))
+    sim.add_body(make_body("Mercury", 3.285e23, nbody.Vec3(mercury_dist, 0, 0), nbody.Vec3(0, mercury_vel, 0)))
 
     # Venus
     venus_dist = 0.723 * AU
     venus_vel = math.sqrt(G * SOLAR_MASS / venus_dist)
-    sim.add_body_constBody(make_body("Venus", 4.867e24, nbody.Vec3(venus_dist, 0, 0), nbody.Vec3(0, venus_vel, 0)))
+    sim.add_body(make_body("Venus", 4.867e24, nbody.Vec3(venus_dist, 0, 0), nbody.Vec3(0, venus_vel, 0)))
 
     # Earth
     earth_dist = AU
     earth_vel = math.sqrt(G * SOLAR_MASS / earth_dist)
-    sim.add_body_constBody(make_body("Earth", EARTH_MASS, nbody.Vec3(earth_dist, 0, 0), nbody.Vec3(0, earth_vel, 0)))
+    sim.add_body(make_body("Earth", EARTH_MASS, nbody.Vec3(earth_dist, 0, 0), nbody.Vec3(0, earth_vel, 0)))
 
     # Mars
     mars_dist = 1.524 * AU
     mars_vel = math.sqrt(G * SOLAR_MASS / mars_dist)
-    sim.add_body_constBody(make_body("Mars", 6.39e23, nbody.Vec3(mars_dist, 0, 0), nbody.Vec3(0, mars_vel, 0)))
+    sim.add_body(make_body("Mars", 6.39e23, nbody.Vec3(mars_dist, 0, 0), nbody.Vec3(0, mars_vel, 0)))
 
     sim.set_softening(1e8)  # 100 km softening
 

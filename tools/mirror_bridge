@@ -44,10 +44,13 @@ LANG="python"
 RELEASE_GIL=0
 GEN_STUBS=0
 NO_TEMPLATES=0
-# Enum types found while scanning. They are not bound (Python has no object
-# for them and their values cross as plain int), so they are reported at the
-# end of a generate run rather than disappearing.
+# Enum types found while scanning. The Python backend binds them as
+# enum.IntEnum (an IntEnum member is an int, so no conversion changes); the
+# Lua and JavaScript backends have no equivalent yet and still only report
+# them. DISCOVERED_ENUM_HEADERS is parallel, because an enum can live in a
+# header that holds no bound class and the include list is built from classes.
 DISCOVERED_ENUMS=()
+DISCOVERED_ENUM_HEADERS=()
 # Declaration site of each discovered class, parallel to the class list, so a
 # name collision can be reported as header:line rather than just a name.
 DISCOVERED_LINES=()
@@ -686,10 +689,19 @@ header_is_excluded() {
         while IFS=$'\t' read -r class_name line_num kind; do
             [ -z "$class_name" ] && continue
 
-            # Enums are discovered so they can be reported, never bound: there
-            # is no Python enum type yet, and their values cross as plain int.
             if [ "$kind" = "enum" ]; then
+                # Honour MIRROR_BRIDGE_SKIP for an enum too, the same way a
+                # class gets it. Checked here rather than below, because the
+                # class path is not reached.
+                if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
+                    local prev_enum_line=$((line_num - 1))
+                    if sed -n "${prev_enum_line}p" "$header_file" | grep -q "MIRROR_BRIDGE_SKIP"; then
+                        [ $VERBOSE -eq 1 ] && echo -e "${BLUE}  Skipping: $class_name (marked SKIP)${NC}"
+                        continue
+                    fi
+                fi
                 DISCOVERED_ENUMS+=("$class_name")
+                DISCOVERED_ENUM_HEADERS+=("$rel_path")
                 continue
             fi
 
@@ -759,6 +771,17 @@ EOF
             included["$header"]=1
         fi
     done
+    # An enum can be declared in a header that holds no bound class, and the
+    # include list above is built from classes, so bind_enum would name a
+    # type the translation unit has never seen.
+    if [ "$lang" = "python" ]; then
+        for header in "${DISCOVERED_ENUM_HEADERS[@]}"; do
+            if [ -n "$header" ] && [ -z "${included["$header"]}" ]; then
+                echo "#include \"$header\"" >> "$output_file"
+                included["$header"]=1
+            fi
+        done
+    fi
     # Headers without classes that the template planner found functions or
     # templates in
     if [ -n "$TEMPLATE_INCLUDES_FILE" ] && [ -s "$TEMPLATE_INCLUDES_FILE" ]; then
@@ -880,6 +903,29 @@ PYSCRIPT
     # since they're flat identifiers in the target language. The C++ template
     # argument keeps the fully-qualified scope.
     echo "$module_macro($module_name," >> "$output_file"
+
+    # Enums first, so the IntEnum exists before anything annotated with it.
+    # Python only: Lua and JavaScript have no enum object to map onto, and
+    # their values keep crossing as numbers.
+    if [ "$lang" = "python" ]; then
+        local -A enum_name_taken=()
+        local enum_name enum_simple
+        for enum_name in "${DISCOVERED_ENUMS[@]}"; do
+            enum_simple="${enum_name##*::}"
+            # A class already answering to this name wins it, the same way
+            # two classes sharing one do: the module exposes each type under
+            # its unqualified name and only one can have it.
+            if [ -n "${BINDING_NAME_WINNER[$enum_simple]:-}" ]; then
+                continue
+            fi
+            if [ -n "${enum_name_taken[$enum_simple]:-}" ]; then
+                continue
+            fi
+            enum_name_taken[$enum_simple]=1
+            echo "    mirror_bridge::bind_enum<$enum_name>(m, \"$enum_simple\");" >> "$output_file"
+        done
+    fi
+
     for class_name in "${classes[@]}"; do
         local simple_name="${class_name##*::}"
         # Another class won this name. Binding both emitted two calls with the
@@ -999,6 +1045,16 @@ verify_python_module() {
 # Grouped by reason and capped, so twelve dropped overloads cost four lines.
 report_unbound() {
     local module_name="$1"
+    local built_langs="${2:-}"
+    # The Python backend binds enums as enum.IntEnum, so for that language
+    # they are not missing from the module and do not belong in this list.
+    # Lua and JavaScript have no equivalent yet and their values still cross
+    # as bare numbers.
+    local -a unbound_enums=()
+    case " $built_langs " in
+        *" python "*) ;;
+        *) unbound_enums=("${DISCOVERED_ENUMS[@]}") ;;
+    esac
     local -a overloaded=() shares_name=()
     local reason name
 
@@ -1012,7 +1068,7 @@ report_unbound() {
         done < "$TEMPLATE_UNBOUND_FILE"
     fi
 
-    local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#DISCOVERED_ENUMS[@]}
+    local total=$(( ${#overloaded[@]} + ${#shares_name[@]} + ${#unbound_enums[@]}
                     + ${#VERIFY_SKIPPED_CLASSES[@]} + ${#VERIFY_SKIPPED_FUNCS[@]}
                     + ${#COLLIDED_CLASSES[@]} ))
     [ "$total" -eq 0 ] && return 0
@@ -1069,11 +1125,11 @@ report_unbound() {
         echo "    ${#VERIFY_SKIPPED_FUNCS[@]} free function(s) the module declined"
         print_reasoned VERIFY_SKIPPED_FUNCS
     fi
-    if [ ${#DISCOVERED_ENUMS[@]} -gt 0 ]; then
+    if [ ${#unbound_enums[@]} -gt 0 ]; then
         echo ""
-        echo "    ${#DISCOVERED_ENUMS[@]} enum type(s) — values still cross as plain int, unchecked"
-        print_group DISCOVERED_ENUMS
-        echo "      Fix: mirror each enum as a Python enum.IntEnum; stubs annotate these as int"
+        echo "    ${#unbound_enums[@]} enum type(s) — values still cross as plain numbers, unchecked"
+        print_group unbound_enums
+        echo "      The Python backend binds these as enum.IntEnum; Lua and JavaScript do not yet"
     fi
     if [ ${#overloaded[@]} -gt 0 ]; then
         echo ""
@@ -1328,7 +1384,7 @@ adopt_reflected_classes() {
         return 1
     fi
 
-    local -a names=() files=() lines=() enums=()
+    local -a names=() files=() lines=() enums=() enum_headers=()
     local kind qualified_name where file line header
     while IFS=$'\t' read -r kind qualified_name where; do
         [ -z "$qualified_name" ] && continue
@@ -1354,6 +1410,7 @@ adopt_reflected_classes() {
 
         if [ "$kind" = "enum" ]; then
             enums+=("$qualified_name")
+            enum_headers+=("$header")
             continue
         fi
         names+=("$qualified_name")
@@ -1375,6 +1432,7 @@ adopt_reflected_classes() {
     ar_headers=("${files[@]}")
     DISCOVERED_LINES=("${lines[@]}")
     DISCOVERED_ENUMS=("${enums[@]}")
+    DISCOVERED_ENUM_HEADERS=("${enum_headers[@]}")
     return 0
 }
 
@@ -1815,7 +1873,7 @@ cmd_generate() {
     echo ""
     if [ ${#failed_langs[@]} -gt 0 ]; then
         echo -e "${RED}✗ Failed languages: ${failed_langs[*]}${NC}"
-        report_unbound "$module_name"
+        report_unbound "$module_name" "${languages[*]}"
         exit 1
     fi
     if [ "$VERIFY_OK" -eq 0 ]; then
@@ -1823,11 +1881,11 @@ cmd_generate() {
         echo "    $VERIFY_REASON"
         echo ""
         echo "  $VERIFY_NOTE" | fold -s -w 78
-        report_unbound "$module_name"
+        report_unbound "$module_name" "${languages[*]}"
         exit 1
     fi
     echo -e "${GREEN}✓ Successfully built bindings for: ${languages[*]}${NC}"
-    report_unbound "$module_name"
+    report_unbound "$module_name" "${languages[*]}"
 }
 
 # Command: api — gate the module's Python surface on a committed stub.

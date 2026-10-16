@@ -82,12 +82,13 @@ def test_vector_utilities():
 
 def test_range_functions():
     """Test range generation functions."""
-    # Integer range
+    # A vector of a numeric type crosses as an array.array, so compare
+    # through list() rather than against a list directly.
     r = utilities.range(0, 5)
-    assert r == [0, 1, 2, 3, 4]
+    assert list(r) == [0, 1, 2, 3, 4], r
 
     r = utilities.range(5, 10)
-    assert r == [5, 6, 7, 8, 9]
+    assert list(r) == [5, 6, 7, 8, 9], r
 
     # Linspace (like numpy.linspace)
     ls = utilities.linspace(0.0, 1.0, 5)

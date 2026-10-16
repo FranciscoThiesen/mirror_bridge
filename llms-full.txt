@@ -3866,11 +3866,7 @@ mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); /
 ```
 ✓ Successfully built bindings for: python
 
-⚠ 3 names were not bound into 'book' — Python raises AttributeError on them:
-
-    1 enum type(s) — values still cross as plain int, unchecked
-      trading::Side
-      Fix: mirror each enum as a Python enum.IntEnum; stubs annotate these as int
+⚠ 2 names were not bound into 'book' — Python raises AttributeError on them:
 
     2 free function(s) overloaded in C++ — overload sets are not bound yet
       lib::price, lib::delta
@@ -3897,7 +3893,7 @@ rather than in your first import:
 
 **Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind. A class or function the module declined is one whose parameters or return type have no conversion, and the reason given is the specific gate that refused.
 
-**Fix** Each group states its own. An enum's values still cross correctly as plain `int`, so the usual answer is to mirror the enum on the Python side; the generated stub annotates those parameters as `int`. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
+**Fix** Each group states its own. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
 
 ### The module built but does not import
 
@@ -4417,8 +4413,17 @@ m.resource = None  # Sets to nullptr
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `enum` | `int` | `number` | `number` |
-| `enum class` | `int` | `number` | `number` |
+| `enum` | `enum.IntEnum` | `number` | `number` |
+| `enum class` | `enum.IntEnum` | `number` | `number` |
+
+The Python backend exports the enum *type* as an `enum.IntEnum` whose members
+carry the C++ enumerator names and values. Nothing about the *value*
+conversion changed, because an `IntEnum` member is an `int`: a function that
+took a bare `int` still takes one, and one that returns an enum still returns
+a plain `int`, which compares equal to the member. An enumerator whose name is
+a Python keyword gets a trailing underscore, since `Permission.None` is a
+syntax error rather than an attribute lookup. Lua and JavaScript have no enum
+object to map onto and their values keep crossing as numbers.
 
 **C++:**
 ```cpp
@@ -6072,6 +6077,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Ten of the eleven numbered examples run again, and CI runs all of them.** Six were failing and had been for a long time, which nobody could see because the test harness globs `tests/` and the examples are not under it. That is the same blind spot that let `examples/open3d-comprehensive` ship with `o3d.PointCloud()` raising TypeError. Three asserted a `list` where a numeric vector has given an `array.array` for as long as the mapping has been documented, one called an overload under a mangled name the binder stopped emitting, one imported from the wrong directory, and one wanted enums, which now work. `tests/examples/test_examples.sh` builds and runs every one of them in 76 seconds, and takes its expectation from each example's own README: an example whose README carries a "not implemented" banner is expected to fail, and one that starts passing fails the test until the banner goes. `examples/10-smart-pointers` is the remaining failure and now says so, because `std::shared_ptr` is converted by value and the shared ownership does not cross the boundary either way (issue #54).
 - **The generated `.pyi` says `array[...]` where the runtime hands back an `array.array`.** A `std::vector<double>` crosses as `array('d')` and the stub said `list[float]`, which is worse than saying nothing: a type checker then approves `result + [1.0]` and `json.dumps(result)`, and an agent reading the stub to write the call has no way to find out. `type_hint` was one function serving three positions with three different right answers, so it now takes the position. Returns say what comes back. Parameters keep `list[T]`, deliberately: the ingest side takes a list, a tuple, an `array.array` or any buffer, and the obvious spelling for that, `Sequence[float]`, admits `bytes`, which `from_python` rejects outright, so it would approve a call that fails. A member whose read and write differ now renders as a property with a setter, and only where they differ, so an ordinary member stays an ordinary annotation. The decision itself moved next to the stub generator and `to_python` now reads it from there, because two copies of it is how the stub came to disagree with the runtime in the first place.
 - **Three smaller things the stub was wrong about.** `char` is arithmetic and signed, so it crosses as an `int` in both directions and the stub said `str`. `bytes` has exactly one producer, `std::vector<unsigned char>`, while the stub also claimed it for `std::vector<char>`, `std::vector<std::byte>` and `std::array<unsigned char, N>`, all of which come back as lists of `int`. And a numeric vector the `array` module has no typecode for, such as `std::vector<long double>` or `std::vector<signed char>`, is a list: the stub mirrors the typecode table rather than approximating it with "numeric".
 - **The two stub generators give one answer.** `scripts/generate_stubs.py`, which `mirror_bridge_auto` runs, rebuilt a stub by importing the finished `.so` and reading docstrings off it. Every module mirror_bridge builds already carries one written from the reflection the binding was written from, which knows the real C++ parameter names, the exact member types and the `array.array` return. The script asks for that first now and keeps the reconstruction for a module that has none.
@@ -6086,6 +6092,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Namespaces a macro opens no longer poison the generated binding.** The `using namespace` lines are read from header text, which cannot expand a macro, so nlohmann-json's `NLOHMANN_JSON_NAMESPACE_BEGIN` produced `using namespace detail::detail::detail;` and seventeen errors before the first line of binding code. They exist only so unqualified names from the text scan resolve, and are now emitted only for it; reflection reports names in full.
 
 ### Added
+- **An enum reaches Python as an enum.** The values always crossed correctly, as plain `int`. The types did not, so a module with a `Color` parameter exposed 0, 1 and 2 with nothing in it saying which was which, and `book.add(99, ...)` was accepted. Each enum the CLI discovers is now bound as an `enum.IntEnum` carrying the C++ enumerator names and values, and the stub declares it and annotates members, returns and parameters with it instead of `int`. Nothing about the conversions changed, because an `IntEnum` member is an `int`: a function that took a bare int still takes one, and one that returns an enum still returns a bare int, which compares equal to the member. An enumerator whose name is a Python keyword gets a trailing underscore, because `Permission.None` is a syntax error rather than a failed attribute lookup, so there would be no spelling for a caller to find. Scoped, unscoped, nested and negative or non-contiguous values all work. Lua and JavaScript have no enum object to map onto, their values keep crossing as numbers, and the CLI's unbound report now says which backend does which. Closes #20, including its open question: enumerator values come out through an ordinary splice, where `display_string_of(constant_of(e))` had returned `(unsupported-reflection)`.
 - **`--batch`: a method you call in a Python loop gets a sibling that takes the whole sequence.** For each method taking and returning exactly one arithmetic value, `<name>_batch` is generated from reflection, so the boundary is crossed once instead of once per element. Measured over 100,000 elements: 6.8x from a list and 12.9x from an `array.array`, which is what another batch call returns. It carries state across the loop, which a list comprehension cannot be rewritten to do. Off by default because each sibling costs compile time -- +12% on a class with ten eligible methods, +55% with forty -- and because it is 1.0x when the method itself is the expensive part, the boundary having never been the cost. Generated rather than asked for: the header previously told the C++ author to write `process_batch` by hand, which is the team that owns the header doing work for the team that consumes it. Never generated over a `<name>_batch` the author wrote, and never for an overloaded name, a `bool`, a `void` return or anything non-arithmetic.
 
 ### Fixed

@@ -18,7 +18,10 @@
 //
 // ============================================================================
 
+#include <meta>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 #include <map>
 #include <set>
@@ -107,6 +110,84 @@ template<typename C>
 inline constexpr bool crosses_as_bytes_v =
     std::is_same_v<std::remove_cvref_t<C>, std::vector<unsigned char>>;
 
+// The enumerators of E, reached the way the rest of this project reaches a
+// reflection range: define_static_array plus an index sequence. A pack used
+// only inside a splice is not expandable on GCC, which is why there is no
+// expand() anywhere in this codebase.
+//
+// Here rather than beside bind_enum for the same reason as the array
+// decision above: this header is included first, and the stub generator
+// needs these to write the member list.
+// A C++ name that is a Python keyword cannot be written down in Python
+// source. Here rather than inside the stub registry because bind_enum needs
+// the same answer at runtime and two keyword lists would be one list too
+// many.
+inline bool is_python_keyword(const std::string& s) {
+    static const std::set<std::string> kw = {
+        "False", "None", "True", "and", "as", "assert", "async", "await",
+        "break", "class", "continue", "def", "del", "elif", "else",
+        "except", "finally", "for", "from", "global", "if", "import",
+        "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+        "return", "try", "while", "with", "yield"
+    };
+    return kw.count(s) != 0;
+}
+
+namespace detail {
+
+template<typename E>
+consteval auto enumerators_of_array() {
+    return std::define_static_array(std::meta::enumerators_of(^^E));
+}
+
+template<typename E, std::size_t I>
+consteval std::string_view enumerator_name() {
+    return std::meta::identifier_of(enumerators_of_array<E>()[I]);
+}
+
+template<typename E, std::size_t I>
+consteval long long enumerator_value() {
+    return static_cast<long long>([:enumerators_of_array<E>()[I]:]);
+}
+
+}  // namespace detail
+
+// The (python name, value) pairs for E, with every name writable in Python
+// source.
+//
+// A keyword gets a trailing underscore, which is the convention Python's own
+// style guide names for exactly this ("single_trailing_underscore_: used by
+// convention to avoid conflicts with Python keyword"). `enum class
+// Permission { None, Read }` is the ordinary case and it would otherwise be
+// reachable only through Permission["None"]: `Permission.None` is a syntax
+// error, not an AttributeError, so there is no spelling for a caller to
+// find. More underscores are added until the name is free, for the enum
+// that declares both `None` and `None_`.
+template<typename E>
+inline std::vector<std::pair<std::string, long long>> enum_members() {
+    constexpr std::size_t count = detail::enumerators_of_array<E>().size();
+    std::vector<std::pair<std::string, long long>> out;
+    out.reserve(count);
+
+    std::set<std::string> taken;
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (taken.insert(std::string(detail::enumerator_name<E, Is>())), ...);
+    }(std::make_index_sequence<count>{});
+
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        auto one = [&](std::string name, long long value) {
+            if (is_python_keyword(name)) {
+                do { name += "_"; } while (taken.count(name) != 0);
+                taken.insert(name);
+            }
+            out.emplace_back(std::move(name), value);
+        };
+        (one(std::string(detail::enumerator_name<E, Is>()),
+             detail::enumerator_value<E, Is>()), ...);
+    }(std::make_index_sequence<count>{});
+    return out;
+}
+
 namespace stubgen {
 
 // ============================================================================
@@ -146,6 +227,11 @@ struct ConstructorInfo {
     std::vector<ParameterInfo> parameters;
 };
 
+struct EnumInfo {
+    std::string name;
+    std::vector<std::pair<std::string, long long>> members;
+};
+
 struct ClassInfo {
     std::string name;
     std::vector<ConstructorInfo> constructors;
@@ -176,6 +262,10 @@ public:
         functions_.push_back(info);
     }
 
+    void add_enum(const EnumInfo& info) {
+        enums_[info.name] = info;
+    }
+
     // A bound class is known to the stub by its Python name; type_hint<T>()
     // refers to classes through a typeid placeholder (see type_hint) that
     // generate() resolves against this table, so the hint is right no matter
@@ -186,6 +276,15 @@ public:
 
     static std::string type_placeholder(const char* typeid_name) {
         return std::string("\x01") + typeid_name + "\x02";
+    }
+
+    // An enum is a placeholder too, but with a different answer when it is
+    // not bound. A class that was never bound has no Python name and the
+    // fallback guesses one from the mangled name; an enum that was never
+    // bound genuinely is an int on both sides of the boundary, so saying so
+    // is right rather than a guess.
+    static std::string enum_placeholder(const char* typeid_name) {
+        return std::string("\x01") + typeid_name + "\x03";
     }
 
     std::string generate(const std::string& module_name) const {
@@ -203,6 +302,7 @@ public:
 
     void clear() {
         classes_.clear();
+        enums_.clear();
         functions_.clear();
         type_names_.clear();
     }
@@ -238,6 +338,9 @@ private:
         if (rendered.find("_array[") != std::string::npos) {
             ss << "from array import array as _array\n";
         }
+        if (rendered.find("_IntEnum") != std::string::npos) {
+            ss << "from enum import IntEnum as _IntEnum\n";
+        }
         ss << "from typing import Any, List, Tuple, Optional, Union, overload";
         if (any_class_iterates()) ss << ", Iterator";
         ss << "\n\n";
@@ -247,6 +350,21 @@ private:
     }
 
     void render_body(std::ostringstream& ss) const {
+        // Enums first: a class whose member is one names it in an
+        // annotation, and `from __future__ import annotations` makes that
+        // lazy, but a reader wants the definition above the use anyway.
+        for (const auto& [name, info] : enums_) {
+            ss << "class " << name << "(_IntEnum):\n";
+            if (info.members.empty()) {
+                ss << "    pass\n\n";
+                continue;
+            }
+            for (const auto& [member, value] : info.members) {
+                ss << "    " << member << " = " << value << "\n";
+            }
+            ss << "\n";
+        }
+
         // Classes
         for (const auto& [name, info] : classes_) {
             ss << generate_class_stub(info) << "\n";
@@ -271,15 +389,16 @@ private:
     std::string resolve_placeholders(std::string text) const {
         std::string::size_type start = 0;
         while ((start = text.find('\x01', start)) != std::string::npos) {
-            auto end = text.find('\x02', start);
+            auto end = text.find_first_of("\x02\x03", start);
             if (end == std::string::npos) break;
+            const bool is_enum = text[end] == '\x03';
             std::string typeid_name = text.substr(start + 1, end - start - 1);
             std::string replacement;
             auto it = type_names_.find(typeid_name);
             if (it != type_names_.end()) {
                 replacement = it->second;
             } else {
-                replacement = fallback_class_name(typeid_name);
+                replacement = is_enum ? "int" : fallback_class_name(typeid_name);
             }
             text.replace(start, end - start + 1, replacement);
             start += replacement.size();
@@ -303,14 +422,7 @@ private:
     // string, so a C++ member called `pass` is still reachable through
     // getattr(). It is only the *declaration* that cannot be written down.
     static bool is_python_keyword(const std::string& s) {
-        static const std::set<std::string> kw = {
-            "False", "None", "True", "and", "as", "assert", "async", "await",
-            "break", "class", "continue", "def", "del", "elif", "else",
-            "except", "finally", "for", "from", "global", "if", "import",
-            "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
-            "return", "try", "while", "with", "yield"
-        };
-        return kw.count(s) != 0;
+        return mirror_bridge::is_python_keyword(s);
     }
 
     // Render a parameter list, renaming anything that cannot be spelled as a
@@ -477,6 +589,7 @@ private:
     }
 
     std::map<std::string, ClassInfo> classes_;
+    std::map<std::string, EnumInfo> enums_;
     std::vector<MethodInfo> functions_;
     std::map<std::string, std::string> type_names_;
 };
@@ -524,9 +637,13 @@ std::string type_hint() {
         // std::is_integral is false for enums, so without this an enum fell
         // through to the "it must be a class" path and the stub annotated it
         // with the C++ enum's own name — a name the module never defines,
-        // which makes the whole .pyi unusable to a type checker. The values
-        // really do cross as plain int (PyLong_FromLong / PyLong_Check).
-        return "int";
+        // which makes the whole .pyi unusable to a type checker.
+        //
+        // A module that binds the enum does define a name for it, and an
+        // IntEnum member is an int, so naming it is both true and more
+        // useful. One that does not still gets "int", because that is
+        // exactly what crosses (PyLong_FromLong / PyLong_Check).
+        return StubRegistry::enum_placeholder(typeid(CleanT).name());
     } else if constexpr (std::is_floating_point_v<CleanT>) {
         return "float";
     } else if constexpr (std::is_same_v<CleanT, std::string> ||
@@ -657,6 +774,16 @@ void register_function_stub(const char* name, const std::vector<std::string>& pa
     }
 
     StubRegistry::instance().add_function(func);
+}
+
+// Register an enum, from the same reflection bind_enum built it from.
+template<typename E>
+void register_enum_stub(const char* name) {
+    StubRegistry::instance().register_type_name(typeid(E).name(), name);
+    EnumInfo info;
+    info.name = name;
+    info.members = mirror_bridge::enum_members<E>();
+    StubRegistry::instance().add_enum(info);
 }
 
 // Register a property

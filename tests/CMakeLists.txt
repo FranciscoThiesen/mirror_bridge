@@ -57,6 +57,12 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
     )
 
+    # Scoped, unscoped, nested, negative and keyword-named enumerators.
+    mirror_bridge_python_module(enums_test
+        enums/enums_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/enums
+    )
+
     # Every shape the array.array decision can land on, so the stub has to
     # mirror the typecode table rather than approximate it.
     mirror_bridge_python_module(stub_container_types

@@ -35,7 +35,7 @@ reject "and no class called alignas is bound"       "alignas"
 expect "an attributed class is not lost"            "Found: exportlib::Tagged in exportlib.hpp"
 expect "a final class is found"                     "Found: exportlib::Sealed in exportlib.hpp"
 reject "MIRROR_BRIDGE_SKIP is honoured"             "exportlib::Internal"
-expect "the enum is reported rather than bound"     "Status"
+reject "the enum is not reported as unbound"        "enum type(s)"
 expect "the list came from the compiler"            "(reflection)"
 
 python3 test_export_macro.py

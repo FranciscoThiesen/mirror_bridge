@@ -61,23 +61,32 @@ out=$("$TOOL" generate "$TMPDIR/enums/src" --module tdiag --lang python \
 # report it as a class to bind, and a plain `enum Venue` was invisible.
 check "scoped enum is not discovered as a class" "$out" "Discovered 1 classes"
 check_absent "enum is not listed as a found class" "$out" "Found: Side"
-check "enums are reported as unbound" "$out" "enum type(s)"
-check "the enum is named" "$out" "Side"
-check "the plain enum is named too" "$out" "Venue"
-check "the report says what Python does instead" "$out" "AttributeError"
-check "the report points at the catalogue" "$out" "errors.md#names-missing-from-the-module"
+# The Python backend binds them now, so they are not names missing from the
+# module and the "not bound" report must not claim them.
+check_absent "enums are not reported as unbound for Python" "$out" "enum type(s)"
 
 # The stub used to annotate enum members with the C++ enum's own name, which
 # the module never defines, making the whole file unusable to a type checker.
+# Now the module does define it, so naming it is both true and more useful.
 pyi="$TMPDIR/enums/build/tdiag.pyi"
 if [ -f "$pyi" ]; then
     stub=$(cat "$pyi")
-    check "stub annotates an enum member as int" "$stub" "side: int"
-    check_absent "stub does not name an undefined enum type" "$stub" ": Side"
+    check "stub declares the enum" "$stub" "class Side(_IntEnum):"
+    check "stub declares the plain enum too" "$stub" "class Venue(_IntEnum):"
+    check "stub annotates an enum member with the enum" "$stub" "side: Side"
+    check "and imports IntEnum under an alias" "$stub" "from enum import IntEnum as _IntEnum"
 else
     echo "  ✗ no stub generated at $pyi"
     fail=$((fail + 1))
 fi
+
+# The same enums through the Lua backend, which has no enum object to map
+# onto and so still reports them.
+lua_out=$("$TOOL" generate "$TMPDIR/enums/src" --module tdiag_lua --lang lua \
+      --output "$TMPDIR/enums/build_lua" --force 2>&1)
+check "Lua still reports enums as unbound" "$lua_out" "enum type(s)"
+check "and names them" "$lua_out" "Side"
+check "and says which backend does bind them" "$lua_out" "enum.IntEnum"
 
 # --------------------------------------------------------------------------
 echo "Free functions that cannot be bound say so after the banner"

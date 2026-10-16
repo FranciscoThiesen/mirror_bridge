@@ -9,7 +9,7 @@ No special error handling code needed in the binding layer.
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build'))
 import file_parser
 
 def main():

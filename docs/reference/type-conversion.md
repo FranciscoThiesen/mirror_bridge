@@ -160,8 +160,17 @@ m.resource = None  # Sets to nullptr
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `enum` | `int` | `number` | `number` |
-| `enum class` | `int` | `number` | `number` |
+| `enum` | `enum.IntEnum` | `number` | `number` |
+| `enum class` | `enum.IntEnum` | `number` | `number` |
+
+The Python backend exports the enum *type* as an `enum.IntEnum` whose members
+carry the C++ enumerator names and values. Nothing about the *value*
+conversion changed, because an `IntEnum` member is an `int`: a function that
+took a bare `int` still takes one, and one that returns an enum still returns
+a plain `int`, which compares equal to the member. An enumerator whose name is
+a Python keyword gets a trailing underscore, since `Permission.None` is a
+syntax error rather than an attribute lookup. Lua and JavaScript have no enum
+object to map onto and their values keep crossing as numbers.
 
 **C++:**
 ```cpp
