@@ -1778,38 +1778,37 @@ PyObject* create_buffer_view(std::vector<T>& vec, PyObject* owner) {
 // Batch Processing API - Hot Loop Optimization
 // ============================================================================
 //
-// The batch processing API enables keeping iteration entirely in C++,
-// avoiding the overhead of crossing the Python/C++ boundary N times.
+// Taking a method that Python calls in a loop and giving it a sibling that
+// takes the whole sequence keeps the iteration in C++, so the boundary is
+// crossed once instead of N times.
 //
-// Problem: Traditional Python->C++ calls have ~100-500ns overhead per call.
-// For 1M elements, that's 100-500ms of pure overhead!
+//   // called N times from Python
+//   double scale(double x) const { return x * gain + offset; }
 //
-// Solution: Process entire arrays/vectors in a single C++ call.
-//
-// Usage pattern (in C++ class definition):
-//
-//   // Old way (called N times from Python):
-//   double process(double x) { return std::sqrt(x); }
-//
-//   // New batch API (called once, processes N elements):
-//   std::vector<double> process_batch(const std::vector<double>& input) {
-//       std::vector<double> result;
-//       result.reserve(input.size());
-//       for (auto x : input) {
-//           result.push_back(std::sqrt(x));
-//       }
-//       return result;
+//   // called once
+//   std::vector<double> scale_batch(const std::vector<double>& input) const {
+//       std::vector<double> out;
+//       out.reserve(input.size());
+//       for (double x : input) out.push_back(scale(x));
+//       return out;
 //   }
 //
-// From Python:
-//   # Old: ~500ms for 1M calls
-//   results = [sim.process(x) for x in data]
+// What that is worth, measured over 100,000 elements, as
+// [o.m(x) for x in xs] against o.m_batch(xs):
 //
-//   # New: ~5ms for 1M elements (100x faster!)
-//   results = sim.process_batch(data)
+//   x * gain + offset              2.40 ms -> 0.43 ms   5.5x
+//   sqrt(x * gain) + sin(x)        3.23 ms -> 0.81 ms   4.0x
+//   a stateful EWMA update         2.35 ms -> 0.43 ms   5.4x
+//   200 iterations of real work  372.46 ms -> 364.11 ms 1.0x
 //
-// The binding system automatically handles vector<T> conversion, so batch
-// methods work seamlessly with Python lists and NumPy arrays.
+// So the ceiling is about 5x, and it is 5x because that is what the boundary
+// costs relative to a cheap method -- about 24 ns per element here, including
+// the comprehension. The last row is the one to understand before writing a
+// batch method: when the method itself is the expensive part there is nothing
+// to win, because the boundary was never the cost.
+//
+// The binding system handles vector<T> conversion, so a batch method works
+// with Python lists and with array.array.
 
 // Helper to transform a vector element-wise using a functor
 // Returns a new vector - used for methods that return transformed data
