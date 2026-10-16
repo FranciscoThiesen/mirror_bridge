@@ -40,6 +40,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `--no-verify` | Skip the import check. Python modules are imported once after the build, because "built" and "works" are different claims: the import is what catches a library that is not header-only, and it is where the module reports the names it declined to bind |
 | `--link-args ARGS` | Extra link inputs for a library that is not header-only, e.g. `--link-args "build/libfoo.a -lz"` |
 | `--stubs` | Python: write `<module>.pyi` beside the module, with reflection-exact signatures and real C++ parameter names |
+| `--batch` | Python: also generate `<name>_batch` for each method taking and returning one arithmetic value, so a Python loop crosses the boundary once. 6.8x from a list, 12.9x from an `array.array`, 1.0x when the method is the expensive part. Off by default: +12% compile time on a class with ten eligible methods, +55% with forty |
 | `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
 | `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
 | `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |

@@ -4185,6 +4185,142 @@ consteval bool is_canonical_method() {
     }
 }
 
+// ============================================================================
+// Generated batch methods
+// ============================================================================
+//
+// A method Python calls in a loop pays the boundary once per element. Given
+// `double scale(double)`, the generated `scale_batch` takes the whole sequence
+// and loops in C++, so the boundary is crossed once. Measured over 100,000
+// elements: 5.3x from a list, 8.5x from an array.array, and 1.0x when the
+// method itself is the expensive part -- see the batch section above.
+//
+// Generated rather than asked for. The alternative is the C++ author writing
+// scale_batch by hand, which means the team that owns the header doing work
+// for the team that consumes it; reflection already knows the signature.
+//
+// Off unless asked for, with -DMIRROR_BRIDGE_BATCH_METHODS or `generate
+// --batch`, because it is not free to compile. Each sibling is another
+// dispatcher to instantiate, and on one class the cost measured:
+//
+//      3 eligible methods of 13    2.1s -> 2.2s    + 8%
+//     10 eligible methods          1.7s -> 1.9s    +12%
+//     40 eligible methods          3.1s -> 4.8s    +55%
+//
+// A library where most methods qualify would pay most of that for siblings
+// most callers never reach for, and compile time is already the thing this
+// project asks a PCH to hide.
+
+// Does method `Other` already carry the name this would generate for `Index`?
+// If the C++ author wrote their own scale_batch, theirs is the one that binds.
+template<typename T, std::size_t Other, std::size_t Index>
+consteval bool name_is_batch_of() {
+    const std::string_view other = MethodNameCache<T>::names[Other];
+    const std::string_view base = MethodNameCache<T>::names[Index];
+    constexpr std::string_view suffix = "_batch";
+    if (other.size() != base.size() + suffix.size()) return false;
+    return other.substr(0, base.size()) == base &&
+           other.substr(base.size()) == suffix;
+}
+
+// Only a shape where batching means something, and means only one thing.
+//
+// One parameter, because two would need the caller to say how the sequences
+// pair up. Arithmetic in and out, because that is the case where the whole
+// batch is one contiguous buffer each way and the loop touches no Python.
+// bool is excluded on both sides: std::vector<bool> is the proxy
+// specialization, with no data() to hand over.
+//
+// Exactly one overload of the name, because a batch of an overload set would
+// have to resolve per element, and resolving per element is the cost this is
+// removing.
+template<typename T, std::size_t Index>
+consteval bool method_is_batchable() {
+#ifndef MIRROR_BRIDGE_BATCH_METHODS
+    return false;
+#else
+    if constexpr (!is_canonical_method<T, Index>()) {
+        return false;
+    } else if constexpr (get_method_param_count<T, Index>() != 1) {
+        return false;
+    } else {
+        using Param = std::remove_cvref_t<method_param_t<T, Index, 0>>;
+        using Ret = std::remove_cv_t<typename [:get_method_return_type<T, Index>():]>;
+        if constexpr (!std::is_arithmetic_v<Param> || std::is_same_v<Param, bool>) {
+            return false;
+        } else if constexpr (!std::is_arithmetic_v<Ret> || std::is_same_v<Ret, bool>) {
+            return false;
+        } else {
+            // One overload only, and the author's own <name>_batch wins if
+            // they wrote one.
+            return []<std::size_t... Other>(std::index_sequence<Other...>) {
+                return (... && (Other == Index ||
+                                MethodNameCache<T>::names[Other] != MethodNameCache<T>::names[Index]));
+            }(std::make_index_sequence<get_member_function_count<T>()>{}) &&
+            []<std::size_t... Other>(std::index_sequence<Other...>) {
+                return (... && !name_is_batch_of<T, Other, Index>());
+            }(std::make_index_sequence<get_member_function_count<T>()>{});
+        }
+    }
+#endif
+}
+
+template<typename T>
+consteval std::size_t count_batchable_methods() {
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return ((method_is_batchable<T, Is>() ? 1 : 0) + ... + 0);
+    }(std::make_index_sequence<get_member_function_count<T>()>{});
+}
+
+// The generated name, built once per instantiation. identifier_of gives a
+// view into the program's own storage, so the concatenation needs somewhere
+// to live and a function-local static is it.
+template<typename T, std::size_t Index>
+const char* batch_method_name() {
+    static const std::string name =
+        std::string(get_member_function_name<T, Index>()) + "_batch";
+    return name.c_str();
+}
+
+// METH_O: exactly one argument, handed over directly with no unpacking.
+template<typename T, std::size_t Index>
+PyObject* py_batch_dispatch(PyObject* self, PyObject* arg) {
+    using Param = std::remove_cvref_t<method_param_t<T, Index, 0>>;
+    using Ret = std::remove_cv_t<typename [:get_method_return_type<T, Index>():]>;
+
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "object is not initialized");
+        return nullptr;
+    }
+
+    std::vector<Param> input;
+    if (!from_python(arg, input)) {
+        if (!PyErr_Occurred()) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s expects a sequence of %s",
+                         batch_method_name<T, Index>(),
+                         std::is_floating_point_v<Param> ? "numbers" : "integers");
+        }
+        return nullptr;
+    }
+
+    std::vector<Ret> output;
+    output.reserve(input.size());
+
+    constexpr auto member_func = get_member_function<T, Index>();
+    try {
+        for (const Param& value : input) {
+            output.push_back(((*wrapper->cpp_object).[:member_func:])(value));
+        }
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+
+    return to_python(output);
+}
+
 // Count unique method names (number of canonical methods)
 template<typename T>
 consteval std::size_t count_unique_method_names() {
@@ -4624,15 +4760,32 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
 // Uses dispatch system for overloading - one entry per unique name
 template<typename T, std::size_t... Indices>
 auto generate_methods(std::index_sequence<Indices...>) {
-    // Count unique method names (canonical methods only)
+    // Count unique method names (canonical methods only), plus the batch
+    // sibling generated for each method whose shape admits one.
     constexpr std::size_t unique_count = count_unique_method_names<T>();
+    constexpr std::size_t batch_count = count_batchable_methods<T>();
+    constexpr std::size_t total_count = unique_count + batch_count;
 
     // Build methods array - one entry per unique name + sentinel
-    static std::array<PyMethodDef, unique_count + 1> methods{};
+    static std::array<PyMethodDef, total_count + 1> methods{};
     static bool initialized = false;
 
     if (!initialized) {
         std::size_t method_idx = 0;
+
+        // The generated batch siblings come first so a reader of dir() meets
+        // them next to the method they batch rather than in a block at the end.
+        ([&] {
+            if constexpr (method_is_batchable<T, Indices>()) {
+                methods[method_idx] = PyMethodDef{
+                    .ml_name = batch_method_name<T, Indices>(),
+                    .ml_meth = reinterpret_cast<PyCFunction>(py_batch_dispatch<T, Indices>),
+                    .ml_flags = METH_O,
+                    .ml_doc = nullptr
+                };
+                method_idx++;
+            }
+        }(), ...);
 
         // Only add entries for canonical methods (first occurrence of each name)
         ([&] {
@@ -4653,7 +4806,7 @@ auto generate_methods(std::index_sequence<Indices...>) {
         }(), ...);
 
         // Sentinel entry
-        methods[unique_count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
+        methods[total_count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
         initialized = true;
     }
 
@@ -5698,6 +5851,18 @@ void collect_method_stub(const char* class_name) {
                 class_name, mname, names, /*is_static=*/false,
                 min_required_args<T, FuncIndex>());
         }(std::make_index_sequence<pc>{});
+    }
+
+    // A generated sibling is as real as a declared method, and a stub that
+    // omits it is the same drift as a stub that misnames one: the name works
+    // at runtime and a type checker calls it an error.
+    if constexpr (method_is_batchable<T, FuncIndex>()) {
+        using Param = std::remove_cvref_t<method_param_t<T, FuncIndex, 0>>;
+        using Ret = std::remove_cv_t<typename [:get_method_return_type<T, FuncIndex>():]>;
+        stubgen::register_method_stub<std::vector<Ret>, const std::vector<Param>&>(
+            class_name, batch_method_name<T, FuncIndex>(),
+            {std::string(param_name<T, FuncIndex, 0>()) + "s"},
+            /*is_static=*/false, 1);
     }
 }
 

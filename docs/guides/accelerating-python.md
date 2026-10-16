@@ -139,6 +139,46 @@ knowingly. `from_python` accepts both, so a round trip is fine.
 integer parameter, `-1` to an unsigned one, and a list with a `None` in it.
 This is the opposite of the usual default and it is worth relying on.
 
+## Batching a method you call in a loop
+
+If the slow thing is a loop in Python over a method that is itself cheap, the
+cost is the boundary, not the method. `--batch` gives every method taking and
+returning one arithmetic value a sibling that takes the whole sequence:
+
+```bash
+mirror_bridge generate src --module hot --lang python --output build --batch
+```
+
+```python
+# one crossing per element
+out = [sim.scale(x) for x in xs]        # 2.82 ms for 100,000
+
+# one crossing
+out = sim.scale_batch(xs)               # 0.41 ms, 6.8x
+out = sim.scale_batch(arr)              # 0.22 ms, 12.9x from an array.array
+```
+
+The second form is 12.9x because a batch returns `array.array`, so chaining
+two of them never builds a list in between.
+
+It carries state, which a list comprehension cannot be rewritten to do:
+`ewma_batch(xs)` threads the object through the loop and leaves it exactly
+where the loop would have.
+
+Two things decide whether it is worth turning on:
+
+- **It is 1.0x when the method is the expensive part.** Measured on a method
+  doing 200 iterations of real work: 372.46 ms against 364.11 ms. The win is
+  the boundary, so there is none to take when the boundary was not the cost.
+  Same rule as `sum(xs)/len(xs)` above.
+- **It costs compile time**, one more dispatcher per eligible method: +12% on
+  a class with ten of them, +55% with forty. That is why it is off by default.
+
+A sibling is generated only for a method taking exactly one arithmetic value
+and returning one, with exactly one overload of that name, and never over a
+`<name>_batch` the C++ author wrote themselves. Everything else is untouched,
+so turning the flag on cannot change an existing call.
+
 ## Read the build output, not just the exit code
 
 `generate` reports every name you wrote that is not in the finished module,

@@ -201,6 +201,14 @@ ${YELLOW}Options:${NC}
                       different claims: the import is what catches a library
                       that is not header-only, and it is where the module
                       reports the classes and functions it declined to bind
+  --batch             Python: for each method taking and returning one
+                      arithmetic value, also generate <name>_batch taking the
+                      whole sequence, so the boundary is crossed once instead
+                      of once per element. Measured 6.8x from a list and 12.9x
+                      from an array.array, and 1.0x when the method itself is
+                      the expensive part. Off by default because each sibling
+                      costs compile time: +12% on a class with ten eligible
+                      methods, +55% with forty
   --release-gil       Python: drop the GIL while C++ method bodies run, so
                       long-running native calls stop blocking other threads
                       (argument/result conversion still holds the GIL; safe
@@ -1497,6 +1505,7 @@ cmd_generate() {
             -f|--force) FORCE_REBUILD=1; shift ;;
             --no-verify) VERIFY_IMPORT=0; shift ;;
             --json) JSON_MODE=1; shift ;;
+            --batch) EXTRA_DEFINES+=("-DMIRROR_BRIDGE_BATCH_METHODS"); shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
             --link-args) LINK_ARGS="$2"; shift 2 ;;

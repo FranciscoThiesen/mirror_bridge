@@ -175,6 +175,9 @@ while IFS= read -r -d '' binding_file; do
 # Exclude v8/ directory - V8 tests are built separately in Step 2d.
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
+# Exclude batch_methods_binding.cpp - a binding, but one whose point is what
+# -DMIRROR_BRIDGE_BATCH_METHODS adds, which tests/batch_methods/test_batch.sh
+# builds both ways.
 # Exclude buffer_shape_check.cpp - a standalone program, not a binding: the
 # buffer-protocol behaviour it checks cannot be reached from Python, because
 # memoryview copies shape out of the Py_buffer and numpy holds only one at a
@@ -197,7 +200,8 @@ done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_
               -not -path "*/build/*" -not -path "*/build_ci/*" -not -path "*/build_ctest/*" \
               -not -path "*/.worktrees/*" \
               -not -name "test_validation.cpp" \
-              -not -name "buffer_shape_check.cpp" -print0)
+              -not -name "buffer_shape_check.cpp" \
+              -not -name "batch_methods_binding.cpp" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"

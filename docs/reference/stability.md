@@ -28,6 +28,8 @@ These may change or be removed in any release; pin a tag if you depend on them:
 - V8 direct-API bindings (`mirror_bridge_v8.hpp`)
 - Auto-trampoline internals (the vtable-swap mechanism; the *behavior* —
   Python subclasses overriding C++ virtuals — is intended to stay)
+- `--batch` and the `<name>_batch` methods it generates: which signatures
+  qualify is expected to widen
 - The `.mirror` config-file format
 - Any header or function not documented in [api.md](api.md)
 

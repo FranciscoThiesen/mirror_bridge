@@ -349,7 +349,11 @@ endif()
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
 set(MB_PYTHON_BASH_ONLY_PATTERN
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro"
+    # batch_methods' module only exists when built with
+    # -DMIRROR_BRIDGE_BATCH_METHODS, which its own script does; the glob below
+    # would otherwise register the .py as a standalone test with nothing to
+    # import.
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^batch_methods"
 )
 
 # The same contract for the other two backends. These were spelled out at
@@ -472,6 +476,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared/build_and_test.sh
     )
     set_tests_properties(cli_friend_declared PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
+# Batch siblings are generated only under a flag, so the module is built both
+# ways rather than relying on the default build.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_methods)
+    add_test(NAME batch_methods
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/batch_methods/test_batch.sh
+    )
+    set_tests_properties(batch_methods PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
     )
 endif()
