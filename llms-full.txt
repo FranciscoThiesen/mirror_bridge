@@ -691,6 +691,11 @@ mirror_bridge generate src/ --module greeter --lang python
 python3 test_greeter.py
 ```
 
+A `greeter.pyi` is written next to the module. It is the fastest way to see
+what crossed: real C++ parameter names, exact member types, and the types that
+actually come back (a numeric vector is an `array.array`, not a `list`). Pass
+`--no-stubs` to skip it.
+
 ## Step 4: Create Your Own
 
 **Write C++:**
@@ -2556,7 +2561,12 @@ mirror_bridge generate src/ --module my_module --lang python --pch
 2. Finds all `struct` and `class` definitions
 3. Auto-generates binding code
 4. Compiles with PCH (fast!)
-5. Produces `build/my_module.so`
+5. Produces `build/my_module.so` and `build/my_module.pyi`
+
+The `.pyi` carries reflection-exact signatures, so an editor, a type checker,
+a reader and an agent all see the real C++ parameter names and the types that
+actually cross. `--no-stubs` skips it. If a build fails, the generated
+binding `.cpp` is kept and the compiler's line numbers refer to it.
 
 **Time cost**: ~194-252ms (3-6x faster than without PCH!)
 
@@ -6099,6 +6109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The agent-facing interface can reach the features built for agents.** The MCP server's `generate_bindings` took five parameters while the CLI accepts nineteen flags, so `--batch` — the largest shipped speedup for the acceleration use case, 6.8x from a list and 12.9x from an `array.array` — was unreachable from the one interface written for an agent, and so were `--link-args`, `--release-gil` and `-k`. `--stubs`, `.pyi` and `--batch` appeared nowhere in `AGENTS.md`, `quickstart.md` or `workflow.md`; they do now. Two more things it got wrong: the CLI's human-readable diagnosis goes to stderr and the wrapper discarded it, so a failed build reached the agent as one grepped line; and only one top-level field was translated from container paths back to host paths, so a path inside `errors[]` pointed at a filesystem the agent cannot see. The whole result is translated now, the `.pyi` comes back as `stub` and `stub_text`, and stderr is attached on failure. `tests/mcp_surface/` covers the argv and the translation, which had no tests at all, and cross-checks every flag the server emits against the CLI's own parser — a flag renamed on one side only is this project's recurring defect in its most literal form.
 - **The CLI runs on macOS.** Every script here uses associative arrays or name references, both bash 4, and all five carried `#!/bin/bash`. macOS ships bash 3.2 from 2007 and will not ship a newer one, so the entire output of every subcommand, `doctor` included, was `declare: -A: invalid option` and exit 2. `docs/README.md` lists macOS as supported and every page says `./tools/mirror_bridge`; all fifteen CI `runs-on` entries are `ubuntu-latest`, so nothing was going to catch it. The shebang is `env bash` now, so a newer bash on PATH is used, and a guard above the first bash-4 construct says what is wrong and what to do about it. `tests/shell_portability/` pins the rule rather than the instance: any script using bash-4 syntax checks `BASH_VERSINFO` before reaching it. It found two more CLIs while being written.
 - **A failed build keeps the file the compiler is complaining about.** The generated binding was deleted on the failure branch too, so the reader got one grepped line referring to line numbers in a file that no longer existed, plus "re-run with --verbose", whose output goes to stderr and which the MCP server discards. The `.cpp` now survives a failure, the terminal says where it is, and `--json` carries `generated_binding` so an agent gets a path rather than a bare line number. Two suggestions were added for errors that had none, including `no matching function for call to 'from_python'`, which is the most common real failure in the corpus and had no entry in the catalogue.
 - **Three documented things that were not true.** The README said enums do not work, hours after they started working, and pointed at a closed issue; it said smart pointers work, which #54 says they do not in either direction; and it counted sixteen corpus libraries where the matrix publishes thirty-two. `docs/reference/cli.md` documented `init --name`, which the CLI rejects. `docs/guides/packaging.md` promised a `setup.py with auto-build` in `examples/packaging/`, which has four files and no build step, so following it produces a package that can only raise the ImportError its own `__init__.py` is written to raise.

@@ -59,9 +59,28 @@ tools/mirror_bridge generate src/ --module my_module --lang python
 tools/mirror_bridge generate src/ --module my_module --lang all
 
 # Useful flags: -o/--output DIR (default build/), -k/--keep-generated,
-# -v/--verbose, -f/--force, -I DIR (extra include dir), --pch [PATH]
+# -v/--verbose, -f/--force, -I DIR (extra include dir), --pch [PATH],
+# --batch, --no-stubs, --link-args, --json
 tools/mirror_bridge generate src/ --module my_module --lang python -I include/ -v
 ```
+
+A `<module>.pyi` is written beside the module unless you pass `--no-stubs`.
+Read it rather than guessing at the surface: the signatures come from the same
+reflection the binding does, so the parameter names are the real C++ ones and
+the types are what actually crosses -- a numeric vector returns an
+`array.array`, not a `list`, and the stub says so.
+
+`--batch` generates a `<name>_batch` sibling for every method taking and
+returning one arithmetic value, so a Python loop crosses the boundary once
+instead of once per element. Measured at 6.8x from a list and 12.9x from an
+`array.array` over 100,000 elements, and 1.0x when the method body is the
+expensive part -- it amortises the boundary, not the work. Off by default
+because each sibling costs compile time.
+
+`--json` puts one object on stdout: the classes found, the outputs built, and
+on failure a per-language `reason`, `suggestion` and `generated_binding` --
+the last being the generated `.cpp` the compiler's line numbers refer to,
+which is kept when a build fails.
 
 `generate` scans every `.hpp`/`.h` under `src_dir`, binds all discovered struct/class definitions,
 emits a `<module>_<lang>_binding.cpp`, compiles it, and (unless `-k`) deletes the generated `.cpp`.
