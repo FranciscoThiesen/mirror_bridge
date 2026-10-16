@@ -30,16 +30,6 @@ jobs:
       - name: Run benchmark suite
         run: ./benchmarks/run_all_benchmarks.sh
 
-      # The page was regenerated monthly and nothing read it, so a regression
-      # could sit in a table for a month. Ratios are the stable signal across
-      # machines, so the gate compares those against committed floors. It
-      # reports where a competitor is faster without failing for it: that is a
-      # fact to see, not a regression.
-      - name: Gate the runtime ratios against the committed floors
-        run: |
-          python3 benchmarks/check_ratios.py \
-            benchmarks/runtime/python/runtime_results.json
-
       - name: Splice regenerated runtime table into the benchmarks page
         run: |
           python3 benchmarks/format_results.py \
@@ -83,5 +73,24 @@ jobs:
             `docs/internals/benchmarks.md` regenerated from the results.
             Compare the ratio columns against the previous page; absolute
             times shift with runner hardware, ratios should be stable.
+
+            If `benchmarks/ratio_floors.json` is in this PR, it is the
+            baseline the regression gate compares against and the gate is
+            unarmed until this merges. The run that produced this PR failed
+            for exactly that reason.
           branch: bot/benchmarks-refresh
           delete-branch: true
+
+      # Last, because on the run that establishes the floors this step fails,
+      # and the PR above is what carries them into the repository. Failing
+      # before it would mean the gate could never become armed.
+      #
+      # Ratios are the stable signal across machines, so the comparison is
+      # against committed floors rather than absolute ns/op. Where a
+      # competitor is faster the output says so without failing: that is a
+      # fact to see, not a regression.
+      - name: Gate the runtime ratios against the committed floors
+        run: |
+          python3 benchmarks/check_ratios.py \
+            benchmarks/runtime/python/runtime_results.json \
+            --require-floors

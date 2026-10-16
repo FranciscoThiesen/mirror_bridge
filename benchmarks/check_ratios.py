@@ -57,10 +57,16 @@ def main():
                          "runner noise on these operations)" % DEFAULT_TOLERANCE)
     ap.add_argument("--update", action="store_true",
                     help="write the current ratios as the new floors, and exit 0")
+    ap.add_argument("--require-floors", action="store_true",
+                    help="treat a missing baseline as a failure. Bootstrapping "
+                         "still writes the file, so the run that establishes "
+                         "the floors is the one that fails, and the run after "
+                         "they are committed is the first that gates anything")
     args = ap.parse_args()
 
     with open(args.results) as f:
         data = json.load(f)
+    bootstrapped = False
     fresh = ratios(data)
     if not fresh:
         sys.exit("no usable mirror_bridge numbers in %s" % args.results)
@@ -72,9 +78,24 @@ def main():
         # Bootstrap rather than fail. The first real run on the real machine is
         # where a floor should come from; a hand-written one would just be a
         # guess that either never fires or fires for no reason.
+        #
+        # But bootstrapping gates nothing, and it reported success, which reads
+        # the same as a passing gate. The floors only reach the repository when
+        # the refresh PR is merged, so an unmerged PR leaves every later run
+        # bootstrapping and green. Say so where it cannot be missed.
         print("no baseline at %s — establishing it from this run" % args.floors)
+        unarmed = (
+            "no ratio was gated: %s is not in the repository, so this run "
+            "measured the floors instead of checking against them. They are "
+            "written now and travel in the benchmark refresh PR; merging it "
+            "arms the gate for every run after." % os.path.basename(args.floors)
+        )
+        print(unarmed)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::warning title=Ratio gate unarmed::%s" % unarmed)
         args.update = True
         floors = None
+        bootstrapped = True
 
     if args.update or floors is None:
         payload = {
@@ -89,6 +110,8 @@ def main():
             json.dump(payload, f, indent=2, sort_keys=True)
             f.write("\n")
         print("wrote %d operations to %s" % (len(fresh), args.floors))
+        if bootstrapped and args.require_floors:
+            return 1
         return 0
 
     regressions, behind, checked = [], [], 0
