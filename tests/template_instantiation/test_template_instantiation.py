@@ -159,6 +159,26 @@ def test_stubs():
     print("✓ stubs name instantiations")
 
 
+def test_member_operator_template_costs_nothing():
+    # The guard's whole point: an operator template is skipped and the class
+    # keeps the member template beside it. If the guard were missing there
+    # would be no module to import at all, so reaching this line is half the
+    # assertion.
+    tg = geom.Tagged()
+    assert tg.tag == 3, tg.tag
+    assert tg.scaled(4) == 12, tg.scaled(4)
+    print("✓ a member operator template does not cost the module")
+
+def test_conversion_template_costs_nothing():
+    # yaml-cpp's shape: a conversion template, which reaches the planner by a
+    # different route than the operator template above. Same rule, different
+    # path, and this is the one that sent yaml-cpp to the text scan.
+    cv = geom.Convertible()
+    assert cv.raw == 7, cv.raw
+    assert cv.doubled() == 14, cv.doubled()
+    print("✓ a conversion template does not cost the module")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
