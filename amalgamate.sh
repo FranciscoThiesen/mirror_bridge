@@ -106,15 +106,18 @@ TMP_ANNOTATIONS=$(mktemp)
 TMP_STUBGEN=$(mktemp)
 TMP_EIGEN=$(mktemp)
 TMP_TEMPLATES=$(mktemp)
-trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES"' EXIT
+TMP_SEQVIEW=$(mktemp)
+trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES" "$TMP_SEQVIEW"' EXIT
 extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_stubgen.hpp" > "$TMP_STUBGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_templates.hpp" > "$TMP_TEMPLATES"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_sequence_view.hpp" > "$TMP_SEQVIEW"
 
 # Extract Python content: skip the core include, splice satellites inline
 awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
-    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" '
+    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" \
+    -v seqview="$TMP_SEQVIEW" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
     /^#include "core\/mirror_bridge_spelling\.hpp"/ { next }   # emitted with core
@@ -136,6 +139,15 @@ awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
     /^#include "python\/mirror_bridge_templates\.hpp"/ {
         while ((getline line < templates) > 0) print line
         close(templates)
+        next
+    }
+    # Every satellite header needs its own rule here. The catch-all in
+    # extract_content deletes any mirror_bridge #include it does not
+    # recognise, so a new header without a rule is not a compile error in
+    # the single-header build -- it is silently missing code.
+    /^#include "python\/mirror_bridge_sequence_view\.hpp"/ {
+        while ((getline line < seqview) > 0) print line
+        close(seqview)
         next
     }
     { print }

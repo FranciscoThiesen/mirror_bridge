@@ -102,6 +102,59 @@ struct crosses_as_array<C, std::void_t<typename C::value_type>>
 template<typename C>
 inline constexpr bool crosses_as_array_v = crosses_as_array<std::remove_cvref_t<C>>::value;
 
+// Which vector members cross as a live view rather than a copy.
+//
+// Here beside crosses_as_array for the same reason that one is here: two
+// things have to agree about it and they live in different headers. py_getter
+// decides whether to build a view; type_hint has to say in the .pyi which one
+// it built. Written through core's concepts because this header is parsed
+// before the python header defines its own copies of them; the two sets are
+// textually identical.
+//
+// A class template with a void_t partial specialization rather than a
+// variable template, for the same reason crosses_as_array is one: `&&` in a
+// variable template's initialiser short-circuits evaluation, not
+// substitution, so naming C::value_type there is a hard error for every C
+// that has none.
+//
+// std::vector only, and not vector<bool>: the proxy reference vector<bool>
+// yields is not an lvalue to view, and it has no data() to expose.
+template<typename C, typename = void>
+struct is_viewable_vector : std::false_type {};
+
+template<typename C>
+struct is_viewable_vector<C, std::void_t<typename C::value_type>>
+    : std::bool_constant<
+          is_std_vector<C>::value &&
+          !std::is_same_v<typename C::value_type, bool> &&
+          (std::is_arithmetic_v<typename C::value_type> ||
+           core::StringLike<typename C::value_type> ||
+           core::NestedBindable<typename C::value_type>)> {};
+
+template<typename C>
+inline constexpr bool is_viewable_vector_v =
+    is_viewable_vector<std::remove_cvref_t<C>>::value;
+
+// Restores the pre-0.4.0 behaviour, where reading a vector member gave a
+// fresh array.array or list. Reading one is then a copy again, so
+// `obj.items.append(x)` goes back to being accepted and discarded -- the
+// escape hatch exists because this changed a mapping stability.md lists as
+// stable, not because copying is a reasonable thing to want.
+#ifdef MIRROR_BRIDGE_COPY_VECTOR_MEMBERS
+inline constexpr bool vector_members_are_views = false;
+#else
+inline constexpr bool vector_members_are_views = true;
+#endif
+
+// The member types py_getter hands back as a live sequence instead of a copy.
+// Mirrors is_viewable_member_v's shape: a const, reference or array-typed
+// member keeps the copy it had.
+template<typename M>
+inline constexpr bool is_viewable_sequence_member_v =
+    vector_members_are_views &&
+    is_viewable_vector_v<M> && !std::is_const_v<M> &&
+    !std::is_array_v<M> && !std::is_reference_v<M>;
+
 // bytes has exactly one producer, the non-template to_python(const
 // std::vector<unsigned char>&). std::vector<char>, std::vector<std::byte>
 // and std::array<unsigned char, N> all come back as lists of int, whatever
@@ -337,6 +390,9 @@ private:
         // predate this.
         if (rendered.find("_array[") != std::string::npos) {
             ss << "from array import array as _array\n";
+        }
+        if (rendered.find("_MutableSequence[") != std::string::npos) {
+            ss << "from collections.abc import MutableSequence as _MutableSequence\n";
         }
         if (rendered.find("_IntEnum") != std::string::npos) {
             ss << "from enum import IntEnum as _IntEnum\n";
@@ -615,7 +671,12 @@ inline std::string demangle(const char* mangled) {
 // goes in as a list, a tuple, an array.array or anything else with the
 // sequence protocol. One string cannot be true in both places, and asking it
 // to be is how the stub came to promise list[float] for an array('d').
-enum class Position { Return, Param };
+//
+// A member read is a third position for the same kind of reason: a
+// std::vector member crosses as a live view while a method returning the very
+// same C++ type still crosses as a copy, because the getter can establish
+// interiority and a method return cannot.
+enum class Position { Return, Param, MemberRead };
 
 // Convert C++ type to Python type hint
 template<typename T, Position P = Position::Return>
@@ -701,10 +762,21 @@ std::string type_hint() {
             // is no spelling for that which is not also a lie. Sequence[int]
             // is the obvious candidate and admits bytes, which from_python
             // rejects outright, so it would approve a call that fails.
-            if constexpr (P == Position::Return && crosses_as_array_v<CleanT>) {
-                return "_array[" + type_hint<ValueT, P>() + "]";
+            // Reading a vector member gives a live view, which registers
+            // as a collections.abc.MutableSequence -- so that is a hint a
+            // type checker can act on and isinstance agrees with, rather
+            // than a name only this project knows. Aliased for the same
+            // reason _array is: a bound C++ class of that name would
+            // otherwise shadow the import.
+            if constexpr (P == Position::MemberRead && is_viewable_sequence_member_v<T>) {
+                return "_MutableSequence[" + type_hint<ValueT, Position::Return>() + "]";
             }
-            return "list[" + type_hint<ValueT, P>() + "]";
+            if constexpr ((P == Position::Return || P == Position::MemberRead) &&
+                          crosses_as_array_v<CleanT>) {
+                return "_array[" + type_hint<ValueT, Position::Return>() + "]";
+            }
+            return "list[" + type_hint<ValueT, (P == Position::MemberRead)
+                                                   ? Position::Return : P>() + "]";
         }
     }
 
@@ -732,6 +804,9 @@ std::string return_hint() { return type_hint<T, Position::Return>(); }
 
 template<typename T>
 std::string param_hint() { return type_hint<T, Position::Param>(); }
+
+template<typename T>
+std::string member_read_hint() { return type_hint<T, Position::MemberRead>(); }
 
 inline std::string StubRegistry::fallback_class_name(const std::string& typeid_name) {
     std::string name = demangle(typeid_name.c_str());
@@ -790,7 +865,7 @@ void register_enum_stub(const char* name) {
 template<typename T, typename MemberT>
 void register_property_stub(const char* class_name, const char* prop_name, bool readonly = false) {
     ClassInfo& info = StubRegistry::instance().get_or_create_class(class_name);
-    info.properties.push_back({prop_name, return_hint<MemberT>(),
+    info.properties.push_back({prop_name, member_read_hint<MemberT>(),
                                param_hint<MemberT>(), readonly});
 }
 

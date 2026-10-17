@@ -67,8 +67,15 @@ tools/mirror_bridge generate src/ --module my_module --lang python -I include/ -
 A `<module>.pyi` is written beside the module unless you pass `--no-stubs`.
 Read it rather than guessing at the surface: the signatures come from the same
 reflection the binding does, so the parameter names are the real C++ ones and
-the types are what actually crosses -- a numeric vector returns an
-`array.array`, not a `list`, and the stub says so.
+the types are what actually crosses -- a method returning a numeric vector
+gives an `array.array`, not a `list`, and the stub says so.
+
+Reading a `std::vector` data member gives a live view of the C++ vector, not a
+copy, so `obj.points.append(p)` reaches C++ and reading the member is O(1)
+whatever its length. It is a `collections.abc.MutableSequence`; call
+`list(...)` on it when you need a snapshot or something that insists on a real
+list, such as `json.dumps`. A numeric one exports the buffer protocol, so
+`numpy.asarray(obj.xs)` is zero-copy.
 
 `--batch` generates a `<name>_batch` sibling for every method taking and
 returning one arithmetic value, so a Python loop crosses the boundary once
