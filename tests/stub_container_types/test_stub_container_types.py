@@ -16,6 +16,7 @@ typecode, so they are lists, and a stub that says "numeric vector means
 array" gets them wrong.
 """
 import array
+from collections.abc import MutableSequence
 import ast
 import os
 import sys
@@ -125,14 +126,26 @@ except TypeError:
     check(True, "bytes is refused, which is why the hint is not Sequence[float]")
 
 print("Test 6: a member that reads and writes differently says both")
-check(props.get("xs", {}).get("get") == "_array[float]", f"xs reads as {props.get('xs')}")
+check(props.get("xs", {}).get("get") == "_MutableSequence[float]",
+      f"xs reads as {props.get('xs')}")
 check(props.get("xs", {}).get("set") == "list[float]", "and accepts a list")
 check(props.get("gain", {}).get("bare") == "float",
       f"while a plain member stays a plain annotation: {props.get('gain')}")
 check(props.get("tag", {}).get("bare") == "int", f"and a char member is an int: {props.get('tag')}")
-check(isinstance(obj.xs, array.array), f"reading xs really gives {type(obj.xs).__name__}")
+# A member read is a live view, so it is a MutableSequence and not the
+# array.array a method return of the same C++ type still gives. The stub
+# says MutableSequence for exactly this reason, and isinstance has to agree
+# with it or the annotation is the same kind of lie this file exists to stop.
+check(isinstance(obj.xs, MutableSequence),
+      f"reading xs really gives a MutableSequence, not {type(obj.xs).__name__}")
+check(not isinstance(obj.xs, array.array),
+      "a member read is not the array.array a method return gives")
+check(isinstance(obj.doubles(), array.array),
+      f"while a method return still gives {type(obj.doubles()).__name__}")
 obj.xs = [7.0, 8.0]
 check(list(obj.xs) == [7.0, 8.0], "and assigning a list really works")
+obj.xs.append(9.0)
+check(list(obj.xs) == [7.0, 8.0, 9.0], "and appending through the view reaches C++")
 check(isinstance(obj.tag, int), f"and tag really is an int: {obj.tag!r}")
 
 print()

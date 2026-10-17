@@ -155,7 +155,12 @@ def test_stubs():
     text = open(pyi).read()
     # A free function takes no keyword arguments at runtime, so its stub
     # marks every parameter positional-only.
-    for needle in ("class Vec3f:", "class Vector3_long:", "position: Vec3d", "path: list[Vec3f]",
+    # `path` is a std::vector member, so it reads as a live view and writes
+    # from a list. Those differ, so it renders as a property rather than the
+    # bare annotation a plain member gets.
+    for needle in ("class Vec3f:", "class Vector3_long:", "position: Vec3d",
+                   "def path(self) -> _MutableSequence[Vec3f]",
+                   "def path(self, value: list[Vec3f]) -> None",
                    "def dot3(a: Vec3f, b: Vec3f, /) -> float", "def answer() -> int"):
         assert needle in text, needle
     print("✓ stubs name instantiations")

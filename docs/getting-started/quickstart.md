@@ -35,8 +35,9 @@ python3 test_greeter.py
 
 A `greeter.pyi` is written next to the module. It is the fastest way to see
 what crossed: real C++ parameter names, exact member types, and the types that
-actually come back (a numeric vector is an `array.array`, not a `list`). Pass
-`--no-stubs` to skip it.
+actually come back (a method returning a numeric vector gives an
+`array.array`, not a `list`; a vector *member* gives a live view of the C++
+vector that you can append to). Pass `--no-stubs` to skip it.
 
 ## Step 4: Create Your Own
 

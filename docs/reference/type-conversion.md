@@ -32,11 +32,40 @@ Mirror Bridge automatically converts types between C++ and target languages. Thi
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `std::vector<T>` (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
-| `std::vector<T>` (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` read as a **data member** | live view (see below) | `table` (array) | `Array` |
 | `std::array<T, N>` | `list` | `table` (array) | `Array` |
 | `std::deque<T>` | `list` | `table` (array) | `Array` |
 | `std::list<T>` | `list` | `table` (array) | `Array` |
+
+**A vector data member is a live view, not a copy.** Reading one gives an
+object that holds a pointer to the C++ vector itself and a reference to its
+owner, so `obj.points.append(p)` and `obj.points[0] = p` reach the C++ object
+instead of mutating a temporary that is then discarded. It registers as a
+`collections.abc.MutableSequence`, which is what the `.pyi` says it is, and
+supports `len`, indexing, negative indices, iteration, `in`, `==` against any
+sequence, `append`, `extend`, `insert`, `pop`, `clear`, `del` and `tolist()`.
+A numeric one also exports the buffer protocol, so `numpy.asarray(obj.xs)`
+shares the vector's own storage rather than copying it.
+
+Because the view does not copy, reading a member is O(1) instead of O(n):
+measured on a `vector<double>` member, 122 ns to 44 ns at ten elements and
+54.0 us to 44 ns at a hundred thousand.
+
+Three cases deliberately keep the copy they always had:
+
+- **A method return.** A reference out of a method cannot be shown to point
+  inside the receiver, so there is nothing to keep alive and nothing to view.
+- **A `const` member.** A writable view of one would get around what C++ said.
+- **`std::vector<bool>`.** It packs its elements and yields a proxy, so there
+  is no element to take a reference to.
+
+A slice (`v[:]`), `list(v)` and `v.tolist()` each give a real copy, which is
+how you take a snapshot. Resizing is refused with `BufferError` while a
+`memoryview` or numpy array is outstanding, because it would reallocate the
+storage they point at. Holding an element of a vector of classes across an
+`append` has the same hazard the underlying C++ reference would.
 
 **Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings copy the buffer in bulk into an `array.array` object instead of converting element by element. This is ~10-50x faster for large arrays. At or above 1 KB the buffer is copied once, out of the C++ container through a borrowed `memoryview`; below that it goes through an intermediate `bytes` object, which is two copies but one fewer call into the interpreter and measurably cheaper at that size. The crossover is a measured one and can be moved with `-DMIRROR_BRIDGE_ARRAY_BORROW_BYTES=<n>`. The `from_python` direction accepts both `list` and `array.array` inputs.
 

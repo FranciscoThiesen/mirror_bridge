@@ -16,9 +16,21 @@ one minor release, an entry in the CHANGELOG, and a migration note:
 | Discovery opt-outs | `// MIRROR_BRIDGE_SKIP`, `// MIRROR_BRIDGE_SKIP_FILE` |
 | CLI commands & flags | `generate`, `build`, `pch`, `diff`, `watch`, `doctor`, `version` and their documented options |
 | `--json` output | Existing fields keep their names and types; changes are additive only |
-| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` → `array.array` |
+| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` returned from a method → `array.array` |
 | Umbrella headers | `mirror_bridge.hpp`, `lua/mirror_bridge_lua.hpp`, `javascript/mirror_bridge_javascript.hpp` |
 | CMake target | `mirror_bridge::mirror_bridge` via `find_package`/FetchContent |
+
+### Changed in 0.4.0
+
+Reading a `std::vector` **data member** gives a live view of the C++ vector
+rather than a copy. A method returning the same type is unchanged. The view is
+a `collections.abc.MutableSequence`, so code that iterates, indexes, slices,
+takes `len` or compares against a list keeps working; code that asserted
+`isinstance(obj.field, list)` or `isinstance(obj.field, array.array)`, or that
+passed the member straight to `json.dumps`, needs `list(obj.field)`.
+
+This was a bug fix with a visible type change: the copy meant
+`obj.field.append(x)` was accepted and silently discarded.
 
 ## Experimental
 

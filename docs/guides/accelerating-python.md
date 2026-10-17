@@ -117,7 +117,9 @@ than silently misbehaving:
 
 ## Two results that will surprise you
 
-**A numeric vector comes back as `array.array`, not a `list`.** This is
+**A numeric vector comes back as `array.array`, not a `list`.** This applies
+to a method return; a vector *data member* is a live view of the C++ vector
+instead, which you can append to and which numpy reads without copying. This is
 deliberate: the conversion is a bulk copy of the buffer rather than building a
 list of boxed floats, which is where a good part of the speedup above comes
 from. From 1 KB up it is one copy, straight out of the C++ container; below

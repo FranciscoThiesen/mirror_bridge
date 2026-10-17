@@ -139,6 +139,7 @@ python3 test_greeter.py
 | **Methods (any arity)** | ✅ | ✅ | ✅ |
 | **Constructors** | ✅ | ✅ | ✅ |
 | **Containers (vector/array)** | ✅ | ✅ | ✅ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ |
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |

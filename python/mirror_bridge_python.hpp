@@ -2182,6 +2182,12 @@ bool resolve_wrapper_slow(PyObject* obj, void*& raw);
 template<typename Member>
 PyObject* to_python_member_view(Member& ref, PyObject* parent);
 
+// The same idea for a std::vector member: a live sequence over the vector's
+// own storage rather than a fresh array.array or list on every read. Defined
+// in mirror_bridge_sequence_view.hpp, included below the conversions it uses.
+template<typename C>
+PyObject* to_python_sequence_view(C& ref, PyObject* parent);
+
 // The member types to_python would otherwise heap-copy into a fresh wrapper.
 // A const member keeps the copy: a view of it would hand Python a writable
 // reference to something C++ declared it may not change.
@@ -3932,7 +3938,17 @@ PyObject* py_getter(PyObject* self, void* closure) {
         // - Container → Recursive to_python for elements
         if constexpr (is_viewable_member_v<MemberType>) {
             return to_python_member_view(value, self);
-        }        return to_python(value);
+        }
+
+        // A std::vector member is handed back the same way and for the same
+        // reason. Without this, `b.items.append(9)` and `b.items[0] = 9` are
+        // both accepted and both silently discarded, because they mutate a
+        // copy that is thrown away at the end of the expression -- the
+        // container form of the bug PR #32 fixed one level up.
+        if constexpr (is_viewable_sequence_member_v<MemberType>) {
+            return to_python_sequence_view(value, self);
+        }
+        return to_python(value);
     }
 }
 
@@ -4021,6 +4037,10 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
         // is_viewable_member_v is false and the branch above took it.
         if constexpr (is_viewable_member_v<MemberType>) {
             return to_python_member_view(value, self);
+        }
+        // And a vector member is a live sequence, for the same reason.
+        if constexpr (is_viewable_sequence_member_v<MemberType>) {
+            return to_python_sequence_view(value, self);
         }
         return to_python(value);
     }
@@ -6864,6 +6884,15 @@ from_python(PyObject* obj, T& out) {
     return ConversionOverloadGenerator<T>::from_python_impl(obj, out);
 }
 
+}  // namespace mirror_bridge
+
+// Live views over std::vector members. Included here rather than at the top
+// because every slot it defines calls to_python, from_python and
+// to_python_member_view, all of which are complete by this point.
+#include "python/mirror_bridge_sequence_view.hpp"
+
+namespace mirror_bridge {
+
 // ============================================================================
 // Automatic stub collection (reflection-exact .pyi metadata)
 // ============================================================================
@@ -7144,8 +7173,26 @@ BoundClass<T> bind_class(PyObject* module, const char* name,
                 ([&] {
                     constexpr auto member = annotations::get_visible_member<T>(Is);
                     constexpr const char* name = std::meta::identifier_of(member).data();
-                    const auto& value = (*wrapper->cpp_object).[:member:];
-                    PyObject* py_val = to_python(value);
+                    using MemberType = typename [:std::meta::type_of(member):];
+
+                    // Render each member the way reading it renders, or the
+                    // repr claims a type the attribute does not hand back:
+                    // a vector member used to print as array('d', [...]) in
+                    // both places and now prints as a list in one of them.
+                    //
+                    // The two branches differ in constness on purpose. A
+                    // const lvalue reference is what binds to a bit-field,
+                    // so the general path keeps it; a view needs a mutable
+                    // reference, and a bit-field can never reach that branch
+                    // because its type is integral, not a vector.
+                    PyObject* py_val;
+                    if constexpr (is_viewable_sequence_member_v<MemberType>) {
+                        auto& live = (*wrapper->cpp_object).[:member:];
+                        py_val = to_python_sequence_view(live, self);
+                    } else {
+                        const auto& value = (*wrapper->cpp_object).[:member:];
+                        py_val = to_python(value);
+                    }
                     if (py_val) {
                         PyObject* py_val_repr = PyObject_Repr(py_val);
                         Py_DECREF(py_val);
