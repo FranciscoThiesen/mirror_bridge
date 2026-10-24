@@ -15,6 +15,7 @@ Run after: mirror_bridge generate tests/csharp_bindings --module csb --lang csha
 import ctypes
 import os
 import re
+import re
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,8 @@ class Driver {
             d.id = 21;
             d.calibration = 2.0;
             Console.WriteLine($"doubled()={d.doubled()} scale(4)={d.scale(4.0)} sum(3,4)={d.sum(3, 4)}");
+            d.label = "日本 café 🚀";
+            Console.WriteLine($"utf8 round trip: {d.label} len={d.label.Length}");
             d.label = "sensor";
             Console.WriteLine($"describe()={d.describe()}");
             d.rename("probe-2");
@@ -121,6 +124,7 @@ class Driver {
         try { var _ = deadVec.Count; Console.WriteLine("BUG: read a freed vector"); }
         catch (ObjectDisposedException) { Console.WriteLine("disposed owner: vector raises"); }
         using (var o = new Outer()) {
+            Console.WriteLine($"views cached: {ReferenceEquals(o.inner, o.inner)}");
             o.inner.x = 7.5;
             Console.WriteLine($"nested view write reaches the owner: inner.x={o.inner.x} scaled(2)={o.inner.scaled(2.0)}");
             using (var made = o.make())
@@ -233,6 +237,14 @@ check("int member reads its C++ initialiser", get_id(d), 7)
 check("double member reads its initialiser", get_cal(d), 1.25)
 check("bool member crosses as 1", get_online(d), 1)
 check("string member round-trips as UTF-8", take(get_label(d)), "probe")
+# A string the claim can actually distinguish: three bytes for the kanji, two
+# for the e-acute, four for the emoji, and a NUL-free multi-byte mix that
+# Latin-1 or a code page would mangle.
+UTF8 = "日本 café 🚀"
+set_label(d, UTF8.encode("utf-8"))
+check("and survives multi-byte characters intact", take(get_label(d)), UTF8)
+check("with the byte length C++ actually stored",
+      len(UTF8.encode("utf-8")), 3 + 3 + 1 + 3 + 2 + 1 + 4)
 check("const member is readable", get_serial(d), 4242)
 truthy("a const member gets no setter",
        not hasattr(lib, "mb_Device_set_serial"))
@@ -291,18 +303,37 @@ missing = [t for t in sorted(set(targets)) if not hasattr(lib, t)]
 check("every DllImport target exists in the shared library", missing, [])
 
 truthy("the namespace is a legal identifier", re.search(r"namespace \w+ \{", cs))
+
+print("\n=== the library name the runtime will actually probe for ===")
+truthy("the C# names the module, letting the runtime apply its own prefix/suffix",
+       'internal const string Lib = "csb";' in cs)
+import platform as _plat
+_want = {"Darwin": "libcsb.dylib", "Windows": "csb.dll"}.get(_plat.system(), "libcsb.so")
+truthy(f"and the built file is named {_want} for this platform",
+       os.path.isfile(os.path.join(work, _want)))
+cli_src = open(CLI).read()
+truthy("the CLI picks the name per platform rather than always .so",
+       "lib${module_name}.dylib" in cli_src and "${module_name}.dll" in cli_src)
+
 truthy("a class is generated per C++ class",
        "public sealed class Device" in cs and "public sealed class Counter" in cs)
 truthy("it is disposable", "public void Dispose()" in cs)
-truthy("a string return is marshalled and freed", "Native.TakeString" in cs)
+string_getters = re.findall(r"get \{\n\s*var r = Get_\w+\(Check\(\)\);(.*?)\}", cs, re.S)
+truthy("there are string property getters to check", len(string_getters) >= 1)
+check("every one of them routes the pointer through TakeString, which frees it",
+      [g for g in string_getters if "Native.TakeString(r)" not in g], [])
+truthy("and a string-returning method does too",
+       "return Native.TakeString(r);" in cs)
 truthy("a string parameter is marshalled in",
        "[MarshalAs(UnmanagedType.LPUTF8Str)] string" in cs)
-truthy("a bool is converted at the edge", "!= 0" in cs)
+truthy("a bool is converted at the edge, in the property itself",
+       "get => Get_online(Check()) != 0;" in cs
+       and "set => Set_online(Check(), value ? 1 : 0);" in cs)
 truthy("a const member has a getter and no setter",
        "public int serial {" in cs and "Set_serial" not in cs)
 truthy("errors are raised, not swallowed", "Native.Throw(" in cs)
-truthy("a string property raises rather than returning null on failure",
-       cs.count("Native.Throw(") >= 4)
+check("every string property getter raises rather than returning null",
+      [g for g in string_getters if "Native.Throw(" not in g], [])
 
 print("\n=== and says what it left out ===")
 # A generator that silently binds a subset is worse than one that refuses:
@@ -313,8 +344,8 @@ truthy("the skipped method too", "widen() --" in cs)
 check("a skipped member gets no property", "public  flags" in cs, False)
 
 # The run itself must report them, so nobody has to read the generated file.
-truthy("the generate run reports what it left out",
-       "left out" in run.stdout and "flags" in run.stdout)
+truthy("the generate run names the member and its reason on one line",
+       re.search(r"Device\.flags: .*vector<bool", run.stdout) is not None)
 # And the honest inverse: what used to be skipped is now bound, so a stale
 # claim here would be the test lying about its own subject.
 check("samples is no longer in the skipped list", "samples --" in cs, False)
@@ -370,9 +401,12 @@ truthy("the derived class keeps its own members too",
        "public double extra {" in derived_body)
 # Pinning the split itself, because the first version matched
 # "class DerivedHandle : SafeHandle" and read the nested handle type instead.
-truthy("the split found the class body and not the nested handle",
-       "SafeHandle" not in derived_body.split("public double extra")[0]
-       or "public int base_id" in derived_body)
+# Stated as a property of derived_body alone, not as an `or` with a claim
+# already asserted above, which could not fail.
+truthy("the split landed on the class body, which declares all three members",
+       all(m in derived_body for m in ("public int base_id {", "public string tag {",
+                                       "public double extra {")))
+truthy("and not on some other class's body", "public double combined()" in derived_body)
 
 print("\n=== the handle is a SafeHandle, not a raw IntPtr ===")
 # Not tidiness. With an IntPtr field the last read of `this` is inside the
@@ -382,8 +416,22 @@ print("\n=== the handle is a SafeHandle, not a raw IntPtr ===")
 # idempotent and thread-safe and gives the handle a critical finalizer.
 truthy("a SafeHandle subclass is generated per class", "DeviceHandle : SafeHandle" in cs)
 truthy("it releases through the native delete", "protected override bool ReleaseHandle()" in cs)
-truthy("instance calls take the handle, so the runtime keeps it alive",
-       "Get_id(DeviceHandle self)" in cs)
+# Three legitimately take a raw pointer. Delete and VFree are called from
+# SafeHandle.ReleaseHandle, which is handed the bare handle field and has no
+# SafeHandle to pass; FreeString takes a malloc'd char*, which is not a handle
+# and is never wrapped in one. Everything else must take the typed handle,
+# because an argument crossing as a bare IntPtr can be released by the GC
+# mid-call -- the exact hole that typing `self` closed.
+instance_externs = re.findall(
+    r"private static extern [^\n(]+ (\w+)\(([^)]*)\)", cs)
+raw_self = [n for n, a in instance_externs
+            if a.startswith("IntPtr ") and n not in ("Delete", "VFree", "FreeString")]
+check("only the release paths take a raw pointer", raw_self, [])
+truthy("and the release paths do, because ReleaseHandle has only the field",
+       any(n == "Delete" and a == "IntPtr self" for n, a in instance_externs))
+truthy("they take the handle instead, so the runtime keeps it alive",
+       any(re.match(r"\w+Handle self", a) for _, a in instance_externs)
+       and any(a.startswith("H v") for _, a in instance_externs))
 check("no hand-rolled finalizer is left behind", "~Device()" in cs, False)
 check("the raw pointer is no longer handed out", "public IntPtr Handle =>" in cs, False)
 truthy("Dispose delegates to the handle", "_h.Dispose();" in cs)
@@ -400,9 +448,10 @@ truthy("the run reports it too", "renamed to Handle_" in run.stdout)
 print("\n=== parameter names are the real C++ ones ===")
 # The project's Python stubs carry the real names and say so in writing; this
 # was the one backend whose output a human reads directly and it said a0, a1.
-for sig in ("scale(double factor)", "toggle(bool on)", "rename(string next)",
-            "sum(int a, int b)", "promote(Mode m)"):
-    truthy(f"signature reads {sig}", "public " in cs and sig in cs)
+for sig in ("public double scale(double factor)", "public bool toggle(bool on)",
+            "public void rename(string next)", "public int sum(int a, int b)",
+            "public Mode promote(Mode m)"):
+    truthy(f"signature reads {sig}", sig in cs)
 check("no positional placeholders remain in the public surface",
       "(double a0)" in cs or "(int a0, int a1)" in cs, False)
 
@@ -415,8 +464,10 @@ truthy("a failed string allocation is an error, not a silent empty string",
        "out of memory copying a string" in shim_src)
 truthy("the managed side maps the kind to a catchable type",
        "ArgumentOutOfRangeException" in cs and "OverflowException" in cs)
-truthy("ExactSpelling is set so the runtime does not probe a second name",
-       cs.count("ExactSpelling = true") > 10)
+dllimports = re.findall(r"\[DllImport\([^\]]*\)\]", cs)
+truthy("there are DllImports to check at all", len(dllimports) > 20)
+check("every one of them sets ExactSpelling",
+      [d for d in dllimports if "ExactSpelling = true" not in d], [])
 
 print("\n=== nested objects: a member is borrowed, a return is owned ===")
 truthy("a class-typed member is a property of the bound C# type",
@@ -430,10 +481,21 @@ truthy("it is constructed not-owning, so its handle will not free the owner's fi
 check("a class-typed member has no setter", "Set_inner" in cs, False)
 truthy("a class returned by value is owned by the caller",
        "public Inner make()" in cs and "new Inner(r, true, null)" in cs)
-truthy("the shim copies a returned value rather than pointing at the temporary",
-       "new csb::Inner(" in shim_src)
+# Anchored to the function that returns by value: "new csb::Inner(" on its own
+# is matched by mb_Inner_new's own `return new csb::Inner();`, so the assertion
+# held no matter what make() did.
+make_body = shim_src.split("mb_Outer_make(")[1].split("\n}")[0]
+truthy("the shim heap-copies the returned value",
+       "new csb::Inner(static_cast<csb::Outer*>(self)->make())" in make_body)
+check("and does not hand back the address of the temporary",
+      "&static_cast<csb::Outer*>(self)->make()" in make_body, False)
 truthy("a class parameter crosses as the wrapper's handle",
-       "public double consume(Inner other)" in cs and "other.Borrow()" in cs)
+       "public double consume(Inner other)" in cs
+       and 'Native.NotNull(other, "other").Borrow()' in cs)
+truthy("and the extern takes the handle type, so the marshaller ref-counts it",
+       "Call_consume(OuterHandle self, Inner.InnerHandle other)" in cs)
+truthy("a null class argument names the parameter instead of dereferencing",
+       "ArgumentNullException(name)" in cs)
 truthy("the wrapper holds its owner so the GC cannot collect it first",
        "private readonly object _parent;" in cs)
 # _parent is otherwise written and never read, which is CS0414 and an error
@@ -475,6 +537,14 @@ truthy("the shim copies rather than pointing at the temporary",
 truthy("the view is enumerable, so LINQ works", "IEnumerator<double> GetEnumerator()" in cs)
 truthy("and indexed writes exist", "public double this[int i] {" in cs)
 truthy("the element helpers range-check", "index out of range" in shim_src)
+truthy("vector element access is handle-typed too, not a raw pointer",
+       "VGet(H v, long i)" in cs and "VSize(H v)" in cs)
+truthy("ToArray does one bulk copy rather than a transition per element",
+       "Marshal.Copy(p, a, 0, n)" in cs)
+# A refused overload used to leave a live entry point that no generated C#
+# calls and that C++ overload resolution would answer from the wrong overload.
+check("a refused overload leaves no entry point behind",
+      shim_src.count("mb_Device_widen") > 1, False)
 # vector<bool> packs bits and hands back a proxy, so there is no element to
 # address. Binding it wrongly would be worse than not binding it.
 truthy("vector<bool> is refused and says why",
@@ -498,6 +568,37 @@ truthy("a class view checks its owner before use",
        "the object this view belongs to has been disposed" in cs)
 truthy("so does a vector view",
        "the object this vector belongs to has been disposed" in cs)
+# Checking the owner and then calling is a check-then-use race: another thread
+# can dispose in between and the in-flight call reads freed memory. A ref held
+# for the view's whole lifetime defers the owner's release, so the racing call
+# reads memory that is still there.
+truthy("a borrowed view holds a ref on its owner's handle",
+       "_pin.DangerousAddRef(ref _pinned);" in cs)
+truthy("and releases it on dispose", "_pin.DangerousRelease();" in cs)
+# With a ref outstanding the handle is deliberately not closed, so it cannot
+# answer "was the owner disposed" -- only "is the memory still there".
+truthy("disposal is tracked separately from the handle",
+       "private volatile bool _disposed;" in cs and "_disposed = true;" in cs)
+truthy("and every guard consults it first",
+       "if (_disposed || _h.IsInvalid || _h.IsClosed)" in cs)
+# A borrowed view's pointer is a fixed offset into the owner, so a fresh
+# wrapper -- and a fresh finalizable SafeHandle -- on every read was only GC
+# pressure. Count is still read from C++ each time, so growth is still seen.
+truthy("a member view is cached rather than rebuilt per read",
+       "private Inner _view_inner;" in cs)
+truthy("and so is a vector view", "private DoubleVector _view_samples;" in cs)
+
+print("\n=== what used to break the generator itself ===")
+# std::array has value_type and .data() but no allocator_type. Naming
+# allocator_type outside the detection guard made this a hard compile error in
+# the generator rather than a member reported as not crossing.
+truthy("a std::array member is reported, not fatal", "fixed --" in cs)
+truthy("and names the type", "array<double" in cs)
+truthy("the class around it still binds", "public sealed class WithArray" in cs)
+# The shim re-parses the project's headers. Pinned at C++17 it rejected any
+# header using a C++20 feature, on a project whose subject is modern C++.
+truthy("a header using a C++20 feature still builds through the shim stage",
+       "public sealed class Modern" in cs)
 
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
@@ -534,6 +635,8 @@ if MCS and MONO:
         truthy("a string return arrives as a C# string",
                "describe()=sensor/21" in out)
         truthy("a string parameter reaches C++", "after rename label=probe-2" in out)
+        truthy("multi-byte UTF-8 survives the round trip through C#",
+               "utf8 round trip: 日本 café 🚀 len=10" in out)
         truthy("a bool round-trips as bool, not int",
                "toggle(false)=False online=False" in out)
         truthy("a C++ throw becomes a C# exception carrying what()",
@@ -579,6 +682,7 @@ if MCS and MONO:
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",
                "disposed owner: vector raises" in out)
+        truthy("the same wrapper comes back on every read", "views cached: True" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:

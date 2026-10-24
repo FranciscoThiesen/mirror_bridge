@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <compare>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -145,6 +147,23 @@ struct Outer {
 struct Collide {
     int x = 1;
     int get_x() const { return x * 10; }
+};
+
+// std::array has value_type and .data() but no allocator_type. Naming
+// allocator_type outside the detection guard made this a hard error in the
+// generator rather than a member reported as not crossing.
+struct WithArray {
+    std::array<double, 3> fixed{1.0, 2.0, 3.0};
+    int tag = 4;
+    double total() const { return fixed[0] + fixed[1] + fixed[2]; }
+};
+
+// A C++20 feature in the bound header. The shim re-parses this header, so
+// pinning that compile at C++17 rejected it.
+struct Modern {
+    int version = 20;
+    auto operator<=>(const Modern&) const = default;
+    int doubled() const { return version * 2; }
 };
 
 }  // namespace csb

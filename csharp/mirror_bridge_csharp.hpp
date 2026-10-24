@@ -50,7 +50,6 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
-#include <vector>
 
 namespace mirror_bridge {
 namespace csharp {
@@ -96,7 +95,9 @@ template<typename, typename = void>
 struct vector_element { using type = void; static constexpr bool is_vector = false; };
 
 template<typename C>
-struct vector_element<C, std::void_t<typename C::value_type, decltype(std::declval<C&>().data())>> {
+struct vector_element<C, std::void_t<typename C::value_type,
+                                     typename C::allocator_type,
+                                     decltype(std::declval<C&>().data())>> {
     using type = typename C::value_type;
     static constexpr bool is_vector =
         std::is_same_v<C, std::vector<typename C::value_type,
@@ -340,8 +341,8 @@ inline std::string cs_member_name(const std::string& name) {
 // the C++ name, which is visible in the generated source rather than silent.
 inline bool cs_name_is_reserved(const std::string& n) {
     static const std::set<std::string> taken = {
-        "Dispose", "Check", "New", "Delete", "Lib", "Handle",
-        "_h", "ReleaseHandle", "IsInvalid", "SetHandle", "Equals",
+        "Dispose", "Check", "New", "Delete", "Lib", "Handle", "Borrow",
+        "MbAlive", "_h", "_parent", "ReleaseHandle", "IsInvalid", "SetHandle", "Equals",
         "GetHashCode", "GetType", "ToString", "MemberwiseClone", "Finalize",
     };
     return taken.count(n) != 0;
@@ -439,7 +440,7 @@ public:
         using CleanE = std::remove_cvref_t<E>;
         EnumPlan e;
         e.cpp_name = cpp_name;
-        e.cs_name = cs_name;
+        e.cs_name = escape_cs_keyword(cs_name);
         e.underlying = cs_wire_type(wire_of<std::underlying_type_t<CleanE>>());
         constexpr std::size_t count = detail::enumerators_array<CleanE>().size();
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
@@ -460,7 +461,7 @@ public:
         const std::size_t index = classes_.size();
         ClassPlan p;
         p.cpp_name = cpp_name;
-        p.cs_name = cs_name;
+        p.cs_name = escape_cs_keyword(cs_name);
         p.symbol = sanitize_symbol(cs_name);
         p.handle = std::string(cs_name) + "Handle";
         p.header = header ? header : "";
@@ -687,20 +688,24 @@ private:
           << "public sealed class " << N << " : IReadOnlyList<" << E << ">, IDisposable, IMbOwner {\n"
           << "private const string Lib = Native.Lib;\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_size\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-          << "private static extern long VSize(IntPtr v);\n\n"
+          << "private static extern long VSize(H v);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_get\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-          << "private static extern " << W << " VGet(IntPtr v, long i);\n\n"
+          << "private static extern " << W << " VGet(H v, long i);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_set\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-          << "private static extern void VSet(IntPtr v, long i, "
+          << "private static extern void VSet(H v, long i, "
           << (vp.is_string ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string" : W) << " x);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_add\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-          << "private static extern void VAdd(IntPtr v, "
+          << "private static extern void VAdd(H v, "
           << (vp.is_string ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string" : W) << " x);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_clear\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-          << "private static extern void VClear(IntPtr v);\n\n"
+          << "private static extern void VClear(H v);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_free\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
           << "private static extern void VFree(IntPtr v);\n\n"
-          << "private sealed class H : SafeHandle {\n"
+          << (vp.is_string ? std::string()
+              : std::string("[DllImport(Lib, EntryPoint = \"") + pre
+                + "_data\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                + "private static extern IntPtr VData(H v);\n\n")
+          << "internal sealed class H : SafeHandle {\n"
           << "internal H(IntPtr h, bool owns) : base(IntPtr.Zero, owns) {\n"
           << "SetHandle(h);\n"
           << "}\n"
@@ -711,19 +716,29 @@ private:
           << "}\n"
           << "}\n\n"
           << "private readonly H _h;\n"
-          << "private readonly object _parent;\n\n"
+          << "private readonly object _parent;\n"
+          << "private readonly SafeHandle _pin;\n"
+          << "private bool _pinned;\n"
+          << "private volatile bool _disposed;\n\n"
           << "internal " << N << "(IntPtr v, bool owned, object parent) {\n"
           << "_h = new H(v, owned);\n"
           << "_parent = parent;\n"
+          << "if (!owned && parent is IMbOwner o) {\n"
+          << "_pin = o.MbHandle;\n"
+          << "_pin.DangerousAddRef(ref _pinned);\n"
+          << "}\n"
           << "}\n\n"
+          << "SafeHandle IMbOwner.MbHandle => _h;\n\n"
           << "bool IMbOwner.MbAlive {\n"
           << "get {\n"
-          << "if (_h.IsInvalid || _h.IsClosed) return false;\n"
+          << "if (_disposed || _h.IsInvalid || _h.IsClosed) return false;\n"
           << "return (_parent as IMbOwner)?.MbAlive != false;\n"
           << "}\n"
           << "}\n\n"
-          << "private IntPtr P() {\n"
-          << "if (_h.IsInvalid || _h.IsClosed) {\n"
+          << "// Returns the handle, not a pointer: every entry point below takes it\n"
+          << "// typed so the marshaller ref-counts it across the call.\n"
+          << "private H P() {\n"
+          << "if (_disposed || _h.IsInvalid || _h.IsClosed) {\n"
           << "throw new ObjectDisposedException(\"" << N << "\");\n"
           << "}\n"
           << "// A borrowed vector points into its owner. The handle stays\n"
@@ -733,7 +748,7 @@ private:
           << "\", \"the object this vector belongs to has been disposed\");\n"
           << "}\n"
           << "GC.KeepAlive(_parent);\n"
-          << "return _h.DangerousGetHandle();\n"
+          << "return _h;\n"
           << "}\n\n"
           << "public int Count => checked((int)VSize(P()));\n\n"
           << "public " << E << " this[int i] {\n"
@@ -757,7 +772,16 @@ private:
           << "public " << E << "[] ToArray() {\n"
           << "var n = Count;\n"
           << "var a = new " << E << "[n];\n"
-          << "for (int i = 0; i < n; i++) a[i] = this[i];\n"
+          << (vp.is_string
+              ? std::string("for (int i = 0; i < n; i++) a[i] = this[i];\n")
+              // One bulk copy out of the vector's own storage instead of a
+              // P/Invoke per element. The shim already exported the data
+              // pointer for this and nothing had declared it.
+              : std::string("if (n > 0) {\n")
+                + "var p = VData(P());\n"
+                + "if (p == IntPtr.Zero) throw Native.LastError(\"" + N + ".ToArray\");\n"
+                + "Marshal.Copy(p, a, 0, n);\n"
+                + "}\n")
           << "return a;\n"
           << "}\n\n"
           << "public IEnumerator<" << E << "> GetEnumerator() {\n"
@@ -768,7 +792,12 @@ private:
           << "return GetEnumerator();\n"
           << "}\n\n"
           << "public void Dispose() {\n"
+          << "_disposed = true;\n"
           << "_h.Dispose();\n"
+          << "if (_pinned) {\n"
+          << "_pinned = false;\n"
+          << "_pin.DangerousRelease();\n"
+          << "}\n"
           << "}\n"
           << "}\n\n";
         return o.str();
@@ -1009,11 +1038,25 @@ private:
              << "// Holding that owner here is what stops the GC collecting it\n"
              << "// while this view is still alive -- the same strong parent\n"
              << "// reference the Python backend's vector views carry.\n"
-             << "private readonly object _parent;\n\n"
+             << "private readonly object _parent;\n"
+             << "private readonly SafeHandle _pin;\n"
+             << "private bool _pinned;\n"
+             << "// Separate from the handle on purpose: with a ref outstanding the\n"
+             << "// handle is deliberately not closed, so it cannot answer whether\n"
+             << "// the owner was disposed, only that the memory is still there.\n"
+             << "private volatile bool _disposed;\n\n"
              << "/// <summary>Wraps a pointer this object does not own.</summary>\n"
              << "internal " << p.cs_name << "(IntPtr self, bool owned, object parent) {\n"
              << "_h = new " << p.handle << "(self, owned);\n"
              << "_parent = parent;\n"
+             << "// Pinned for this wrapper's whole lifetime, not just around\n"
+             << "// one call: checking the owner and then calling is a race, and\n"
+             << "// a ref held here means a call already in flight cannot read\n"
+             << "// freed memory even if the owner is disposed mid-call.\n"
+             << "if (!owned && parent is IMbOwner o) {\n"
+             << "_pin = o.MbHandle;\n"
+             << "_pin.DangerousAddRef(ref _pinned);\n"
+             << "}\n"
              << "}\n\n";
 
         if (p.default_constructible) {
@@ -1025,14 +1068,15 @@ private:
                  << "}\n\n";
         }
 
-        body << "bool IMbOwner.MbAlive {\n"
+        body << "SafeHandle IMbOwner.MbHandle => _h;\n\n"
+             << "bool IMbOwner.MbAlive {\n"
              << "get {\n"
-             << "if (_h.IsInvalid || _h.IsClosed) return false;\n"
+             << "if (_disposed || _h.IsInvalid || _h.IsClosed) return false;\n"
              << "return (_parent as IMbOwner)?.MbAlive != false;\n"
              << "}\n"
              << "}\n\n"
              << "private " << p.handle << " Check() {\n"
-             << "if (_h.IsInvalid || _h.IsClosed) {\n"
+             << "if (_disposed || _h.IsInvalid || _h.IsClosed) {\n"
              << "throw new ObjectDisposedException(\"" << p.cs_name << "\");\n"
              << "}\n"
              << "// A borrowed handle is still \"valid\" after its owner is disposed,\n"
@@ -1051,14 +1095,20 @@ private:
              << "return _h;\n"
              << "}\n\n"
              << "public void Dispose() {\n"
+             << "_disposed = true;\n"
              << "_h.Dispose();\n"
+             << "if (_pinned) {\n"
+             << "_pinned = false;\n"
+             << "_pin.DangerousRelease();\n"
+             << "}\n"
              << "}\n\n"
-             << "/// <summary>The raw pointer, for passing this object to another\n"
-             << "/// binding's entry point. Internal: a caller has no use for it and\n"
-             << "/// every public path goes through the handle instead.</summary>\n"
-             << "internal IntPtr Borrow() {\n"
-             << "var h = Check();\n"
-             << "return h.DangerousGetHandle();\n"
+             << "/// <summary>This object's handle, for passing it to another binding's\n"
+             << "/// entry point. Returns the SafeHandle rather than a raw pointer so the\n"
+             << "/// marshaller ref-counts it across that call too -- an argument passed\n"
+             << "/// as a bare IntPtr can be released by the GC mid-call, which is\n"
+             << "/// exactly what typing `self` as the handle prevents.</summary>\n"
+             << "internal " << p.handle << " Borrow() {\n"
+             << "return Check();\n"
              << "}\n\n";
     }
 
@@ -1126,11 +1176,20 @@ private:
                         << "private static extern IntPtr Get_" << name
                         << "(" << p.handle << " self);\n\n";
                 const std::string vprop = claim_property_name(p, name);
-                body << "/// <summary>The C++ vector itself, not a copy: Add and the\n"
+                body << "private " << vp->cs_name << " _view_" << name << ";\n"
+                     << "/// <summary>The C++ vector itself, not a copy: Add and the\n"
                      << "/// indexer reach the owning object.</summary>\n"
+                     << "/// <remarks>Cached for the same reason as a member object view:\n"
+                     << "/// the vector sits at a fixed offset inside the owner. Count is\n"
+                     << "/// still read from C++ on every access, so growth is seen.</remarks>\n"
                      << "public " << vp->cs_name << " " << vprop << " {\n"
-                     << "get => new " << vp->cs_name << "(Get_" << name
-                     << "(Check()), false, this);\n"
+                     << "get {\n"
+                     << "if (_view_" << name << " == null) {\n"
+                     << "_view_" << name << " = new " << vp->cs_name << "(Get_"
+                     << name << "(Check()), false, this);\n"
+                     << "}\n"
+                     << "return _view_" << name << ";\n"
+                     << "}\n"
                      << "}\n\n";
                 return;
             }
@@ -1146,11 +1205,20 @@ private:
                         << "private static extern IntPtr Get_" << name
                         << "(" << p.handle << " self);\n\n";
                 const std::string prop2 = claim_property_name(p, name);
-                body << "/// <summary>A view of the C++ member, not a copy: writes reach "
+                body << "private " << cr->cs_name << " _view_" << name << ";\n"
+                     << "/// <summary>A view of the C++ member, not a copy: writes reach "
                      << "the owning object.</summary>\n"
+                     << "/// <remarks>Cached. The member sits at a fixed offset inside the\n"
+                     << "/// owner, so the pointer cannot change while the owner lives, and\n"
+                     << "/// building a fresh wrapper per read was only GC pressure.</remarks>\n"
                      << "public " << cr->cs_name << " " << prop2 << " {\n"
-                     << "get => new " << cr->cs_name << "(Get_" << name
-                     << "(Check()), false, this);\n"
+                     << "get {\n"
+                     << "if (_view_" << name << " == null) {\n"
+                     << "_view_" << name << " = new " << cr->cs_name << "(Get_"
+                     << name << "(Check()), false, this);\n"
+                     << "}\n"
+                     << "return _view_" << name << ";\n"
+                     << "}\n"
                      << "}\n\n";
                 // No setter: assigning a whole subobject would need the C++
                 // copy-assignment, and C# `obj.inner = other` reads as a
@@ -1635,7 +1703,12 @@ private:
                         const ClassRef* pr = class_ref<PT>();
                         fwd_args += std::string(fwd_args.empty() ? "" : ", ")
                                   + "(*static_cast<" + (pr ? pr->cpp_name : "") + "*>(" + an + "))";
-                        call_args += an + ".Borrow()";
+                        // Named rather than IntPtr, so the marshaller holds a
+                        // reference for the duration of the call.
+                        cs_ext_params = cs_ext_params.substr(
+                            0, cs_ext_params.size() - (std::string(cs_param_type(pw)) + " " + an).size())
+                            + (pr ? pr->cs_name + "." + pr->handle : std::string("IntPtr")) + " " + an;
+                        call_args += "Native.NotNull(" + an + ", \"" + an + "\").Borrow()";
                     } else {
                         const std::string cast = cpp_cast<PT>(pw);
                         fwd_args += std::string(fwd_args.empty() ? "" : ", ")
@@ -1644,6 +1717,20 @@ private:
                     }
                 }(), ...);
             }(std::make_index_sequence<argc>{});
+
+            // Checked before anything is emitted: refusing after the shim
+            // was written left a live entry point in the library that no
+            // generated C# calls, and that C++ overload resolution would
+            // answer from the wrong overload.
+            const std::string public_sig = name + "(" + cs_types + ")";
+            if (std::count(p.public_sigs.begin(), p.public_sigs.end(), public_sig)) {
+                p.skipped.push_back({p.cs_name, name + "()",
+                    "an earlier overload already has the C# signature "
+                    + public_sig + "; C++ distinguishes these parameter types "
+                    "and C# does not"});
+                return;
+            }
+            p.public_sigs.push_back(public_sig);
 
             const std::string invoke = std::string("static_cast<") + p.cpp_name
                                      + "*>(self)->" + name + "(" + fwd_args + ")";
@@ -1683,16 +1770,6 @@ private:
                 shim << "return " << zero_of(rw) << ";\n";
             }
             shim << "}\n\n";
-
-            const std::string public_sig = name + "(" + cs_types + ")";
-            if (std::count(p.public_sigs.begin(), p.public_sigs.end(), public_sig)) {
-                p.skipped.push_back({p.cs_name, name + "()",
-                    "an earlier overload already has the C# signature "
-                    + public_sig + "; C++ distinguishes these parameter types "
-                    "and C# does not"});
-                return;
-            }
-            p.public_sigs.push_back(public_sig);
 
             externs << "[DllImport(Lib, EntryPoint = \"" << sym
                     << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
@@ -1903,6 +1980,7 @@ private:
           << "// up the whole chain: a view of a view is only as alive as its root.\n"
           << "internal interface IMbOwner {\n"
           << "    bool MbAlive { get; }\n"
+          << "    SafeHandle MbHandle { get; }\n"
           << "}\n\n"
           << "internal static class Native {\n"
           << "    internal const string Lib = \"" << module_ << "\";\n\n"
@@ -1950,6 +2028,12 @@ private:
           << "    // per managed thread. One transition per thread for the address,\n"
           << "    // then a plain memory read per call.\n"
           << "    [ThreadStatic] private static IntPtr _slot;\n\n"
+          << "    /// <summary>Names the parameter when a class argument is null, instead\n"
+          << "    /// of letting it dereference inside the generated method.</summary>\n"
+          << "    internal static T NotNull<T>(T value, string name) where T : class {\n"
+          << "        if (value == null) throw new ArgumentNullException(name);\n"
+          << "        return value;\n"
+          << "    }\n\n"
           << "    /// <summary>Raises whatever the last native call recorded, if any.</summary>\n"
           << "    /// <remarks>Reads the error slot directly rather than calling back\n"
           << "    /// into the library: a second P/Invoke per call would double the\n"

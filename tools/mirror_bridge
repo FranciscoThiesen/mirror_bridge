@@ -960,8 +960,16 @@ build_csharp() {
 
     echo -e "${YELLOW}Compiling the shim into lib${module_name}.so...${NC}"
     # No reflection flags here on purpose: this is the step a consumer repeats
-    # with their own compiler, so it must not need one.
-    log=$($CXX_BIN -std=c++17 $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+    # with their own compiler, so it must not need one. It does re-parse the
+    # project's headers, though, so the standard has to be recent enough for
+    # them: pinned at C++17 this step rejected any header using a C++20
+    # feature, on a project whose whole subject is modern C++.
+    local shim_std="-std=c++20"
+    local shim_stdlib=""
+    case "$CXX_BIN" in
+        *clang*) shim_stdlib="-stdlib=libc++" ;;
+    esac
+    log=$($CXX_BIN $shim_std $shim_stdlib $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
           -fPIC -shared -O2 -DNDEBUG -fvisibility=hidden \
           "$shim_src" -o "$lib_out" 2>&1) || {
         echo -e "${RED}✗ the generated shim did not compile${NC}"
@@ -969,6 +977,28 @@ build_csharp() {
         LAST_COMPILE_LOG="$log"
         return 1
     }
+
+    local csc_bin=""
+    for cand in csc mcs; do
+        command -v "$cand" >/dev/null 2>&1 && { csc_bin="$cand"; break; }
+    done
+    if [ -n "$csc_bin" ] && [ "$VERIFY_IMPORT" -eq 1 ]; then
+        echo -e "${YELLOW}Checking the generated C# compiles...${NC}"
+        local cs_log
+        cs_log=$("$csc_bin" -target:library -warnaserror \
+                 -out:"$output_dir/${module_name}_check.dll" "$cs_out" 2>&1) || {
+            echo -e "${RED}✗ the generated C# does not compile${NC}"
+            echo "$cs_log" | grep -m8 -E "error" || echo "$cs_log" | head -8
+            LAST_COMPILE_LOG="$cs_log"
+            return 1
+        }
+        rm -f "$output_dir/${module_name}_check.dll"
+        echo -e "${GREEN}✓ the generated C# compiles cleanly${NC}"
+    elif [ -z "$csc_bin" ]; then
+        echo -e "  ${YELLOW}No C# compiler on PATH (csc or mcs), so ${module_name}.cs was not"
+        echo -e "  compiled. It is the one artifact here a human reads directly; check it"
+        echo -e "  in your own build before trusting it.${NC}"
+    fi
 
     echo -e "${GREEN}✓ $lib_out${NC}"
     echo -e "${GREEN}✓ $cs_out${NC}"
@@ -1315,11 +1345,13 @@ report_unbound() {
     local built_langs="${2:-}"
     # The Python backend binds enums as enum.IntEnum, so for that language
     # they are not missing from the module and do not belong in this list.
-    # Lua and JavaScript have no equivalent yet and their values still cross
-    # as bare numbers.
+    # Python and C# both bind enums as a real enum type; Lua and JavaScript
+    # have no equivalent yet and their values still cross as bare numbers. This
+    # gate named only Python, so a successful csharp run ended with a warning
+    # whose every clause was false.
     local -a unbound_enums=()
     case " $built_langs " in
-        *" python "*) ;;
+        *" python "*|*" csharp "*|*" cs "*) ;;
         *) unbound_enums=("${DISCOVERED_ENUMS[@]}") ;;
     esac
     local -a overloaded=() shares_name=()
@@ -1402,7 +1434,7 @@ report_unbound() {
         echo ""
         echo "    ${#unbound_enums[@]} enum type(s) — values still cross as plain numbers, unchecked"
         print_group unbound_enums
-        echo "      The Python backend binds these as enum.IntEnum; Lua and JavaScript do not yet"
+        echo "      Python binds these as enum.IntEnum and C# as a real enum; Lua and JavaScript do not yet"
     fi
     if [ ${#overloaded[@]} -gt 0 ]; then
         echo ""
