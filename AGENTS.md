@@ -55,7 +55,9 @@ example dir, `../../tools/mirror_bridge`). All commands below assume you are ins
 # Single language
 tools/mirror_bridge generate src/ --module my_module --lang python
 
-# Choices for --lang: python | lua | js | all
+# Choices for --lang: python | lua | js | csharp | all
+# (csharp is NOT in `all`: it writes a .cs source file plus the shared library
+#  that file loads, not a module the CLI can import and verify)
 tools/mirror_bridge generate src/ --module my_module --lang all
 
 # Useful flags: -o/--output DIR (default build/), -k/--keep-generated,
@@ -63,6 +65,37 @@ tools/mirror_bridge generate src/ --module my_module --lang all
 # --batch, --no-stubs, --link-args, --json
 tools/mirror_bridge generate src/ --module my_module --lang python -I include/ -v
 ```
+
+**Before binding an unfamiliar or large codebase, do these two things first.**
+They turn a long guessing loop into one pass, and they are the flags most worth
+knowing about:
+
+```bash
+# 1. Take the include paths and defines from the project's own build system
+#    rather than rediscovering them as -I/-D by trial and error.
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # or: bear -- make
+# 2. Ask what reflection can see, without generating or compiling anything.
+tools/mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+Read `source` in that JSON before anything else:
+
+- `"source": "reflection"` -- the headers were read after the preprocessor and
+  the class list is real. Proceed.
+- `"source": "text scan"` -- the reflection unit failed and every name came
+  from reading header text, which cannot see `class MYLIB_API Widget` or
+  resolve a typedef. **Do not generate a module from this**; it would bind the
+  wrong names. The output names a planner log that says why it failed, and the
+  usual cause is a missing include path or define, which is what
+  `--compile-commands` is for.
+
+Related flags: `--compile-commands-for PATH` scopes the database to one subtree
+(a monorepo's union of every subsystem's flags is self-contradictory), and
+`--replace-prefix OLD=NEW` maps a database written on another machine onto this
+one. MSVC and clang-cl spellings (`/I`, `/D`, `/external:I`, `/FI`) are
+translated, and the project's own `-std=` is dropped because reflection needs
+C++26.
 
 A `<module>.pyi` is written beside the module unless you pass `--no-stubs`.
 Read it rather than guessing at the surface: the signatures come from the same

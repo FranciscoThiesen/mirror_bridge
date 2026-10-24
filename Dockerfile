@@ -12,6 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev \
         nodejs npm \
         lua5.4 liblua5.4-dev \
+        # The C# backend emits a .cs file, and a structural check of generated
+        # source is not a check. mcs compiles it and mono runs it, which is
+        # how the first version was caught declaring `private static extern
+        # intGet_id(...)` -- valid-looking text that no compiler accepts.
+        mono-mcs mono-runtime \
         libeigen3-dev libfmt-dev libjsoncpp-dev libnanoflann-dev \
         # Build deps for the §7 extended path: Open3D from source. Keeping
         # them in the base image means a reader doesn't need a second

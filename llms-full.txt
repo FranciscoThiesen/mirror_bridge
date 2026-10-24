@@ -84,6 +84,26 @@ stops a module coming out, grouped so the most valuable thing to fix is the
 line with the most libraries on it. pybind11 and nanobind have nothing to put
 in that first column, because the class list is the thing their user writes.
 
+### Pointing it at a large codebase
+
+Large projects do not fail to bind because binding is hard. They fail because their
+headers do not parse without the include paths and defines their own build system
+passes. `--compile-commands` reads those from the build instead of asking you to restate
+them:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+`--discover-only` stops after reading the headers and reports what it found, including
+whether the class list came from reflection or from a fallback text scan. That is the
+number that says whether a codebase is ready, and it costs one pass instead of a module
+per class. MSVC and clang-cl flag spellings are translated, and `--replace-prefix` maps a
+build database written on one machine onto the paths of another.
+[Details](docs/reference/cli.md#large-codebases).
+
 ## Try It Now
 
 No installation required — run in your browser or with Docker:
@@ -133,7 +153,17 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
+| C# (.NET) | Early | `--lang csharp` |
 | Rust | Prototype | Code generation |
+
+C# goes through P/Invoke, so there is no host C API to call the way there is for
+CPython, Lua and Node. `--lang csharp` writes a flat C ABI shim plus the C# that calls
+it, both from one reflection pass, so a member renamed in C++ renames the exported symbol
+and the C# property together. **The shim has no reflection in it**, so it rebuilds with
+whatever compiler you already have — which matters, because MSVC has no reflection
+support. Scalars, `bool`, `std::string` and methods over those types cross today;
+anything that cannot is named in the output and in the generated C# rather than quietly
+omitted. See [the CLI reference](docs/reference/cli.md#csharp-output).
 
 ### Feature Matrix
 
@@ -3047,7 +3077,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 |----------|-------------|
 | `<src_dir>` | Directory containing C++ headers |
 | `--module NAME` | Output module name |
-| `--lang LANG` | Target language: `python`, `lua`, `js`, or `all` |
+| `--lang LANG` | Target language: `python`, `lua`, `js`, `csharp`, or `all`. `csharp` is not part of `all`, because it produces a `.cs` source file to add to a dotnet project plus the shared library that file loads, rather than a module the CLI can import and check |
 
 **Options:**
 
@@ -3066,6 +3096,10 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `--batch` | Python: also generate `<name>_batch` for each method taking and returning one arithmetic value, so a Python loop crosses the boundary once. 6.8x from a list, 12.9x from an `array.array`, 1.0x when the method is the expensive part. Off by default: +12% compile time on a class with ten eligible methods, +55% with forty |
 | `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
 | `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
+| `--compile-commands PATH` | Read include paths and defines from a project's `compile_commands.json` instead of restating them as `-I`/`-D` flags. See [Large codebases](#large-codebases) below |
+| `--compile-commands-for PATH` | Only use compile-database entries whose source file is under `PATH` (repeatable) |
+| `--replace-prefix OLD=NEW` | Rewrite a leading path prefix in every harvested path (repeatable, first match wins) |
+| `--discover-only` | Report what reflection found and stop: no codegen, no compile. Pairs with `--json` |
 | `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |
 | `--instantiate SPEC` | Python: also bind this template specialization, e.g. `"geom::Vector3<short>"` or `"geom::clamp<float>"` (repeatable) |
 | `--template-cap N` | Python: max argument combinations tried per function template before falling back to Python scalars (default 64) |
@@ -3095,6 +3129,115 @@ mirror_bridge generate src/ --module my_module --lang python --pch build/pch.gch
 # Force rebuild
 mirror_bridge generate src/ --module my_module --lang python -f
 ```
+
+#### Large codebases
+
+Pointing the CLI at a large project fails for a dull reason: its headers do not parse
+without the include paths and defines its own build system passes. Restating those by
+hand works at a few hundred files and does not scale. Every large library in the
+[compatibility corpus](../internals/compatibility.md) needed some of it — OpenCV needs a
+generated `opencv_modules.hpp`, Eigen needs sixteen `--exclude` patterns, Open3D is
+reachable only for its `geometry/` subtree.
+
+`--compile-commands` reads the answer instead of asking for it again:
+
+```bash
+# CMake writes the database with this on
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json
+```
+
+For a Make build, `bear -- make` produces the same file.
+
+**Only parse-affecting flags are taken**, by allowlist: `-I`, `-isystem`, `-iquote`,
+`-idirafter`, `-iframework`, `-F`, `-D`, `-U` and `-include`. Optimisation, warning,
+sanitiser, LTO and dependency-generation flags are dropped, because an unrecognised flag
+in a large project's build is far more likely to be one of those than something the
+reflection pass needs.
+
+**The project's own `-std=` is dropped.** Reflection needs C++26 and your project is
+probably on something older; its standard flag winning would break the pass outright.
+
+**MSVC and clang-cl spellings are translated** — `/I`, `/D`, `/U`, `/external:I` and
+`/FI` all arrive as their GNU equivalents. This matters more than it sounds: MSVC has no
+reflection support, so a Windows project's build runs there while generation runs on a
+machine with a reflection compiler, and the database it hands over is full of MSVC flags.
+Paths in it name directories the reading machine does not have, which is what
+`--replace-prefix` is for:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands /mnt/win/build/compile_commands.json \
+    --replace-prefix 'C:/src/mylib=/mnt/win/src/mylib'
+```
+
+On a monorepo, the union of every subsystem's flags is both enormous and
+self-contradictory. Scope it to the subtree you are binding:
+
+```bash
+mirror_bridge generate include/geometry --module geom --lang python \
+    --compile-commands build/compile_commands.json \
+    --compile-commands-for src/geometry
+```
+
+A macro defined two ways across the build, and any flag carrying whitespace, are both
+reported rather than silently resolved — a flag with a space in it would otherwise become
+two flags and change what the compiler is told.
+
+#### Triaging before you build
+
+Reading a large project's headers is the expensive half. Generating and compiling a module
+for every class found is what turns minutes into hours. `--discover-only` stops after
+discovery:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+```json
+{"status":"ok","action":"discover","source":"reflection","seconds":41,
+ "counts":{"classes":312,"enums":28,"headers":97}, ...}
+```
+
+**`source` is the number that matters.** `reflection` means the headers were read after
+the preprocessor and the class list is real. `text scan` means the reflection unit failed
+and every name came from reading header text, which cannot see a class declared through an
+export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting
+`text scan` is not a slow problem, it is a blocked one, and the planner log named in the
+output says why.
+
+### `csharp` output
+
+C# reaches native code through P/Invoke, so unlike the Python, Lua and JavaScript backends
+there is no host C API to call. `--lang csharp` writes two things:
+
+```bash
+mirror_bridge generate src/ --module mylib --lang csharp -o build/
+# build/libmylib.so   the flat C ABI, compiled
+# build/mylib.cs      the C# that calls it
+# build/mylib_shim.cpp  the generated C ABI source
+```
+
+Add the `.cs` to a dotnet project and put the shared library where the runtime looks for
+it. **The shim contains no reflection**, so you can rebuild it with whatever compiler you
+already have — which is the point if that compiler is MSVC.
+
+Both files come from one reflection pass over one class list, so renaming a member in C++
+renames the exported symbol and the C# property together.
+
+What crosses the boundary today: a default constructor, arithmetic members and parameters,
+`bool`, `std::string`, methods over those types, and `const` members as read-only
+properties. Generated classes are `IDisposable`. A C++ exception is caught at the boundary
+and raised as a C# exception carrying `what()`, because an exception crossing `extern "C"`
+is undefined behaviour.
+
+Anything that cannot cross yet — a container member, a class-typed return, a second
+overload of a name — is **named in the run output and as a comment in the generated C#**,
+at the point where the member would have been. See
+[type-conversion.md](type-conversion.md).
 
 ### `pch` - Build Precompiled Header
 
@@ -6108,7 +6251,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The CLI reads a project's `compile_commands.json` instead of asking for its build configuration again.** The argument for this is written in the compatibility corpus' own manifest: opencv needs a hand-generated `opencv_modules.hpp` written into its checkout before its headers parse, open3d is reachable only for `geometry/` because `core/` wants MKL and `ml/` wants CUDA, eigen needs sixteen `--exclude` patterns, abseil needs a bespoke build command. Every one of those is a person rediscovering, as `-I` and `-D` flags, something the project's own build system already recorded. At a few hundred thousand lines that is a chore; at twenty million it is the entire job, and it is the reason pointing a generator at a large codebase fails for a dull reason rather than an interesting one. `--compile-commands PATH` harvests the include paths and defines by allowlist — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-iframework`, `-F`, `-D`, `-U`, `-include` — because an unrecognised flag in a large project's build is far likelier to be an optimisation, a sanitiser or a dependency-generation flag than something the reflection pass needs, and taking it on faith is how a generator ends up passing `-flto` to a syntax-only probe. The flags reach both compile sites the script has, for the same reason the existing `-D` handling does: a discovery unit preprocessed differently from the module reports a different library from the one that gets built. Three deliberate decisions. The project's own `-std=` is **dropped**, because reflection needs C++26 and the project is on something older, so its standard flag winning would break the pass outright; that is reported rather than silent. MSVC and clang-cl spellings — `/I`, `/D`, `/U`, `/external:I`, `/FI` — are translated, which is not politeness but the point: MSVC has no reflection support, so a Windows project's build runs there while generation runs on a machine that has a reflection compiler, and the database handed over is full of MSVC flags. And a flag carrying whitespace is **refused with a warning** rather than passed, because the CLI interpolates these into a string that word-splits, so one `-D` with a spaced value would silently become two flags and change what the compiler was told. A macro defined two ways across one build is reported the same way instead of being resolved quietly. `--compile-commands-for PATH` scopes the database to a subtree, because on a monorepo the union of every subsystem's flags is both enormous and self-contradictory, and `--replace-prefix OLD=NEW` maps a database written on one machine onto the paths of another. That last flag exists because of what the tests found: `os.path.isabs("C:/proj/inc")` is **false** on POSIX, so every Windows path was being joined onto the entry's build directory, producing `-I/linux/build/C:/proj/inc` — an include path that can match nothing and reports no error. That is the normal case for this feature, not an edge case.
+- **`--discover-only` answers "can this codebase be read at all" without building a module per class.** Reading a large project's headers is the expensive and interesting half of the work; generating and compiling a module for everything found is what turns minutes into hours, and the corpus records 138 seconds for Open3D's geometry subtree alone. `--discover-only` stops after discovery and reports the class count, the enum count, the header count, the seconds the reflection pass took, and the harvested-flag count. The field that matters is `source`: `reflection` means the headers were read after the preprocessor and the class list is real, while `text scan` means the reflection unit failed and every name came from reading header text, which cannot see a class declared through an export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting `text scan` is not a slow problem, it is a blocked one, and generating from that list would bind the wrong names — so the report says that outright and names the planner log that explains the failure. Pairs with `--json`, which emits one object carrying the counts, the class and enum names, the headers and the compile-database report.
+- **A C# backend (`--lang csharp`).** C# reaches native code through P/Invoke, so unlike CPython, Lua and Node there is no host C API a generated translation unit can call: the binding needs a flat C ABI on one side and C# declarations on the other, which is the same shape SWIG's C# module has and for the same reason. The architecture is forced further by a hard limit in P2996 — **reflection cannot declare a function whose name is computed**, and every P/Invoke target needs its own exported symbol — so a generator built with reflection emits the shim as text and an ordinary compile turns that into the shared library. The alternative, one indexed entry point dispatching on a class id, would have cost a jump table on every call, and the point of this project is that the generated path is the code a person would have written. Emitting text turned out to be the right shape for the people who want this most: **the shim contains no reflection at all**, so it rebuilds with whatever compiler they already have, and for anyone on MSVC a shim that needed reflection would have been unusable. Both files come out of one reflection pass over one class list, so a member renamed in C++ renames the exported symbol and the C# property together — there is no second list to keep in step. What crosses today: a default constructor, arithmetic members and parameters, `bool` (as a 32-bit integer on the wire, converted at the edge, because a C++ `bool` is one byte and C# marshals one as four and the mismatch is silent), `std::string` (a UTF-8 heap copy out with an explicit free, `LPUTF8Str` marshalled in, rather than a pointer into the live `std::string` that would dangle the moment anything mutated the object), methods over those types, and `const` members as read-only properties. Generated classes are `IDisposable` with a finalizer. A C++ exception is caught at every entry point and recorded in a thread-local, then raised on the managed side as an exception carrying `what()`, because an exception crossing `extern "C"` is undefined behaviour. Everything that cannot cross yet — a container member, a class-typed return, a second overload of a name — is named in the run output **and** as a comment in the generated C# at the point where the member would have been, because a generator that silently binds a subset leaves the caller unable to tell a missing member from an absent one. Generated code for both files is indented by one brace-depth formatter rather than by the care taken at each emission site; the first version had three different indentations inside a single class because each site had guessed separately.
+
 ### Fixed
+- **Structural assertions on generated source are not tests, and the C# backend proved it.** Forty-seven checks passed against C# that no compiler accepts: the generated declaration read `private static extern intGet_id(IntPtr self)`, missing a space, which every check was happy with and `mcs` rejected immediately with fourteen errors. Compiling the output also caught the shim declaring `remove_cvref_t<Device>` — `display_string_of` on an alias prints the alias — and an unqualified `Device` in a translation unit with no using directives, since it prints an unqualified name; the fully qualified name is now passed in by the CLI, which had it all along. `mono-mcs` and `mono-runtime` are in the dev container and the test compiles the generated `.cs` and runs it, asserting on what comes out, including that a C++ throw arrives as a C# exception carrying `what()`. Where no C# toolchain exists the test says so explicitly instead of reporting a pass.
 - **The benchmark page says what the measurement cannot resolve.** Every number in it is timed as `benchmark(name, lambda: ..., n)`, so each carries a Python loop iteration and a full Python function call on top of the operation. That constant is the same for all four frameworks, which means it does not cancel in a ratio: it pulls every ratio toward 1.00. Measured in the dev container at 28.3 ns for an empty lambda, which is 38% of a 74 ns null call. The floor is now measured on every run and published under the table, with the consequence stated: a ratio above 1.00x is a lower bound, one below understates the gap the other way, and a row within a few percent of 1.00 is not a tie that was measured. It lives under `_meta` because `check_ratios.py` gates every key under `mirror_bridge` and `test_published_rows.py` demands a published row for every key the runner writes, so a floor in either shape would be a meaningless gate entry and a meaningless row. Two rows also measured the wrong thing: "Attribute write" timed a list-subscript load, a store and an int add alongside the setter, and "Vector return (list out)" said `list` for a return that is an `array.array` — the claim the `.pyi` stopped making earlier in this release.
 - **A declined method says which one and why.** A declined class and a declined free function were each refused by name on stderr; a declined *method* was refused in silence. Not on stderr, not in `--json`, not in the stub, and `dir()` simply does not list it, so a caller could not tell "I wrote the C++ wrong" from "that method does not exist". `docs/guides/accelerating-python.md` promises in writing that generate "reports every name you wrote that is not in the finished module, with the reason", and the gate computes three distinct reasons and printed none of them. They now reach the unbound report and the `--json` `declined` list as `kind: method`, in the same message shape the class-level ones use, so the CLI harvests them with the parser it already had rather than a second one. Behind `MIRROR_BRIDGE_REPORT_DECLINED`, which the CLI sets for its own verification import, because this runs at import and a large library declines hundreds: the tool sees them and a user's program stays quiet.
 - **The agent-facing interface can reach the features built for agents.** The MCP server's `generate_bindings` took five parameters while the CLI accepts nineteen flags, so `--batch` — the largest shipped speedup for the acceleration use case, 6.8x from a list and 12.9x from an `array.array` — was unreachable from the one interface written for an agent, and so were `--link-args`, `--release-gil` and `-k`. `--stubs`, `.pyi` and `--batch` appeared nowhere in `AGENTS.md`, `quickstart.md` or `workflow.md`; they do now. Two more things it got wrong: the CLI's human-readable diagnosis goes to stderr and the wrapper discarded it, so a failed build reached the agent as one grepped line; and only one top-level field was translated from container paths back to host paths, so a path inside `errors[]` pointed at a filesystem the agent cannot see. The whole result is translated now, the `.pyi` comes back as `stub` and `stub_text`, and stderr is attached on failure. `tests/mcp_surface/` covers the argv and the translation, which had no tests at all, and cross-checks every flag the server emits against the CLI's own parser — a flag renamed on one side only is this project's recurring defect in its most literal form.
