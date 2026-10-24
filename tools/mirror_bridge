@@ -838,7 +838,17 @@ build_csharp() {
     local gen_bin="$output_dir/${module_name}_csharp_gen"
     local shim_src="$output_dir/${module_name}_shim.cpp"
     local cs_out="$output_dir/${module_name}.cs"
-    local lib_out="$output_dir/lib${module_name}.so"
+    # The runtime's own probing decides this, so the file name is not cosmetic.
+    # DllImport("csb") tries {"", "lib"} x {"", platform suffix}: on Linux that
+    # reaches libcsb.so, on macOS libcsb.dylib, and on Windows csb.dll with no
+    # lib prefix. Emitting libcsb.so everywhere means a macOS consumer can
+    # never load the library the generator just built for them.
+    local lib_out
+    case "$(uname -s)" in
+        Darwin)           lib_out="$output_dir/lib${module_name}.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) lib_out="$output_dir/${module_name}.dll" ;;
+        *)                lib_out="$output_dir/lib${module_name}.so" ;;
+    esac
 
     mkdir -p "$output_dir"
 
@@ -851,6 +861,15 @@ build_csharp() {
     local header
     declare -A cs_included=()
     for header in "${cs_headers[@]}"; do
+        if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
+            echo "#include \"$header\"" >> "$gen_src"
+            cs_included[$header]=1
+        fi
+    done
+    # An enum can live in a header holding no bound class, in which case the
+    # include list above -- built from classes -- has never seen it. The Python
+    # backend learned this the same way.
+    for header in "${DISCOVERED_ENUM_HEADERS[@]:-}"; do
         if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
             echo "#include \"$header\"" >> "$gen_src"
             cs_included[$header]=1
@@ -869,6 +888,21 @@ build_csharp() {
         echo "    if (argc < 2) { std::fprintf(stderr, \"usage: %s <out-dir>\\n\", argv[0]); return 2; }"
         echo "    mirror_bridge::csharp::Emitter emitter(\"$module_name\", \"$cs_namespace\");"
     } >> "$gen_src"
+
+    # Enums first: a class member of enum type is reported as not crossing
+    # unless its enum is already registered, so registration order matters.
+    local enum_name enum_simple
+    declare -A cs_enum_taken=()
+    for enum_name in "${DISCOVERED_ENUMS[@]:-}"; do
+        [ -z "$enum_name" ] && continue
+        enum_simple="${enum_name##*::}"
+        if [ -n "${BINDING_NAME_WINNER[$enum_simple]:-}" ] || \
+           [ -n "${cs_enum_taken[$enum_simple]:-}" ]; then
+            continue
+        fi
+        cs_enum_taken[$enum_simple]=1
+        echo "    emitter.add_enum<$enum_name>(\"$enum_simple\", \"$enum_name\");" >> "$gen_src"
+    done
 
     local class_name simple_name i=0 emitted=0
     for (( i = 0; i < ${#cs_classes[@]}; i++ )); do
@@ -938,7 +972,8 @@ build_csharp() {
 
     echo -e "${GREEN}✓ $lib_out${NC}"
     echo -e "${GREEN}✓ $cs_out${NC}"
-    echo "  Add the .cs to a project and put lib${module_name}.so where the runtime looks for it."
+    echo "  Add the .cs to a project and put $(basename "$lib_out") beside the assembly,"
+    echo "  or anywhere the runtime's library search path reaches."
     LAST_OUTPUT_FILE="$lib_out"
     [ $KEEP_GENERATED -eq 0 ] && rm -f "$gen_src" "$gen_bin"
     return 0

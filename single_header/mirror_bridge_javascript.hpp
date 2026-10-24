@@ -438,6 +438,66 @@ consteval std::size_t get_data_member_count() {
     return named_data_members<T>().size();
 }
 
+// The same list, plus the members every base class contributes.
+//
+// nonstatic_data_members_of reports only what T declares directly, which is
+// why the member-function cache below walks bases_of itself. A data member is
+// the same situation: without this, a derived class binds its own fields and
+// silently drops everything it inherited. Splicing a base's member onto a
+// derived object is well-formed and the compiler applies the base offset, the
+// same property the method cache already relies on.
+//
+// Depth-first with the bases before T, so an inherited member keeps a stable
+// index when a derived field is added. A name T redeclares shadows the base's
+// in C++, and binding both would export one name twice, so the derived one
+// wins and the base's is dropped.
+template<typename T>
+consteval std::vector<std::meta::info> data_members_with_bases() {
+    std::vector<std::meta::info> out;
+    std::vector<std::string_view> seen;
+
+    auto already = [&](std::string_view n) {
+        for (auto s : seen) if (s == n) return true;
+        return false;
+    };
+
+    // Collect T's own names first so a base member it shadows can be skipped,
+    // then emit base members before T's for index stability.
+    for (auto m : named_data_members<T>()) {
+        seen.push_back(std::meta::identifier_of(m));
+    }
+
+    auto walk = [&](auto&& self, std::meta::info type) -> void {
+        for (auto b : std::meta::bases_of(type, std::meta::access_context::current())) {
+            self(self, std::meta::type_of(b));
+        }
+        if (type != ^^T) {
+            for (auto m : std::meta::nonstatic_data_members_of(
+                     type, std::meta::access_context::current())) {
+                if (!std::meta::has_identifier(m)) continue;
+                const auto name = std::meta::identifier_of(m);
+                if (already(name)) continue;
+                seen.push_back(name);
+                out.push_back(m);
+            }
+        }
+    };
+    walk(walk, ^^T);
+
+    for (auto m : named_data_members<T>()) out.push_back(m);
+    return out;
+}
+
+template<typename T, std::size_t I>
+consteval auto get_data_member_with_bases() {
+    return data_members_with_bases<T>()[I];
+}
+
+template<typename T>
+consteval std::size_t get_data_member_with_bases_count() {
+    return data_members_with_bases<T>().size();
+}
+
 // Member Function Cache — includes methods inherited from base classes.
 //
 // P2996R13's members_of only returns methods DIRECTLY declared in T. To match
@@ -2383,6 +2443,22 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
     }
     T* self = static_cast<T*>(raw);
 
+    // A const member is readable and never assignable. Without this branch the
+    // declaration below was a default-initialised const and the assignment a
+    // write to a const lvalue, so a class with one const field failed to
+    // compile the whole module rather than failing to set that one field.
+    // tests/const_members had no JavaScript binding, which is why it was never
+    // seen.
+    // Two shapes of the same situation: readable, never assignable. A const
+    // member cannot be written, and a member whose type has no default
+    // constructor cannot even be converted into, because the setter needs a
+    // local to move from. nlohmann::detail::dtoa_impl::diyfp is the real
+    // second case and it took the whole of nlohmann-json down.
+    if constexpr (std::is_const_v<MemberType>
+                  || !std::is_default_constructible_v<MemberType>) {
+        napi_throw_error(env, nullptr, "Property is not assignable from JavaScript");
+        return nullptr;
+    } else {
     MemberType cpp_value;
     if (!from_javascript(env, args[0], cpp_value)) {
         using Member = std::remove_cvref_t<MemberType>;
@@ -2403,6 +2479,7 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
         napi_throw_error(env, nullptr, "Unknown C++ exception in property setter");
         return nullptr;
     }
+    }  // const-member guard
 
     napi_value undefined;
     napi_get_undefined(env, &undefined);
@@ -2683,7 +2760,18 @@ napi_value js_constructor(napi_env env, napi_callback_info info) {
 
     try {
         if (argc == 0) {
-            cpp_object = new T();
+            // A class with no default constructor is still bindable: its other
+            // constructors work and its members read. Calling new T() here
+            // unconditionally made such a class a compile failure for the whole
+            // module -- the same shape as the setter's local, reached from the
+            // constructor instead.
+            if constexpr (std::is_default_constructible_v<T>) {
+                cpp_object = new T();
+            } else {
+                napi_throw_error(env, nullptr,
+                    "This class has no default constructor in C++; pass its arguments");
+                return nullptr;
+            }
         } else {
             constexpr std::size_t ctor_count = get_js_constructor_count<T>();
 
@@ -2700,8 +2788,17 @@ napi_value js_constructor(napi_env env, napi_callback_info info) {
                 }(std::make_index_sequence<ctor_count>{});
             }
 
+            // The fallback when no parameterized constructor matched. Same
+            // guard as above: a class with no default constructor must report
+            // the mismatch rather than make the module uncompilable.
             if (cpp_object == nullptr) {
-                cpp_object = new T();
+                if constexpr (std::is_default_constructible_v<T>) {
+                    cpp_object = new T();
+                } else {
+                    napi_throw_error(env, nullptr,
+                        "No constructor of this class matches those arguments");
+                    return nullptr;
+                }
             }
         }
     } catch (const std::exception& e) {

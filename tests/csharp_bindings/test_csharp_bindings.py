@@ -38,6 +38,12 @@ using System;
 using csb;
 
 class Driver {
+    static void Expect<T>(Action a, string label) where T : Exception {
+        try { a(); Console.WriteLine($"BUG {label}: nothing thrown"); }
+        catch (T ex) { Console.WriteLine($"{label} -> {ex.GetType().Name}"); }
+        catch (Exception ex) { Console.WriteLine($"BUG {label}: got {ex.GetType().Name}"); }
+    }
+
     static int Main() {
         using (var d = new Device()) {
             Console.WriteLine($"id={d.id} cal={d.calibration} online={d.online} label={d.label} serial={d.serial}");
@@ -59,6 +65,70 @@ class Driver {
         }
         using (var c = new Counter()) {
             Console.WriteLine($"bump()={c.bump()} bump()={c.bump()}");
+        }
+        using (var d = new Device()) {
+            d.id = 5;
+            d.calibration = 2.5;
+            Console.WriteLine($"mode={d.mode} promote(None)={d.promote(Mode.None)}");
+            d.mode = Mode.Careful;
+            Console.WriteLine($"mode set={d.mode} asint={(int)d.mode}");
+            Console.WriteLine($"overloads scaled(3)={d.scaled(3)} scaled(3.0)={d.scaled(3.0)}");
+            Console.WriteLine($"statics version()={Device.version()} describe={Device.describe_mode(Mode.Careful)}");
+        }
+        using (var c = new Counter(10)) Console.WriteLine($"ctor1 value={c.value}");
+        using (var c = new Counter(10, 3)) Console.WriteLine($"ctor2 value={c.value}");
+        using (var dd = new Derived()) {
+            dd.base_id = 20;
+            Console.WriteLine($"inherit base_id={dd.base_id} tag={dd.tag} base_method()={dd.base_method()} combined()={dd.combined()}");
+        }
+        using (var cl = new Clashing()) {
+            Console.WriteLine($"renamed Handle_={cl.Handle_} Lib_={cl.Lib_} Dispose_()={cl.Dispose_()} New_()={cl.New_()}");
+        }
+        using (var e = new Device()) {
+            Expect<InvalidOperationException>(() => e.fail(), "runtime_error");
+            Expect<ArgumentException>(() => e.reject(), "invalid_argument");
+            Expect<ArgumentOutOfRangeException>(() => e.overrun(), "out_of_range");
+            Expect<OverflowException>(() => e.too_big(), "overflow_error");
+        }
+        var gone = new Device();
+        gone.Dispose();
+        try { var _ = gone.id; Console.WriteLine("BUG: read after dispose"); return 1; }
+        catch (ObjectDisposedException) { Console.WriteLine("disposed read raises"); }
+        gone.Dispose();
+        Console.WriteLine("double dispose is a no-op");
+        using (var v = new Device()) {
+            v.samples.Add(1.5);
+            v.samples.Add(2.5);
+            v.samples[0] = 9.0;
+            Console.WriteLine($"vector member: Count={v.samples.Count} [0]={v.samples[0]} sum={System.Linq.Enumerable.Sum(v.samples)}");
+            using (var h = v.history())
+                Console.WriteLine($"vector return: Count={h.Count} [0]={h[0]}");
+            v.names.Add("alpha");
+            v.names[0] = "gamma";
+            Console.WriteLine($"string vector: [0]={v.names[0]} Count={v.names.Count}");
+            try { var _ = v.samples[99]; Console.WriteLine("BUG: no range check"); }
+            catch (ArgumentOutOfRangeException) { Console.WriteLine("vector range check raises"); }
+        }
+        var dead = new Outer();
+        var deadView = dead.inner;
+        var deadDev = new Device();
+        deadDev.samples.Add(1.0);
+        var deadVec = deadDev.samples;
+        dead.Dispose();
+        deadDev.Dispose();
+        try { var _ = deadView.x; Console.WriteLine("BUG: read a freed subobject"); }
+        catch (ObjectDisposedException) { Console.WriteLine("disposed owner: view raises"); }
+        try { var _ = deadVec.Count; Console.WriteLine("BUG: read a freed vector"); }
+        catch (ObjectDisposedException) { Console.WriteLine("disposed owner: vector raises"); }
+        using (var o = new Outer()) {
+            o.inner.x = 7.5;
+            Console.WriteLine($"nested view write reaches the owner: inner.x={o.inner.x} scaled(2)={o.inner.scaled(2.0)}");
+            using (var made = o.make())
+                Console.WriteLine($"owned return: x={made.x} n={made.n}");
+            using (var arg = new Inner()) {
+                arg.x = 100.0;
+                Console.WriteLine($"class parameter: consume={o.consume(arg)}");
+            }
         }
         return 0;
     }
@@ -237,14 +307,18 @@ truthy("a string property raises rather than returning null on failure",
 print("\n=== and says what it left out ===")
 # A generator that silently binds a subset is worse than one that refuses:
 # the caller cannot tell a missing member from an absent one.
-truthy("the skipped member is named in the C#", "samples --" in cs)
-truthy("with the type that could not cross", "vector<double" in cs)
-truthy("the skipped method too", "history() --" in cs)
-check("a skipped member gets no property", "public  samples" in cs, False)
+truthy("the skipped member is named in the C#", "flags --" in cs)
+truthy("with the type that could not cross", "vector<bool" in cs)
+truthy("the skipped method too", "widen() --" in cs)
+check("a skipped member gets no property", "public  flags" in cs, False)
 
 # The run itself must report them, so nobody has to read the generated file.
 truthy("the generate run reports what it left out",
-       "left out" in run.stdout and "samples" in run.stdout)
+       "left out" in run.stdout and "flags" in run.stdout)
+# And the honest inverse: what used to be skipped is now bound, so a stale
+# claim here would be the test lying about its own subject.
+check("samples is no longer in the skipped list", "samples --" in cs, False)
+check("history() is no longer in the skipped list", "history() --" in cs, False)
 
 print("\n=== C# indentation is produced by one formatter ===")
 # Every line in a generated class body sits at a multiple of four, which the
@@ -252,6 +326,178 @@ print("\n=== C# indentation is produced by one formatter ===")
 bad = [ln for ln in cs.splitlines()
        if ln.strip() and (len(ln) - len(ln.lstrip(" "))) % 4 != 0]
 check("no line is indented off the grid", bad[:3], [])
+
+print("\n=== enums cross as a real C# enum, not a bare integer ===")
+truthy("the enum is declared", "public enum Mode : int {" in cs)
+truthy("every enumerator is carried", all(k in cs for k in ("None = 0", "Fast = 1", "Careful = 7")))
+# None is a keyword in Python and not in C#. The Python backend has to rename it;
+# this one keeps the C++ spelling, which is the reason the two are not shared code.
+check("a C# non-keyword is not escaped", "@None" in cs, False)
+truthy("an enum member is typed", "public Mode mode {" in cs)
+truthy("an enum return is typed", "public Mode promote(Mode m)" in cs)
+truthy("and is cast back on the way out", "return (Mode)r;" in cs)
+
+print("\n=== overloads bind, because C# overloads natively ===")
+truthy("both arities of an overload set are present",
+       "public int scaled(int factor)" in cs and "public double scaled(double factor)" in cs)
+truthy("the second overload gets its own exported symbol",
+       'EntryPoint = "mb_Device_scaled_1"' in cs)
+# C++ tells long and long long apart; C# calls both `long`. Emitting both would
+# be a duplicate member, so the second is refused by name.
+truthy("an overload C# cannot tell apart is refused and says why",
+       "widen() --" in cs and "C# does not" in cs)
+
+print("\n=== static methods and parameterized constructors ===")
+truthy("a static method is static in C#", "public static int version()" in cs)
+truthy("a static taking an enum is bound", "public static string describe_mode(Mode m)" in cs)
+truthy("its symbol carries the _s_ infix so it cannot collide with an instance method",
+       'EntryPoint = "mb_Device_s_version"' in cs)
+truthy("a one-argument constructor is bound", "public Counter(int start)" in cs)
+truthy("a two-argument constructor is bound", "public Counter(int start, int bumps)" in cs)
+# Binding a copy constructor would make `new Foo(other)` silently duplicate a
+# C++ object, and C# has no spelling that would mark it as a copy.
+check("the copy constructor is not bound", "public Counter(Counter" in cs, False)
+
+print("\n=== inherited members and methods ===")
+# core's member-function cache already walked bases; data members did not until
+# this backend needed them, so both halves are checked.
+derived_body = cs.split("public sealed class Derived :")[1].split("\n}\n")[0]
+truthy("an inherited data member appears on the derived class",
+       "public int base_id {" in derived_body)
+truthy("an inherited method appears on the derived class",
+       "public int base_method()" in derived_body)
+truthy("the derived class keeps its own members too",
+       "public double extra {" in derived_body)
+# Pinning the split itself, because the first version matched
+# "class DerivedHandle : SafeHandle" and read the nested handle type instead.
+truthy("the split found the class body and not the nested handle",
+       "SafeHandle" not in derived_body.split("public double extra")[0]
+       or "public int base_id" in derived_body)
+
+print("\n=== the handle is a SafeHandle, not a raw IntPtr ===")
+# Not tidiness. With an IntPtr field the last read of `this` is inside the
+# argument list, so the JIT may report the object dead and the finalizer may
+# run Delete while the native call is still on the stack. A SafeHandle is
+# ref-counted across the call, which closes that window; it also makes Dispose
+# idempotent and thread-safe and gives the handle a critical finalizer.
+truthy("a SafeHandle subclass is generated per class", "DeviceHandle : SafeHandle" in cs)
+truthy("it releases through the native delete", "protected override bool ReleaseHandle()" in cs)
+truthy("instance calls take the handle, so the runtime keeps it alive",
+       "Get_id(DeviceHandle self)" in cs)
+check("no hand-rolled finalizer is left behind", "~Device()" in cs, False)
+check("the raw pointer is no longer handed out", "public IntPtr Handle =>" in cs, False)
+truthy("Dispose delegates to the handle", "_h.Dispose();" in cs)
+
+print("\n=== a C++ name that collides with the generated surface ===")
+# `int Handle` and a method called `Dispose()` are house style at several large
+# shops. Before this, such a class produced C# that would not compile.
+truthy("the colliding member is renamed", "public int Handle_ {" in cs)
+truthy("so is a colliding method", "public int Dispose_()" in cs)
+truthy("and the rename is written where the reader is",
+       "Renamed, because the C++ name is taken" in cs and "Handle -> Handle_" in cs)
+truthy("the run reports it too", "renamed to Handle_" in run.stdout)
+
+print("\n=== parameter names are the real C++ ones ===")
+# The project's Python stubs carry the real names and say so in writing; this
+# was the one backend whose output a human reads directly and it said a0, a1.
+for sig in ("scale(double factor)", "toggle(bool on)", "rename(string next)",
+            "sum(int a, int b)", "promote(Mode m)"):
+    truthy(f"signature reads {sig}", "public " in cs and sig in cs)
+check("no positional placeholders remain in the public surface",
+      "(double a0)" in cs or "(int a0, int a1)" in cs, False)
+
+print("\n=== every entry point catches, and says which exception it was ===")
+truthy("the shim classifies with a dynamic_cast ladder", "mb_set_exception" in shim_src)
+truthy("the kind crosses the boundary", "mb_last_error_kind" in shim_src)
+truthy("delete catches too, against the shim's own invariant",
+       "try { delete static_cast<" in shim_src)
+truthy("a failed string allocation is an error, not a silent empty string",
+       "out of memory copying a string" in shim_src)
+truthy("the managed side maps the kind to a catchable type",
+       "ArgumentOutOfRangeException" in cs and "OverflowException" in cs)
+truthy("ExactSpelling is set so the runtime does not probe a second name",
+       cs.count("ExactSpelling = true") > 10)
+
+print("\n=== nested objects: a member is borrowed, a return is owned ===")
+truthy("a class-typed member is a property of the bound C# type",
+       "public Inner inner {" in cs)
+truthy("and is documented as a view rather than a copy",
+       "not a copy: writes reach" in cs)
+truthy("it is constructed not-owning, so its handle will not free the owner's field",
+       "(Get_inner(Check()), false, this)" in cs)
+# Assigning a whole subobject would need C++ copy-assignment, and in C#
+# `obj.inner = other` reads as rebinding a reference. Mutate through the view.
+check("a class-typed member has no setter", "Set_inner" in cs, False)
+truthy("a class returned by value is owned by the caller",
+       "public Inner make()" in cs and "new Inner(r, true, null)" in cs)
+truthy("the shim copies a returned value rather than pointing at the temporary",
+       "new csb::Inner(" in shim_src)
+truthy("a class parameter crosses as the wrapper's handle",
+       "public double consume(Inner other)" in cs and "other.Borrow()" in cs)
+truthy("the wrapper holds its owner so the GC cannot collect it first",
+       "private readonly object _parent;" in cs)
+# _parent is otherwise written and never read, which is CS0414 and an error
+# under warnings-as-errors; the read is also the guarantee being made.
+truthy("and that reference is actually read", "GC.KeepAlive(_parent);" in cs)
+
+print("\n=== two name spaces that were never disjoint ===")
+# A member x and a method get_x both want mb_<C>_get_x, which is a link error.
+# And a C# property X compiles to hidden get_X/set_X, so the same pair is also
+# "a member is already reserved" in C# -- a second, independent collision the
+# native ledger cannot see.
+truthy("the native symbols are distinct",
+       "mb_Collide_get_x\"" in cs and "mb_Collide_get_x_\"" in cs)
+truthy("the C# method is renamed off the property's hidden accessor",
+       "public int get_x_()" in cs)
+truthy("and the property keeps the C++ spelling", "public int x {" in cs)
+
+print("\n=== one P/Invoke transition per call, not two ===")
+# Throw used to call back into the library to ask whether an error was pending,
+# so every generated call paid for two transitions. Measured at 58.1 -> 49.2
+# ns/call under mono, which is 1.18x rather than the 2x it looks like: the
+# second transition carries no arguments.
+truthy("the shim exposes the error slot's address", "mb_error_slot" in shim_src)
+truthy("the managed side caches it per thread", "[ThreadStatic] private static IntPtr _slot;" in cs)
+truthy("and tests it with a memory read", "Marshal.ReadInt32(s)" in cs)
+
+print("\n=== containers: a member is the live vector, a return is a copy ===")
+truthy("a view class is generated per element type",
+       "public sealed class DoubleVector : IReadOnlyList<double>, IDisposable" in cs)
+truthy("and for strings too", "public sealed class StringVector" in cs)
+truthy("one set of element helpers serves every class that uses that vector type",
+       shim_src.count("mb_vec_double_size") == 1)
+truthy("a vector member is handed back as the real vector",
+       "public DoubleVector samples {" in cs and "(Get_samples(Check()), false, this)" in cs)
+truthy("a vector returned by value is a copy the caller owns",
+       "new DoubleVector(r, true, null)" in cs)
+truthy("the shim copies rather than pointing at the temporary",
+       "new std::vector<double>(" in shim_src)
+truthy("the view is enumerable, so LINQ works", "IEnumerator<double> GetEnumerator()" in cs)
+truthy("and indexed writes exist", "public double this[int i] {" in cs)
+truthy("the element helpers range-check", "index out of range" in shim_src)
+# vector<bool> packs bits and hands back a proxy, so there is no element to
+# address. Binding it wrongly would be worse than not binding it.
+truthy("vector<bool> is refused and says why",
+       "flags --" in cs and "vector<bool" in cs)
+truthy("the run reports it", "flags" in run.stdout and "does not cross" in run.stdout)
+# Only an owned copy may be freed; a borrowed member view points into its owner.
+truthy("the free helper is documented as owned-only",
+       "must never reach this" in shim_src)
+
+print("\n=== a borrowed view cannot outlive its owner ===")
+# Holding a reference to the owner stops the GC collecting it and says nothing
+# about Dispose. Before this, reading o.inner.x after o.Dispose() returned
+# 9.27e-310 and samples.Count returned 37 -- freed memory, no exception.
+# Python's equivalent views need only the reference, because Python has no
+# explicit dispose. C# does, so the view has to be able to ask.
+truthy("the owner-liveness interface is declared", "internal interface IMbOwner" in cs)
+truthy("every class answers for itself", "bool IMbOwner.MbAlive {" in cs)
+truthy("and the check walks the whole chain, so a view of a view is covered",
+       "(_parent as IMbOwner)?.MbAlive != false" in cs)
+truthy("a class view checks its owner before use",
+       "the object this view belongs to has been disposed" in cs)
+truthy("so does a vector view",
+       "the object this vector belongs to has been disposed" in cs)
 
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
@@ -267,13 +513,15 @@ if MCS and MONO:
         subprocess.run(["cp", os.path.join(work, f), drive], check=True)
     with open(os.path.join(drive, "Driver.cs"), "w") as fh:
         fh.write(DRIVER_CS)
-    build = subprocess.run([MCS, "-out:driver.exe", "csb.cs", "Driver.cs"],
+    # -warnaserror because a consumer's project very likely has it on, and it
+    # is how the _parent field's CS0414 ("assigned but never used") was found.
+    build = subprocess.run([MCS, "-warnaserror", "-out:driver.exe", "csb.cs", "Driver.cs"],
                            cwd=drive, capture_output=True, text=True)
     if build.returncode != 0:
         check("the generated C# compiles", build.stdout.strip()[:400]
               + build.stderr.strip()[:400], "")
     else:
-        truthy("the generated C# compiles", True)
+        truthy("the generated C# compiles with warnings as errors", True)
         env = dict(os.environ, LD_LIBRARY_PATH=drive)
         runp = subprocess.run([MONO, "driver.exe"], cwd=drive, env=env,
                               capture_output=True, text=True)
@@ -291,6 +539,46 @@ if MCS and MONO:
         truthy("a C++ throw becomes a C# exception carrying what()",
                "fail() raised" in out and "device is on fire" in out)
         truthy("each object keeps its own state", "bump()=1 bump()=2" in out)
+        truthy("an enum round-trips as the enum, not an int",
+               "mode=Fast promote(None)=Fast" in out and "mode set=Careful asint=7" in out)
+        truthy("both overloads dispatch to the right C++ function",
+               "overloads scaled(3)=15 scaled(3.0)=7.5" in out)
+        truthy("statics run without an instance",
+               "statics version()=3 describe=careful" in out)
+        truthy("parameterized constructors reach the right C++ one",
+               "ctor1 value=10" in out and "ctor2 value=13" in out)
+        truthy("an inherited field writes through to the base subobject",
+               "inherit base_id=20 tag=base base_method()=40 combined()=20.5" in out)
+        truthy("a renamed colliding member still reaches the right C++ field",
+               "renamed Handle_=1 Lib_=2 Dispose_()=3 New_()=99" in out)
+        truthy("std::invalid_argument arrives as ArgumentException",
+               "invalid_argument -> ArgumentException" in out)
+        truthy("std::out_of_range arrives as ArgumentOutOfRangeException",
+               "out_of_range -> ArgumentOutOfRangeException" in out)
+        truthy("std::overflow_error arrives as OverflowException",
+               "overflow_error -> OverflowException" in out)
+        truthy("reading through a disposed wrapper raises rather than crashing",
+               "disposed read raises" in out)
+        truthy("disposing twice is a no-op", "double dispose is a no-op" in out)
+        check("nothing reported a wrong exception type", "BUG " in out, False)
+        truthy("writing through a borrowed member view reaches the real subobject",
+               "nested view write reaches the owner: inner.x=7.5 scaled(2)=15" in out)
+        truthy("a returned object is a copy the caller owns",
+               "owned return: x=9.5 n=42" in out)
+        truthy("an object passed as a parameter arrives intact",
+               "class parameter: consume=107.5" in out)
+        truthy("a vector member is live: Add and the indexer reach C++",
+               "vector member: Count=2 [0]=9 sum=11.5" in out)
+        truthy("a vector returned by value is the caller's copy",
+               "vector return: Count=2 [0]=9" in out)
+        truthy("a string vector round-trips per element",
+               "string vector: [0]=gamma Count=1" in out)
+        truthy("an out-of-range index raises rather than reading past the end",
+               "vector range check raises" in out)
+        truthy("a borrowed object view refuses to read a disposed owner",
+               "disposed owner: view raises" in out)
+        truthy("a borrowed vector view refuses too",
+               "disposed owner: vector raises" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
