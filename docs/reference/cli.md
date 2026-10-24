@@ -156,6 +156,41 @@ export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase r
 `text scan` is not a slow problem, it is a blocked one, and the planner log named in the
 output says why.
 
+#### When discovery runs out of constexpr budget
+
+Discovery walks every class in the codebase at compile time, so on a large
+project it is the pass most likely to exhaust the compiler's constexpr
+evaluation limit. The cost of exhausting it is not a slow build, it is a wrong
+answer: the CLI falls back to scanning header text, which cannot see a class
+declared through an export macro and reports the macro's name instead.
+
+OpenCV's core module — 139 headers, 86k lines, `CV_EXPORTS` on every public
+class — exceeded the first budget and was discovered that way for no other
+reason.
+
+So the budget escalates when the compiler says that is what went wrong, and
+says so on the terminal:
+
+```
+  reflection ran out of constexpr budget for a codebase this size; retrying at
+  -fconstexpr-steps=2000000000.
+  This is slower, and the alternative is a text scan that cannot see a class
+  declared through an export macro.
+```
+
+**The retry is slow.** On a codebase large enough to need it, discovery can go
+from under a minute to many minutes, because the plan is produced by *running*
+the probe rather than only parsing it. It is still the better trade, since the
+alternative is not a faster answer but an incorrect one — and the message is
+printed rather than logged so a long wait is not mistaken for a hang. Interrupt
+it if you would rather proceed on the text scan, with the caveat above.
+
+The budget is not raised unconditionally, because a genuinely runaway
+`constexpr` loop would then take twenty times as long to fail.
+`MB_CONSTEXPR_BUDGET` overrides the first tier; it exists so this path can be
+tested without a codebase big enough to exhaust a real budget, and is not
+something a normal build needs.
+
 ### `csharp` output
 
 C# reaches native code through P/Invoke, so unlike the Python, Lua and JavaScript backends

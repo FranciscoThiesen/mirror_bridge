@@ -120,6 +120,25 @@ case "$CXX_BIN" in
              CXX_CONSTEXPR_BUDGET="-fconstexpr-ops-limit=1000000000" ;;
 esac
 
+# Same override the discovery pass honours, for the same reason: this path only
+# runs on a codebase large enough to exhaust a real budget, which is too large
+# to put in a test.
+# Both compilers' real wording. GCC says "'constexpr' evaluation operation
+# count exceeds limit of N (use '-fconstexpr-ops-limit=' ...)" and clang says
+# "constexpr evaluation hit maximum step limit"; the flag names are matched too
+# because both compilers name the flag in the hint, which is the most stable
+# part of either message.
+budget_exhausted() {
+    echo "$1" | grep -qE "constexpr evaluation hit maximum step limit|operation count exceeds limit|fconstexpr-(steps|ops-limit)="
+}
+
+if [[ -n "${MB_CONSTEXPR_BUDGET:-}" && "${MB_CONSTEXPR_BUDGET}" =~ ^[0-9]+$ ]]; then
+    case "$CXX_BIN" in
+        *clang*) CXX_CONSTEXPR_BUDGET="-fconstexpr-steps=${MB_CONSTEXPR_BUDGET}" ;;
+        *)       CXX_CONSTEXPR_BUDGET="-fconstexpr-ops-limit=${MB_CONSTEXPR_BUDGET}" ;;
+    esac
+fi
+
 # JSON output support (--json on generate/diff/doctor). Contract: in JSON
 # mode stdout carries exactly one JSON object and all human-readable
 # progress goes to stderr, so scripts and AI agents can parse results
@@ -1907,13 +1926,50 @@ compile_binding() {
     # would let a stale .so from a previous run mask a failed compile.
     LAST_COMPILE_LOG=""
     local compile_rc=0
-    if [ $VERBOSE -eq 1 ]; then
-        echo -e "${BLUE}$cmd${NC}"
-        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
-        [ -n "$LAST_COMPILE_LOG" ] && echo "$LAST_COMPILE_LOG"
-    else
-        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
-        echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+    [ $VERBOSE -eq 1 ] && echo -e "${BLUE}$cmd${NC}"
+    LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
+
+    # Whether to show this attempt's output is decided after looking at it,
+    # not before. A compile that is about to be retried at a higher constexpr
+    # budget prints a wall of errors that are not the reason anything failed,
+    # and following them with a success reads as the tool contradicting itself.
+    local show_log=1
+    if [ $compile_rc -ne 0 ] && budget_exhausted "$LAST_COMPILE_LOG"; then
+        show_log=0
+    fi
+    if [ "$show_log" -eq 1 ]; then
+        if [ $VERBOSE -eq 1 ]; then
+            [ -n "$LAST_COMPILE_LOG" ] && echo "$LAST_COMPILE_LOG"
+        else
+            echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+        fi
+    fi
+
+    # The discovery pass escalates its constexpr budget when the compiler says
+    # it ran out (see Compiler.raise_budget in mirror_bridge_templates.py), and
+    # this compile has to do the same or the fix is half-applied: discovery
+    # would escalate, report a clean class list, and the module build would
+    # then die on the identical cause with no retry, which reads as the two
+    # steps disagreeing about the same headers.
+    if [ $compile_rc -ne 0 ] && budget_exhausted "$LAST_COMPILE_LOG"; then
+        local bigger
+        case "$CXX_BIN" in
+            *clang*) bigger="-fconstexpr-steps=2000000000" ;;
+            *)       bigger="-fconstexpr-ops-limit=20000000000" ;;
+        esac
+        if [ "$CXX_CONSTEXPR_BUDGET" != "$bigger" ]; then
+            echo -e "  ${YELLOW}the module compile ran out of constexpr budget; retrying at $bigger${NC}"
+            local retry_cmd="${cmd/$CXX_CONSTEXPR_BUDGET/$bigger}"
+            compile_rc=0
+            LAST_COMPILE_LOG=$(eval "$retry_cmd" 2>&1) || compile_rc=$?
+            if [ $compile_rc -ne 0 ]; then
+                echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+            fi
+        else
+            # No higher budget to try, so the errors held back above are the
+            # real ones and have to be shown after all.
+            echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+        fi
     fi
 
     if [ $compile_rc -eq 0 ] && [ -f "$output_file" ]; then
