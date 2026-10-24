@@ -166,4 +166,22 @@ struct Modern {
     int doubled() const { return version * 2; }
 };
 
+// Two bases contributing one member name. Unqualified access gave "member 'v'
+// found in multiple base classes of different types" and took the whole module
+// down; the access is qualified with the declaring class now.
+struct LeftBase  { int v = 1; int from_left() const { return v * 10; } };
+struct RightBase { int v = 2; };
+struct Mixin : LeftBase, RightBase { double w = 0.5; };
+
+// An inherited member named after the derived class. The injected-class-name
+// wins in C++ ("cannot refer to type member 'Shadow' ... with '->'"), and C#
+// separately forbids a member named after its enclosing type.
+struct HasShadow { int Shadow = 7; };
+struct Shadow : HasShadow { double z = 1.0; };
+
+// Names the generator uses for itself at namespace scope. Before these were
+// prefixed, either one was CS0101 "already contains a definition".
+struct Native { int id = 3; };
+struct DoubleVector { int n = 4; };
+
 }  // namespace csb

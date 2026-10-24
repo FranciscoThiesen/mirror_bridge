@@ -84,6 +84,22 @@ class Driver {
             dd.base_id = 20;
             Console.WriteLine($"inherit base_id={dd.base_id} tag={dd.tag} base_method()={dd.base_method()} combined()={dd.combined()}");
         }
+        using (var c2 = new Collide()) {
+            Console.WriteLine($"collide x={c2.x} get_x_()={c2.get_x_()}");
+        }
+        using (var w = new Device()) {
+            w.id = 4;
+            Console.WriteLine($"widen(7)={w.widen(7L)}");
+        }
+        using (var mx = new Mixin()) {
+            mx.v = 9;
+            Console.WriteLine($"mixin v={mx.v} from_left()={mx.from_left()} w={mx.w}");
+        }
+        using (var sh = new Shadow()) {
+            Console.WriteLine($"shadowed member={sh.Shadow_} z={sh.z}");
+        }
+        using (var nv = new Native()) Console.WriteLine($"class called Native: id={nv.id}");
+        using (var dv = new DoubleVector()) Console.WriteLine($"class called DoubleVector: n={dv.n}");
         using (var cl = new Clashing()) {
             Console.WriteLine($"renamed Handle_={cl.Handle_} Lib_={cl.Lib_} Dispose_()={cl.Dispose_()} New_()={cl.New_()}");
         }
@@ -321,9 +337,9 @@ truthy("it is disposable", "public void Dispose()" in cs)
 string_getters = re.findall(r"get \{\n\s*var r = Get_\w+\(Check\(\)\);(.*?)\}", cs, re.S)
 truthy("there are string property getters to check", len(string_getters) >= 1)
 check("every one of them routes the pointer through TakeString, which frees it",
-      [g for g in string_getters if "Native.TakeString(r)" not in g], [])
+      [g for g in string_getters if "MbNative.TakeString(r)" not in g], [])
 truthy("and a string-returning method does too",
-       "return Native.TakeString(r);" in cs)
+       "return MbNative.TakeString(r);" in cs)
 truthy("a string parameter is marshalled in",
        "[MarshalAs(UnmanagedType.LPUTF8Str)] string" in cs)
 truthy("a bool is converted at the edge, in the property itself",
@@ -333,7 +349,7 @@ truthy("a const member has a getter and no setter",
        "public int serial {" in cs and "Set_serial" not in cs)
 truthy("errors are raised, not swallowed", "Native.Throw(" in cs)
 check("every string property getter raises rather than returning null",
-      [g for g in string_getters if "Native.Throw(" not in g], [])
+      [g for g in string_getters if "MbNative.Throw(" not in g], [])
 
 print("\n=== and says what it left out ===")
 # A generator that silently binds a subset is worse than one that refuses:
@@ -485,10 +501,12 @@ truthy("a class returned by value is owned by the caller",
 # is matched by mb_Inner_new's own `return new csb::Inner();`, so the assertion
 # held no matter what make() did.
 make_body = shim_src.split("mb_Outer_make(")[1].split("\n}")[0]
+# The access is qualified with its declaring class now, which is why this
+# names Outer::make rather than make.
 truthy("the shim heap-copies the returned value",
-       "new csb::Inner(static_cast<csb::Outer*>(self)->make())" in make_body)
+       "new csb::Inner(static_cast<csb::Outer*>(self)->Outer::make())" in make_body)
 check("and does not hand back the address of the temporary",
-      "&static_cast<csb::Outer*>(self)->make()" in make_body, False)
+      "&static_cast<csb::Outer*>(self)->Outer::make()" in make_body, False)
 truthy("a class parameter crosses as the wrapper's handle",
        "public double consume(Inner other)" in cs
        and 'Native.NotNull(other, "other").Borrow()' in cs)
@@ -524,14 +542,14 @@ truthy("and tests it with a memory read", "Marshal.ReadInt32(s)" in cs)
 
 print("\n=== containers: a member is the live vector, a return is a copy ===")
 truthy("a view class is generated per element type",
-       "public sealed class DoubleVector : IReadOnlyList<double>, IDisposable" in cs)
-truthy("and for strings too", "public sealed class StringVector" in cs)
+       "public sealed class MbDoubleVector : IReadOnlyList<double>, IDisposable" in cs)
+truthy("and for strings too", "public sealed class MbStringVector" in cs)
 truthy("one set of element helpers serves every class that uses that vector type",
        shim_src.count("mb_vec_double_size") == 1)
 truthy("a vector member is handed back as the real vector",
-       "public DoubleVector samples {" in cs and "(Get_samples(Check()), false, this)" in cs)
+       "public MbDoubleVector samples {" in cs and "(Get_samples(Check()), false, this)" in cs)
 truthy("a vector returned by value is a copy the caller owns",
-       "new DoubleVector(r, true, null)" in cs)
+       "new MbDoubleVector(r, true, null)" in cs)
 truthy("the shim copies rather than pointing at the temporary",
        "new std::vector<double>(" in shim_src)
 truthy("the view is enumerable, so LINQ works", "IEnumerator<double> GetEnumerator()" in cs)
@@ -586,7 +604,30 @@ truthy("and every guard consults it first",
 # pressure. Count is still read from C++ each time, so growth is still seen.
 truthy("a member view is cached rather than rebuilt per read",
        "private Inner _view_inner;" in cs)
-truthy("and so is a vector view", "private DoubleVector _view_samples;" in cs)
+truthy("and so is a vector view", "private MbDoubleVector _view_samples;" in cs)
+
+print("\n=== inherited access is qualified with the class that declares it ===")
+# Unqualified worked until inherited members started crossing. Two bases with
+# one member name gave "member 'v' found in multiple base classes", and a
+# member named after the derived class lost to the injected-class-name. Both
+# took the whole module down rather than one member.
+truthy("the shim names the declaring base", "->LeftBase::v" in shim_src)
+truthy("and qualifies the shadowed member too", "->HasShadow::Shadow" in shim_src)
+check("no unqualified inherited access is left", "self)->v" in shim_src, False)
+# C# separately forbids a member named after its enclosing type.
+truthy("a member named after its class is renamed", "public int Shadow_ {" in cs)
+truthy("and the rename is reported", "Shadow.Shadow renamed to Shadow_" in run.stdout)
+
+print("\n=== the generator's own namespace-scope names cannot be taken ===")
+# A C++ struct called Native, or DoubleVector beside a vector<double> member,
+# was CS0101 "already contains a definition for". The generator's own types are
+# prefixed so no C++ name reaching here can collide.
+truthy("the helper class is prefixed", "internal static class MbNative" in cs)
+truthy("so are the vector views", "public sealed class MbDoubleVector" in cs)
+truthy("a C++ class really called Native still binds",
+       "public sealed class Native :" in cs)
+truthy("and one called DoubleVector does too",
+       "public sealed class DoubleVector :" in cs)
 
 print("\n=== what used to break the generator itself ===")
 # std::array has value_type and .data() but no allocator_type. Naming
@@ -683,6 +724,21 @@ if MCS and MONO:
         truthy("a borrowed vector view refuses too",
                "disposed owner: vector raises" in out)
         truthy("the same wrapper comes back on every read", "views cached: True" in out)
+        # The ledger exists so a member x and a method get_x reach different
+        # C++ things. Asserted behaviourally: swapping the two entry points
+        # used to leave every assertion byte-identical.
+        truthy("the symbol ledger wires x and get_x to different C++ members",
+               "collide x=1 get_x_()=10" in out)
+        truthy("the bound overload of a collapsed pair is the first one",
+               "widen(7)=8" in out)
+        truthy("two bases with one member name resolve to the declaring base",
+               "mixin v=9 from_left()=90 w=0.5" in out)
+        truthy("a member named after its class reaches the renamed property",
+               "shadowed member=7 z=1" in out)
+        truthy("a C++ class called Native binds and works",
+               "class called Native: id=3" in out)
+        truthy("so does one called DoubleVector",
+               "class called DoubleVector: n=4" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:

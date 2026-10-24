@@ -198,7 +198,7 @@ constexpr const char* cs_wire_type(Wire w) {
 // a string in is free to us: the CLR allocates a native UTF-8 buffer, passes
 // it, and releases it. A string coming out cannot be a managed string, because
 // then nothing would free the native copy, so it arrives as IntPtr and
-// Native.TakeString copies and frees it.
+// MbNative.TakeString copies and frees it.
 constexpr const char* cs_param_type(Wire w) {
     return w == Wire::Utf8 ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string"
                            : cs_wire_type(w);
@@ -464,6 +464,8 @@ public:
         p.cs_name = escape_cs_keyword(cs_name);
         p.symbol = sanitize_symbol(cs_name);
         p.handle = std::string(cs_name) + "Handle";
+        p.taken_names.insert(p.cs_name);
+        p.taken_names.insert(p.handle);
         p.header = header ? header : "";
         p.default_constructible = std::is_default_constructible_v<T>;
         if (!p.header.empty()) headers_.insert(p.header);
@@ -596,6 +598,7 @@ private:
             vp.tag = sanitize_symbol(vp.cs_elem);
             vp.cs_name = std::string(1, static_cast<char>(std::toupper(vp.cs_elem[0])))
                        + vp.cs_elem.substr(1) + "Vector";
+            vp.cs_name = "Mb" + vp.cs_name;
             vp.shim = vector_shim(vp);
             vector_key_[key] = vectors_.size();
             vectors_.push_back(std::move(vp));
@@ -686,7 +689,7 @@ private:
           << "/// dispose. Count is read from C++ on every access, so a vector grown\n"
           << "/// behind your back is seen rather than cached.</remarks>\n"
           << "public sealed class " << N << " : IReadOnlyList<" << E << ">, IDisposable, IMbOwner {\n"
-          << "private const string Lib = Native.Lib;\n\n"
+          << "private const string Lib = MbNative.Lib;\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_size\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
           << "private static extern long VSize(H v);\n\n"
           << "[DllImport(Lib, EntryPoint = \"" << pre << "_get\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
@@ -754,17 +757,17 @@ private:
           << "public " << E << " this[int i] {\n"
           << "get {\n"
           << "var r = VGet(P(), i);\n"
-          << "Native.Throw(\"" << N << "[]\");\n"
-          << "return " << (vp.is_string ? "Native.TakeString(r)" : "r") << ";\n"
+          << "MbNative.Throw(\"" << N << "[]\");\n"
+          << "return " << (vp.is_string ? "MbNative.TakeString(r)" : "r") << ";\n"
           << "}\n"
           << "set {\n"
           << "VSet(P(), i, value" << (vp.is_string ? " ?? string.Empty" : "") << ");\n"
-          << "Native.Throw(\"" << N << "[]\");\n"
+          << "MbNative.Throw(\"" << N << "[]\");\n"
           << "}\n"
           << "}\n\n"
           << "public void Add(" << E << " x) {\n"
           << "VAdd(P(), x" << (vp.is_string ? " ?? string.Empty" : "") << ");\n"
-          << "Native.Throw(\"" << N << ".Add\");\n"
+          << "MbNative.Throw(\"" << N << ".Add\");\n"
           << "}\n\n"
           << "public void Clear() {\n"
           << "VClear(P());\n"
@@ -779,7 +782,7 @@ private:
               // pointer for this and nothing had declared it.
               : std::string("if (n > 0) {\n")
                 + "var p = VData(P());\n"
-                + "if (p == IntPtr.Zero) throw Native.LastError(\"" + N + ".ToArray\");\n"
+                + "if (p == IntPtr.Zero) throw MbNative.LastError(\"" + N + ".ToArray\");\n"
                 + "Marshal.Copy(p, a, 0, n);\n"
                 + "}\n")
           << "return a;\n"
@@ -922,6 +925,33 @@ private:
         return nullptr;
     }
 
+    template<typename T, std::size_t I>
+    static consteval const char* member_owner() {
+        constexpr auto m = get_data_member_with_bases<T, I>();
+        auto owner = std::meta::parent_of(m);
+        if (std::meta::has_identifier(owner)) {
+            return std::meta::identifier_of(owner).data();
+        }
+        return nullptr;
+    }
+
+    template<typename T, std::size_t I>
+    static consteval const char* method_owner() {
+        constexpr auto f = get_member_function<T, I>();
+        auto owner = std::meta::parent_of(f);
+        if (std::meta::has_identifier(owner)) {
+            return std::meta::identifier_of(owner).data();
+        }
+        return nullptr;
+    }
+
+    // "Owner::name", or just "name" when the declaring class has no name to
+    // spell (an anonymous base is not reachable this way and would be a
+    // different bug).
+    static std::string qualified(const char* owner, const std::string& name) {
+        return owner ? std::string(owner) + "::" + name : name;
+    }
+
     static std::string arg_name(const char* ident, std::size_t pos) {
         return ident ? escape_cs_keyword(std::string(ident))
                      : "a" + std::to_string(pos);
@@ -948,8 +978,10 @@ private:
     // methods, so reserving the accessor spellings here is enough.
     static std::string claim_property_name(ClassPlan& p, const std::string& cpp_name) {
         const std::string out = claim_cs_name(p, cpp_name);
-        p.taken_names.insert("get_" + out);
-        p.taken_names.insert("set_" + out);
+        const std::string bare = (!out.empty() && out.front() == '@')
+                               ? out.substr(1) : out;
+        p.taken_names.insert("get_" + bare);
+        p.taken_names.insert("set_" + bare);
         return out;
     }
 
@@ -1062,7 +1094,7 @@ private:
         if (p.default_constructible) {
             body << "public " << p.cs_name << "() {\n"
                  << "var p = New();\n"
-                 << "if (p == IntPtr.Zero) throw Native.LastError(\"" << p.cs_name << "()\");\n"
+                 << "if (p == IntPtr.Zero) throw MbNative.LastError(\"" << p.cs_name << "()\");\n"
                  << "_h = new " << p.handle << "(p, true);\n"
                  << "_parent = null;\n"
                  << "}\n\n";
@@ -1127,6 +1159,7 @@ private:
     void emit_member(ClassPlan& p, std::ostringstream& shim,
                      std::ostringstream& externs, std::ostringstream& body) {
         constexpr auto member = get_data_member_with_bases<T, I>();
+        constexpr const char* owner_id = member_owner<T, I>();
         using Raw = typename [:std::meta::type_of(member):];
         using M = std::remove_cvref_t<Raw>;
         constexpr Wire w = wire_of<M>();
@@ -1169,7 +1202,7 @@ private:
                 const VectorPlan* vp = vector_plan<M>();
                 shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
                      << "return static_cast<void*>(&static_cast<" << p.cpp_name
-                     << "*>(self)->" << name << ");\n"
+                     << "*>(self)->" << qualified(owner_id, name) << ");\n"
                      << "}\n\n";
                 externs << "[DllImport(Lib, EntryPoint = \"" << sym
                         << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
@@ -1198,7 +1231,7 @@ private:
                 const ClassRef* cr = class_ref<M>();
                 shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
                      << "return static_cast<void*>(&static_cast<" << p.cpp_name
-                     << "*>(self)->" << name << ");\n"
+                     << "*>(self)->" << qualified(owner_id, name) << ");\n"
                      << "}\n\n";
                 externs << "[DllImport(Lib, EntryPoint = \"" << sym
                         << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
@@ -1230,14 +1263,14 @@ private:
             if constexpr (w == Wire::Utf8) {
                 shim << "mb_clear_error();\n"
                      << "try { return mb_dup(static_cast<" << p.cpp_name
-                     << "*>(self)->" << name << "); }\n"
+                     << "*>(self)->" << qualified(owner_id, name) << "); }\n"
                      << "catch (...) { mb_set_error(\"" << name << " getter threw\"); return nullptr; }\n";
             } else if constexpr (w == Wire::Bool) {
                 shim << "return static_cast<" << p.cpp_name << "*>(self)->"
-                     << name << " ? 1 : 0;\n";
+                     << qualified(owner_id, name) << " ? 1 : 0;\n";
             } else {
                 shim << "return static_cast<" << ct << ">(static_cast<"
-                     << p.cpp_name << "*>(self)->" << name << ");\n";
+                     << p.cpp_name << "*>(self)->" << qualified(owner_id, name) << ");\n";
             }
             shim << "}\n\n";
 
@@ -1252,18 +1285,19 @@ private:
                 if constexpr (w == Wire::Utf8) {
                     shim << "mb_clear_error();\n"
                          << "try { static_cast<" << p.cpp_name << "*>(self)->"
-                         << name << " = value ? value : \"\"; }\n"
+                         << qualified(owner_id, name) << " = value ? value : \"\"; }\n"
                          << "catch (...) { mb_set_error(\"" << name << " setter threw\"); }\n";
                 } else if constexpr (w == Wire::Bool) {
                     shim << "static_cast<" << p.cpp_name << "*>(self)->"
-                         << name << " = (value != 0);\n";
+                         << qualified(owner_id, name) << " = (value != 0);\n";
                 } else {
                     // decltype rather than a spelled-out type: a member whose
                     // type is a nested typedef has no name valid at namespace
                     // scope in the shim, and this needs none.
                     shim << "static_cast<" << p.cpp_name << "*>(self)->"
-                         << name << " = static_cast<decltype(static_cast<"
-                         << p.cpp_name << "*>(self)->" << name << ")>(value);\n";
+                         << qualified(owner_id, name) << " = static_cast<decltype(static_cast<"
+                         << p.cpp_name << "*>(self)->" << qualified(owner_id, name)
+                         << ")>(value);\n";
                 }
                 shim << "}\n\n";
                 externs << "[DllImport(Lib, EntryPoint = \"" << ssym
@@ -1279,8 +1313,8 @@ private:
             if constexpr (w == Wire::Utf8) {
                 body << "get {\n"
                      << "var r = Get_" << name << "(Check());\n"
-                     << "Native.Throw(\"" << name << "\");\n"
-                     << "return Native.TakeString(r);\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "return MbNative.TakeString(r);\n"
                      << "}\n";
             } else if constexpr (w == Wire::Bool) {
                 body << "get => Get_" << name << "(Check()) != 0;\n";
@@ -1291,7 +1325,7 @@ private:
                 if constexpr (w == Wire::Utf8) {
                     body << "set {\n"
                          << "Set_" << name << "(Check(), value ?? \"\");\n"
-                         << "Native.Throw(\"" << name << "\");\n"
+                         << "MbNative.Throw(\"" << name << "\");\n"
                          << "}\n";
                 } else if constexpr (w == Wire::Bool) {
                     body << "set => Set_" << name << "(Check(), value ? 1 : 0);\n";
@@ -1446,7 +1480,7 @@ private:
 
             body << "public " << p.cs_name << "(" << cs_sig_params << ") {\n"
                  << "var p = " << ext_name << "(" << call_args << ");\n"
-                 << "if (p == IntPtr.Zero) throw Native.LastError(\""
+                 << "if (p == IntPtr.Zero) throw MbNative.LastError(\""
                  << p.cs_name << " constructor\");\n"
                  << "_h = new " << p.handle << "(p, true);\n"
                  << "_parent = null;\n"
@@ -1577,18 +1611,18 @@ private:
                  << claim_cs_name(p, name) << "(" << cs_sig_params << ") {\n";
             const std::string call = ext_name + "(" + call_args + ")";
             if constexpr (rw == Wire::None) {
-                body << call << ";\n" << "Native.Throw(\"" << name << "\");\n";
+                body << call << ";\n" << "MbNative.Throw(\"" << name << "\");\n";
             } else if constexpr (rw == Wire::Utf8) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
-                     << "return Native.TakeString(r);\n";
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "return MbNative.TakeString(r);\n";
             } else if constexpr (rw == Wire::Bool) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
                      << "return r != 0;\n";
             } else {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
                      << "return " << cs_cast_out<Ret>(rw) << "r;\n";
             }
             body << "}\n\n";
@@ -1616,6 +1650,7 @@ private:
     void emit_method(ClassPlan& p, std::ostringstream& shim,
                      std::ostringstream& externs, std::ostringstream& body) {
         constexpr auto func = get_member_function<T, I>();
+        constexpr const char* owner_id = method_owner<T, I>();
         using Ret = std::remove_cvref_t<typename [:get_method_return_type<T, I>():]>;
         constexpr Wire rw = wire_of<Ret>();
         constexpr std::size_t argc = get_method_param_count<T, I>();
@@ -1708,7 +1743,7 @@ private:
                         cs_ext_params = cs_ext_params.substr(
                             0, cs_ext_params.size() - (std::string(cs_param_type(pw)) + " " + an).size())
                             + (pr ? pr->cs_name + "." + pr->handle : std::string("IntPtr")) + " " + an;
-                        call_args += "Native.NotNull(" + an + ", \"" + an + "\").Borrow()";
+                        call_args += "MbNative.NotNull(" + an + ", \"" + an + "\").Borrow()";
                     } else {
                         const std::string cast = cpp_cast<PT>(pw);
                         fwd_args += std::string(fwd_args.empty() ? "" : ", ")
@@ -1733,7 +1768,8 @@ private:
             p.public_sigs.push_back(public_sig);
 
             const std::string invoke = std::string("static_cast<") + p.cpp_name
-                                     + "*>(self)->" + name + "(" + fwd_args + ")";
+                                     + "*>(self)->" + qualified(owner_id, name)
+                                     + "(" + fwd_args + ")";
 
             shim << "MB_EXPORT " << rct << " " << sym << "(" << c_params << ") {\n"
                  << "mb_clear_error();\n"
@@ -1782,28 +1818,28 @@ private:
                                    + (call_args.empty() ? "" : ", " + call_args) + ")";
             if constexpr (rw == Wire::None) {
                 body << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n";
+                     << "MbNative.Throw(\"" << name << "\");\n";
             } else if constexpr (rw == Wire::Utf8) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
-                     << "return Native.TakeString(r);\n";
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "return MbNative.TakeString(r);\n";
             } else if constexpr (rw == Wire::Bool) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
                      << "return r != 0;\n";
             } else if constexpr (rw == Wire::Vector) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
-                     << "if (r == IntPtr.Zero) throw Native.LastError(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
                      << "return new " << vector_plan<Ret>()->cs_name << "(r, true, null);\n";
             } else if constexpr (rw == Wire::Object) {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
-                     << "if (r == IntPtr.Zero) throw Native.LastError(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
                      << "return new " << cs_name_for<Ret>(rw) << "(r, true, null);\n";
             } else {
                 body << "var r = " << call << ";\n"
-                     << "Native.Throw(\"" << name << "\");\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
                      << "return " << cs_cast_out<Ret>(rw) << "r;\n";
             }
             body << "}\n\n";
@@ -1930,6 +1966,11 @@ private:
           << "// this, an error left by an unchecked call -- a string property accessor,\n"
           << "// which has no natural place to raise -- surfaced as the next method's\n"
           << "// failure instead.\n"
+          << "// KNOWN LIMIT: the wire is a NUL-terminated const char*, so a\n"
+          << "// std::string containing an embedded NUL is truncated at it in both\n"
+          << "// directions. Lua and JavaScript carry the length and do not. It\n"
+          << "// matters for callers using std::string as a byte buffer; carrying\n"
+          << "// the length here is the fix.\n"
           << "// The managed caller owns every string it receives and frees it here.\n"
           << "// Returning a pointer into the live std::string would be one allocation\n"
           << "// cheaper and would dangle as soon as anything mutated the object.\n"
@@ -1982,7 +2023,7 @@ private:
           << "    bool MbAlive { get; }\n"
           << "    SafeHandle MbHandle { get; }\n"
           << "}\n\n"
-          << "internal static class Native {\n"
+          << "internal static class MbNative {\n"
           << "    internal const string Lib = \"" << module_ << "\";\n\n"
           << "    [DllImport(Lib, EntryPoint = \"mb_last_error\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
           << "    private static extern IntPtr LastErrorPtr();\n\n"
@@ -2067,7 +2108,7 @@ private:
             std::ostringstream cls;
             cls << "/// <summary>Binds the C++ class <c>" << c.cpp_name << "</c>.</summary>\n"
                 << "public sealed class " << c.cs_name << " : IDisposable, IMbOwner {\n"
-                << "private const string Lib = Native.Lib;\n\n"
+                << "private const string Lib = MbNative.Lib;\n\n"
                 << c.externs
                 << c.body;
             if (!c.renamed.empty()) {
