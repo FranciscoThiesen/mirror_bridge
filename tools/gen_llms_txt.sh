@@ -43,6 +43,9 @@ link "docs/getting-started/quickstart.md"   "Quick Start"        "Get bindings w
 link "docs/getting-started/first-binding.md" "Your First Binding" "Step-by-step first C++ to Python binding"
 link "docs/guides/workflow.md"            "Development Workflow"  "Recommended day-to-day workflow"
 link "docs/guides/accelerating-python.md" "Replacing a hot Python function with C++" "Measured workflow for taking one slow function out of a Python program, which shapes pay and which do not, and how to read the build report"
+# Single-quoted because the description contains backticks, which the shell
+# would otherwise treat as a command substitution and drop.
+link "docs/guides/columnar-returns.md"     "Returning a vector of structs without building a list" '`--columnar` returns a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying; about 200x on the return above a thousand elements, 500x end to end'
 link "docs/guides/multi-language.md"      "Multi-Language Support" "Generate Python, Lua, and JavaScript from one source"
 link "docs/guides/packaging.md"           "Packaging"            "Distribute bindings as installable packages"
 link "docs/guides/single-header.md"       "Single-Header"        "Integrate via amalgamated single-header builds"
