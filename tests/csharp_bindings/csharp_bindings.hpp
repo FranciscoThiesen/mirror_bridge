@@ -271,6 +271,39 @@ struct Pair {
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
 };
 
+// Freed by an owning pool, so its destructor is not public. tinyxml2's
+// XMLElement and box2d's bodies are both this shape. mb_<C>_delete was emitted
+// unconditionally and SafeHandle's release path has nothing else to call, so
+// this did not compile -- and had it compiled it would have been a double free
+// the first time C# disposed one. The whole class is refused and named.
+struct PoolOwned {
+    int id = 11;
+    int doubled() const { return id * 2; }
+
+protected:
+    ~PoolOwned() = default;
+};
+
+// An abstract interface. Every member call is qualified with its declaring
+// class to disambiguate an inherited name, and a qualified call suppresses
+// virtual dispatch -- which for a PURE virtual means naming a symbol that
+// exists nowhere, so the whole library failed to link with "undefined
+// reference to Iface::kind() const". cxxopts::Value is the real one.
+//
+// Only the pure-virtual case drops the qualification. An overridden virtual
+// keeps it and is still correct, because the walk attributes the method to the
+// class that declares the override -- Impl::kind below, not Iface::kind.
+struct Iface {
+    virtual ~Iface() = default;
+    virtual int kind() const = 0;
+    int twice() const { return kind() * 2; }
+};
+
+struct Impl : Iface {
+    int v = 3;
+    int kind() const override { return v; }
+};
+
 // A std::vector and a std::optional parameter on a STATIC method. Neither was
 // expressible before the three emitters shared one slot description: the static
 // emitter had no second wire slot for a length or a has-flag, so a vector

@@ -961,13 +961,36 @@ build_csharp() {
 
     echo -e "${YELLOW}Compiling the C# generator (reflection)...${NC}"
     local log
-    log=$($CXX_BIN $CXX_REFLECT_FLAGS $CXX_CONSTEXPR_BUDGET $inc_flags \
+    local gen_budget="$CXX_CONSTEXPR_BUDGET"
+    log=$($CXX_BIN $CXX_REFLECT_FLAGS $gen_budget $inc_flags \
           ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
           -O1 "$gen_src" -o "$gen_bin" 2>&1) || {
-        echo -e "${RED}✗ the C# generator did not compile${NC}"
-        echo "$log" | grep -m8 -E "error" || true
-        LAST_COMPILE_LOG="$log"
-        return 1
+        # Discovery and the Python module compile both retry at a higher
+        # constexpr budget when the compiler says it ran out, and this pass has
+        # to as well or the fix is only two thirds applied: discovery would
+        # escalate and report a clean class list, and then this step would die
+        # on the identical cause with no retry. Clipper2 is the library that
+        # showed it -- constexpr-limit for C# and a clean build for Python, off
+        # the same headers.
+        if budget_exhausted "$log"; then
+            local bigger
+            case "$CXX_BIN" in
+                *clang*) bigger="-fconstexpr-steps=2000000000" ;;
+                *)       bigger="-fconstexpr-ops-limit=20000000000" ;;
+            esac
+            if [ "$gen_budget" != "$bigger" ]; then
+                echo -e "  ${YELLOW}the C# generator ran out of constexpr budget; retrying at $bigger${NC}"
+                log=$($CXX_BIN $CXX_REFLECT_FLAGS $bigger $inc_flags \
+                      ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+                      -O1 "$gen_src" -o "$gen_bin" 2>&1) && gen_budget="$bigger"
+            fi
+        fi
+        if [ ! -x "$gen_bin" ]; then
+            echo -e "${RED}✗ the C# generator did not compile${NC}"
+            echo "$log" | grep -m8 -E "error|undefined reference|undefined symbol" || true
+            LAST_COMPILE_LOG="$log"
+            return 1
+        fi
     }
 
     echo -e "${YELLOW}Writing the C ABI shim and the C# source...${NC}"
@@ -992,11 +1015,36 @@ build_csharp() {
     case "$CXX_BIN" in
         *clang*) shim_stdlib="-stdlib=libc++" ;;
     esac
+    # --link-args has to reach HERE. It used to be threaded only to the Python
+    # module link, so for C# it was accepted and silently dropped -- and because
+    # -shared tolerates undefined symbols and the only checks were "the shim
+    # compiled" and "the .cs compiled", neither of which looks at a symbol, a
+    # library that needed linking produced a .so that could not be loaded and a
+    # green tick saying it had been built. jsoncpp's was 125 undefined symbols
+    # and an immediate dlopen failure, reported as success.
+    #
+    # --no-undefined turns that into a named build error. A C# binding is
+    # loaded by the .NET runtime through DllImport and gets nothing from the
+    # host process, unlike a Python extension which resolves CPython's symbols
+    # from the interpreter, so for this backend "self-contained" is the correct
+    # requirement rather than a strict one. MB_CSHARP_ALLOW_UNDEFINED=1 opts
+    # out for the rare library whose symbols really do come from its host.
+    local shim_undef="-Wl,--no-undefined"
+    [ -n "${MB_CSHARP_ALLOW_UNDEFINED:-}" ] && shim_undef=""
     log=$($CXX_BIN $shim_std $shim_stdlib $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
-          -fPIC -shared -O2 -DNDEBUG -fvisibility=hidden \
-          "$shim_src" -o "$lib_out" 2>&1) || {
-        echo -e "${RED}✗ the generated shim did not compile${NC}"
-        echo "$log" | grep -m8 -E "error" || true
+          -fPIC -shared -O2 -DNDEBUG -fvisibility=hidden $shim_undef \
+          "$shim_src" -o "$lib_out" ${LINK_ARGS:-} 2>&1) || {
+        echo -e "${RED}✗ the generated shim did not build${NC}"
+        # GNU ld does not write the word "error", so a link failure used to
+        # print nothing at all and the first diagnosis had to be done by
+        # re-running the compile by hand.
+        echo "$log" | grep -m8 -E "error|undefined reference|undefined symbol" || true
+        if echo "$log" | grep -q "undefined reference\|undefined symbol"; then
+            echo -e "  ${YELLOW}these are the library's own symbols: the shim calls"
+            echo -e "  functions declared in its headers and defined in its sources."
+            echo -e "  Point --link-args at the built library, e.g."
+            echo -e "  --link-args \"-L/path/to/build -lthelib\"${NC}"
+        fi
         LAST_COMPILE_LOG="$log"
         return 1
     }

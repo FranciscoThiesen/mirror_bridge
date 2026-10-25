@@ -125,8 +125,15 @@ def classify_failure(cli_json, stderr):
         return (category, reason, line)
 
     tail = [l.strip() for l in blob.splitlines() if l.strip()]
-    return ("unknown", "no recognisable error in the output",
-            tail[-1][:220] if tail else "")
+    # Prefer an actual compiler diagnostic over the last line of output. The
+    # last line is a good guess for a backend whose failures end the run, but
+    # the C# backend prints its machine-readable summary last, so an
+    # unclassified C# failure reported the JSON and said nothing about why the
+    # shim did not compile -- which made the corpus useless for diagnosing it.
+    diag = [l for l in tail
+            if re.search(r"error:|error CS[0-9]+|fatal error", l)]
+    pick = diag[0] if diag else (tail[-1] if tail else "")
+    return ("unknown", "no recognisable error in the output", pick[:220])
 
 
 # Reflection toolchains, most specific first. MB_CXX wins if it is set, which
@@ -349,7 +356,7 @@ def build_library(lib, checkout, build_dir, timeout):
     return None
 
 
-def run_one(lib, cli, cache_dir, work_dir, timeout):
+def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     row = {
         "name": lib["name"], "ref": lib["ref"], "shape": lib.get("shape", "oo"),
         "expect": lib.get("expect", "unknown"), "repo": lib["repo"],
@@ -383,7 +390,11 @@ def run_one(lib, cli, cache_dir, work_dir, timeout):
             return row
 
     cmd = [cli, "generate", headers, "--module", lib["module"],
-           "--lang", "python", "--output", out, "--force", "--json", "--stubs"]
+           "--lang", lang, "--output", out, "--force", "--json"]
+    # .pyi stubs are a Python artifact; asking for them under another backend
+    # is an argument error rather than a library finding.
+    if lang == "python":
+        cmd += ["--stubs"]
     for inc in lib.get("include_dirs", []):
         cmd += ["-I", os.path.normpath(os.path.join(checkout, inc))]
     # Only set for libraries that are not header-only and that the manifest
@@ -578,6 +589,11 @@ def main():
                     help="run just this library (repeatable)")
     ap.add_argument("--timeout", type=int, default=600,
                     help="per-library budget in seconds")
+    ap.add_argument("--lang", default="python",
+                    help="backend to point at the corpus (python, lua, js, "
+                         "csharp). Pair a non-default one with its own --out: "
+                         "results.json is the Python baseline CI regenerates, "
+                         "and a run of another backend is not comparable to it.")
     ap.add_argument("--validate", action="store_true",
                     help="check every manifest path against its checkout and exit; "
                          "a wrong path otherwise shows up as a library failure")
@@ -635,7 +651,8 @@ def main():
     for i, lib in enumerate(corpus, 1):
         sys.stderr.write("[%d/%d] %s @ %s ... " % (i, len(corpus), lib["name"], lib["ref"]))
         sys.stderr.flush()
-        row = run_one(lib, cli, args.cache_dir, args.work_dir, args.timeout)
+        row = run_one(lib, cli, args.cache_dir, args.work_dir, args.timeout,
+                      args.lang)
         rows.append(row)
         sys.stderr.write("%s [%s] (%s classes, %.0fs)\n" % (
             row["status"], row.get("category", "?"),
@@ -649,6 +666,19 @@ def main():
     sys.stderr.write("\n%d/%d bind usefully (%d partial, %d token) -> %s\n" % (
         payload["summary"]["ok"], len(rows), payload["summary"]["partial"],
         payload["summary"]["token"], args.out))
+
+    # The manifest's `expect` is the PYTHON baseline, so comparing another
+    # backend against it reports every difference as a regression and exits
+    # non-zero on a run that was perfectly informative. A non-default backend
+    # therefore reports its categories and stops there -- what a C# run is
+    # measured against is a previous C# run, not Python's.
+    if args.lang != "python":
+        by_cat = payload["summary"]["by_category"]
+        for cat in sorted(by_cat):
+            sys.stderr.write("  %-26s %d\n" % (cat, by_cat[cat]))
+        sys.stderr.write("no expectation comparison: `expect` in the manifest is "
+                         "the python baseline\n")
+        return 0
 
     # A library doing WORSE than its recorded expectation is a failure. A
     # library that has never bound is data, not a broken build, and one that
