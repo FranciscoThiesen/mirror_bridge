@@ -213,6 +213,58 @@ struct WithArray {
     }
 };
 
+// Every one of these is a defect found by an adversarial read of the backend
+// and reproduced before it was fixed. They are ordinary C++ -- that is the
+// point: each one used to take the whole module down, or worse, bind silently
+// to the wrong thing, on a header nobody would call unusual.
+
+// `in` is a C# keyword and a perfectly ordinary C++ parameter name. One
+// escaped spelling used to be written into both surfaces, so the shim read
+// `const char* @in` and the module did not parse.
+struct Echoer {
+    std::string prefix = "p:";
+    std::string echo(std::string in) const { return prefix + in; }
+};
+
+// `r` and `p` are what the generated C# calls its own locals, and C# puts
+// parameters and locals in one scope, so these were CS0128 twice over.
+struct Locals {
+    int v = 0;
+    explicit Locals(int p) : v(p) {}
+    int add(int r) const { return v + r; }
+};
+
+// Two C++ overloads that collapse to one C# signature, so one is refused. The
+// shim used to forward the raw wire variable and let C++ re-resolve, which on
+// LP64 picked the exact match -- whichever overload was REFUSED. Both
+// declaration orders are here because a single order passes by luck: with the
+// narrow overload first the accidental resolution happens to agree with the
+// choice, so only the other order shows the bug.
+struct WideFirst {
+    int pick(long long) const { return 2; }
+    int pick(long) const { return 1; }
+    static int spick(long long) { return 2; }
+    static int spick(long) { return 1; }
+};
+
+struct NarrowFirst {
+    int pick(long) const { return 1; }
+    int pick(long long) const { return 2; }
+    static int spick(long) { return 1; }
+    static int spick(long long) { return 2; }
+};
+
+// A constructor taking a container, beside one taking bool. The constructor
+// emitter has no vector arm, so the vector overload was declared as a bare
+// void* and `new Pair(xs)` resolved through the pointer-to-bool conversion:
+// it compiled, ran the bool constructor, and reported nothing.
+struct Pair {
+    int which = 0;
+    int n = 0;
+    Pair(std::vector<double> xs) : which(1), n(static_cast<int>(xs.size())) {}
+    Pair(bool b) : which(2), n(b ? 1 : 0) {}
+};
+
 // A string-keyed map is the most common non-vector container in a real public
 // API. Its snapshot is two owned vectors rather than a third indexable type,
 // so the key and value halves reuse the view classes their element types

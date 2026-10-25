@@ -187,6 +187,21 @@ class Driver {
                 Console.WriteLine($"class parameter: consume={o.consume(arg)}");
             }
         }
+        using (var e = new Echoer()) {
+            Console.WriteLine($"keyword param: echo={e.echo("hi")}");
+        }
+        using (var lo = new Locals(5)) {
+            Console.WriteLine($"locals: add={lo.add(7)}");
+        }
+        using (var wf = new WideFirst()) {
+            Console.WriteLine($"wide-first: pick={wf.pick(5)} spick={WideFirst.spick(5)}");
+        }
+        using (var nf = new NarrowFirst()) {
+            Console.WriteLine($"narrow-first: pick={nf.pick(5)} spick={NarrowFirst.spick(5)}");
+        }
+        using (var pr = new Pair(true)) {
+            Console.WriteLine($"ctor kept: which={pr.which} n={pr.n}");
+        }
         using (var wa = new WithArray()) {
             Console.WriteLine($"fixed view: Count={wa.@fixed.Count} IsFixedSize={wa.@fixed.IsFixedSize} [1]={wa.@fixed[1]}");
             wa.@fixed[2] = 7.0;
@@ -478,6 +493,48 @@ truthy("while the writable member beside them still binds",
        "public double drift {" in cs)
 truthy("and a method reading the const member still binds",
        "public double baseline_sum()" in cs)
+
+print("\n=== the C# surface and the C++ shim spell a name separately ===")
+# escape_cs_keyword turns `in` into `@in` for C#, which is not a C++
+# identifier. One spelling used to reach both and the shim did not parse.
+truthy("the C# parameter is escaped", "public string echo(string @in)" in cs)
+truthy("and the shim keeps the name C++ declared",
+       "mb_Echoer_echo(void* self, const char* in)" in shim_src)
+check("no C# escape leaked into the shim", "@in" in shim_src, False)
+
+print("\n=== a parameter cannot collide with a generated local ===")
+# The body declares r, p, i, _has and <name>_arr for itself, and C# shares one
+# scope between parameters and locals, so these were CS0128 on plain ints.
+truthy("a parameter called r is renamed on the C# side",
+       "public int add(int r_)" in cs)
+truthy("so is one called p", "public Locals(int p_)" in cs)
+truthy("while the shim still uses the declared names",
+       "mb_Locals_add(void* self, int32_t r)" in shim_src
+       and "mb_Locals_new_0(int32_t p)" in shim_src)
+
+print("\n=== a collapsed overload pair calls the overload that was kept ===")
+# Without a cast the shim forwards the raw wire variable and C++ re-resolves,
+# picking the exact match -- which is the overload the generator REFUSED. The
+# generated code is checked here; the behaviour is checked under mono below.
+truthy("the forwarded argument is cast to the chosen overload's type",
+       "pick(static_cast<long long>(" in shim_src
+       and "pick(static_cast<long>(" in shim_src)
+truthy("one overload of each pair is refused",
+       cs.count("an earlier overload already has the C# signature pick(long)") == 2)
+truthy("and of each static pair",
+       cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
+
+print("\n=== a constructor refuses what it cannot spell ===")
+# The constructor emitter has no vector arm, so the vector overload used to be
+# declared void* and resolve through pointer-to-bool: it compiled and ran the
+# bool constructor.
+truthy("the container constructor is refused by name",
+       re.search(r"Pair\.Pair\(1 args\): a constructor parameter type", run.stdout)
+       is not None)
+truthy("and says which form does work",
+       "assign the member, or add a setter" in run.stdout)
+check("no constructor takes a bare pointer", "public Pair(IntPtr" in cs, False)
+truthy("the bool constructor still binds", "public Pair(bool b)" in cs)
 
 print("\n=== maps cross as a live view, and a set is not one ===")
 truthy("a string-keyed map is an IReadOnlyDictionary",
@@ -1055,6 +1112,20 @@ if MCS and MONO:
                "fixed Clear -> NotSupportedException" in out)
         truthy("a plain vector view is still not fixed",
                "vector IsFixedSize=False" in out)
+        # The expected value comes from each fixture's DECLARATION ORDER, not
+        # from a literal: the first-declared overload is the one bound, and a
+        # single-order test passes by luck because on LP64 the accidental
+        # resolution agrees with the choice in exactly one of the two orders.
+        truthy("the wide-first pair calls its wide overload",
+               "wide-first: pick=2 spick=2" in out)
+        truthy("the narrow-first pair calls its narrow overload",
+               "narrow-first: pick=1 spick=1" in out)
+        truthy("a parameter named after a generated local still works",
+               "locals: add=12" in out)
+        truthy("a C# keyword parameter name still works",
+               "keyword param: echo=p:hi" in out)
+        truthy("the constructor that was kept is the one that runs",
+               "ctor kept: which=2 n=1" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
