@@ -104,17 +104,24 @@ check(named[1].label == "n1", "and its elements work")
 flat = src.get_flat()
 check(type(flat).__name__ == "array", "a vector<double> is still an array.array")
 
-print("a member goes through the same conversion:")
+print("a member is the live vector, not a columnar snapshot:")
 src.fill(4)
 member_view = src.points
-check(type(member_view).__name__.startswith("ColumnView"),
-      "reading the member gives a view too")
-snapshot = np.asarray(member_view)
-check(list(snapshot["x"]) == [0.0, 1.0, 2.0, 3.0], "and it reads correctly")
+# --columnar converts a method RESULT, which is a value the caller just
+# computed and is about to drop, so a snapshot loses nothing. A member is the
+# object's own storage, and handing back a snapshot is what made
+# `obj.points[0].x = 5` discard the write in silence. Each feature owns the
+# conversion where it is correct; this assertion used to read the other way
+# and said so itself ("it is a snapshot, not a window onto the live member").
+check(not type(member_view).__name__.startswith("ColumnView"),
+      "reading the member does not go through the columnar conversion")
+check(len(member_view) == 4, "the member view reports the C++ length")
+check(member_view[1].x == 1.0, "and its elements read")
+member_view[2].x = 77.0
+check(src.points[2].x == 77.0, "a write through the member view reaches C++")
 src.fill(9)
-check(list(np.asarray(member_view)["x"]) == [0.0, 1.0, 2.0, 3.0],
-      "it is a snapshot, not a window onto the live member")
-check(len(src.points) == 9, "while a fresh read sees the new value")
+check(len(member_view) == 9,
+      "and it is a window onto the live member, so it sees a resize")
 
 print("indexing copies, as the list's elements were copies too:")
 check(pts[0] is not pts[0], "each index gives a new object")
