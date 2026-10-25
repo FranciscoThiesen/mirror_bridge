@@ -1991,7 +1991,11 @@ private:
                 std::meta::display_string_of(std::meta::type_of(member)).data();
             p.skipped.push_back({p.cs_name, name,
                 std::string("type ") + tname
-                + " does not cross the C ABI yet; scalars, bool and std::string do"});
+                + " does not cross the C ABI yet. What does: arithmetic types, "
+                  "bool, std::string, a bound enum, a bound class, std::vector "
+                  "or std::array of a scalar or string, std::map and "
+                  "std::unordered_map with a scalar or string key and value, "
+                  "and std::optional of a scalar, enum or string"});
             return;
         } else if constexpr ((w == Wire::Vector || w == Wire::Array
                               || w == Wire::Map || w == Wire::Object)
