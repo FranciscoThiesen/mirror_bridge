@@ -1002,6 +1002,9 @@ build_csharp() {
 
     echo -e "${GREEN}✓ $lib_out${NC}"
     echo -e "${GREEN}✓ $cs_out${NC}"
+    echo -e "${GREEN}✓ $output_dir/${module_name}.h${NC}"
+    echo "  The .h declares the same flat C ABI the C# calls, with no reflection in"
+    echo "  it, so anything that can call C can use these bindings (issue #3)."
     echo "  Add the .cs to a project and put $(basename "$lib_out") beside the assembly,"
     echo "  or anywhere the runtime's library search path reaches."
     LAST_OUTPUT_FILE="$lib_out"
