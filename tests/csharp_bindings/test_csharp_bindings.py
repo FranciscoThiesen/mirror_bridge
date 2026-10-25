@@ -115,6 +115,14 @@ class Driver {
         catch (ObjectDisposedException) { Console.WriteLine("disposed read raises"); }
         gone.Dispose();
         Console.WriteLine("double dispose is a no-op");
+        using (var op = new Device()) {
+            Console.WriteLine($"opt defaults: limit={(op.limit.HasValue ? op.limit.Value.ToString() : "null")} trim={op.trim.Value} note={op.note}");
+            op.limit = 42;
+            op.trim = null;
+            op.note = null;
+            op.fallback = Mode.Careful;
+            Console.WriteLine($"opt set: limit={op.limit.Value} trim={(op.trim.HasValue ? "set" : "null")} note={(op.note == null ? "null" : op.note)} fallback={op.fallback.Value}");
+        }
         using (var sq = new Square()) {
             sq.sides = 4;
             sq.weight = 9.5;
@@ -697,6 +705,25 @@ truthy("the pointer is adjusted by C++, not assumed",
 truthy("the upcast is a borrowed view, so it carries the owner pin",
        "AsShapeBaseRaw(Check()), false, this)" in cs)
 
+print("\n=== std::optional is C# nullable, both ways ===")
+truthy("a scalar optional is a nullable", "public int? limit {" in cs
+       and "public double? trim {" in cs)
+truthy("an optional enum keeps the enum type", "public Mode? fallback {" in cs)
+# A string is already nullable in C#, so a null pointer is the whole signal
+# and no separate has-value flag is on the wire for it.
+truthy("an optional string is just a string", "public string note {" in cs)
+truthy("a scalar optional carries a has-value flag",
+       "out int has" in cs and "int32_t* has" in shim_src)
+check("a string optional does not need one",
+      "mb_Device_get_note(void* self, int32_t* has)" in shim_src, False)
+truthy("assigning null calls reset on the C++ side", ".reset();" in shim_src)
+# optional<int> is a reflectable class that is not string-like, not a
+# container, not arithmetic and not a smart pointer, so it satisfies
+# NestedBindable and was classified as an opaque handle before the optional
+# branch was reached.
+check("an optional is not reported as an unbound class",
+      "limit --" in cs or "note --" in cs, False)
+
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
 # this backend emitted `private static extern intGet_id(IntPtr self)`, which
@@ -791,6 +818,10 @@ if MCS and MONO:
                "upcast implicit: count=4 weigh=9.5" in out)
         truthy("and the base view writes through to the derived object",
                "base view writes through: sides=7 describe=700 area=9" in out)
+        truthy("an optional reads its C++ value or null",
+               "opt defaults: limit=null trim=2.5 note=hi" in out)
+        truthy("and writing null reaches reset() on the C++ side",
+               "opt set: limit=42 trim=null note=null fallback=Careful" in out)
         truthy("a borrowed object view refuses to read a disposed owner",
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",

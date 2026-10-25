@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <compare>
 #include <stdexcept>
 #include <string>
@@ -66,6 +67,12 @@ struct Device {
     }
 
     Mode mode = Mode::Fast;
+
+    // std::optional: null in C# is nullopt in C++, both ways.
+    std::optional<int> limit;
+    std::optional<double> trim{2.5};
+    std::optional<std::string> note{"hi"};
+    std::optional<Mode> fallback;
 
     Mode promote(Mode m) const { return m == Mode::None ? Mode::Fast : Mode::Careful; }
 

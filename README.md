@@ -198,7 +198,7 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Cross-Module Types** | ✅ | ❌ | ❌ | ❌ |
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ | ❌ |
 | **Async/Await** | ✅ | ❌ | ✅ | ❌ |
-| **std::optional** | ✅ | ✅ | ✅ | ❌ |
+| **std::optional** | ✅ | ✅ | ✅ | ✅ |
 | **std::expected** | ✅ | ✅ | ✅ | ❌ |
 
 Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
