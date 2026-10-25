@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Test container bindings."""
 
+import array
+import os
 import sys
-sys.path.insert(0, 'build')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build'))
 
 import containers
 
@@ -18,9 +20,14 @@ def test_vector_double():
     assert dp.sum() == 6.0, f"Expected 6.0, got {dp.sum()}"
     assert dp.average() == 2.0, f"Expected 2.0, got {dp.average()}"
 
-    # Get values as list
+    # A vector of a numeric type comes back as an array.array rather than a
+    # list: the whole buffer is copied in one go instead of allocating a
+    # Python float per element. It indexes, slices and iterates like any
+    # sequence, and list() gives a list where a list is what you want.
     values = dp.get_values()
-    assert values == [1.0, 2.0, 3.0], f"Expected [1.0, 2.0, 3.0], got {values}"
+    assert isinstance(values, array.array), f"Expected array.array, got {type(values)}"
+    assert values.typecode == 'd'
+    assert list(values) == [1.0, 2.0, 3.0], f"Expected [1.0, 2.0, 3.0], got {values}"
 
     print("✓ Vector<double> test passed")
 

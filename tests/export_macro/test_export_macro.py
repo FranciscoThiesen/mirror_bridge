@@ -36,7 +36,12 @@ assert tagged.tagged() == 22, tagged.tagged()
 sealed = exportlib_py.Sealed()
 assert sealed.next_serial() == 6, sealed.next_serial()
 
-for absent in ("EXPORTLIB_API", "Internal", "Secret", "Status"):
+for absent in ("EXPORTLIB_API", "Internal", "Secret"):
     assert not hasattr(exportlib_py, absent), f"{absent} should not be in the module"
+
+# An enum beside the classes is bound too, as an enum.IntEnum.
+assert hasattr(exportlib_py, "Status"), "the enum should be in the module"
+assert [m.name for m in exportlib_py.Status] == ["Idle", "Busy"], list(exportlib_py.Status)
+assert exportlib_py.Status.Busy == 1
 
 print("✓ export-macro discovery test passed")

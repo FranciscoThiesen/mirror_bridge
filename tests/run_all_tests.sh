@@ -144,8 +144,15 @@ while IFS= read -r -d '' binding_file; do
     # Use || true to prevent set -e from exiting on compile failure
     # -Ipython lets bindings include language-backend headers directly
     # (e.g. auto_trampoline's mirror_bridge_auto_trampoline.hpp).
+    # -fvisibility=hidden matches what the CLI and the CMake helper compile
+    # with, and the agreement is load-bearing, not cosmetic: bind_class's
+    # PyTypeObject is a static of a template, so with default visibility two
+    # modules in one process share whichever copy loaded first. abi_skew
+    # builds two modules that disagree about one class, and without this it
+    # is the shared type object that decides, not the registry key.
     compile_output=$(cd "$binding_dir" && $CXX_COMPILER $CXX_FLAGS \
         -I"$PROJECT_ROOT" -I"$PROJECT_ROOT/python" -I. -fPIC -shared \
+        -fvisibility=hidden -fvisibility-inlines-hidden \
         $includes \
         "$(basename "$binding_file")" -o "$BUILD_DIR/${output_name}${output_ext}" 2>&1) || true
 
@@ -175,6 +182,9 @@ while IFS= read -r -d '' binding_file; do
 # Exclude v8/ directory - V8 tests are built separately in Step 2d.
 # Exclude test_validation.cpp - it's a negative compile test (it MUST fail
 # to compile) driven by tests/expected/test_validation.sh in Step 3.
+# Exclude batch_methods_binding.cpp - a binding, but one whose point is what
+# -DMIRROR_BRIDGE_BATCH_METHODS adds, which tests/batch_methods/test_batch.sh
+# builds both ways.
 # Exclude columnar_binding.cpp - a binding, but one that only means anything
 # built with -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which test_columnar.sh does.
 # Exclude columnar_layout_check.cpp - a standalone program, not a binding. It
@@ -203,6 +213,7 @@ done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_
               -not -path "*/.worktrees/*" \
               -not -name "test_validation.cpp" \
               -not -name "buffer_shape_check.cpp" \
+              -not -name "batch_methods_binding.cpp" \
               -not -name "columnar_layout_check.cpp" \
               -not -name "columnar_binding.cpp" -print0)
 
@@ -226,6 +237,9 @@ SKIP_TESTS=(
     # export_macro proves discovery sees past an export macro, which only the
     # CLI's generate pipeline can show
     "export_macro/test_export_macro.py:Run via test_export_macro_cli.sh (module built by CLI generate)"
+    # batch_methods' module exists only when built with
+    # -DMIRROR_BRIDGE_BATCH_METHODS, and its script builds it both ways
+    "batch_methods/test_batched.py:Run via batch_methods/test_batch.sh (built twice, with the flag and without)"
     # columnar's module exists only when built with
     # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its script builds
     "columnar/test_columnar_runtime.py:Run via columnar/test_columnar.sh (module needs the flag)"

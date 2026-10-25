@@ -223,48 +223,82 @@ struct CustomVTable {
     static void** entry_point() { return &vtable[2]; }
 };
 
-// Called from bind_class_auto's tp_new. Allocates T, installs the custom
-// vtable, registers py_self so dispatchers can find it, and returns the
-// PyWrapper<T>*.
+// Point a freshly constructed object's vptr at the custom vtable and record
+// where its PyObject is, so a dispatcher can find the Python override.
+//
+// Installing unconditionally rather than only for Python subclasses: the
+// fallback path is correct when there is no override, and deciding costs
+// more than it saves.
+template<typename T>
+inline void install_auto_vtable(PyWrapper<T>* self) {
+    // A member view holds a pointer into someone else's object and owns
+    // nothing. Re-vtabling it would hijack the owner's dispatch and register
+    // a second entry under an address the owner's dealloc will unregister.
+    if (!self->owns || !self->cpp_object) return;
+
+    T* obj = self->cpp_object;
+    CustomVTable<T>::ensure_built(obj);
+    void** orig_vptr = *(void***)obj;
+    // register_instance overwrites rather than refusing, which is what heals
+    // a stale entry when an address is reused. The payload now usually sits
+    // inside the Python object, so the key comes from obmalloc's size-class
+    // free list and is recycled far more eagerly than a malloc address was.
+    AutoTrampolineRegistry<T>::register_instance(
+        obj, orig_vptr, reinterpret_cast<PyObject*>(self));
+    *(void***)obj = CustomVTable<T>::entry_point();
+}
+
+// tp_new for a class whose constructor takes nothing: py_new builds the
+// object, so the vtable goes on here.
+//
+// Delegating rather than allocating again is what keeps this path from
+// drifting. The hand-written version this replaced did its own `new T()`,
+// which meant it missed the inline payload, never set `parent`, silently
+// discarded constructor arguments, and gave none of py_new's diagnostics for
+// an abstract or non-default-constructible class.
 template<typename T>
 inline PyObject* py_new_auto(PyTypeObject* type, PyObject* args, PyObject* kwds) {
-    auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
+    PyObject* self = py_new<T, T>(type, args, kwds);
     if (!self) return nullptr;
+    install_auto_vtable(reinterpret_cast<PyWrapper<T>*>(self));
+    return self;
+}
 
-    if constexpr (std::is_default_constructible_v<T>) {
-        T* obj = new T();
-        self->cpp_object = obj;
-        self->owns = true;
-
-        // Only install vtable swap for instances that are Python subclasses.
-        // If the user instantiated the bound type directly with no override
-        // intent, we could skip installation; but installing is cheap and
-        // the fallback path is correct, so we always install.
-        CustomVTable<T>::ensure_built(obj);
-        void** orig_vptr = *(void***)obj;
-        AutoTrampolineRegistry<T>::register_instance(
-            obj, orig_vptr, reinterpret_cast<PyObject*>(self));
-        *(void***)obj = CustomVTable<T>::entry_point();
-    } else {
-        self->cpp_object = nullptr;
-        self->owns = false;
-    }
-    return reinterpret_cast<PyObject*>(self);
+// tp_init for a class with a parameterized constructor: py_init is what
+// builds the object for those, so the vtable goes on here instead.
+//
+// Without this, bind_class_auto on such a class raised TypeError on every
+// construction, including the zero-argument one: bind_class had left
+// py_init in tp_init, bind_class_auto replaced only tp_new with a slot that
+// constructed unconditionally, and py_init then refused to initialise an
+// object that already held one.
+template<typename T>
+inline int py_init_auto(PyObject* self, PyObject* args, PyObject* kwds) {
+    int rc = py_init<T, T>(self, args, kwds);
+    if (rc == 0) install_auto_vtable(reinterpret_cast<PyWrapper<T>*>(self));
+    return rc;
 }
 
 template<typename T>
 inline void py_dealloc_auto(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (wrapper->owns && wrapper->cpp_object) {
-        // Restore original vptr before deletion so T's real destructor runs
-        // through the correct vtable.
+        // Restore original vptr before destruction so T's real destructor
+        // runs through the correct vtable.
         auto* entry = AutoTrampolineRegistry<T>::lookup(wrapper->cpp_object);
         if (entry) {
             *(void***)wrapper->cpp_object = entry->orig_vptr;
             AutoTrampolineRegistry<T>::unregister(wrapper->cpp_object);
         }
-        delete wrapper->cpp_object;
+        // Not `delete`: the payload may sit inside this Python object, in
+        // which case it was placement-constructed and freeing it as a heap
+        // pointer aborts the process. release_held_object is the one place
+        // that knows which it is, and py_dealloc uses it for the same reason.
+        release_held_object(wrapper);
     }
+    // A member view owns nothing but the reference that keeps its storage
+    // alive, and this dealloc never released it.
+    Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -281,13 +315,18 @@ inline void py_dealloc_auto(PyObject* self) {
 template<Bindable T>
 PyTypeObject* bind_class_auto(PyObject* module, const char* name,
                               const char* file_hash = nullptr) {
-    // Leverage bind_class for the regular binding setup (methods, getters,
-    // etc.), then override tp_new / tp_dealloc to install the vtable swap.
-    PyTypeObject* type = bind_class<T>(module, name, file_hash);
-    if (!type) return nullptr;
-    type->tp_new = detail::py_new_auto<T>;
-    type->tp_dealloc = detail::py_dealloc_auto<T>;
-    return type;
+    // bind_class does the whole binding; these three slots are the only
+    // difference, and they are handed over before PyType_Ready rather than
+    // written on afterwards. PyType_Ready copies tp_init into the __init__
+    // descriptor it builds, so a later overwrite would not be what
+    // super().__init__() calls, and bind_class is also the only place that
+    // knows whether the object is built in tp_new or in tp_init.
+    static const AutoTrampolineSlots slots{
+        .tp_new = detail::py_new_auto<T>,
+        .tp_init = (initproc)detail::py_init_auto<T>,
+        .tp_dealloc = (destructor)detail::py_dealloc_auto<T>,
+    };
+    return bind_class<T>(module, name, file_hash, &slots);
 }
 
 }  // namespace mirror_bridge

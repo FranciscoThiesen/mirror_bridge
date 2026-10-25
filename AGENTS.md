@@ -55,13 +55,77 @@ example dir, `../../tools/mirror_bridge`). All commands below assume you are ins
 # Single language
 tools/mirror_bridge generate src/ --module my_module --lang python
 
-# Choices for --lang: python | lua | js | all
+# Choices for --lang: python | lua | js | csharp | all
+# (csharp is NOT in `all`: it writes a .cs source file plus the shared library
+#  that file loads, not a module the CLI can import and verify)
+#
+# For csharp, read <module>.cs the way you would read a .pyi: it IS the typed
+# surface, it carries the real C++ parameter names, and anything that could not
+# cross is a comment at the point the member would have been -- so a missing
+# member can be told from an absent one without rerunning anything.
 tools/mirror_bridge generate src/ --module my_module --lang all
 
 # Useful flags: -o/--output DIR (default build/), -k/--keep-generated,
-# -v/--verbose, -f/--force, -I DIR (extra include dir), --pch [PATH]
+# -v/--verbose, -f/--force, -I DIR (extra include dir), --pch [PATH],
+# --batch, --no-stubs, --link-args, --json
 tools/mirror_bridge generate src/ --module my_module --lang python -I include/ -v
 ```
+
+**Before binding an unfamiliar or large codebase, do these two things first.**
+They turn a long guessing loop into one pass, and they are the flags most worth
+knowing about:
+
+```bash
+# 1. Take the include paths and defines from the project's own build system
+#    rather than rediscovering them as -I/-D by trial and error.
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # or: bear -- make
+# 2. Ask what reflection can see, without generating or compiling anything.
+tools/mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+Read `source` in that JSON before anything else:
+
+- `"source": "reflection"` -- the headers were read after the preprocessor and
+  the class list is real. Proceed.
+- `"source": "text scan"` -- the reflection unit failed and every name came
+  from reading header text, which cannot see `class MYLIB_API Widget` or
+  resolve a typedef. **Do not generate a module from this**; it would bind the
+  wrong names. The output names a planner log that says why it failed, and the
+  usual cause is a missing include path or define, which is what
+  `--compile-commands` is for.
+
+Related flags: `--compile-commands-for PATH` scopes the database to one subtree
+(a monorepo's union of every subsystem's flags is self-contradictory), and
+`--replace-prefix OLD=NEW` maps a database written on another machine onto this
+one. MSVC and clang-cl spellings (`/I`, `/D`, `/external:I`, `/FI`) are
+translated, and the project's own `-std=` is dropped because reflection needs
+C++26.
+
+A `<module>.pyi` is written beside the module unless you pass `--no-stubs`.
+Read it rather than guessing at the surface: the signatures come from the same
+reflection the binding does, so the parameter names are the real C++ ones and
+the types are what actually crosses -- a method returning a numeric vector
+gives an `array.array`, not a `list`, and the stub says so.
+
+Reading a `std::vector` data member gives a live view of the C++ vector, not a
+copy, so `obj.points.append(p)` reaches C++ and reading the member is O(1)
+whatever its length. It is a `collections.abc.MutableSequence`; call
+`list(...)` on it when you need a snapshot or something that insists on a real
+list, such as `json.dumps`. A numeric one exports the buffer protocol, so
+`numpy.asarray(obj.xs)` is zero-copy.
+
+`--batch` generates a `<name>_batch` sibling for every method taking and
+returning one arithmetic value, so a Python loop crosses the boundary once
+instead of once per element. Measured at 6.8x from a list and 12.9x from an
+`array.array` over 100,000 elements, and 1.0x when the method body is the
+expensive part -- it amortises the boundary, not the work. Off by default
+because each sibling costs compile time.
+
+`--json` puts one object on stdout: the classes found, the outputs built, and
+on failure a per-language `reason`, `suggestion` and `generated_binding` --
+the last being the generated `.cpp` the compiler's line numbers refer to,
+which is kept when a build fails.
 
 `generate` scans every `.hpp`/`.h` under `src_dir`, binds all discovered struct/class definitions,
 emits a `<module>_<lang>_binding.cpp`, compiles it, and (unless `-k`) deletes the generated `.cpp`.

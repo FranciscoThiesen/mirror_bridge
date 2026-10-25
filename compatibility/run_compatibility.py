@@ -44,8 +44,14 @@ FAILURE_SIGNATURES = [
      r"(destructor|~\w+)[^\n]*(is (private|protected)|deleted)|calling a (private|protected) destructor",
      "a bound class cannot be destroyed from the binding",
      re.I),
+    # Only the compiler's own complaint, not the CLI's warning. The CLI prints
+    # "'Factory' is the binding name of 2 classes", picks the one in the
+    # shallowest namespace and carries on, so that line is advice and not a
+    # cause. Matching it made the matrix report jsoncpp as a name collision
+    # for a week while the real failure was a conversion further down, and a
+    # category here is a claim that we know what the problem is.
     ("duplicate-binding-name",
-     r"binding name of \d+ classes|redefinition of '\w+'",
+     r"redefinition of '\w+'",
      "two classes share an unqualified name, so the module cannot name both",
      re.I),
     # The template planner names a type it is not allowed to name. tinyxml2's

@@ -2,6 +2,16 @@
 
 **Difficulty**: Intermediate
 
+> **Partly implemented.** A `std::shared_ptr<T>` is converted by value, so the
+> shared ownership does not cross the boundary: a `shared_ptr` return gives a
+> Python object holding a *copy* of the pointee, and a `shared_ptr` parameter
+> is refused outright with a TypeError. `test_smart_ptrs.py` in this directory
+> asserts the aliasing semantics the feature should have and does not pass.
+> What works today is binding a class that holds smart pointers, returning one
+> and using the object you get back. See issue #54; the wrapper has no slot for
+> a control block, which is the same shortage of ownership vocabulary as #48.
+
+
 Demonstrates binding `std::shared_ptr`, `std::unique_ptr`, and `std::weak_ptr`.
 
 ## What You'll Learn

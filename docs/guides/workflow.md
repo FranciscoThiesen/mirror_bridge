@@ -67,7 +67,12 @@ mirror_bridge generate src/ --module my_module --lang python --pch
 2. Finds all `struct` and `class` definitions
 3. Auto-generates binding code
 4. Compiles with PCH (fast!)
-5. Produces `build/my_module.so`
+5. Produces `build/my_module.so` and `build/my_module.pyi`
+
+The `.pyi` carries reflection-exact signatures, so an editor, a type checker,
+a reader and an agent all see the real C++ parameter names and the types that
+actually cross. `--no-stubs` skips it. If a build fails, the generated
+binding `.cpp` is kept and the compiler's line numbers refer to it.
 
 **Time cost**: ~194-252ms (3-6x faster than without PCH!)
 

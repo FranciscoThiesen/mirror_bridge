@@ -153,10 +153,37 @@ def test_abstract_and_rvalue_members():
 def test_stubs():
     pyi = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "geom.pyi")
     text = open(pyi).read()
-    for needle in ("class Vec3f:", "class Vector3_long:", "position: Vec3d", "path: list[Vec3f]",
-                   "def dot3(a: Vec3f, b: Vec3f) -> float", "def answer() -> int"):
+    # A free function takes no keyword arguments at runtime, so its stub
+    # marks every parameter positional-only.
+    # `path` is a std::vector member, so it reads as a live view and writes
+    # from a list. Those differ, so it renders as a property rather than the
+    # bare annotation a plain member gets.
+    for needle in ("class Vec3f:", "class Vector3_long:", "position: Vec3d",
+                   "def path(self) -> _MutableSequence[Vec3f]",
+                   "def path(self, value: list[Vec3f]) -> None",
+                   "def dot3(a: Vec3f, b: Vec3f, /) -> float", "def answer() -> int"):
         assert needle in text, needle
     print("✓ stubs name instantiations")
+
+
+def test_member_operator_template_costs_nothing():
+    # The guard's whole point: an operator template is skipped and the class
+    # keeps the member template beside it. If the guard were missing there
+    # would be no module to import at all, so reaching this line is half the
+    # assertion.
+    tg = geom.Tagged()
+    assert tg.tag == 3, tg.tag
+    assert tg.scaled(4) == 12, tg.scaled(4)
+    print("✓ a member operator template does not cost the module")
+
+def test_conversion_template_costs_nothing():
+    # yaml-cpp's shape: a conversion template, which reaches the planner by a
+    # different route than the operator template above. Same rule, different
+    # path, and this is the one that sent yaml-cpp to the text scan.
+    cv = geom.Convertible()
+    assert cv.raw == 7, cv.raw
+    assert cv.doubled() == 14, cv.doubled()
+    print("✓ a conversion template does not cost the module")
 
 
 if __name__ == "__main__":

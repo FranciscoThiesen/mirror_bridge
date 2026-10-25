@@ -126,8 +126,11 @@ roundtrip, kwargs, operators, repr, inheritance.
   would preserve polymorphism through the wrapper's lifetime. ~150
   lines, borrowed from nanobind's intrusive-ptr approach.
 
-- **Python type stubs (.pyi)**: existing `scripts/generate_stubs.py`
-  needs polish to reflect parameter names, defaults, overloads.
+- **Python type stubs (.pyi)**: done. Every module carries
+  `__mirror_bridge_stubs__()`, written by `python/mirror_bridge_stubgen.hpp`
+  from the same reflection as the binding, so parameter names, defaults and
+  overloads are exact. `scripts/generate_stubs.py` asks the module for that
+  and only reconstructs a stub for one that has none.
 
 ---
 

@@ -24,7 +24,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 |----------|-------------|
 | `<src_dir>` | Directory containing C++ headers |
 | `--module NAME` | Output module name |
-| `--lang LANG` | Target language: `python`, `lua`, `js`, or `all` |
+| `--lang LANG` | Target language: `python`, `lua`, `js`, `csharp`, or `all`. `csharp` is not part of `all`, because it produces a `.cs` source file to add to a dotnet project plus the shared library that file loads, rather than a module the CLI can import and check |
 
 **Options:**
 
@@ -40,9 +40,14 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `--no-verify` | Skip the import check. Python modules are imported once after the build, because "built" and "works" are different claims: the import is what catches a library that is not header-only, and it is where the module reports the names it declined to bind |
 | `--link-args ARGS` | Extra link inputs for a library that is not header-only, e.g. `--link-args "build/libfoo.a -lz"` |
 | `--stubs` | Python: write `<module>.pyi` beside the module, with reflection-exact signatures and real C++ parameter names |
+| `--batch` | Python: also generate `<name>_batch` for each method taking and returning one arithmetic value, so a Python loop crosses the boundary once. 6.8x from a list, 12.9x from an `array.array`, 1.0x when the method is the expensive part. Off by default: +12% compile time on a class with ten eligible methods, +55% with forty |
 | `--columnar` | Python: return a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying. Changes the return type, so off by default — see [columnar-returns.md](../guides/columnar-returns.md) |
 | `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
 | `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
+| `--compile-commands PATH` | Read include paths and defines from a project's `compile_commands.json` instead of restating them as `-I`/`-D` flags. See [Large codebases](#large-codebases) below |
+| `--compile-commands-for PATH` | Only use compile-database entries whose source file is under `PATH` (repeatable) |
+| `--replace-prefix OLD=NEW` | Rewrite a leading path prefix in every harvested path (repeatable, first match wins) |
+| `--discover-only` | Report what reflection found and stop: no codegen, no compile. Pairs with `--json` |
 | `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |
 | `--instantiate SPEC` | Python: also bind this template specialization, e.g. `"geom::Vector3<short>"` or `"geom::clamp<float>"` (repeatable) |
 | `--template-cap N` | Python: max argument combinations tried per function template before falling back to Python scalars (default 64) |
@@ -72,6 +77,216 @@ mirror_bridge generate src/ --module my_module --lang python --pch build/pch.gch
 # Force rebuild
 mirror_bridge generate src/ --module my_module --lang python -f
 ```
+
+#### Large codebases
+
+Pointing the CLI at a large project fails for a dull reason: its headers do not parse
+without the include paths and defines its own build system passes. Restating those by
+hand works at a few hundred files and does not scale. Every large library in the
+[compatibility corpus](../internals/compatibility.md) needed some of it — OpenCV needs a
+generated `opencv_modules.hpp`, Eigen needs sixteen `--exclude` patterns, Open3D is
+reachable only for its `geometry/` subtree.
+
+`--compile-commands` reads the answer instead of asking for it again:
+
+```bash
+# CMake writes the database with this on
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json
+```
+
+For a Make build, `bear -- make` produces the same file.
+
+**Only parse-affecting flags are taken**, by allowlist: `-I`, `-isystem`, `-iquote`,
+`-idirafter`, `-iframework`, `-F`, `-D`, `-U` and `-include`. Optimisation, warning,
+sanitiser, LTO and dependency-generation flags are dropped, because an unrecognised flag
+in a large project's build is far more likely to be one of those than something the
+reflection pass needs.
+
+**The project's own `-std=` is dropped.** Reflection needs C++26 and your project is
+probably on something older; its standard flag winning would break the pass outright.
+
+**MSVC and clang-cl spellings are translated** — `/I`, `/D`, `/U`, `/external:I` and
+`/FI` all arrive as their GNU equivalents. This matters more than it sounds: MSVC has no
+reflection support, so a Windows project's build runs there while generation runs on a
+machine with a reflection compiler, and the database it hands over is full of MSVC flags.
+Paths in it name directories the reading machine does not have, which is what
+`--replace-prefix` is for:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands /mnt/win/build/compile_commands.json \
+    --replace-prefix 'C:/src/mylib=/mnt/win/src/mylib'
+```
+
+On a monorepo, the union of every subsystem's flags is both enormous and
+self-contradictory. Scope it to the subtree you are binding:
+
+```bash
+mirror_bridge generate include/geometry --module geom --lang python \
+    --compile-commands build/compile_commands.json \
+    --compile-commands-for src/geometry
+```
+
+A macro defined two ways across the build, and any flag carrying whitespace, are both
+reported rather than silently resolved — a flag with a space in it would otherwise become
+two flags and change what the compiler is told.
+
+#### Triaging before you build
+
+Reading a large project's headers is the expensive half. Generating and compiling a module
+for every class found is what turns minutes into hours. `--discover-only` stops after
+discovery:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+```json
+{"status":"ok","action":"discover","source":"reflection","seconds":41,
+ "counts":{"classes":312,"enums":28,"headers":97}, ...}
+```
+
+**`source` is the number that matters.** `reflection` means the headers were read after
+the preprocessor and the class list is real. `text scan` means the reflection unit failed
+and every name came from reading header text, which cannot see a class declared through an
+export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting
+`text scan` is not a slow problem, it is a blocked one, and the planner log named in the
+output says why.
+
+#### When discovery runs out of constexpr budget
+
+Discovery walks every class in the codebase at compile time, so on a large
+project it is the pass most likely to exhaust the compiler's constexpr
+evaluation limit. The cost of exhausting it is not a slow build, it is a wrong
+answer: the CLI falls back to scanning header text, which cannot see a class
+declared through an export macro and reports the macro's name instead.
+
+OpenCV's core module — 139 headers, 86k lines, `CV_EXPORTS` on every public
+class — exceeded the first budget and was discovered that way for no other
+reason.
+
+So the budget escalates when the compiler says that is what went wrong, and
+says so on the terminal:
+
+```
+  reflection ran out of constexpr budget for a codebase this size; retrying at
+  -fconstexpr-steps=2000000000.
+  This is slower, and the alternative is a text scan that cannot see a class
+  declared through an export macro.
+```
+
+**The retry is slow.** On a codebase large enough to need it, discovery can go
+from under a minute to many minutes, because the plan is produced by *running*
+the probe rather than only parsing it. It is still the better trade, since the
+alternative is not a faster answer but an incorrect one — and the message is
+printed rather than logged so a long wait is not mistaken for a hang. Interrupt
+it if you would rather proceed on the text scan, with the caveat above.
+
+The budget is not raised unconditionally, because a genuinely runaway
+`constexpr` loop would then take twenty times as long to fail.
+`MB_CONSTEXPR_BUDGET` overrides the first tier; it exists so this path can be
+tested without a codebase big enough to exhaust a real budget, and is not
+something a normal build needs.
+
+### `csharp` output
+
+C# reaches native code through P/Invoke, so unlike the Python, Lua and JavaScript backends
+there is no host C API to call. `--lang csharp` writes two things:
+
+```bash
+mirror_bridge generate src/ --module mylib --lang csharp -o build/
+# build/libmylib.so     the flat C ABI, compiled (.dylib on macOS, .dll on Windows)
+# build/mylib.cs        the C# that calls it
+# build/mylib.h         the same ABI as a C header
+# build/mylib_shim.cpp  the generated C ABI source
+```
+
+`generate` compiles the `.cs` itself when `csc` or `mcs` is on PATH, so a codegen
+bug fails the build rather than shipping as source that looks fine. It says so when
+no C# compiler is available.
+
+Add the `.cs` to a dotnet project and put the shared library where the runtime looks for
+it. **The shim contains no reflection**, so you can rebuild it with whatever compiler you
+already have — which is the point if that compiler is MSVC.
+
+Both files come from one reflection pass over one class list, so renaming a member in C++
+renames the exported symbol and the C# property together.
+
+What crosses the boundary today:
+
+| C++ | C# |
+|---|---|
+| arithmetic, `bool` | the matching C# primitive (`bool` travels as `int32` and converts at the edge) |
+| `std::string` | `string`, UTF-8, heap copy out with an explicit free; `LPUTF8Str` marshalled in |
+| `enum` / `enum class` | a real C# `enum` over the same underlying type |
+| a bound class, as a **member** | a view of the real subobject: writes reach the owning object |
+| a bound class, **returned by value** | a copy you own and should dispose |
+| a bound class, as a **parameter** | the wrapper, passed by handle |
+| `std::vector<T>` of a scalar or string, as a **member** | the live vector as `IReadOnlyList<T>` with an indexer setter, `Add`, `Clear` and `ToArray`: `Add` reaches C++ |
+| `std::vector<T>`, **returned by value** | a copy you own and should dispose |
+| `std::vector<T>` of a **scalar**, as a **parameter** | `IReadOnlyList<T>`, crossing as a pointer and a length so nothing is allocated managed-side; a generated vector view can be passed straight through |
+| `const` member | a get-only property |
+| overloaded methods | C# overloads, one exported symbol each |
+| static methods | `public static` |
+| constructors of any arity | C# constructors |
+| inherited members and methods | flattened onto the derived class |
+
+Generated classes are `IDisposable` over a `SafeHandle`, which the runtime ref-counts for
+the duration of each call — with a raw `IntPtr` the GC could release the handle while a
+native call on it was still running.
+
+A C++ exception is caught at every entry point and raised on the managed side carrying
+`what()`, because an exception crossing `extern "C"` is undefined behaviour. The kind is
+carried too, so `std::invalid_argument` arrives as `ArgumentException`, `std::out_of_range`
+as `ArgumentOutOfRangeException`, `std::overflow_error` as `OverflowException` and
+`std::bad_alloc` as `OutOfMemoryException`, rather than one exception type for everything.
+
+**Names are adjusted only when they have to be, and it is always reported.** A C++ member
+called `Dispose` or `Handle` would collide with the generated surface, and a method `get_x`
+beside a member `x` collides with the hidden accessor a C# property compiles to. Either is
+renamed with a trailing underscore, recorded in the run output and written as a comment in
+the generated class.
+
+Anything that cannot cross yet — a map, a set, a tuple, a variant, `std::optional`, a smart
+pointer, `std::array`, `vector<bool>`, a container of **strings** passed in, a
+`vector<BoundClass>`, or a second overload C# cannot tell from the first — is **named in the
+run output and as a comment in the generated C#** at the point the member would have been,
+so a missing member can be told from an absent one.
+
+#### Using the bindings from C or C++17
+
+The shim contains no reflection, which means the ABI beside it is callable by any compiler,
+not only one that can do C++26. `<module>.h` declares it:
+
+```cpp
+#include "mylib.h"            // only <stdint.h> behind it
+
+void* r = mb_Reading_new();
+mb_Reading_set_id(r, 21);
+double xs[3] = {1.0, 2.5, 3.5};
+double total = mb_Reading_sum_of(r, xs, 3);
+const char* tag = mb_Reading_get_tag(r);   // malloc'd UTF-8
+mb_free_string(tag);
+mb_Reading_delete(r);
+```
+
+```bash
+g++ -std=c++17 -Wall use.cpp -lmylib     # or: gcc -std=c99
+```
+
+Every declaration in the header is a signature lifted from `<module>_shim.cpp` with its
+body removed, so the two cannot drift. Ownership is in the entry point's name: `mb_<C>_new`
+and a by-value return hand you something to free with `mb_<C>_delete`, while a member
+accessor returns a pointer interior to its owner that must not be freed and must not outlive
+it. After any call that can fail, `mb_last_error()` is non-NULL and `mb_last_error_kind()`
+says which C++ exception it was.
+
+This is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked
+for: generate with a reflection compiler, consume with an ordinary one.
 
 ### `pch` - Build Precompiled Header
 
@@ -361,23 +576,24 @@ mirror_bridge init [dir] [options]
 
 | Argument | Description |
 |----------|-------------|
-| `[dir]` | Project directory (default: current directory) |
+| `<project_name>` | Directory to create. Required; the module is named after it |
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--name NAME` | Module name |
-| `--lang LANG` | Target language(s) |
+| `--lang, -l LANG` | Target language: `python`, `lua`, `js`, or `all` (default: `python`) |
+| `--wheel` | Also scaffold pip packaging: `pyproject.toml` with scikit-build-core, a CMake build, and a wheel-building workflow |
+| `--no-ci` | Skip the GitHub Actions workflow |
 
 **Examples:**
 
 ```bash
-# Initialize in current directory
-mirror_bridge init --name my_module
+# Scaffold a Python project
+mirror_bridge init my_project
 
-# Initialize in new directory
-mirror_bridge init my_project --name my_module --lang all
+# All three backends, with pip packaging
+mirror_bridge init my_project --lang all --wheel
 ```
 
 ## Global Options

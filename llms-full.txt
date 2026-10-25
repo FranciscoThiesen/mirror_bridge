@@ -9,11 +9,12 @@
 [![Tests](https://github.com/FranciscoThiesen/mirror_bridge/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/FranciscoThiesen/mirror_bridge/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/FranciscoThiesen/mirror_bridge)](https://github.com/FranciscoThiesen/mirror_bridge/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespaces-Open-blue?logo=github)](https://codespaces.new/FranciscoThiesen/mirror_bridge)
 
 Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
-> **Experimental**: Requires a C++26 reflection (P2996) compiler. Works on **stock GCC 16+** (`g++ -std=c++26 -freflection`) or [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996). The CLI auto-detects whichever is present.
+![mirror_bridge demo: one command generates Python, Lua and JavaScript modules](docs/assets/mirror_bridge_demo.svg)
+
+> C++26 reflection ships in **stock GCC 16.1+** (`g++ -std=c++26 -freflection`); [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996) also works. The CLI auto-detects whichever is present. Reflection was voted into C++26 in June 2025 — this is standard C++, not a fork-only experiment.
 
 ## One C++ Class, Three Languages
 
@@ -29,13 +30,79 @@ struct Calculator {
 mirror_bridge generate src/ --module calc --lang all
 ```
 
-**Python** | **Lua** | **JavaScript**
+That command is the entire binding process — no `.def()`, no macros in your class, no wrapper files. The same `Calculator` is now native in all three languages:
+
+**Python**
 ```python
 import calc
 c = calc.Calculator()
 c.add(10)
-print(c.value)  # 10.0
+print(c.value)   # 10.0
 ```
+
+**Lua**
+```lua
+package.cpath = "build/lua/?.so;" .. package.cpath
+local calc = require("calc")
+local c = calc.Calculator()
+c:add(10)
+print(c.value)   -- 10.0
+```
+
+**JavaScript (Node.js)**
+```javascript
+const calc = require('./build/calc.node');
+const c = new calc.Calculator();
+c.add(10);
+console.log(c.value);   // 10.0
+```
+
+## Proof on a Real Library: Open3D
+
+We ported [Open3D](https://github.com/isl-org/Open3D)'s geometry module — the same API surface that takes **25,262 lines of hand-written pybind11** upstream — with **71 generated lines and one command** ([full case study](https://chico.dev/Mirror-Bridge-Open3D-71-Lines/), [runnable example](examples/open3d-port/)):
+
+```bash
+cd examples/open3d-port
+mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/eigen3
+```
+
+And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
+
+### And on thirty-one libraries we didn't pick
+
+Open3D is a case we worked, so on its own it proves only that it can be done.
+To make the claim falsifiable instead, CI runs the same one-line command every
+week against a corpus of unmodified third-party libraries and publishes the
+result, failures included: **[the compatibility
+matrix](docs/internals/compatibility.md)**.
+
+Today that page is mostly a work queue, which is the reason to publish it. The
+discovery half holds up — reflection reads the headers and reports the real
+class list without anyone naming a class by hand, 23 in jsoncpp, 41 in
+yaml-cpp, 108 in spdlog — and the matrix then says, per library, exactly what
+stops a module coming out, grouped so the most valuable thing to fix is the
+line with the most libraries on it. pybind11 and nanobind have nothing to put
+in that first column, because the class list is the thing their user writes.
+
+### Pointing it at a large codebase
+
+Large projects do not fail to bind because binding is hard. They fail because their
+headers do not parse without the include paths and defines their own build system
+passes. `--compile-commands` reads those from the build instead of asking you to restate
+them:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+`--discover-only` stops after reading the headers and reports what it found, including
+whether the class list came from reflection or from a fallback text scan. That is the
+number that says whether a codebase is ready, and it costs one pass instead of a module
+per class. MSVC and clang-cl flag spellings are translated, and `--replace-prefix` maps a
+build database written on one machine onto the paths of another.
+[Details](docs/reference/cli.md#large-codebases).
 
 ## Try It Now
 
@@ -86,38 +153,116 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
-| Rust | Beta | Code generation |
+| C# (.NET) | Stable for scalars, strings, enums, objects and vectors | `--lang csharp` |
+| Rust | Prototype | Code generation |
+
+C# goes through P/Invoke, so there is no host C API to call the way there is for
+CPython, Lua and Node. `--lang csharp` writes a flat C ABI shim plus the C# that calls
+it, both from one reflection pass, so a member renamed in C++ renames the exported symbol
+and the C# property together. **The shim has no reflection in it**, so it rebuilds with
+whatever compiler you already have — which matters, because MSVC has no reflection
+support.
+
+```csharp
+using var d = new Device();          // IDisposable, over a SafeHandle
+d.calibration = 2.5;                 // real C++ parameter and member names
+d.mode = Mode.Careful;               // a real C# enum, not an int
+d.samples.Add(1.5);                  // the live C++ vector: Add reaches C++
+Console.WriteLine(d.samples.Sum());  // IReadOnlyList<double>, so LINQ works
+d.inner.x = 7.5;                     // a member object is a view, not a copy
+d.replace_samples(new[]{1.0, 2.0});  // and a container crosses inward too
+```
+
+The shim has no reflection in it, so the ABI beside it is callable from any compiler:
+`<module>.h` declares the same entry points, and a plain `g++ -std=c++17` or `gcc -std=c99`
+can use them ([issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3)).
+
+See [the CLI reference](docs/reference/cli.md#csharp-output).
 
 ### Feature Matrix
 
-| Feature | Python | Lua | JavaScript |
-|---------|:------:|:---:|:----------:|
-| **Data Members** | ✅ | ✅ | ✅ |
-| **Methods (any arity)** | ✅ | ✅ | ✅ |
-| **Constructors** | ✅ | ✅ | ✅ |
-| **Containers (vector/array)** | ✅ | ✅ | ✅ |
-| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
-| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
-| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
-| **Variants (std::variant)** | ✅ | ✅ | ✅ |
-| **Nested Objects** | ✅ | ✅ | ✅ |
-| **Enums** | ✅ | ✅ | ✅ |
-| **Inheritance** | ✅ | ✅ | ✅ |
-| **Method Overloading** | ✅ | ⚠️ | ⚠️ |
-| **Smart Pointers** | ✅ | ✅ | ✅ |
-| **Exception Handling** | ✅ | ✅ | ✅ |
-| **Cross-Module Types** | ✅ | ❌ | ❌ |
-| **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
-| **Async/Await** | ✅ | ❌ | ✅ |
-| **std::optional** | ✅ | ✅ | ✅ |
-| **std::expected** | ✅ | ✅ | ✅ |
+| Feature | Python | Lua | JavaScript | C# |
+|---------|:------:|:---:|:----------:|:--:|
+| **Data Members** | ✅ | ✅ | ✅ | ✅ |
+| **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
+| **Constructors** | ✅ | ✅ | ✅ | ✅ |
+| **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
+| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
+| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
+| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
+| **Variants (std::variant)** | ✅ | ✅ | ✅ | ❌ |
+| **Nested Objects** | ✅ | ✅ | ✅ | ✅ |
+| **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ | ❌ |
+| **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ | ❌ |
+| **Enums** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Inheritance** | ✅ | ✅ | ✅ | ⚠️ |
+| **Method Overloading** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| **Exception Handling** | ✅ | ✅ | ✅ | ✅ |
+| **Cross-Module Types** | ✅ | ❌ | ❌ | ❌ |
+| **Zero-Copy Buffers** | ✅ | ❌ | ❌ | ❌ |
+| **Async/Await** | ✅ | ❌ | ✅ | ❌ |
+| **std::optional** | ✅ | ✅ | ✅ | ❌ |
+| **std::expected** | ✅ | ✅ | ✅ | ❌ |
+
+Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
+output and as a comment in the `.cs` at the point the member would have been, so a missing
+member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
+view; `std::array` and `vector<bool>` do not.
+
+**Inheritance** is ⚠️ for C# in the other direction: inherited members and methods are
+flattened onto the derived class, which Lua and JavaScript do not do at all, but a generated
+class has no C# base type, so a `Derived` cannot be passed where a `Base` is expected. Lua and
+JavaScript both have the upcast machinery for that and C# does not yet. The two backends are
+incomplete in opposite directions, and one tick on both would hide it.
+
+Two rows read better for C# than for Lua and JavaScript, and that is not an accident of the
+table. On **overloading**, Lua reaches only the first overload of a name and JavaScript only
+the last, and neither says so; C# emits one exported symbol per overload and lets C#'s own
+resolution pick, refusing only the pair C# genuinely cannot distinguish. On **enums**, Lua
+and JavaScript pass the underlying integer with no enum type at all.
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
+
+✅ **Python data model**: a class whose `begin()`/`end()` form a range over
+convertible elements iterates and answers `in`; add `size()` and it gains
+`len()`, and an empty one is falsy. A default-constructible class whose members
+are all assignable pickles and deep-copies, with the member list taken from
+reflection so it cannot fall behind the C++ struct; one that cannot be
+reconstructed — a `const` or `[[=readonly{}]]` member, a private or
+`[[=exclude{}]]` one the state cannot see, or a member a base class declares —
+keeps refusing to pickle rather than silently dropping a field.
+
+`hash()` is not generated, and what that leaves differs by class. A class with
+`operator==` is **unhashable**: CPython inherits `tp_hash` from `object` only
+when it also inherits `tp_richcompare`, so defining comparison and no hash
+makes `set`, `dict` and `in` over a set raise
+`TypeError: unhashable type: 'mod.Point'`. Use a list, or key on a member. A
+class without `operator==` keeps the identity hash, so two equal-looking
+objects remain two distinct keys. Hashing the member values instead would be
+worse: every non-`const` member is assignable from Python, and a hash that
+moves corrupts any set or dict already holding the object.
+
+⚠️ **Enums, outside Python**: Python gets the enum type as an `enum.IntEnum`
+carrying the C++ enumerator names and values, so `Color.Red` exists and
+`list(Color)` works. Nothing about the value conversion changed, because an
+`IntEnum` member is an `int`. Lua and JavaScript have no enum object to map
+onto and their values still cross as bare numbers; `generate` says which
+backend does which. An out-of-range integer is still accepted where an enum
+is expected, in every backend.
+
+⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
+`shared_ptr` return gives you a usable object. What does not cross is the
+shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
+parameter is refused. Tracked in
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ### Additional Features
 
 - **Precompiled headers**: 3-6x faster builds
 - **Auto-discovery**: Zero binding code required
+- **Templates without hints** (Python): `generate` binds every specialization the headers name (`using Vec3f = Vector3<float>;` is the declaration), instantiates function templates over the types the headers use, and lets the compiler reject what does not exist. Python sees families: `geom.Vector3[float]`, `geom.Vector3(1.0, 2.0, 3.0)`, `geom.clamp(1.5, 0.0, 1.0)`, `v.cast[int]()`. The plan is written next to the module — [details](docs/reference/cli.md#templates-and-free-functions-python)
 - **Type stubs**: `.pyi` generation for Python IDE support
 
 ## Documentation
@@ -125,7 +270,7 @@ python3 test_greeter.py
 | Topic | Description |
 |-------|-------------|
 | **[Getting Started](docs/getting-started/)** | Quick start, installation, first binding |
-| **[Guides](docs/guides/)** | Workflow, PCH, multi-language, contributing |
+| **[Guides](docs/guides/)** | Workflow, PCH, multi-language, independent teams, contributing |
 | **[Reference](docs/reference/)** | CLI, API, configuration, type conversion |
 | **[Architecture](docs/internals/architecture.md)** | System design and internals |
 | **[Examples](examples/)** | Progressive examples from hello-world to production |
@@ -148,15 +293,17 @@ mirror_bridge generate src/ --module my_mod --lang all
 
 ## Performance
 
-| Metric | Mirror Bridge | pybind11 | Speedup |
-|--------|--------------|----------|---------|
-| **Method dispatch** | 37ns | 130ns | **3.5x faster** |
-| **Object construction** | 47ns | 235ns | **5x faster** |
-| **Vector return** | 173ns | 610ns | **3.5x faster** |
-| **Compile time** (with PCH) | 194ms | 1,938ms | **10x faster** |
-| **Binding code** | 0 lines | 18+ lines/class | **Zero boilerplate** |
+From the CI-regenerated benchmark table (same C++ class, same compiler, `-O3` for every framework; only the binding layer differs — absolute times shift with runner hardware, compare the ratios):
 
-Same C++ class, same compiler, `-O3` for every framework; only the binding layer differs. The numbers above are **regenerated by CI** so they track the current code: see **[Benchmarks →](docs/internals/benchmarks.md)** for the live table (including nanobind and SWIG) and methodology.
+| Operation | Mirror Bridge | pybind11 | nanobind | vs pybind11 |
+|-----------|--------------|----------|----------|-------------|
+| **Method dispatch** (null call) | 73ns | 190ns | 70ns | **2.6x faster** |
+| **Object construction** | 89ns | 376ns | 111ns | **4.2x faster** |
+| **Vector return** | 316ns | 914ns | 2,650ns | **2.9x faster** (8.4x vs nanobind) |
+| **Point-cloud ingest** (1M × `[x,y,z]` → `vector<Eigen::Vector3d>`) | 12.2ms | 509ms | — | **42x faster** |
+| **Binding code** | 0 lines | 18+ lines/class | 18+ lines/class | **Zero boilerplate** |
+
+Honest summary: 2-4x faster than pybind11 across the board, parity with nanobind on scalar dispatch (nanobind wins some by ~10%), and far ahead of both on container traffic. Compile time is ~3.4x faster than pybind11 (567ms vs 1,938ms, no PCH for either); nanobind compiles faster still — Mirror Bridge only matches it with `--pch` (194ms). The full table is **[regenerated monthly by CI](docs/internals/benchmarks.md)** so it tracks the current code, with methodology and SWIG numbers included. The same run now gates the ratios against committed floors, so a regression fails the build instead of sitting in a table for a month — and it reports every operation where a competitor is still faster rather than rounding that away.
 
 ## For AI Agents
 
@@ -164,7 +311,7 @@ mirror_bridge is built to be driven by coding agents as well as humans:
 
 - **[AGENTS.md](AGENTS.md)**: operating manual for agents working in this repo
 - **`--json` everywhere**: `generate`, `diff`, and `doctor` emit exactly one JSON object on stdout, with actionable suggestions on failure
-- **MCP server**: `pip install 'mirror-bridge[mcp]'` → `claude mcp add mirror_bridge -- mirror-bridge-mcp` gives any MCP-capable agent `generate_bindings`, `doctor`, and `check_binding_drift` as tool calls
+- **MCP server**: gives any MCP-capable agent `generate_bindings`, `doctor`, and `check_binding_drift` as tool calls. Until the PyPI release lands, build it locally (`cd packaging/pip && ./build_wheel.sh`, then `pip install "$(ls dist/*.whl)[mcp]"` and `claude mcp add mirror_bridge -- mirror-bridge-mcp`)
 - **[Claude Code skill](integrations/claude-code/)**: drop-in `bind-cpp` skill teaching the full generate → fix → verify loop
 - **[llms.txt](llms.txt)** / **[llms-full.txt](llms-full.txt)**: docs index and full corpus for LLM consumption
 
@@ -187,7 +334,7 @@ mirror_bridge/
 - **Compiler**: a C++26 reflection compiler — stock **GCC 16+** (`-freflection`) or **Bloomberg clang-p2996**. Both are provided via Docker; the CLI auto-detects which is installed (override with `MB_CXX`).
 - **Python**: 3.7+ | **Lua**: 5.4 | **Node.js**: 14+
 
-> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; GCC builds ignore them (all members bound) until GCC ships P3394.
+> **Note**: P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work under both compilers, in the Python backend. The Lua and JavaScript backends do not read them yet: they bind every named member, so an annotated field is still exposed there.
 
 ## Contributing
 
@@ -411,8 +558,9 @@ Mirror Bridge requires a C++26 compiler with reflection (P2996) support. Two com
 The CLI auto-detects whichever is installed (force a choice with the `MB_CXX` environment variable).
 The easiest way to get a working toolchain is Docker.
 
-> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) currently require clang-p2996; on
-> GCC they are ignored (all members bound) until GCC ships P3394.
+> P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) work on both compilers, in the
+> Python backend. The Lua and JavaScript backends bind every named member and do not read
+> annotations yet, so an annotated field is still exposed there.
 
 ## Docker Setup (Recommended)
 
@@ -605,6 +753,12 @@ mirror_bridge generate src/ --module greeter --lang python
 python3 test_greeter.py
 ```
 
+A `greeter.pyi` is written next to the module. It is the fastest way to see
+what crossed: real C++ parameter names, exact member types, and the types that
+actually come back (a method returning a numeric vector gives an
+`array.array`, not a `list`; a vector *member* gives a live view of the C++
+vector that you can append to). Pass `--no-stubs` to skip it.
+
 ## Step 4: Create Your Own
 
 **Write C++:**
@@ -664,6 +818,271 @@ mirror_bridge generate src/ --module my_module --lang all
 ```
 
 See the [Multi-Language Guide](../guides/multi-language.md) for details.
+
+
+---
+# FILE: docs/guides/accelerating-python.md
+---
+
+# Replacing a hot Python function with C++
+
+This is the workflow for taking one slow function out of a Python program and
+running it in C++ instead. It is written for whoever is doing the replacing,
+including an agent working without a human in the loop, so every number and
+every claim below was measured rather than estimated.
+
+Nothing here requires you to write binding code. You write a header and the
+generator reads it.
+
+## The loop
+
+```bash
+mirror_bridge generate src --module hot --lang python --output build --json
+```
+
+```python
+import sys; sys.path.insert(0, "build")
+import hot
+```
+
+On a header with ten free functions and one class, `generate` takes about four
+seconds end to end, including the reflection pass over the headers. `--pch`
+takes it to about three. That is the whole iteration cost, so there is no
+reason to batch up changes before trying them.
+
+Free functions do not need a class to live in. A header of plain functions
+produces a module of plain functions.
+
+## Decide whether it is worth doing first
+
+The speedup is not "C++ is faster than Python". It tracks how much
+*interpreted per-element work* you remove, minus what it costs to marshal the
+arguments across. Measured on the same machine, same data:
+
+| What the Python version does | n | Speedup |
+|---|---|---|
+| `sorted(range(len(v)), key=lambda i: -v[i])[:10]` | 100,000 | **72.7x** |
+| `[x/nrm for x in v]` after a generator sum | 100,000 | **8.3x** |
+| `sum(a*b for a, b in zip(xs, xs))` | 1,000,000 | **4.4x** |
+| a Python class accumulating in a list, 20,000 calls | 20,000 | **4.9x** |
+| nested `for` loops over `str.split()` | 2,000 docs | **2.4x** |
+| `sum(xs) / len(xs)` | 1,000,000 | **0.70x (slower)** |
+
+The last row is the one to understand before writing anything. `sum()` is
+already a C loop over the list, so there is no interpreted work left to
+remove, and converting a million-element list into a `std::vector<double>`
+costs more than the arithmetic saves. A function that is already one call into
+a C builtin cannot be made faster this way.
+
+What does pay:
+
+- **A `key=` lambda, or any callback invoked per element.** That is one
+  interpreter entry per element and it disappears entirely. This is where the
+  72x comes from.
+- **Nested loops and element-wise arithmetic written in Python.**
+- **State that stays on the C++ side across many calls**, so the data is
+  marshalled once instead of per call. Hold a bound class and call methods on
+  it.
+
+What does not pay:
+
+- Anything already delegating to C: `sum`, `min`, `sorted` without a key,
+  `str.join`, numpy.
+- A function called a huge number of times with tiny arguments, where the call
+  overhead is the whole cost.
+
+## What crosses, and what to write
+
+`docs/reference/type-conversion.md` has the full table. The parts that matter
+most when you are writing a header from scratch:
+
+```cpp
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <optional>
+
+namespace hot {
+
+// Containers cross both ways. Take them by const reference.
+double dot(const std::vector<double>& a, const std::vector<double>& b);
+
+// Return by value. A returned pointer is refused, because a pointer says
+// nothing about who owns the thing.
+std::vector<double> normalize(const std::vector<double>& xs);
+
+// Maps become dicts, pairs and tuples become tuples, optional becomes None.
+std::unordered_map<std::string, int> word_count(const std::vector<std::string>& docs);
+std::optional<double> first_above(const std::vector<double>& xs, double t);
+
+// A std::function parameter accepts any Python callable, so you can keep a
+// predicate on the Python side. It costs an interpreter entry per call, which
+// is usually the thing you were trying to remove.
+double apply(const std::vector<double>& xs, const std::function<double(double)>& f);
+
+// State that stays in C++. Marshalled once at construction, not per call.
+struct RollingStats {
+    std::vector<double> window;
+    std::size_t capacity = 16;
+
+    void push(double v);
+    double mean() const;
+};
+
+}  // namespace hot
+```
+
+Three things to avoid, each of which is refused by name at build time rather
+than silently misbehaving:
+
+- **Out-parameters.** `void sum_into(const std::vector<double>&, double& total)`
+  does not bind. Python would pass a copy and the write would be lost, so the
+  function would return `None` having done nothing. Return the value.
+- **`std::span`.** A span does not own its storage. Take `const std::vector<T>&`.
+- **Overloaded free functions.** Give one of them a distinct name.
+
+## Two results that will surprise you
+
+**A numeric vector comes back as `array.array`, not a `list`.** This applies
+to a method return; a vector *data member* is a live view of the C++ vector
+instead, which you can append to and which numpy reads without copying. This is
+deliberate: the conversion is a bulk copy of the buffer rather than building a
+list of boxed floats, which is where a good part of the speedup above comes
+from. From 1 KB up it is one copy, straight out of the C++ container; below
+that it goes through an intermediate `bytes` object, because at that size the
+extra call into the interpreter costs more than the extra copy. It indexes,
+iterates and measures like a list, but it is not one:
+
+```python
+>>> hot.normalize([3.0, 4.0])
+array('d', [0.6, 0.8])
+```
+
+So `json.dumps(result)` and `isinstance(result, list)` and `result + [x]` all
+fail. If the caller needs a real list, say `list(result)` and pay for it
+knowingly. `from_python` accepts both, so a round trip is fine.
+
+**Out-of-range numbers raise instead of truncating.** Passing `2**40` to an
+`int32_t` parameter is a `TypeError`, not a silent wrap. So is `3.7` to an
+integer parameter, `-1` to an unsigned one, and a list with a `None` in it.
+This is the opposite of the usual default and it is worth relying on.
+
+## Batching a method you call in a loop
+
+If the slow thing is a loop in Python over a method that is itself cheap, the
+cost is the boundary, not the method. `--batch` gives every method taking and
+returning one arithmetic value a sibling that takes the whole sequence:
+
+```bash
+mirror_bridge generate src --module hot --lang python --output build --batch
+```
+
+```python
+# one crossing per element
+out = [sim.scale(x) for x in xs]        # 2.82 ms for 100,000
+
+# one crossing
+out = sim.scale_batch(xs)               # 0.41 ms, 6.8x
+out = sim.scale_batch(arr)              # 0.22 ms, 12.9x from an array.array
+```
+
+The second form is 12.9x because a batch returns `array.array`, so chaining
+two of them never builds a list in between.
+
+It carries state, which a list comprehension cannot be rewritten to do:
+`ewma_batch(xs)` threads the object through the loop and leaves it exactly
+where the loop would have.
+
+Two things decide whether it is worth turning on:
+
+- **It is 1.0x when the method is the expensive part.** Measured on a method
+  doing 200 iterations of real work: 372.46 ms against 364.11 ms. The win is
+  the boundary, so there is none to take when the boundary was not the cost.
+  Same rule as `sum(xs)/len(xs)` above.
+- **It costs compile time**, one more dispatcher per eligible method: +12% on
+  a class with ten of them, +55% with forty. That is why it is off by default.
+
+A sibling is generated only for a method taking exactly one arithmetic value
+and returning one, with exactly one overload of that name, and never over a
+`<name>_batch` the C++ author wrote themselves. Everything else is untouched,
+so turning the flag on cannot change an existing call.
+
+## Read the build output, not just the exit code
+
+`generate` reports every name you wrote that is not in the finished module,
+with the reason:
+
+```
+✓ Successfully built bindings for: python
+
+⚠ 3 names were not bound into 'hot' — Python raises AttributeError on them:
+
+    1 class(es) the module declined
+      Node — a member type has no converter; mark it [[=exclude{}]] or add a
+      custom converter
+
+    2 free function(s) the module declined
+      out_param — a non-const reference parameter, whose writes cannot reach
+      the caller: Python would pass a copy and the result would be lost.
+      Return the value instead
+      label — the return type has no converter
+```
+
+`--json` carries the same thing, which is the form to use when nothing is
+reading the terminal:
+
+```json
+{
+  "status": "ok",
+  "imported": {"ok": true, "reason": "", "suggestion": ""},
+  "declined": [
+    {"kind": "function", "name": "out_param",
+     "reason": "a non-const reference parameter, whose writes cannot reach ..."}
+  ]
+}
+```
+
+Three fields are worth branching on:
+
+- `status` is `error` if any language failed to compile **or** if the built
+  module does not import.
+- `imported.ok` is the end-to-end check. `generate` imports the Python module
+  it just built, because a `.so` that raises `ImportError` is not a result.
+  `imported.suggestion` says what to do about it.
+- `declined` is every name that did not make it. An empty array means
+  everything you wrote crossed.
+
+If `declined` is non-empty and you expected otherwise, fix the signature and
+run again. It costs three seconds.
+
+## Checking you actually won
+
+The generator will not tell you whether the result is correct or faster. Both
+are worth measuring before you delete the Python version:
+
+```python
+import math, timeit
+
+reps = 20
+py = timeit.timeit(lambda: py_normalize(xs), number=reps) / reps
+cpp = timeit.timeit(lambda: hot.normalize(xs), number=reps) / reps
+assert all(math.isclose(a, b) for a, b in zip(hot.normalize(xs), py_normalize(xs)))
+print(f"{py/cpp:.2f}x")
+```
+
+Measure at the size the program actually uses, because the ratio moves with
+it. Across n=100 to n=1,000,000, `dot` held between 5.7x and 4.4x, drifting
+down as the conversion cost grew. `mean` was a loss at every size and a worse
+one as n rose, 0.93x to 0.70x: its conversion cost grew the same way and there
+was never any interpreted work to pay for it.
+
+## Related
+
+- [Type conversion reference](../reference/type-conversion.md) -- the full table
+- [CLI reference](../reference/cli.md) -- every flag
+- [Errors](../reference/errors.md) -- what each diagnostic means
+- [Threading](threading.md) -- `--release-gil`, for a long C++ call that should
+  not block other Python threads
 
 
 ---
@@ -1010,6 +1429,171 @@ Apache License 2.0 - See LICENSE for details.
 
 
 ---
+# FILE: docs/guides/independent-teams.md
+---
+
+# Running mirror_bridge in production with two independent teams
+
+This guide is for the case where a C++ team owns a library and a Python team
+consumes it, and the two do not coordinate daily. Generating a module is the
+easy half of that. The hard half is making sure the Python team finds out
+when the C++ team changes something, before production does.
+
+## The problem
+
+A binding generator removes the glue. It does not, by itself, tell anyone
+what the glue currently exposes.
+
+So the default failure looks like this. On Monday a C++ engineer renames
+`PointCloud::compute_normals` to `estimate_normals`, because nothing in
+their repository mentions the old name. CI is green: it builds C++ and runs
+C++ tests. The binding still generates, because it generates from whatever
+the header says. On Thursday a Python service raises `AttributeError` in
+production.
+
+Nothing in that sequence was careless. The information simply never left the
+C++ repository.
+
+## What makes this solvable
+
+Every module exposes `__mirror_bridge_stubs__()`, filled in during
+`bind_class` from the same reflection data the binding itself is generated
+from. `mirror_bridge generate --stubs` writes it next to the module as a
+`.pyi`.
+
+Three properties make that file usable as a contract rather than a
+convenience:
+
+- **It cannot drift.** It is not parsed back out of a built module or
+  maintained by hand. The binding and the stub come from one pass over the
+  same reflected declarations, so a stub that disagrees with the binding is
+  not a state the tool can reach.
+- **It is byte-reproducible.** Two runs over the same headers produce
+  identical bytes, so a comparison has no false positives.
+- **It does not depend on the compiler.** clang-p2996 and GCC 16 produce the
+  same bytes, so the gate does not break when CI changes toolchain.
+
+A file with those three properties is a lockfile. The rest of this guide is
+about treating it like one.
+
+## The workflow
+
+**Commit the stub.** It belongs in the C++ repository, next to the headers
+it describes, not in a build directory. One file per module:
+
+```
+include/quotes/*.hpp
+api/quotes.pyi          <- committed
+```
+
+Create it once and commit it:
+
+```bash
+mirror_bridge api include/quotes --module quotes --update
+git add api/quotes.pyi
+```
+
+**Gate it in CI.** Add one step to the C++ repository's existing build job:
+
+```yaml
+- name: Python surface unchanged
+  run: mirror_bridge api include/quotes --module quotes --check
+```
+
+`--check` exits 1 when a name disappeared or changed signature. It does not
+fail on additions, because nobody's import breaks when a method appears.
+
+**Read the diff in review.** When the gate fires, the author sees what the
+other team is about to lose:
+
+```
+API surface of 'quotes' changed (baseline api/quotes.pyi):
+
+  removed — importers raise AttributeError:
+      Book.best
+
+  changed — importers may pass the wrong type:
+      Book.add
+          was: (self, q: Quote) -> None
+          now: (self, q: Quote, qty: int) -> None
+
+  added — safe for existing importers:
+      Book.best_bid
+
+  2 breaking changes, 1 additive.
+  Accept with: mirror_bridge api include/quotes --module quotes --update
+```
+
+The C++ engineer renaming a method now learns, in their own pull request,
+that a Python caller depends on the old name. That is the whole point: the
+information moves at review time instead of at runtime.
+
+**Accept deliberately.** A breaking change is often correct. Re-run with
+`--update` and commit the new baseline in the same pull request. The
+stub diff is then part of the review, and `git log api/quotes.pyi` is the
+history of the Python surface.
+
+## Giving the Python team something to build against
+
+The committed stub is also the Python team's type information, and they can
+have it without building the C++ at all. Ship it in a stub-only package:
+
+```
+quotes-stubs/
+    quotes-stubs/__init__.pyi   <- the committed api/quotes.pyi
+    pyproject.toml
+```
+
+Their editor and their type checker then work against the real surface, and
+`mypy` fails in their repository when they call something that no longer
+exists, without them compiling a line of C++.
+
+## Versioning
+
+Treat the stub the way you treat any published interface.
+
+- A removed or changed name is a major version bump for the module.
+- An added name is a minor bump.
+- `--check` tells you which you are making, so the decision does not depend
+  on anyone remembering.
+
+If the C++ library already has a version, the useful discipline is that the
+Python surface version changes only when the stub changes. A C++ refactor
+that leaves the stub byte-identical cannot break the Python team, and the
+gate proves it rather than asserting it.
+
+## What this does not cover
+
+Be clear about the boundaries, because a gate that is trusted beyond its
+remit is worse than no gate.
+
+- **Behaviour is not in the stub.** A method that keeps its signature and
+  changes what it returns passes the gate. The stub is an interface
+  contract, not a test suite. The Python team still needs their own tests.
+- **Only what was bound is in the stub.** If a name was never bound, its
+  removal is invisible here. `generate` reports what it could not bind at
+  the end of a run, so read that too.
+- **`mirror_bridge diff` is a different, weaker thing.** It compares header
+  text, misses a class renamed inside an indented namespace, and fires on
+  private members that Python never sees. Use `api` for the Python contract
+  and leave `diff` for a quick local look at header churn.
+- **ABI is a separate problem.** If the Python team links against a
+  prebuilt `.so` rather than building from headers, the standard library and
+  compiler have to match. The stub says nothing about that.
+
+## Summary
+
+| | |
+|---|---|
+| Artifact | `api/<module>.pyi`, committed to the C++ repository |
+| Create | `mirror_bridge api <src> --module <m> --update` |
+| Gate | `mirror_bridge api <src> --module <m> --check` in C++ CI |
+| Fails on | a removed name, or a changed signature |
+| Passes on | additions, and any C++ change the Python surface does not see |
+| Accept a change | re-run with `--update`, commit the stub in the same PR |
+
+
+---
 # FILE: docs/guides/multi-language.md
 ---
 
@@ -1306,8 +1890,7 @@ my_project/
 ├── build/
 │   ├── my_lib_binding.cpp     # Auto-generated binding
 │   └── my_lib.so              # Compiled shared library
-├── pyproject.toml              # Package metadata
-├── setup.py                    # Build configuration
+├── pyproject.toml              # Package metadata and build configuration
 └── my_lib/
     ├── __init__.py             # Python package init
     └── my_lib.so -> ../build/my_lib.so
@@ -1447,14 +2030,28 @@ mirror_bridge_python_module(my_lib
 install(TARGETS my_lib DESTINATION my_lib)
 ```
 
-## Example: Complete Distributable Project
+## Example: project layout
 
-See [examples/packaging/](../../examples/packaging/) for a complete working example with:
-- C++ source header
-- pyproject.toml configuration
-- setup.py with auto-build
-- __init__.py with proper imports
-- Tests with pytest
+[examples/packaging/](../../examples/packaging/) shows the shape of a
+distributable project: a C++ header, a `pyproject.toml`, an `__init__.py` that
+imports the built module, and a pytest file. It is a layout to copy, not a
+wheel that builds: it has no build step and does not install the `.so`, so
+building it produces a package whose `__init__.py` raises the ImportError it
+is written to raise.
+
+For a wheel that actually builds, use the scaffold instead:
+
+```bash
+mirror_bridge init my_project --wheel
+```
+
+which writes a `pyproject.toml` using scikit-build-core, a CMake build for the
+extension, and a workflow that builds the wheel in the reflection container.
+
+Either way, the resulting `.so` is linked against the toolchain that built it.
+With the default clang image that means it needs `libc++.so.1` on the machine
+that imports it, which a stock Linux box does not have. Build with GCC
+(`MB_CXX=g++`) for a module that links against the libstdc++ already there.
 
 ## Tips
 
@@ -1880,6 +2477,83 @@ Into a single self-contained header for each language.
 
 
 ---
+# FILE: docs/guides/threading.md
+---
+
+# Threading: GIL Release and Free-Threaded Python
+
+## Releasing the GIL around C++ calls
+
+By default, a bound method holds Python's GIL for its entire duration — a
+long-running C++ call blocks every other Python thread. Opt a class into
+GIL release and its method bodies run with the interpreter released:
+
+```bash
+# CLI: applies to every class in the module
+mirror_bridge generate src/ --module engine --lang python --release-gil
+```
+
+```cpp
+// Hand-written binding: per class
+MIRROR_BRIDGE_MODULE(engine,
+    mirror_bridge::bind_class<Simulation>(m, "Simulation").release_gil();
+    mirror_bridge::bind_class<Config>(m, "Config");   // stays GIL-held
+)
+```
+
+With the policy on, the sequence per call is: convert arguments (GIL held)
+→ release → run the C++ body → re-acquire → convert the result. Four
+Python threads each calling a 150ms native function finish in ~150ms
+instead of ~600ms (`tests/gil_release/` measures exactly this).
+
+### Why this is safe by construction
+
+Unlike `pybind11::gil_scoped_release` — where calling anything that touches
+Python without the GIL is undefined behavior you must reason about per
+method — every mirror_bridge path that re-enters Python re-acquires the GIL
+itself:
+
+- `std::function` parameters: the callback wrapper uses `PyGILState_Ensure`
+- Virtual overrides (trampolines): `dispatch_python` and
+  `has_python_override` carry a GIL acquire guard — which also makes
+  overridden virtuals callable from pure C++ threads that never held the GIL
+
+What remains **your** responsibility is C++-side thread safety: two Python
+threads calling methods on the *same* C++ object concurrently race on that
+object unless it is internally synchronized. That contract is identical to
+pybind11/nanobind.
+
+### When to enable it
+
+Enable for classes whose methods do real work (simulation steps, I/O,
+image processing). Leave it off for getter/setter-style classes: the
+release/acquire pair costs a few tens of nanoseconds per call, which is
+noise on a 1ms call and pure overhead on a 70ns one.
+
+## Free-threaded CPython (3.13+ `--disable-gil`)
+
+On a free-threaded interpreter, any extension module that doesn't declare
+a GIL policy causes CPython to **silently re-enable the GIL for the whole
+process**. To declare a mirror_bridge module free-threading-ready, compile
+it with `-DMB_FREE_THREADED`:
+
+```bash
+MB_CXX=g++ mirror_bridge generate src/ --module engine --lang python  # then add
+# -DMB_FREE_THREADED via a custom build, or use mirror_bridge build with the flag
+```
+
+The declaration is deliberately opt-in (mirroring nanobind's
+`FREE_THREADED` flag): mirror_bridge's own entry points are thread-state
+correct, but declaring `Py_MOD_GIL_NOT_USED` asserts that *your* C++
+classes tolerate concurrent access from Python threads.
+
+## See also
+
+- [tests/gil_release/](../../tests/gil_release/) — the parallelism regression test
+- [Benchmarks](../internals/benchmarks.md) — per-call dispatch costs
+
+
+---
 # FILE: docs/guides/workflow.md
 ---
 
@@ -1952,7 +2626,12 @@ mirror_bridge generate src/ --module my_module --lang python --pch
 2. Finds all `struct` and `class` definitions
 3. Auto-generates binding code
 4. Compiles with PCH (fast!)
-5. Produces `build/my_module.so`
+5. Produces `build/my_module.so` and `build/my_module.pyi`
+
+The `.pyi` carries reflection-exact signatures, so an editor, a type checker,
+a reader and an agent all see the real C++ parameter names and the types that
+actually cross. `--no-stubs` skips it. If a build fails, the generated
+binding `.cpp` is kept and the compiler's line numbers refer to it.
 
 **Time cost**: ~194-252ms (3-6x faster than without PCH!)
 
@@ -2433,7 +3112,7 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 |----------|-------------|
 | `<src_dir>` | Directory containing C++ headers |
 | `--module NAME` | Output module name |
-| `--lang LANG` | Target language: `python`, `lua`, `js`, or `all` |
+| `--lang LANG` | Target language: `python`, `lua`, `js`, `csharp`, or `all`. `csharp` is not part of `all`, because it produces a `.cs` source file to add to a dotnet project plus the shared library that file loads, rather than a module the CLI can import and check |
 
 **Options:**
 
@@ -2446,6 +3125,20 @@ mirror_bridge generate <src_dir> --module <name> --lang <language> [options]
 | `-f, --force` | Force rebuild even if sources haven't changed |
 | `-I DIR` | Add include directory |
 | `--json` | Emit one JSON result object on stdout (see [Machine-readable output](#machine-readable-output)) |
+| `--no-verify` | Skip the import check. Python modules are imported once after the build, because "built" and "works" are different claims: the import is what catches a library that is not header-only, and it is where the module reports the names it declined to bind |
+| `--link-args ARGS` | Extra link inputs for a library that is not header-only, e.g. `--link-args "build/libfoo.a -lz"` |
+| `--stubs` | Python: write `<module>.pyi` beside the module, with reflection-exact signatures and real C++ parameter names |
+| `--batch` | Python: also generate `<name>_batch` for each method taking and returning one arithmetic value, so a Python loop crosses the boundary once. 6.8x from a list, 12.9x from an `array.array`, 1.0x when the method is the expensive part. Off by default: +12% compile time on a class with ten eligible methods, +55% with forty |
+| `--release-gil` | Python: drop the GIL while C++ method bodies run, so a long native call stops blocking other threads |
+| `--exclude GLOB` | Skip headers matching this shell glob, matched as an include spells the path; without a leading `/` it matches at any depth, the way `.gitignore` does |
+| `--compile-commands PATH` | Read include paths and defines from a project's `compile_commands.json` instead of restating them as `-I`/`-D` flags. See [Large codebases](#large-codebases) below |
+| `--compile-commands-for PATH` | Only use compile-database entries whose source file is under `PATH` (repeatable) |
+| `--replace-prefix OLD=NEW` | Rewrite a leading path prefix in every harvested path (repeatable, first match wins) |
+| `--discover-only` | Report what reflection found and stop: no codegen, no compile. Pairs with `--json` |
+| `-D, --define M[=V]` | Define a macro for both the reflection pass and the module compile (repeatable) |
+| `--instantiate SPEC` | Python: also bind this template specialization, e.g. `"geom::Vector3<short>"` or `"geom::clamp<float>"` (repeatable) |
+| `--template-cap N` | Python: max argument combinations tried per function template before falling back to Python scalars (default 64) |
+| `--no-templates` | Python: skip template and free-function planning, bind classes only |
 
 **Examples:**
 
@@ -2471,6 +3164,216 @@ mirror_bridge generate src/ --module my_module --lang python --pch build/pch.gch
 # Force rebuild
 mirror_bridge generate src/ --module my_module --lang python -f
 ```
+
+#### Large codebases
+
+Pointing the CLI at a large project fails for a dull reason: its headers do not parse
+without the include paths and defines its own build system passes. Restating those by
+hand works at a few hundred files and does not scale. Every large library in the
+[compatibility corpus](../internals/compatibility.md) needed some of it — OpenCV needs a
+generated `opencv_modules.hpp`, Eigen needs sixteen `--exclude` patterns, Open3D is
+reachable only for its `geometry/` subtree.
+
+`--compile-commands` reads the answer instead of asking for it again:
+
+```bash
+# CMake writes the database with this on
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json
+```
+
+For a Make build, `bear -- make` produces the same file.
+
+**Only parse-affecting flags are taken**, by allowlist: `-I`, `-isystem`, `-iquote`,
+`-idirafter`, `-iframework`, `-F`, `-D`, `-U` and `-include`. Optimisation, warning,
+sanitiser, LTO and dependency-generation flags are dropped, because an unrecognised flag
+in a large project's build is far more likely to be one of those than something the
+reflection pass needs.
+
+**The project's own `-std=` is dropped.** Reflection needs C++26 and your project is
+probably on something older; its standard flag winning would break the pass outright.
+
+**MSVC and clang-cl spellings are translated** — `/I`, `/D`, `/U`, `/external:I` and
+`/FI` all arrive as their GNU equivalents. This matters more than it sounds: MSVC has no
+reflection support, so a Windows project's build runs there while generation runs on a
+machine with a reflection compiler, and the database it hands over is full of MSVC flags.
+Paths in it name directories the reading machine does not have, which is what
+`--replace-prefix` is for:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands /mnt/win/build/compile_commands.json \
+    --replace-prefix 'C:/src/mylib=/mnt/win/src/mylib'
+```
+
+On a monorepo, the union of every subsystem's flags is both enormous and
+self-contradictory. Scope it to the subtree you are binding:
+
+```bash
+mirror_bridge generate include/geometry --module geom --lang python \
+    --compile-commands build/compile_commands.json \
+    --compile-commands-for src/geometry
+```
+
+A macro defined two ways across the build, and any flag carrying whitespace, are both
+reported rather than silently resolved — a flag with a space in it would otherwise become
+two flags and change what the compiler is told.
+
+#### Triaging before you build
+
+Reading a large project's headers is the expensive half. Generating and compiling a module
+for every class found is what turns minutes into hours. `--discover-only` stops after
+discovery:
+
+```bash
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+```json
+{"status":"ok","action":"discover","source":"reflection","seconds":41,
+ "counts":{"classes":312,"enums":28,"headers":97}, ...}
+```
+
+**`source` is the number that matters.** `reflection` means the headers were read after
+the preprocessor and the class list is real. `text scan` means the reflection unit failed
+and every name came from reading header text, which cannot see a class declared through an
+export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting
+`text scan` is not a slow problem, it is a blocked one, and the planner log named in the
+output says why.
+
+#### When discovery runs out of constexpr budget
+
+Discovery walks every class in the codebase at compile time, so on a large
+project it is the pass most likely to exhaust the compiler's constexpr
+evaluation limit. The cost of exhausting it is not a slow build, it is a wrong
+answer: the CLI falls back to scanning header text, which cannot see a class
+declared through an export macro and reports the macro's name instead.
+
+OpenCV's core module — 139 headers, 86k lines, `CV_EXPORTS` on every public
+class — exceeded the first budget and was discovered that way for no other
+reason.
+
+So the budget escalates when the compiler says that is what went wrong, and
+says so on the terminal:
+
+```
+  reflection ran out of constexpr budget for a codebase this size; retrying at
+  -fconstexpr-steps=2000000000.
+  This is slower, and the alternative is a text scan that cannot see a class
+  declared through an export macro.
+```
+
+**The retry is slow.** On a codebase large enough to need it, discovery can go
+from under a minute to many minutes, because the plan is produced by *running*
+the probe rather than only parsing it. It is still the better trade, since the
+alternative is not a faster answer but an incorrect one — and the message is
+printed rather than logged so a long wait is not mistaken for a hang. Interrupt
+it if you would rather proceed on the text scan, with the caveat above.
+
+The budget is not raised unconditionally, because a genuinely runaway
+`constexpr` loop would then take twenty times as long to fail.
+`MB_CONSTEXPR_BUDGET` overrides the first tier; it exists so this path can be
+tested without a codebase big enough to exhaust a real budget, and is not
+something a normal build needs.
+
+### `csharp` output
+
+C# reaches native code through P/Invoke, so unlike the Python, Lua and JavaScript backends
+there is no host C API to call. `--lang csharp` writes two things:
+
+```bash
+mirror_bridge generate src/ --module mylib --lang csharp -o build/
+# build/libmylib.so     the flat C ABI, compiled (.dylib on macOS, .dll on Windows)
+# build/mylib.cs        the C# that calls it
+# build/mylib.h         the same ABI as a C header
+# build/mylib_shim.cpp  the generated C ABI source
+```
+
+`generate` compiles the `.cs` itself when `csc` or `mcs` is on PATH, so a codegen
+bug fails the build rather than shipping as source that looks fine. It says so when
+no C# compiler is available.
+
+Add the `.cs` to a dotnet project and put the shared library where the runtime looks for
+it. **The shim contains no reflection**, so you can rebuild it with whatever compiler you
+already have — which is the point if that compiler is MSVC.
+
+Both files come from one reflection pass over one class list, so renaming a member in C++
+renames the exported symbol and the C# property together.
+
+What crosses the boundary today:
+
+| C++ | C# |
+|---|---|
+| arithmetic, `bool` | the matching C# primitive (`bool` travels as `int32` and converts at the edge) |
+| `std::string` | `string`, UTF-8, heap copy out with an explicit free; `LPUTF8Str` marshalled in |
+| `enum` / `enum class` | a real C# `enum` over the same underlying type |
+| a bound class, as a **member** | a view of the real subobject: writes reach the owning object |
+| a bound class, **returned by value** | a copy you own and should dispose |
+| a bound class, as a **parameter** | the wrapper, passed by handle |
+| `std::vector<T>` of a scalar or string, as a **member** | the live vector as `IReadOnlyList<T>` with an indexer setter, `Add`, `Clear` and `ToArray`: `Add` reaches C++ |
+| `std::vector<T>`, **returned by value** | a copy you own and should dispose |
+| `std::vector<T>` of a **scalar**, as a **parameter** | `IReadOnlyList<T>`, crossing as a pointer and a length so nothing is allocated managed-side; a generated vector view can be passed straight through |
+| `const` member | a get-only property |
+| overloaded methods | C# overloads, one exported symbol each |
+| static methods | `public static` |
+| constructors of any arity | C# constructors |
+| inherited members and methods | flattened onto the derived class |
+
+Generated classes are `IDisposable` over a `SafeHandle`, which the runtime ref-counts for
+the duration of each call — with a raw `IntPtr` the GC could release the handle while a
+native call on it was still running.
+
+A C++ exception is caught at every entry point and raised on the managed side carrying
+`what()`, because an exception crossing `extern "C"` is undefined behaviour. The kind is
+carried too, so `std::invalid_argument` arrives as `ArgumentException`, `std::out_of_range`
+as `ArgumentOutOfRangeException`, `std::overflow_error` as `OverflowException` and
+`std::bad_alloc` as `OutOfMemoryException`, rather than one exception type for everything.
+
+**Names are adjusted only when they have to be, and it is always reported.** A C++ member
+called `Dispose` or `Handle` would collide with the generated surface, and a method `get_x`
+beside a member `x` collides with the hidden accessor a C# property compiles to. Either is
+renamed with a trailing underscore, recorded in the run output and written as a comment in
+the generated class.
+
+Anything that cannot cross yet — a map, a set, a tuple, a variant, `std::optional`, a smart
+pointer, `std::array`, `vector<bool>`, a container of **strings** passed in, a
+`vector<BoundClass>`, or a second overload C# cannot tell from the first — is **named in the
+run output and as a comment in the generated C#** at the point the member would have been,
+so a missing member can be told from an absent one.
+
+#### Using the bindings from C or C++17
+
+The shim contains no reflection, which means the ABI beside it is callable by any compiler,
+not only one that can do C++26. `<module>.h` declares it:
+
+```cpp
+#include "mylib.h"            // only <stdint.h> behind it
+
+void* r = mb_Reading_new();
+mb_Reading_set_id(r, 21);
+double xs[3] = {1.0, 2.5, 3.5};
+double total = mb_Reading_sum_of(r, xs, 3);
+const char* tag = mb_Reading_get_tag(r);   // malloc'd UTF-8
+mb_free_string(tag);
+mb_Reading_delete(r);
+```
+
+```bash
+g++ -std=c++17 -Wall use.cpp -lmylib     # or: gcc -std=c99
+```
+
+Every declaration in the header is a signature lifted from `<module>_shim.cpp` with its
+body removed, so the two cannot drift. Ownership is in the entry point's name: `mb_<C>_new`
+and a by-value return hand you something to free with `mb_<C>_delete`, while a member
+accessor returns a pointer interior to its owner that must not be freed and must not outlive
+it. After any call that can fail, `mb_last_error()` is non-NULL and `mb_last_error_kind()`
+says which C++ exception it was.
+
+This is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked
+for: generate with a reflection compiler, consume with an ordinary one.
 
 ### `pch` - Build Precompiled Header
 
@@ -2635,6 +3538,55 @@ mirror_bridge diff src/ --check
 mirror_bridge diff src/ --output build/
 ```
 
+### `api` - API Surface Gate
+
+Gate a module's Python surface on a committed `.pyi` baseline.
+
+```bash
+mirror_bridge api <src_dir> --module <name> [options]
+```
+
+Builds the module, extracts its reflection-derived stub, and compares it
+with a committed baseline. The stub is produced from the same reflection
+data as the binding, is byte-identical between runs, and is the same under
+clang-p2996 and GCC 16, so it is safe to commit and to compare in CI.
+
+| Option | Meaning |
+|---|---|
+| `--module, -m` | Module name (required) |
+| `--baseline, -b` | Stub to compare against (default: `api/<module>.pyi`) |
+| `--include, -I` | Extra include directory (repeatable) |
+| `--update, -u` | Write the baseline instead of comparing |
+| `--check` | Exit 1 if anything breaking changed (use in CI) |
+| `--json` | One JSON object on stdout, progress to stderr |
+
+A removed name or a changed signature is breaking. An added name is not:
+nobody's import breaks because a method appeared.
+
+| Exit | Meaning |
+|---|---|
+| 0 | unchanged, or additive only |
+| 1 | a name was removed or re-signed (with `--check`) |
+| 2 | no baseline exists yet |
+
+```
+API surface of 'quotes' changed (baseline api/quotes.pyi):
+
+  removed — importers raise AttributeError:
+      Book.best
+
+  changed — importers may pass the wrong type:
+      Book.add
+          was: (self, q: Quote) -> None
+          now: (self, q: Quote, qty: int) -> None
+
+  2 breaking changes, 0 additive.
+  Accept with: mirror_bridge api src/ --module quotes --update
+```
+
+See [Independent Teams](../guides/independent-teams.md) for the workflow
+this is built for.
+
 ### `watch` - Live Reload
 
 Watch header files for changes and automatically recompile bindings.
@@ -2711,23 +3663,24 @@ mirror_bridge init [dir] [options]
 
 | Argument | Description |
 |----------|-------------|
-| `[dir]` | Project directory (default: current directory) |
+| `<project_name>` | Directory to create. Required; the module is named after it |
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--name NAME` | Module name |
-| `--lang LANG` | Target language(s) |
+| `--lang, -l LANG` | Target language: `python`, `lua`, `js`, or `all` (default: `python`) |
+| `--wheel` | Also scaffold pip packaging: `pyproject.toml` with scikit-build-core, a CMake build, and a wheel-building workflow |
+| `--no-ci` | Skip the GitHub Actions workflow |
 
 **Examples:**
 
 ```bash
-# Initialize in current directory
-mirror_bridge init --name my_module
+# Scaffold a Python project
+mirror_bridge init my_project
 
-# Initialize in new directory
-mirror_bridge init my_project --name my_module --lang all
+# All three backends, with pip packaging
+mirror_bridge init my_project --lang all --wheel
 ```
 
 ## Global Options
@@ -2741,7 +3694,13 @@ These options work with all commands:
 
 ## Auto-Discovery
 
-When using `generate`, Mirror Bridge scans all `.hpp` and `.h` files in the source directory and automatically binds all `struct` and `class` definitions found.
+When using `generate`, Mirror Bridge reads all `.hpp` and `.h` files in the source directory and automatically binds every `struct` and `class` they declare, nested classes included.
+
+The list comes from the compiler, through reflection, not from a scan of the header text. That matters because the text of a declaration rarely begins with the class name: `class JSON_API Value`, `class V8_EXPORT Isolate` and `struct alignas(64) Wide` all put something else between the keyword and the name, and a scan binds that something else. Reflection reads the headers after the preprocessor has run, so it reports `Json::Value`.
+
+Only the source directory's own classes are bound. Reflection sees the whole translation unit, so it also sees every system and third-party header reached through `-I`; a class is kept only when the file it is defined in lies inside the directory `generate` was pointed at. A vendored `vendorlib/config.h` next to your own `config.h` contributes nothing to the module.
+
+If the headers cannot be compiled on their own — one of them is not self-contained, say — `generate` says so and falls back to a scan of the text, which is approximate for exactly the reason above. It also falls back, with a different message, when the headers compile but the walk names no class at all: that happens when every class is somewhere the walk does not go, such as an anonymous namespace.
 
 ### Opt-Out Mechanism
 
@@ -2756,6 +3715,48 @@ Skip entire files:
 // MIRROR_BRIDGE_SKIP_FILE
 // At the top of a header file
 ```
+
+### Templates and Free Functions (Python)
+
+A template is not a type until it is instantiated, and headers rarely say
+which instantiations a binding should contain. For Python modules, `generate`
+works it out from the headers themselves and lets the compiler settle what it
+cannot:
+
+- **Aliases are declarations.** `using Vec3f = Vector3<float>;` binds
+  `Vector3<float>` as `Vec3f`. Specializations that only appear in signatures
+  or members (`Vector3<long> ticks;`) are bound under a synthesized name
+  (`Vector3_long`, `Matrix_float_3`).
+- **Function and member templates** are instantiated over the *universe* —
+  Python's scalars (`bool`, `long`, `double`, `std::string`) plus every type
+  the headers *accept*: template arguments, parameter and member types
+  (a `size_t` that only appears as a return type does not count) — and each
+  candidate is compiled in a probe; the ones that fail (unsatisfied
+  constraints, no `operator+` for that type, ...) are dropped with the
+  compiler's reason. A class template nobody mentions gets the scalar
+  baseline.
+- **Free functions** are bound when every parameter and the return type
+  convert. Overload sets are skipped for now.
+
+In Python every template is a *family* that behaves like a generic type:
+
+```python
+geom.Vec3f(1.0, 2.0, 3.0)          # the alias
+geom.Vector3[float]                # == geom.Vec3d (Python float is a double)
+geom.Vector3["int"]                # a C++ spelling names the exact instantiation
+geom.Vector3[np.float32]           # numpy dtypes work as keys
+geom.Vector3(1.0, 2.0, 3.0)        # CTAD-like: the best constructor across instantiations
+geom.Vector3.instantiations        # ['float', 'double', 'int', 'long', 'bool']
+geom.clamp(1.5, 0.0, 1.0)          # dispatches on the arguments
+geom.twice[np.int16](7)            # or pick the instantiation explicitly
+v.cast[int]()                      # member templates too
+```
+
+The full plan — what was bound, what the compiler rejected and why, what
+compiles but cannot be bound (a `T*` parameter), and every note — is written
+to `<output>/<module>_plan.txt`. To bind an instantiation the headers never
+mention, pass `--instantiate "geom::Vector3<short>"`; to keep the old
+classes-only behaviour, pass `--no-templates`.
 
 ## Change Detection
 
@@ -2777,9 +3778,39 @@ scraping log text.
   "languages": ["python"],
   "classes": [{"name": "Greeter", "header": "greeter.hpp"}],
   "outputs": ["/path/to/build/my_module.so"],
-  "errors": []
+  "templates": {
+    "functions": ["dot3", "answer"],
+    "instantiations": [{"kind": "class", "template": "geom::Vector3", "args": "float",
+                        "cpp": "geom::Vector3<float>", "python": "Vec3f", "origin": "alias Vec3f"}],
+    "rejected": [{"cpp": "geom::twice<geom::Robot>", "reason": "invalid operands to binary expression ..."}],
+    "unbindable": [{"cpp": "geom::deref<long>", "reason": "parameter 'long*' is a raw pointer (only const char* converts)"}],
+    "skipped_functions": [],
+    "notes": [],
+    "rounds": 4,
+    "report": "/path/to/build/my_module_plan.txt"
+  },
+  "errors": [],
+  "imported": {"ok": true, "reason": "", "suggestion": ""},
+  "declined": [
+    {"kind": "function", "name": "out_param",
+     "reason": "a non-const reference parameter, whose writes cannot reach the caller: Python would pass a copy and the result would be lost. Return the value instead"}
+  ]
 }
 ```
+
+`templates` is `null` for non-Python modules and with `--no-templates`.
+
+`imported` is the end-to-end check: the built Python module is loaded once,
+because a `.so` that raises `ImportError` is not a result. `ok` is `false` when
+it does not load, `status` is then `error`, and `suggestion` says what to do
+about it, which for an undefined symbol is to pass the built library to
+`--link-args`. The field is `null` for non-Python modules and with
+`--no-verify`.
+
+`declined` is every class and free function that did not make it into the
+module, each with the reason the module gave. An empty array is the only
+evidence that everything you wrote crossed, so it is the field to branch on
+when nothing is reading the terminal.
 
 On failure, each entry in `errors` carries the first compiler error plus an
 actionable suggestion:
@@ -3061,7 +4092,7 @@ clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ binding.cpp .
 error: "This library requires C++26 reflection (P2996) from 2023-06 or later"
 ```
 
-**Cause** `__cpp_reflection` is defined but reports a value below `202306L`, meaning the compiler implements a pre-P2996-revision of reflection that mirror_bridge does not support.
+**Cause** The compiler defines the pre-adoption `__cpp_reflection` macro with a value below `202306L`, meaning it implements a pre-P2996-revision of reflection that mirror_bridge does not support. Compilers that define the standard `__cpp_impl_reflection` (stock GCC 16+) never hit this.
 
 **Fix** Update clang-p2996 to a current `p2996` branch build (the container ships one). Rebuild the image with `docker rmi mirror_bridge:latest && ./start_dev_container.sh` if you are on an old image.
 
@@ -3070,12 +4101,30 @@ error: "This library requires C++26 reflection (P2996) from 2023-06 or later"
 **Symptom**
 
 ```
-warning: "Compiler does not define __cpp_reflection feature-test macro. Reflection support is experimental and may be incomplete."
+warning: "Compiler defines neither __cpp_impl_reflection nor __cpp_reflection. Reflection support is experimental and may be incomplete."
 ```
 
-**Cause** The experimental clang-p2996 build does not always set `__cpp_reflection`. This is expected and harmless — mirror_bridge falls back to detecting reflection via the `<meta>` header.
+**Cause** The experimental clang-p2996 build sets neither the standard `__cpp_impl_reflection` macro nor the older `__cpp_reflection`. This is expected and harmless — if `<meta>` compiled, reflection works. Stock GCC 16+ defines `__cpp_impl_reflection` and does not warn.
 
-**Fix** None needed. If `<meta>` compiles, reflection works. Suppress with `-Wno-#warnings` only if the warning is noisy in your build logs.
+**Fix** None needed. Suppress with `-Wno-#warnings` (clang) only if the warning is noisy in your build logs.
+
+### `mirror_bridge diff` snapshot is empty
+
+**Symptom**
+
+```
+Error: 'mirror_bridge diff' found no headers to snapshot in src/
+      2 header(s) are in subdirectories; diff scans only the top level
+```
+
+**Cause** `diff` scans only the top level of the given directory and skips any header containing the text `MIRROR_BRIDGE_SKIP`. If that leaves nothing, the snapshot would be empty — and an empty baseline makes `diff --check` pass forever, including after you delete every class. It now refuses (exit 3) rather than recording nothing.
+
+**Fix** Point `diff` at a directory whose headers are at the top level, or gate on the generated stub instead. The stub is derived from the same reflection data as the binding and is byte-reproducible, so it cannot drift from what was built:
+
+```bash
+mirror_bridge generate src/ --module m --lang python --output build --stubs --force
+diff -u api/m.pyi build/m.pyi
+```
 
 ### Unconvertible member type (`bind_class` / `MIRROR_BRIDGE_VALIDATE`)
 
@@ -3120,6 +4169,90 @@ error: static assertion failed: Trampoline must derive from T (or be T itself)
 mirror_bridge::python::bind_class<MyBase>(module, "MyBase");                  // no overrides
 mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); // with overrides
 ```
+
+### Names missing from the module
+
+**Symptom**
+
+```
+✓ Successfully built bindings for: python
+
+⚠ 2 names were not bound into 'book' — Python raises AttributeError on them:
+
+    2 free function(s) overloaded in C++ — overload sets are not bound yet
+      lib::price, lib::delta
+      Fix: give one overload a distinct name, or bind a single non-overloaded wrapper
+```
+
+Further groups come from the module itself, which decides at compile time
+whether each class and function can bind and reports it when it is loaded.
+`generate` imports the Python module it just built, so those land here too
+rather than in your first import:
+
+```
+    1 class(es) the module declined
+      Node — a member type has no converter; mark it [[=exclude{}]] or add a custom converter
+
+    2 free function(s) the module declined
+      out_param — a non-const reference parameter, whose writes cannot reach the caller:
+      Python would pass a copy and the result would be lost. Return the value instead
+      label — the return type has no converter
+
+    1 class(es) that lost their unqualified name to another class
+      lib::detail::Config — 'Config' is bound to lib::Config instead
+```
+
+**Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind. A class or function the module declined is one whose parameters or return type have no conversion, and the reason given is the specific gate that refused.
+
+**Fix** Each group states its own. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
+
+### The module built but does not import
+
+**Symptom**
+
+```
+✓ Built: build/open3d_compat.so
+
+✗ Built, but the module does not import — it is not usable yet:
+    ImportError: build/open3d_compat.so: undefined symbol: _ZTIN6open3d8geometry10PointCloudE
+
+  These headers are not header-only: the definitions live in the library's
+  compiled sources. Build it and pass the result to --link-args, e.g.
+  --link-args "/path/to/libFoo.a"
+```
+
+`generate` exits non-zero and does not print the success banner.
+
+**Cause** The headers declare more than they define. Everything compiled, because a declaration is all a compile needs, and the missing definitions only show up when the dynamic loader resolves them. This is the normal shape of a library that ships a compiled `.a` or `.so` alongside its headers.
+
+**Fix** Build the library and pass the result to `--link-args`:
+
+```bash
+mirror_bridge generate include/foo --module foo --lang python \
+    --link-args "/path/to/libfoo.a"
+```
+
+Several inputs can go in one string, and `-l` flags work too: `--link-args "build/libfoo.a -lpthread -lz"`. If the library is a shared object resolved at load time instead, its directory has to be on `LD_LIBRARY_PATH` when the module is imported. `--no-verify` skips the import check altogether, for when you are building a module you cannot load on this machine.
+
+### Two bound classes with the same unqualified name
+
+**Symptom**
+
+```
+⚠ 'Config' is the binding name of 2 classes:
+      shapes.hpp:3
+      shapes.hpp:5
+```
+
+The module still builds, and exactly one of them answers to `Config`: the one
+in the shallowest namespace. The others are not bound at all, and are listed
+again under [Names missing from the module](#names-missing-from-the-module).
+
+**Cause** A module exposes every class under its *unqualified* name, because Python, Lua and JavaScript identifiers are flat. Two classes that share a simple name therefore cannot share a module, no matter which namespaces they live in. The C++ side is unambiguous, because the generated file names each class in full, so nothing downstream reports it.
+
+Which one wins used to be whichever was bound last, which is whichever the header declared second. That is how `lib::detail::Config` took the name and the public `lib::Config` became unreachable while the build reported success. The choice is made before codegen now: fewest scope components wins, ties going to the first in discovery order, which is sorted by header path, so the answer is the same on every run.
+
+**Fix** If the one you want is not the one chosen, bind it in a module of its own, rename one class, or put `// MIRROR_BRIDGE_SKIP` on the line above the one this module does not need.
 
 ### Unsupported container shape
 
@@ -3388,13 +4521,25 @@ one minor release, an entry in the CHANGELOG, and a migration note:
 |---|---|
 | Module macros | `MIRROR_BRIDGE_MODULE`, `MIRROR_BRIDGE_LUA_MODULE`, `MIRROR_BRIDGE_JS_MODULE` |
 | Binding entry points | `mirror_bridge::bind_class<T>(m, "Name")` and the Lua/JS equivalents |
-| Field annotations | `[[=exclude{}]]`, `[[=readonly{}]]` (P3394) |
+| Field annotations | `[[=exclude{}]]`, `[[=readonly{}]]` (P3394), read by the Python backend |
 | Discovery opt-outs | `// MIRROR_BRIDGE_SKIP`, `// MIRROR_BRIDGE_SKIP_FILE` |
 | CLI commands & flags | `generate`, `build`, `pch`, `diff`, `watch`, `doctor`, `version` and their documented options |
 | `--json` output | Existing fields keep their names and types; changes are additive only |
-| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` → `array.array` |
+| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` returned from a method → `array.array` |
 | Umbrella headers | `mirror_bridge.hpp`, `lua/mirror_bridge_lua.hpp`, `javascript/mirror_bridge_javascript.hpp` |
 | CMake target | `mirror_bridge::mirror_bridge` via `find_package`/FetchContent |
+
+### Changed in 0.4.0
+
+Reading a `std::vector` **data member** gives a live view of the C++ vector
+rather than a copy. A method returning the same type is unchanged. The view is
+a `collections.abc.MutableSequence`, so code that iterates, indexes, slices,
+takes `len` or compares against a list keeps working; code that asserted
+`isinstance(obj.field, list)` or `isinstance(obj.field, array.array)`, or that
+passed the member straight to `json.dumps`, needs `list(obj.field)`.
+
+This was a bug fix with a visible type change: the copy meant
+`obj.field.append(x)` was accepted and silently discarded.
 
 ## Experimental
 
@@ -3404,6 +4549,8 @@ These may change or be removed in any release; pin a tag if you depend on them:
 - V8 direct-API bindings (`mirror_bridge_v8.hpp`)
 - Auto-trampoline internals (the vtable-swap mechanism; the *behavior* —
   Python subclasses overriding C++ virtuals — is intended to stay)
+- `--batch` and the `<name>_batch` methods it generates: which signatures
+  qualify is expected to widen
 - The `.mirror` config-file format
 - Any header or function not documented in [api.md](api.md)
 
@@ -3461,13 +4608,42 @@ Mirror Bridge automatically converts types between C++ and target languages. Thi
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `std::vector<T>` (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
-| `std::vector<T>` (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` read as a **data member** | live view (see below) | `table` (array) | `Array` |
 | `std::array<T, N>` | `list` | `table` (array) | `Array` |
 | `std::deque<T>` | `list` | `table` (array) | `Array` |
 | `std::list<T>` | `list` | `table` (array) | `Array` |
 
-**Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings use a single `memcpy` into an `array.array` object instead of element-by-element conversion. This is ~10-50x faster for large arrays. The `from_python` direction accepts both `list` and `array.array` inputs.
+**A vector data member is a live view, not a copy.** Reading one gives an
+object that holds a pointer to the C++ vector itself and a reference to its
+owner, so `obj.points.append(p)` and `obj.points[0] = p` reach the C++ object
+instead of mutating a temporary that is then discarded. It registers as a
+`collections.abc.MutableSequence`, which is what the `.pyi` says it is, and
+supports `len`, indexing, negative indices, iteration, `in`, `==` against any
+sequence, `append`, `extend`, `insert`, `pop`, `clear`, `del` and `tolist()`.
+A numeric one also exports the buffer protocol, so `numpy.asarray(obj.xs)`
+shares the vector's own storage rather than copying it.
+
+Because the view does not copy, reading a member is O(1) instead of O(n):
+measured on a `vector<double>` member, 122 ns to 44 ns at ten elements and
+54.0 us to 44 ns at a hundred thousand.
+
+Three cases deliberately keep the copy they always had:
+
+- **A method return.** A reference out of a method cannot be shown to point
+  inside the receiver, so there is nothing to keep alive and nothing to view.
+- **A `const` member.** A writable view of one would get around what C++ said.
+- **`std::vector<bool>`.** It packs its elements and yields a proxy, so there
+  is no element to take a reference to.
+
+A slice (`v[:]`), `list(v)` and `v.tolist()` each give a real copy, which is
+how you take a snapshot. Resizing is refused with `BufferError` while a
+`memoryview` or numpy array is outstanding, because it would reallocate the
+storage they point at. Holding an element of a vector of classes across an
+`append` has the same hazard the underlying C++ reference would.
+
+**Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings copy the buffer in bulk into an `array.array` object instead of converting element by element. This is ~10-50x faster for large arrays. At or above 1 KB the buffer is copied once, out of the C++ container through a borrowed `memoryview`; below that it goes through an intermediate `bytes` object, which is two copies but one fewer call into the interpreter and measurably cheaper at that size. The crossover is a measured one and can be moved with `-DMIRROR_BRIDGE_ARRAY_BORROW_BYTES=<n>`. The `from_python` direction accepts both `list` and `array.array` inputs.
 
 **Example:**
 
@@ -3483,7 +4659,7 @@ struct Container {
 c = Container()
 c.numbers = [1, 2, 3, 4, 5]
 c.names = ["Alice", "Bob"]
-print(c.numbers)  # [1, 2, 3, 4, 5]
+print(c.numbers)  # array('i', [1, 2, 3, 4, 5])  -- see the note above
 ```
 
 **Lua:**
@@ -3589,8 +4765,17 @@ m.resource = None  # Sets to nullptr
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `enum` | `int` | `number` | `number` |
-| `enum class` | `int` | `number` | `number` |
+| `enum` | `enum.IntEnum` | `number` | `number` |
+| `enum class` | `enum.IntEnum` | `number` | `number` |
+
+The Python backend exports the enum *type* as an `enum.IntEnum` whose members
+carry the C++ enumerator names and values. Nothing about the *value*
+conversion changed, because an `IntEnum` member is an `int`: a function that
+took a bare `int` still takes one, and one that returns an enum still returns
+a plain `int`, which compares equal to the member. An enumerator whose name is
+a Python keyword gets a trailing underscore, since `Permission.None` is a
+syntax error rather than an attribute lookup. Lua and JavaScript have no enum
+object to map onto and their values keep crossing as numbers.
 
 **C++:**
 ```cpp
@@ -3717,20 +4902,345 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
+## Argument Type Checking
+
+A parameter, data member, or container element whose type is a bound C++
+class accepts only an object of that class, an object of a class derived
+from it, or a host-language subclass of either. Anything else is refused:
+`TypeError` in Python and JavaScript, a Lua error in Lua.
+
+```python
+curve = pricing.Curve()
+pricing.discount(curve, 2.0)   # fine
+pricing.discount(42, 2.0)      # TypeError: Argument 1: type conversion failed
+pricing.discount(label, 2.0)   # TypeError, even though Label is also bound
+```
+
+```lua
+local curve = pricing.Curve.new()
+curve:at(2.0)        -- fine
+curve.at(label, 2.0) -- error: at: expected Curve, got Label
+```
+
+```javascript
+const curve = new pricing.Curve();
+curve.at(2.0);                                  // fine
+pricing.Curve.prototype.at.call(label, 2.0);    // TypeError: at: expected Curve, got Label
+```
+
+The receiver is checked as well as the arguments. `obj.method(x, ...)` in Lua
+and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as
+`obj:method(...)` and `obj.method(...)`, with whatever the caller put first as
+`self`, so an object of the wrong class there is refused too.
+
+Conversion to a base class is offset-adjusted, so it is correct for a base
+that is not the first one:
+
+```cpp
+struct Swap : Observable, Priceable { ... };   // Priceable is not at offset 0
+double value(const Priceable&);
+```
+
+```python
+value(swap)   # reaches the Priceable subobject, not the start of the Swap
+```
+
+Virtual bases work too in Python: the offset is resolved at call time rather
+than assumed.
+
+The conversion is recorded by the derived class when it is bound, so the
+base and the derived class may live in different modules and be loaded in
+either order. Two cases are deliberately not convertible:
+
+- A derived class whose module has never been loaded, because nothing has
+  registered it yet.
+- A base that C++ itself would not let you reach from that call site: one
+  that is inaccessible (`private`/`protected`) or ambiguous because it is
+  inherited twice non-virtually.
+
+Inside an overload set a rejected argument simply moves to the next
+candidate, so the error is raised only when no overload matches.
+
+### What differs between the backends
+
+| | Python | Lua | JS (N-API) | V8 (direct) |
+|---|---|---|---|---|
+| Wrong class refused | yes | yes | yes | untested |
+| Derived-to-base, offset-adjusted | yes | yes | yes | untested |
+| Same class bound by two modules | yes | yes | yes | untested |
+| Derived class bound by *another* module | yes | yes | no | no |
+
+The first three are what the identity check has to preserve. The fourth is
+where the backends differ in how far their cross-module state reaches: Python
+keeps it in `sys.modules` and Lua in the Lua registry, both shared by every
+module in the process, while the N-API backend keeps its upcast table per
+`.node` file — which matches the rest of that backend, where `to_javascript`
+already falls back to a plain-object snapshot for a class the module did not
+bind.
+
+The V8 column is marked untested because it is. `javascript/mirror_bridge_v8.hpp`
+does not compile against the V8 in the dev image (7.8, from `libnode-dev`): it
+calls `String::NewFromUtf8Literal` and the one-argument
+`String::NewFromUtf8`, both V8 8.x, and a bound-class parameter or data member
+hits a declaration-order defect in `from_v8` besides. The gate it carries was
+exercised by hand against a locally patched copy and behaved, but nothing in
+CI covers it. Use the N-API backend.
+
+Two modules recognise each other's objects by the class's reflected C++
+spelling, so they have to spell it the same way. For every shape a discovered
+class actually has — plain, nested, namespaced, inherited — clang-p2996 and
+GCC 16 agree byte for byte, and `std::string` and `std::string_view` are
+special-cased so they agree too. They do not agree on a key that names any
+other standard-library template, because clang is only usable with libc++ and
+that puts its ABI inline namespace in the name: `std::__1::vector<int, ...>`
+against `std::vector<int, ...>`. Those keys reach error messages, not
+identity, since a container can never be the expected class. The exception is
+a class that *is* a template specialisation mentioning one — a hand-written
+`bind_class<MyVec<int>>`, where `MyVec`'s defaulted allocator is spelled out,
+or a discovered class deriving from one. Two such modules built by different
+compilers would stop recognising each other, in a process where they are
+already ABI-incompatible for other reasons.
+
+### Forged identity
+
+The check asks what a value *is*, so it is worth being precise about what it
+trusts. Both backends read the answer out of memory the backend itself wrote
+into the wrapper, after establishing that the memory is theirs:
+
+- **Lua** reads the class's metatable address from the wrapper's payload,
+  having first confirmed with `lua_touserdata` and `lua_rawlen` that the value
+  is a full userdata long enough to hold one. It deliberately does *not* trust
+  the metatable attached to the value, because Lua lets a script attach any
+  metatable to any value — `setmetatable({}, getmetatable(curve))` needs no
+  privileged library, and `debug.setmetatable` reaches userdata that belongs to
+  other C libraries entirely. Nothing in Lua writes a full userdata's payload,
+  so the payload cannot be forged the same way.
+- **N-API** reads a magic word and then the class tag, because `napi_unwrap`
+  establishes that an object was wrapped and not by whom: another addon's
+  wrapped objects come back through it with that addon's payload layout.
+
+Neither is a proof. A full userdata or a foreign payload whose first word
+happened to match would be accepted, which is a coincidence a script cannot
+aim for — it never learns the address and cannot write those bytes. N-API 8
+(Node 14.17+) offers `napi_type_tag_object`, which would be a proof, at the
+cost of a property lookup on every boundary crossing.
+
+In Lua a plain table is still accepted where a bound class is expected: that
+is how nested structs are written from Lua, and it reads the fields rather
+than the object's bytes, so the check does not close it.
+
+## Python Data Model
+
+This section describes the Python backend. Lua and JavaScript bind neither
+iteration nor serialization yet.
+
+Four protocol slots are filled from the shape of the C++ class, with nothing
+to declare per class.
+
+| You write in C++ | Python gains |
+|------------------|--------------|
+| `begin()` / `end()` over convertible elements | `for x in obj`, `list(obj)`, `x in obj` |
+| the above plus `size()` | `len(obj)`, and `bool(obj)` is `len(obj) != 0` |
+| default-constructible, every member assignable | `pickle`, `copy.copy`, `copy.deepcopy` |
+
+### Iteration
+
+`tp_iter`/`tp_iternext` are generated from `begin()`/`end()`: `++it`, `*it`
+and the sentinel comparison are splices, and the element goes through the
+same conversion gate a method return value does. A range whose element has no
+Python representation — a range of raw pointers, say — declines the slot
+rather than failing the build. Membership needs nothing extra: with no
+`sq_contains`, CPython answers `in` by iterating.
+
+`end()` does not have to return the same type as `begin()`. A C++20 range
+that ends at a sentinel iterates normally, and the element is taken from
+`std::iterator_traits<It>::value_type` where the iterator has traits, so
+`std::vector<bool>` yields `True`/`False` rather than the layout of the proxy
+reference `*it` actually returns.
+
+Iterating a `std::map`-shaped class yields `(key, value)` pairs, because that
+is what the C++ range yields. `in` therefore tests pairs, not keys:
+`("a", 1) in lookup` is `True` where `"a" in lookup` is `False`. This is the
+one place where following the C++ range disagrees with the Python convention
+that a mapping iterates its keys.
+
+The iterator holds a reference to the object the range belongs to, so
+`for x in make_bag()` is safe even though nothing else refers to the
+container while the loop runs. This is the equivalent of pybind11's
+`py::keep_alive<0, 1>()`, except that it is not something you can forget.
+
+What ownership cannot fix is mutation: a `push_back` that reallocates
+invalidates C++ iterators whoever holds the memory. The generated iterator
+checks the two things it can check cheaply, and it is worth being precise
+about what that does and does not cover.
+
+| mutation during iteration | detected? |
+|---|---|
+| `push_back`, `insert`, `erase`, `clear` — the count moves | yes, `RuntimeError: Bag changed size during iteration` |
+| `reserve`, `shrink_to_fit`, assigning a fresh container — the buffer moves, the count does not | yes, `RuntimeError: Bag reallocated its storage during iteration` |
+| an `erase` paired with a `push_back` — same count, same buffer, elements shifted | **no** |
+| anything at all, on a range whose iterator cannot be compared to another iterator | **no** |
+
+The first check is the element count, the one CPython's own `dict` and `set`
+iterators use; it needs `size()`, so a range without one does not get it. The
+second re-reads `begin()` and compares, which is what catches the
+reallocation that would otherwise read freed memory.
+
+Neither check sees a mutation that preserves both the count and the buffer.
+Such a range keeps iterating and yields shifted elements — wrong values read
+from live memory, not a crash. **Mutating a container while iterating it is
+undefined, exactly as it is in C++.** The guards turn the most common ways to
+do it by accident into an exception; they are not a licence to do it.
+
+### len() and truthiness
+
+`len()` is offered only to a class that is both iterable and sized, never to
+one that merely has a method spelled `size()`. The reason is truthiness: a
+length slot is where CPython gets `bool(obj)` from, so gating on `size()`
+alone would quietly turn `if obj:` into "it has elements" for a gauge whose
+`size()` is a physical dimension. A class with `size()` and no range keeps
+both its truthiness and its absence of `len()`.
+
+A `size()` whose value will not fit a `Py_ssize_t` raises
+`OverflowError: Bag.size() is 18446744073709551615, which cannot be a Python
+length`. The realistic way to get there is an unsigned count that underflowed,
+`items.size() - 1` on an empty container; reaching CPython as a negative
+length instead produces only `SystemError: returned NULL without setting an
+exception`.
+
+### bool() is a behavior change
+
+A class that is iterable and sized used to be truthy always, because nothing
+in the type defined otherwise. It is now falsy when empty. This changes more
+than `if obj:`:
+
+```python
+if bag: ...                  # now skipped when bag is empty
+assert bag                   # now raises on an empty bag
+bag or fallback              # now evaluates to fallback when bag is empty
+[b for b in bags if b]       # now drops the empty ones
+filter(None, bags)           # same
+any(bags) / all(bags)        # now answer about emptiness
+```
+
+For a class that is really a container this is the Python semantics you want.
+The case to look for is a container-shaped class used as a handle or a flag —
+a `Connection` that happens to expose a queue through `begin()`/`end()` and
+`size()`, where `if conn: conn.send(...)` used to mean "I have a connection"
+and now means "my queue is non-empty". That reads the same and silently stops
+sending.
+
+The migration is to say what was meant: `if conn is not None:` for an
+existence check, `if len(conn):` for a count. There is no per-class opt-out;
+truthiness follows from the length slot, and a class gets the length slot only
+by having both `begin()`/`end()` and `size()`. Removing `size()` from the
+binding surface with `[[=exclude{}]]` is not an option either, since that
+annotation applies to data members rather than methods.
+
+One asymmetry is worth knowing: a range *without* `size()` has no length slot,
+so it stays truthy even when empty. `bool()` therefore depends on whether the
+class offers `size()`, not on whether it is a range.
+
+A class with `operator[]` and `size()` but no `begin()`/`end()` is also not
+covered. `mp_subscript` accepts whatever key `operator[]` takes, so reading a
+`0..n-1` sequence out of it would be a guess; give the class `begin()` and
+`end()` and it iterates.
+
+### Pickling
+
+`__reduce__` serializes the reflected non-static data member list — the same
+walk `__repr__` uses, so a member added in C++ joins the pickle without
+anyone editing a list. Reconstruction is `cls()` followed by `__setstate__`,
+which is why a class qualifies only when Python can default-construct it and
+assign every member back. Anything the state would not carry, or would not be
+able to put back, disqualifies the class, and `pickle.dumps` raises
+`TypeError: cannot pickle 'mod.Frozen' object` rather than handing back an
+object that quietly lost a field:
+
+| the class has | why it cannot round-trip |
+|---|---|
+| no default constructor | reconstruction is `cls()` |
+| a `const` or `[[=readonly{}]]` member | read into the state, not assignable back out |
+| a `private` member | not in the reflected visible member list, so the state never sees it |
+| a `[[=exclude{}]]` member | same |
+| a member declared by a base class | `nonstatic_data_members_of` reports direct members only |
+
+The last three are the ones worth naming explicitly, because the member is
+invisible from Python and an unpickled object would look right in `repr()`
+while holding a default-constructed value for it.
+
+A Python subclass pickles as itself, and its instance `__dict__` travels with
+the C++ members.
+
+For pickle to find the class again, a bound type's `tp_name` is
+`<module>.<Class>`; CPython reads a static type's `__module__` from the text
+before the last dot, and without it every bound class claimed to live in
+`builtins`. `__name__`, `__qualname__` and `repr()` are unaffected.
+
+### Hashing
+
+No `tp_hash` is generated, which leaves two different behaviors depending on
+whether the class defines `operator==`.
+
+| the class | `hash()` | in a `set` or as a `dict` key |
+|---|---|---|
+| no `operator==` | identity hash | works; two equal-looking objects are two keys |
+| has `operator==` | **unhashable** | `TypeError: unhashable type: 'mod.Point'` |
+
+The second row is CPython's own rule, not a mirror_bridge decision:
+`inherit_slots` copies `tp_hash` from the base only when `tp_richcompare` is
+also being inherited, so a type that sets comparison and leaves hashing null
+ends up with `__hash__` of `None` — the same state Python puts a class in when
+it defines `__eq__` and no `__hash__`. It is self-consistent: you never get
+`a == b` while `hash(a) != hash(b)`. It is also easy to trip over, because
+`operator==` is the thing that takes the class out of a `set`:
+
+```python
+a == b          # True
+{a, b}          # TypeError: unhashable type: 'mod.Point'
+[x for x in xs if x == a]   # the workaround: a list and ==
+```
+
+Hashing the member values instead would be worse: every non-`const` member is
+assignable from Python, and a hash that changes when the object is mutated
+corrupts any `set` or `dict` already holding it. The safe opt-in — every
+member `const` or `[[=readonly{}]]` — describes almost no real class.
+
 ## Limitations
 
-### Not Currently Supported
+### Shapes at the edge
 
-| Type | Status |
-|------|--------|
-| Raw pointers (T*) | Not supported |
-| References as parameters | Partial support |
-| Function pointers | Not supported |
-| `weak_ptr` | Not supported |
+Every row below was measured against a built module, not reasoned about. The
+ones that are refused are refused by name at build time, so a signature that
+cannot cross is something you hear about from `generate` rather than from an
+`AttributeError` later.
+
+| Shape | Status | What to write instead |
+|-------|--------|-----------------------|
+| `T*` as a parameter or return | Not bound | A pointer says nothing about who owns the thing. Return by value, or use `shared_ptr`/`unique_ptr`, which do |
+| `const char*` as a parameter or return | Bound, crosses as `str` | Nothing. The caller borrows it and the value is copied into a Python `str` before the call returns. A null crosses as `None`, which is how a C API says "absent" |
+| `char*` as a return | Not bound | By convention that one is the caller's to free, so copying it would leak. Return `std::string` |
+| `const T&` as a parameter | Bound, no copy | Nothing |
+| `T&` as a parameter, `T` a bound class | Bound, aliases the Python object, writes are visible | Nothing |
+| `T&` as a parameter, `T` anything else | Not bound | The argument would be a copy and the write would be lost, so this is refused rather than silently doing nothing. Return the value: `double sum(const std::vector<double>&)`, not `void sum(const std::vector<double>&, double&)` |
+| `std::span<T>` as a parameter | Not bound | A span does not own its storage. Take `const std::vector<T>&` |
+| Overloaded free functions | Not bound | Give one overload a distinct name, or bind a single non-overloaded wrapper |
+| Function pointers | Not bound | Take `std::function<R(Args...)>`, which does cross and can be called with any Python callable |
+| `weak_ptr` | Not bound | Pass `shared_ptr` |
+
+Every one of these is reported by `mirror_bridge generate`, by name and with
+the reason, and carried in `--json` under `declined`. Nothing is dropped in
+silence.
 
 ### Template Classes
 
-Template classes must be explicitly instantiated before binding:
+`mirror_bridge generate` plans template instantiations itself: it reads the
+parameter list from the headers, tries combinations against the compiler, and
+binds the ones that compile. `--instantiate "geom::Vector3<short>"` names one
+explicitly and `--no-templates` turns the pass off.
+
+Writing a binding by hand, there is no planner, so the specialization has to
+exist before it can be bound:
 
 ```cpp
 template<typename T>
@@ -4285,7 +5795,7 @@ pointee can't be materialized by value.
 
 | Limitation | Status |
 |------------|--------|
-| Cross-module types | Not supported |
+| Cross-module types | The same class bound by two modules is recognised in both; a *derived* class bound by another module is not convertible to its base in JavaScript. See [type-conversion](../reference/type-conversion.md#what-differs-between-the-backends) |
 | Method overloading | Limited |
 
 ## Performance
@@ -4919,14 +6429,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A container can be passed into C#, not only read out of it, and the ABI is now usable from C or C++17.** A `std::vector<T>` of a scalar crosses inward as two wire parameters for one C# argument — a pointer and a length — so the shim builds the vector from that range and nothing is allocated or freed on the managed side. The C# surface takes `IReadOnlyList<T>`, which means a generated vector view passes straight through: `a.sum_of(b.samples)` reaches C++ with no copy on this side. An array already of the right type is forwarded without a second copy. A vector of *strings* would need an array of `char*` with its own marshalling and is still refused — by name, saying which half is missing, rather than refusing both directions as before. Separately, `<module>.h` is now emitted beside the shim, declaring the same flat C ABI; every declaration in it is a signature lifted from `<module>_shim.cpp` with the body removed, so the header cannot drift from the library. The shim has never contained any reflection, which is what makes this worth having: a plain `g++ -std=c++17 -Wall -Wextra` and a plain `gcc -std=c99` both compile and run against it, with ownership stated in the entry point's name and the C++ exception kind readable through `mb_last_error_kind()`. That is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked for in December — generate with a reflection compiler, consume with an ordinary one — and `tests/c_abi_consumer/` pins it by building the consumer at `-std=c++17` and `-std=c99` with a compiler that does not know what reflection is. `generate` also compiles the generated `.cs` itself when `csc` or `mcs` is present, so a managed-side codegen bug fails the build instead of shipping as source that looks fine.
+- **The C# backend reaches the other backends, and passes two of them.** It began as scalars, bool and strings. It now also carries enums as real C# enums over the same underlying type, method overloading (one exported symbol per overload, with C#'s own resolution picking, refusing only the pair C# genuinely cannot distinguish), static methods, constructors of any arity, inherited data members and methods, nested objects, and `std::vector<T>` of a scalar or string. A class-typed **member** is a view of the real subobject so writes reach the owning object, while one **returned by value** is a copy the caller owns, because a pointer to the temporary would dangle; the same split governs vectors, so `obj.samples.Add(x)` reaches the C++ vector and `obj.history()` hands back a copy. The view holds a strong reference to its owner, which is what stops the GC collecting the owner first, and that reference is read through `GC.KeepAlive` rather than merely stored, because a field written and never read is `CS0414` and an error in any project built with warnings-as-errors. The generated vector view implements `IReadOnlyList<T>` so LINQ works on it, and reads `Count` from C++ on every access rather than caching it. Inherited data members needed a new walk: `nonstatic_data_members_of` reports only direct members, so `core` gained `data_members_with_bases` beside the member-function cache that already walked `bases_of` for exactly the same reason. Two rows now read better for C# than for Lua and JavaScript, and not by accident of the table: Lua reaches only the first overload of a name and JavaScript only the last, neither says so, and both pass an enum as a bare integer with no enum type at all.
+- **The generated C# is what a .NET engineer would accept, which took finding three things that were wrong.** A review of the real generated output, compiled with `mcs` and run under `mono`, found that the wrapper could be finalized mid-call: with an `IntPtr` field the last read of the instance is inside the argument list, so the JIT may report it dead and the finalizer may run `Delete` while the native call is still on the stack. Every class now wraps a `SafeHandle`, which the runtime ref-counts across the call and which makes `Dispose` idempotent and thread-safe besides. Second, a C++ name that collides with the generated surface produced C# that does not compile — `int Handle` and a method called `Dispose()` are house style at several large shops — and there is a second, independent collision the native ledger cannot see, because a C# property `X` compiles to hidden `get_X`/`set_X` and so a method `get_x` beside a member `x` is "already reserved". Both are resolved by renaming with a trailing underscore, reported in the run output and written into the generated class. Third, the library was named `lib<module>.so` on every platform, which `DllImport` probing can never find on macOS; it is now `.dylib` on Darwin and `<module>.dll` on Windows. Smaller things from the same review: the exception kind is carried across the boundary through a `dynamic_cast` ladder so a caller can catch `ArgumentException` for `std::invalid_argument` instead of one `InvalidOperationException` for everything; `mb_*_delete` catches, which the shim's own comment already claimed every entry point did; a failed string allocation records an error instead of arriving as a successful empty string; `ExactSpelling = true` stops the runtime probing a second, non-existent name; parameter names are the real C++ ones rather than `a0`, `a1`, which this project's Python stubs have carried all along; and the generated file compiles under `-warnaserror` with no warnings.
+- **One P/Invoke transition per call instead of two.** The generated code asked the library whether an error was pending after every call, which is itself a transition. The error slot's address is now cached per managed thread and tested with `Marshal.ReadInt32`. Measured 58.1 to 49.2 ns/call under mono, which is 1.18x rather than the 2x it looks like, because the second transition carried no arguments.
+- **The CLI reads a project's `compile_commands.json` instead of asking for its build configuration again.** The argument for this is written in the compatibility corpus' own manifest: opencv needs a hand-generated `opencv_modules.hpp` written into its checkout before its headers parse, open3d is reachable only for `geometry/` because `core/` wants MKL and `ml/` wants CUDA, eigen needs sixteen `--exclude` patterns, abseil needs a bespoke build command. Every one of those is a person rediscovering, as `-I` and `-D` flags, something the project's own build system already recorded. At a few hundred thousand lines that is a chore; at twenty million it is the entire job, and it is the reason pointing a generator at a large codebase fails for a dull reason rather than an interesting one. `--compile-commands PATH` harvests the include paths and defines by allowlist — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-iframework`, `-F`, `-D`, `-U`, `-include` — because an unrecognised flag in a large project's build is far likelier to be an optimisation, a sanitiser or a dependency-generation flag than something the reflection pass needs, and taking it on faith is how a generator ends up passing `-flto` to a syntax-only probe. The flags reach both compile sites the script has, for the same reason the existing `-D` handling does: a discovery unit preprocessed differently from the module reports a different library from the one that gets built. Three deliberate decisions. The project's own `-std=` is **dropped**, because reflection needs C++26 and the project is on something older, so its standard flag winning would break the pass outright; that is reported rather than silent. MSVC and clang-cl spellings — `/I`, `/D`, `/U`, `/external:I`, `/FI` — are translated, which is not politeness but the point: MSVC has no reflection support, so a Windows project's build runs there while generation runs on a machine that has a reflection compiler, and the database handed over is full of MSVC flags. And a flag carrying whitespace is **refused with a warning** rather than passed, because the CLI interpolates these into a string that word-splits, so one `-D` with a spaced value would silently become two flags and change what the compiler was told. A macro defined two ways across one build is reported the same way instead of being resolved quietly. `--compile-commands-for PATH` scopes the database to a subtree, because on a monorepo the union of every subsystem's flags is both enormous and self-contradictory, and `--replace-prefix OLD=NEW` maps a database written on one machine onto the paths of another. That last flag exists because of what the tests found: `os.path.isabs("C:/proj/inc")` is **false** on POSIX, so every Windows path was being joined onto the entry's build directory, producing `-I/linux/build/C:/proj/inc` — an include path that can match nothing and reports no error. That is the normal case for this feature, not an edge case.
+- **`--discover-only` answers "can this codebase be read at all" without building a module per class.** Reading a large project's headers is the expensive and interesting half of the work; generating and compiling a module for everything found is what turns minutes into hours, and the corpus records 138 seconds for Open3D's geometry subtree alone. `--discover-only` stops after discovery and reports the class count, the enum count, the header count, the seconds the reflection pass took, and the harvested-flag count. The field that matters is `source`: `reflection` means the headers were read after the preprocessor and the class list is real, while `text scan` means the reflection unit failed and every name came from reading header text, which cannot see a class declared through an export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting `text scan` is not a slow problem, it is a blocked one, and generating from that list would bind the wrong names — so the report says that outright and names the planner log that explains the failure. Pairs with `--json`, which emits one object carrying the counts, the class and enum names, the headers and the compile-database report.
+- **A C# backend (`--lang csharp`).** C# reaches native code through P/Invoke, so unlike CPython, Lua and Node there is no host C API a generated translation unit can call: the binding needs a flat C ABI on one side and C# declarations on the other, which is the same shape SWIG's C# module has and for the same reason. The architecture is forced further by a hard limit in P2996 — **reflection cannot declare a function whose name is computed**, and every P/Invoke target needs its own exported symbol — so a generator built with reflection emits the shim as text and an ordinary compile turns that into the shared library. The alternative, one indexed entry point dispatching on a class id, would have cost a jump table on every call, and the point of this project is that the generated path is the code a person would have written. Emitting text turned out to be the right shape for the people who want this most: **the shim contains no reflection at all**, so it rebuilds with whatever compiler they already have, and for anyone on MSVC a shim that needed reflection would have been unusable. Both files come out of one reflection pass over one class list, so a member renamed in C++ renames the exported symbol and the C# property together — there is no second list to keep in step. What crosses today: a default constructor, arithmetic members and parameters, `bool` (as a 32-bit integer on the wire, converted at the edge, because a C++ `bool` is one byte and C# marshals one as four and the mismatch is silent), `std::string` (a UTF-8 heap copy out with an explicit free, `LPUTF8Str` marshalled in, rather than a pointer into the live `std::string` that would dangle the moment anything mutated the object), methods over those types, and `const` members as read-only properties. Generated classes are `IDisposable` with a finalizer. A C++ exception is caught at every entry point and recorded in a thread-local, then raised on the managed side as an exception carrying `what()`, because an exception crossing `extern "C"` is undefined behaviour. Everything that cannot cross yet — a container member, a class-typed return, a second overload of a name — is named in the run output **and** as a comment in the generated C# at the point where the member would have been, because a generator that silently binds a subset leaves the caller unable to tell a missing member from an absent one. Generated code for both files is indented by one brace-depth formatter rather than by the care taken at each emission site; the first version had three different indentations inside a single class because each site had guessed separately.
+### Changed
+- **A `std::vector` data member is a live view of the C++ vector, not a copy.** `obj.items.append(9)` and `obj.items[0] = 9` were both accepted and both silently discarded: the getter built a fresh `array.array` or `list` on every read, the mutation landed on that temporary, and the temporary was dropped at the end of the statement. No exception, no warning, no way to find out. This is the container half of what member views did for class members in PR #32, and it rests on the same fact: a non-static data member is interior to the wrapped object by construction, so the getter can hand back something that borrows the storage and keeps its owner alive, which a method return cannot. The view registers as a `collections.abc.MutableSequence` and supports `len`, indexing, negative indices, iteration, `in`, `==` against any sequence, `append`, `extend`, `insert`, `pop`, `clear`, `del` and `tolist()`. A numeric one also exports the buffer protocol, so `numpy.asarray(obj.xs)` shares the vector's own storage. Not copying also removes an O(n) allocation from every attribute read: measured on a `vector<double>` member, 122 ns to 44 ns at ten elements and 54.0 us to 44 ns at a hundred thousand, where the new cost is flat because it no longer depends on the length. Three cases keep the copy on purpose — a method return, because interiority cannot be established for one; a `const` member, because a writable view would get around what C++ said; and `std::vector<bool>`, which packs its elements and has no element to reference. Resizing is refused with `BufferError` while a `memoryview` or numpy array is outstanding, since it would reallocate the storage they point at; the export count is kept per C++ container rather than per view object, because every attribute read builds a new view of the same vector and a per-view count said yes to exactly the append that invalidates the buffer. **Migration:** code that asserted `isinstance(obj.field, list)` or `isinstance(obj.field, array.array)`, or that passed a member straight to `json.dumps`, wants `list(obj.field)`. This changes a mapping [stability.md](docs/reference/stability.md) lists as stable, which is why it is called out here rather than filed under Fixed.
+
+### Fixed
+- **Lua and JavaScript could not bind any class with a `const` data member, or with a member whose type has no default constructor.** Both setters declare a local of the member's declared type to convert into and then move into place. For a `const` member that local is a default-initialised const and the assignment a write to a const lvalue; for a type like `nlohmann::detail::dtoa_impl::diyfp`, which declares only `diyfp(uint64_t, int)`, there is no default constructor to declare it with. Either one is ill-formed, so the whole module failed to compile rather than that one attribute failing to assign — and the Python backend has handled both for long enough that `tests/const_members/` documents them in comments. It had only a Python test, which is exactly why nobody saw it. Both setters now refuse such a member by name at runtime, and JavaScript's constructor path had the same shape twice over in two unguarded `new T()` calls, so a class with no default constructor took the module down from there as well. `tests/lua/const_members/` and `tests/js/const_members/` were added, because the gap was never in the code so much as in which languages the test covered. Found while bringing the C# backend to parity: C# had to decide what a const member means, and the answer turned out to be one the other two had never been asked.
+- **Reflection was silently losing to a text scan on industrial codebases, over one constant.** Discovery walks every class in the codebase at compile time, which makes it the pass most likely to exhaust the compiler's constexpr evaluation limit, and the cost of exhausting it is not a slow build but a wrong answer: the CLI falls back to scanning header text, which cannot see a class declared through an export macro and reports the macro's name instead. `--discover-only` is what surfaced it. OpenCV's core module — 139 headers, 86,273 lines, `CV_EXPORTS` on every public class — reported `source: text scan` in 64 seconds, and the planner log said `constexpr evaluation hit maximum step limit`. The same discovery probe fails at `-fconstexpr-steps=100000000` and compiles clean at `2000000000`. The budget now escalates when the compiler says that is what went wrong, rather than being raised unconditionally, because raising it outright would make a genuinely runaway `constexpr` loop take twenty times as long to fail; `MB_CONSTEXPR_BUDGET` overrides the first tier so the path is testable without a codebase large enough to exhaust a real one. Two things the tests caught first. **GCC never escalated at all**: the guess at its wording, "maximum number of operations", matched nothing, while the real diagnostic is `'constexpr' evaluation operation count exceeds limit of N`, so GCC degraded in silence while clang worked — a bug in the shape that hides longest. And one assertion passed for the wrong reason, grepping stderr for "export macro" when the CLI's *own* text-scan fallback notice says that too, so it was green on a GCC run where nothing had escalated; it now matches a phrase only the escalation message carries. The escalation is reported on the terminal and not only in the log, because on a codebase large enough to need it the retry takes minutes and an unexplained wait of that length is indistinguishable from a hang. **It does not make a large codebase fast**: it converts a silently wrong answer into a correct, slow, self-explaining one, and the remaining cost is the single discovery translation unit rather than anything this fixes. At an absurd limit, incidentally, GCC 16.2 hits an internal compiler error in `coerce_template_parms` instead of reporting the limit, so the test uses measured per-compiler values rather than one small number.
+- **Structural assertions on generated source are not tests, and the C# backend proved it.** Forty-seven checks passed against C# that no compiler accepts: the generated declaration read `private static extern intGet_id(IntPtr self)`, missing a space, which every check was happy with and `mcs` rejected immediately with fourteen errors. Compiling the output also caught the shim declaring `remove_cvref_t<Device>` — `display_string_of` on an alias prints the alias — and an unqualified `Device` in a translation unit with no using directives, since it prints an unqualified name; the fully qualified name is now passed in by the CLI, which had it all along. `mono-mcs` and `mono-runtime` are in the dev container and the test compiles the generated `.cs` and runs it, asserting on what comes out, including that a C++ throw arrives as a C# exception carrying `what()`. Where no C# toolchain exists the test says so explicitly instead of reporting a pass.
+- **The benchmark page says what the measurement cannot resolve.** Every number in it is timed as `benchmark(name, lambda: ..., n)`, so each carries a Python loop iteration and a full Python function call on top of the operation. That constant is the same for all four frameworks, which means it does not cancel in a ratio: it pulls every ratio toward 1.00. Measured in the dev container at 28.3 ns for an empty lambda, which is 38% of a 74 ns null call. The floor is now measured on every run and published under the table, with the consequence stated: a ratio above 1.00x is a lower bound, one below understates the gap the other way, and a row within a few percent of 1.00 is not a tie that was measured. It lives under `_meta` because `check_ratios.py` gates every key under `mirror_bridge` and `test_published_rows.py` demands a published row for every key the runner writes, so a floor in either shape would be a meaningless gate entry and a meaningless row. Two rows also measured the wrong thing: "Attribute write" timed a list-subscript load, a store and an int add alongside the setter, and "Vector return (list out)" said `list` for a return that is an `array.array` — the claim the `.pyi` stopped making earlier in this release.
+- **A declined method says which one and why.** A declined class and a declined free function were each refused by name on stderr; a declined *method* was refused in silence. Not on stderr, not in `--json`, not in the stub, and `dir()` simply does not list it, so a caller could not tell "I wrote the C++ wrong" from "that method does not exist". `docs/guides/accelerating-python.md` promises in writing that generate "reports every name you wrote that is not in the finished module, with the reason", and the gate computes three distinct reasons and printed none of them. They now reach the unbound report and the `--json` `declined` list as `kind: method`, in the same message shape the class-level ones use, so the CLI harvests them with the parser it already had rather than a second one. Behind `MIRROR_BRIDGE_REPORT_DECLINED`, which the CLI sets for its own verification import, because this runs at import and a large library declines hundreds: the tool sees them and a user's program stays quiet.
+- **The agent-facing interface can reach the features built for agents.** The MCP server's `generate_bindings` took five parameters while the CLI accepts nineteen flags, so `--batch` — the largest shipped speedup for the acceleration use case, 6.8x from a list and 12.9x from an `array.array` — was unreachable from the one interface written for an agent, and so were `--link-args`, `--release-gil` and `-k`. `--stubs`, `.pyi` and `--batch` appeared nowhere in `AGENTS.md`, `quickstart.md` or `workflow.md`; they do now. Two more things it got wrong: the CLI's human-readable diagnosis goes to stderr and the wrapper discarded it, so a failed build reached the agent as one grepped line; and only one top-level field was translated from container paths back to host paths, so a path inside `errors[]` pointed at a filesystem the agent cannot see. The whole result is translated now, the `.pyi` comes back as `stub` and `stub_text`, and stderr is attached on failure. `tests/mcp_surface/` covers the argv and the translation, which had no tests at all, and cross-checks every flag the server emits against the CLI's own parser — a flag renamed on one side only is this project's recurring defect in its most literal form.
+- **The CLI runs on macOS.** Every script here uses associative arrays or name references, both bash 4, and all five carried `#!/bin/bash`. macOS ships bash 3.2 from 2007 and will not ship a newer one, so the entire output of every subcommand, `doctor` included, was `declare: -A: invalid option` and exit 2. `docs/README.md` lists macOS as supported and every page says `./tools/mirror_bridge`; all fifteen CI `runs-on` entries are `ubuntu-latest`, so nothing was going to catch it. The shebang is `env bash` now, so a newer bash on PATH is used, and a guard above the first bash-4 construct says what is wrong and what to do about it. `tests/shell_portability/` pins the rule rather than the instance: any script using bash-4 syntax checks `BASH_VERSINFO` before reaching it. It found two more CLIs while being written.
+- **A failed build keeps the file the compiler is complaining about.** The generated binding was deleted on the failure branch too, so the reader got one grepped line referring to line numbers in a file that no longer existed, plus "re-run with --verbose", whose output goes to stderr and which the MCP server discards. The `.cpp` now survives a failure, the terminal says where it is, and `--json` carries `generated_binding` so an agent gets a path rather than a bare line number. Two suggestions were added for errors that had none, including `no matching function for call to 'from_python'`, which is the most common real failure in the corpus and had no entry in the catalogue.
+- **Three documented things that were not true.** The README said enums do not work, hours after they started working, and pointed at a closed issue; it said smart pointers work, which #54 says they do not in either direction; and it counted sixteen corpus libraries where the matrix publishes thirty-two. `docs/reference/cli.md` documented `init --name`, which the CLI rejects. `docs/guides/packaging.md` promised a `setup.py with auto-build` in `examples/packaging/`, which has four files and no build step, so following it produces a package that can only raise the ImportError its own `__init__.py` is written to raise.
+- **Ten of the eleven numbered examples run again, and CI runs all of them.** Six were failing and had been for a long time, which nobody could see because the test harness globs `tests/` and the examples are not under it. That is the same blind spot that let `examples/open3d-comprehensive` ship with `o3d.PointCloud()` raising TypeError. Three asserted a `list` where a numeric vector has given an `array.array` for as long as the mapping has been documented, one called an overload under a mangled name the binder stopped emitting, one imported from the wrong directory, and one wanted enums, which now work. `tests/examples/test_examples.sh` builds and runs every one of them in 76 seconds, and takes its expectation from each example's own README: an example whose README carries a "not implemented" banner is expected to fail, and one that starts passing fails the test until the banner goes. `examples/10-smart-pointers` is the remaining failure and now says so, because `std::shared_ptr` is converted by value and the shared ownership does not cross the boundary either way (issue #54).
+- **The generated `.pyi` says `array[...]` where the runtime hands back an `array.array`.** A `std::vector<double>` crosses as `array('d')` and the stub said `list[float]`, which is worse than saying nothing: a type checker then approves `result + [1.0]` and `json.dumps(result)`, and an agent reading the stub to write the call has no way to find out. `type_hint` was one function serving three positions with three different right answers, so it now takes the position. Returns say what comes back. Parameters keep `list[T]`, deliberately: the ingest side takes a list, a tuple, an `array.array` or any buffer, and the obvious spelling for that, `Sequence[float]`, admits `bytes`, which `from_python` rejects outright, so it would approve a call that fails. A member whose read and write differ now renders as a property with a setter, and only where they differ, so an ordinary member stays an ordinary annotation. The decision itself moved next to the stub generator and `to_python` now reads it from there, because two copies of it is how the stub came to disagree with the runtime in the first place.
+- **Three smaller things the stub was wrong about.** `char` is arithmetic and signed, so it crosses as an `int` in both directions and the stub said `str`. `bytes` has exactly one producer, `std::vector<unsigned char>`, while the stub also claimed it for `std::vector<char>`, `std::vector<std::byte>` and `std::array<unsigned char, N>`, all of which come back as lists of `int`. And a numeric vector the `array` module has no typecode for, such as `std::vector<long double>` or `std::vector<signed char>`, is a list: the stub mirrors the typecode table rather than approximating it with "numeric".
+- **The two stub generators give one answer.** `scripts/generate_stubs.py`, which `mirror_bridge_auto` runs, rebuilt a stub by importing the finished `.so` and reading docstrings off it. Every module mirror_bridge builds already carries one written from the reflection the binding was written from, which knows the real C++ parameter names, the exact member types and the `array.array` return. The script asks for that first now and keeps the reconstruction for a module that has none.
+- **`llms.txt` matches the generator that writes it.** The curated index is a hand-written list of link lines in `tools/gen_llms_txt.sh`, and the accelerating-python guide had been added to the committed file and not to the list, so the next run would have silently deleted it. `llms-full.txt` was 1,300 lines behind besides. `tests/llms_sync/` runs the generator into a temporary directory and diffs, the same contract `check_single_header_sync.sh` holds the single headers to.
+- **A class whose `value_type` is unrelated to what iterating it yields binds again.** Converting a container casts the dereferenced item to the container's `value_type`, which is what keeps a `std::vector<bool>` proxy from reaching Python as a dict. Nothing checked that the cast existed. `Json::Value` declares `value_type` as `std::string` and hands back a `Json::Value`, and a hard error inside a conversion template fails the whole module rather than that one conversion, so jsoncpp went from binding to not building at all. The cast is now made only where it is valid, asked as `is_constructible_v` and not `is_convertible_v`, because a proxy's conversion operator is usually explicit and the second trait reports false for exactly the case the branch exists to catch. `tests/data_model` gains both shapes side by side.
+- **The compatibility matrix stops blaming a warning for a compile error.** The CLI prints `'Factory' is the binding name of 2 classes`, picks the one in the shallowest namespace and carries on, so that line is advice. The failure classifier matched it anyway and published jsoncpp as a name collision while the real failure was a conversion two thousand lines away, which is worse than saying `compile-error`: a category is a claim that we know what the problem is, and this one sent the reader after the wrong bug. It now matches the compiler's own `redefinition of` instead. The classifier had no tests, and the file that tests it has moved from `compatibility/` to `tests/compatibility_matrix/` because the bash harness is the only thing CI runs and it only looks under `tests/`.
+- **A returned object carries the type of the module that returned it, whatever was imported last.** Constructing a bound class goes through that module's `tp_new`, which can only produce that module's type object. Returning one by value went through `to_python`, which asked the shared registry in `sys.modules` first, and that registry holds whichever module registered last. So `isinstance(m.Maker().make(), m.Part)` was False, and which module's type the object actually carried flipped with the order of the imports above it, which is the thing Python code type-checks with. One question, which `PyTypeObject` represents a class in this module, was answered in three places and two ways: the inbound conversion asked this module's own registry first and wrote a cross-module hit back into it, with a comment explaining why, and the two outbound conversions did the opposite with no comment. All three now call one function. Returning a bound object falls from 34.9 ns to 25.4 ns as a consequence, with returning a `double` and constructing flat as controls, because the common case is a load and a compare rather than a dict probe. Two modules binding one class still build two type objects, which is the other half of the problem and is not fixed here.
+- **`bind_class_auto` works again for a class whose constructor takes arguments.** Every construction of such a class raised `TypeError: ... is already initialised`, the zero-argument one included, so the flagship `examples/open3d-comprehensive` could not build a `PointCloud` at all. `bind_class` puts the object together in `tp_init` when the class has a parameterized constructor and in `tp_new` when it does not, and `bind_class_auto` replaced only `tp_new`, with a slot that constructed unconditionally. The suite stayed green because its one auto class declares nothing but a defaulted constructor, and nothing in CI runs `examples/`. Underneath it was one construction path written twice: `py_new_auto` did its own `new T()`, which is also why these classes never got the inline payload, never set `parent`, silently discarded constructor arguments and had none of `py_new`'s diagnostics for an abstract or non-default-constructible class. It now delegates to `py_new` or to a new `py_init_auto`, and adds only the vtable swap. The slots travel into `bind_class` and are chosen before `PyType_Ready` rather than written over the type afterwards: `PyType_Ready` copies `tp_init` into the `__init__` descriptor it builds, so a later overwrite is not what `super().__init__()` calls. Measured, because that failure is silent rather than loud -- with the slot patched afterwards the object constructs correctly and C++ then calls the base while Python calls the override. One behaviour change falls out: an auto class with no parameterized constructor now refuses `Cls("x")` with the same message `bind_class` gives, where it used to drop the argument.
+- **The monthly benchmarks refresh publishes again.** The job regenerates two tables and opens a PR with them, and two of its checks deliberately run after that PR so that a red build cannot cost a month of numbers. The trading splice was not written that way. `format_trading_results.py` refuses to render when numpy was absent, rightly, since the page would otherwise claim a vectorised comparison it never made, and the benchmark image installs jupyter, pybind11 and nanobind but never installed numpy or scipy. So the refusal fired on every run and killed the job before the PR step, taking with it a runtime table that had already regenerated cleanly. That is why the published page still listed seven of the twelve measured operations weeks after the formatter was fixed to emit twelve, and why `benchmarks/ratio_floors.json` never landed, leaving the ratio gate with nothing to gate against. numpy and scipy are now in the benchmark image, the trading splice records its refusal and leaves the committed table where it is, and the failing is done by a step that runs after the PR exists. `tests/benchmark_table/test_refresh_contract.py` feeds the step's own shell to `sh -e` and watches what it does, which is what nothing was doing: the rule was written in a comment in the workflow and checked by no one.
+- **A member whose type has no default constructor no longer fails the whole module.** The attribute setter converts into a local and moves it into place, and that local needs a default constructor, so one such member was a compile error for every class in the module rather than for the one attribute. It is now readable and not assignable, which is the answer a `const` member already got three lines above. `nlohmann::detail::dtoa_impl::diyfp` declares only `diyfp(uint64_t, int)`, and a class holding one was most of why nlohmann-json counted as a compile failure.
+- **The generated `.pyi` describes the members the module actually binds.** It walked every data member and asked only whether the type was `const`, while `bind_class` walks the visible members and weighs the annotation, constness and assignability. So a `[[=exclude{}]]` field appeared in the stub while raising `AttributeError` at runtime, and a `[[=readonly{}]]` field was described as writable. On the project's own example that meant the stub promised `password_hash` and `internal_flag` -- a type checker approving exactly the access the annotation exists to prevent. Both now ask one shared predicate.
+- **Namespaces a macro opens no longer poison the generated binding.** The `using namespace` lines are read from header text, which cannot expand a macro, so nlohmann-json's `NLOHMANN_JSON_NAMESPACE_BEGIN` produced `using namespace detail::detail::detail;` and seventeen errors before the first line of binding code. They exist only so unqualified names from the text scan resolve, and are now emitted only for it; reflection reports names in full.
+
+### Added
+- **The `.pyi` is written by default.** `--stubs` was off, and `--stubs` and `.pyi` appear nowhere in `AGENTS.md`, `quickstart.md` or `workflow.md`, so the artifact that tells a reader, an IDE, a type checker and an agent what the module exposes was only written by someone who already knew to ask for it. It costs one import of a module that was just built, against a generate that takes seconds to minutes. `--no-stubs` opts out, and the default lives in the one place that decided it before.
+- **An enum reaches Python as an enum.** The values always crossed correctly, as plain `int`. The types did not, so a module with a `Color` parameter exposed 0, 1 and 2 with nothing in it saying which was which, and `book.add(99, ...)` was accepted. Each enum the CLI discovers is now bound as an `enum.IntEnum` carrying the C++ enumerator names and values, and the stub declares it and annotates members, returns and parameters with it instead of `int`. Nothing about the conversions changed, because an `IntEnum` member is an `int`: a function that took a bare int still takes one, and one that returns an enum still returns a bare int, which compares equal to the member. An enumerator whose name is a Python keyword gets a trailing underscore, because `Permission.None` is a syntax error rather than a failed attribute lookup, so there would be no spelling for a caller to find. Scoped, unscoped, nested and negative or non-contiguous values all work. Lua and JavaScript have no enum object to map onto, their values keep crossing as numbers, and the CLI's unbound report now says which backend does which. Closes #20, including its open question: enumerator values come out through an ordinary splice, where `display_string_of(constant_of(e))` had returned `(unsupported-reflection)`.
+- **`--batch`: a method you call in a Python loop gets a sibling that takes the whole sequence.** For each method taking and returning exactly one arithmetic value, `<name>_batch` is generated from reflection, so the boundary is crossed once instead of once per element. Measured over 100,000 elements: 6.8x from a list and 12.9x from an `array.array`, which is what another batch call returns. It carries state across the loop, which a list comprehension cannot be rewritten to do. Off by default because each sibling costs compile time -- +12% on a class with ten eligible methods, +55% with forty -- and because it is 1.0x when the method itself is the expensive part, the boundary having never been the cost. Generated rather than asked for: the header previously told the C++ author to write `process_batch` by hand, which is the team that owns the header doing work for the team that consumes it. Never generated over a `<name>_batch` the author wrote, and never for an overloaded name, a `bool`, a `void` return or anything non-arithmetic.
+
+### Fixed
+- **The Python header compiles on GCC again, and annotations are honoured there.** `#include "python/mirror_bridge_python.hpp"` had stopped compiling under `g++ -std=c++26 -freflection`: a helper added to the clang arm of a `#if defined(__clang__)` fork was called from the GCC arm, where it did not exist. Behind that, the GCC arm was a stub that ignored every annotation, on the belief that P3394 was a clang-p2996 extension. It is not: both standard libraries implement it, and both spell `std::meta::annotations_of` the same way. Measured against the last header version that compiled on GCC, a field marked `[[=exclude{}]]` was exported to Python under its own name and was writable, and a `[[=readonly{}]]` field accepted writes. The fork is gone: there is now no compiler-conditional code in the annotations header at all. `tests/annotations/` asserts the runtime behaviour, which nothing did before -- the existing test compiled a binding with annotations and checked nothing about what they did, so it could not tell an honoured annotation from an ignored one.
+- **A returned numeric vector is copied once rather than twice.** `std::vector<double>` and friends crossed into an `array.array` by way of an intermediate `bytes` object that was copied from and then immediately discarded. `array.frombytes` accepts any buffer, so a memoryview over the container's own storage stands in for that copy. Worth 1.47x to 1.64x from 32 KB up and 1.02x at 800 bytes; below 1 KB the extra interpreter call costs more than the copy saves, so the old path is kept there.
+- **The benchmarks page publishes every operation it measures.** The runtime suite measures twelve operations per framework and the page showed seven, because the formatter's row list and the runner's result keys disagreed on three names and omitted two more. Attribute read and write, the most frequent operation on a bound object, had never appeared in the published comparison, nor had the list-in direction. A drop is now named on stderr and fails the refresh under `--strict`, and `tests/benchmark_table/` pins the two lists together.
+- **The ratio regression gate fails when it has nothing to compare against.** `check_ratios.py` measured its floors and returned 0 when `benchmarks/ratio_floors.json` was absent, which reads the same as a passing gate, and did the same for floors that were `null`, empty, or keyed by operations the run no longer measures. All four now fail under `--require-floors`, which CI passes.
+- **Class discovery reads the headers through reflection, not as text.** `generate` tokenized the header text and took the identifier after `class`/`struct` as the class name. In a shipped C++ library that identifier is almost never the class: `class JSON_API Value`, `class V8_EXPORT Isolate`, `class CV_EXPORTS Mat`, `class LLVM_ABI Module`. Pointed at jsoncpp's headers the CLI reported 23 classes, all of them named `JSON_API`, and emitted twenty copies of `bind_class_when_bindable<JSON_API>`; it now reports `Json::Value`, `Json::Reader`, `Json::CharReader::Factory` and the rest. It is not only macros — `struct alignas(64) Wide` bound a keyword, and `struct [[nodiscard]] Tagged` was dropped without a word. The reflection pass that gets this right already ran in the same command for the template planner; nothing read its answer. Nested classes and declaration sites are now part of what it reports, and the walk skips type aliases before recursing (`using iterator = ValueIterator;` is a class type, and following it ran the discovery unit into the constexpr step limit on jsoncpp). When the headers cannot be compiled on their own the text scan still runs, and `generate` says which list it is using.
+- **Discovery is confined to the directory `generate` was pointed at.** Reading the headers after the preprocessor has run means reading the whole translation unit, third-party headers included, and a header was matched to the project only by the end of its path. A project with a `config.h` that includes a vendored `vendorlib/config.h` got both, so `lib::VendorInternal` and everything beside it entered the module — compiling and shipping, with nothing said. Pointing the CLI at a directory containing `value.h` and a vendored jsoncpp put all ten `Json::` classes in the module and the build then failed inside jsoncpp's own container shape. The suffix match is now anchored to the resolved source directory, which also stops `/x/src` from matching `/x/src_vendor/`. On jsoncpp the same collision was also costing a whole planning pass, because `in_source` is what `ours()` and `inventory()` use as well: libc++ spells one of its own headers `__memory/allocator.h`, which ends the same way as jsoncpp's `allocator.h`, so `std::allocator` read as ours, the foreign entities that let into the planner's universe made the first planning attempt fail, and it retried with a reduced header set. `generate` on `jsoncpp/include/json` goes from 73.7s to 17.9s on an idle 16-core box, and the module gets back the six headers the retry had been dropping. That part is the cost of one collision disappearing, not a general speedup — where no header name collides, the walk still costs the ~9% it says it does.
+- **A reflection pass that reports no class falls back instead of emptying the module.** The walk does not enter an anonymous namespace, or one whose name starts with an underscore, so headers whose classes all live there compiled clean and produced an empty list, and `generate` then stopped with "No classes found" on a header that built a working module before. The text scan's answer now stands when reflection names nothing at all, and the message distinguishes a walk that found nothing from a reflection unit that would not compile — the two have different causes and only one has a log to read.
+- **A header set with no classes in it no longer stops the CLI.** Templates and free functions alone are an ordinary surface, and an empty class list expanded to one empty word where the CLI wanted an array subscript: `generate` on such a directory died with `bad array subscript` before it reached the planner, where it used to build the module.
+- **`--output` below a directory that does not exist yet keeps reflection on.** `realpath` refuses a path whose parent is missing, so `--output build/py` on a clean tree stayed relative; the planner's working directory under it was then unreachable from the compiler, which runs with the source directory as its cwd. The discovery unit failed for a reason that had nothing to do with the headers, discovery fell back to the text scan, and the CLI reported that the headers did not compile.
+- **Two classes with one binding name no longer claim the build will fail.** It does not: the generated file names each class in full, so the collision is in the target language, where the last class bound is the only one reachable under that name. The warning says that instead, and offers `MIRROR_BRIDGE_SKIP`, which now does resolve it.
+
+### Added
+- **Bound classes answer the Python data model: `for x in obj`, `len(obj)`, `x in obj`, `pickle.dumps(obj)`.** All four raised `TypeError` before, whatever the C++ type offered, and they are what a team hits in week one through `multiprocessing`, `copy.deepcopy` and a plain `for` loop. Nothing is declared per class. A type whose `begin()`/`end()` form a range over convertible elements gets `tp_iter`/`tp_iternext` generated with `++it`, `*it` and the sentinel comparison as splices; `end()` may return a sentinel of its own type as a C++20 range does, and the element is taken from `std::iterator_traits<It>::value_type` where the iterator has traits, so `std::vector<bool>` yields booleans rather than the proxy reference `*it` returns. Membership falls out of that, because with no `sq_contains` CPython searches by iterating; a range that is also `size()`-able gets `mp_length` and `sq_length`, and a `size()` too large for a `Py_ssize_t` — an unsigned count that underflowed — raises `OverflowError` naming the class and the value instead of reaching CPython as a negative length. A default-constructible class gets `__reduce__`/`__setstate__` over the reflected member list — the same walk `__repr__` does, so a member added in C++ joins the pickle by itself instead of being forgotten by a hand-written `py::pickle()` that lists every field twice — and only when the state can carry every member and put it back: a `const` or `[[=readonly{}]]` member, a `private` or `[[=exclude{}]]` one the visible member list does not report, or a member a base class declares each keep `pickle.dumps` raising `TypeError`, because each would otherwise load into an object that looked right in `repr()` while holding a default value for that field. Iterating a million ints costs 6.99 ns per element against 50.08 for pybind11's `make_iterator` and 14.22 for nanobind's, and 6.74 for CPython's own `range`, which is the floor: fastest of nine runs, collector off, one framework per process, same compiler and flags.
+- **The generated iterator holds a reference to the container, so it cannot dangle.** pybind11 makes the author ask for this with `py::keep_alive<0, 1>()` and reads freed memory if they forget; here it is what the slot does. `for x in make_bag()` drops the last Python reference to the container the moment the loop starts, and with the reference removed that exact test segfaults under `PYTHONMALLOC=debug`, while the shipped slot walks all 1000 elements correctly and frees the C++ object once the iterator goes. Mutation is a separate problem that no ownership scheme solves — a reallocation invalidates C++ iterators no matter who holds the memory — so the generated iterator checks two things each step: the element count, CPython's own answer for `dict` and `set`, raising `RuntimeError: Bag changed size during iteration`; and whether `begin()` has moved, raising `RuntimeError: Bag reallocated its storage during iteration`, which is what catches a `reserve()` or a `shrink_to_fit()` that relocates the buffer without changing the count. Neither check sees a mutation that preserves both the count and the buffer — an `erase` paired with a `push_back` — so iterating a container while mutating it stays undefined exactly as it is in C++; the guards turn the common accidents into an exception rather than a wrong number. `docs/reference/type-conversion.md` has the table of what is and is not caught.
+- **`__iter__` and `__len__` are written into the generated `.pyi`** for the classes that have them, so a type checker agrees with what the module does: `for value in bag` and `len(bag)` now pass `mypy --strict` where they were `"Bag" has no attribute "__iter__" (not iterable)`. `Iterator` is imported only when a class in the module declares `__iter__`, so a module with no ranges keeps the stub it already had and a committed `api --check` baseline moves only when the surface does.
+- **Methods, static methods and free functions are called through the vectorcall protocol.** CPython hands a fastcall entry point a flat array of borrowed references; the previous `METH_VARARGS` entry point made it allocate an argument tuple and a keyword dict per call and tear both down. At zero arguments the two conventions already measured the same, which is what identified the tuple rather than the design as the cost: the gap grew about 2ns per argument. Keyword calls gained most, 87ns to 33ns.
+- **Scalar conversion no longer leaves the header in the common case.** An exact Python float is one macro load, and an int small enough for CPython's compact representation is a load and a sign flip, read directly below 3.12 and through the public `PyUnstable_Long_*` accessors from 3.12 on. The public readers are calls into libpython that cannot be inlined, and on an 80,000-element list that call was the whole difference between the integer and floating-point ingest paths. Anything the fast path declines — a wider int, the stable ABI, PyPy — falls through to the public API.
+- **Lists and tuples of exact scalars convert through a bulk tier** that needs neither the per-element size re-read nor the `from_python` dispatch the general tier needs. A non-exact element is not an error: the tier stops and the general one resumes at that index.
+- **Trading workload benchmarks** (`benchmarks/runtime/shared/trading_bench.hpp`): a price-level order book, Black-Scholes over a contract vector, and an EWMA crossover driven at every chunk size from 1 to 262,144. Each framework is timed in its own interpreter, fastest of nine runs with the collector off, because sharing a heap made the third-timed framework read up to 30% slow.
+- **Generated modules are built with `-fvisibility=hidden`.** A module was exporting every template instantiation the reflection pass produced, 170 of them on the benchmark class. Through the CLI the module goes from 109,336 to 92,512 bytes, a 15.4% cut, almost all of it symbol tables and relocations. Lua's `luaopen_` entry point is now marked with a new `MIRROR_BRIDGE_EXPORT`; `PyMODINIT_FUNC` and `NAPI_MODULE` already carried the attribute.
+- **`mirror_bridge api`: gate a module's Python surface on a committed stub.** Generating a module is the easy half of running this in production; the hard half is the Python team finding out when the C++ team changes something. The generated `.pyi` is the one artifact that cannot drift from the binding — it is filled in during `bind_class` from the same reflection data — and it is byte-identical between runs and between clang-p2996 and GCC 16, so it can be committed and compared like a lockfile. `api --update` writes the baseline, `api --check` fails CI when a name disappears or changes signature, and additions pass because nobody's import breaks when a method appears. The report classifies the diff rather than printing it, so a C++ pull request shows which names the Python team is about to lose. New guide: `docs/guides/independent-teams.md`.
+- **GIL release policy**: `bind_class<T>(...).release_gil()` (or `mirror_bridge generate --release-gil`) drops the GIL while C++ method bodies run, so long native calls stop blocking other Python threads — 4 threads × 150ms native sleep now finish in ~150ms instead of ~600ms (regression-tested in `tests/gil_release/`). Safe by construction: `std::function` callbacks and virtual-override trampolines re-acquire the GIL themselves, so no per-method signature reasoning is needed. Zero overhead when not enabled.
+- **Free-threaded CPython declaration**: compiling a module with `-DMB_FREE_THREADED` on Python 3.13+ declares `Py_MOD_GIL_NOT_USED`, preventing a mirror_bridge module from silently re-enabling the GIL process-wide on free-threaded builds (opt-in, mirroring nanobind's `FREE_THREADED` flag). New guide: `docs/guides/threading.md`.
+- `bind_class` now returns a fluent `BoundClass<T>` handle (implicitly converts to `PyTypeObject*`, so existing code is unaffected) — the home for per-class binding options like `release_gil()`.
+- **Reflection-exact `.pyi` stubs**: every module now exposes `__mirror_bridge_stubs__()`, populated automatically during `bind_class` from the same reflection data the binding is generated from — exact member types, constructor overloads (`@overload`), real C++ parameter names, `@staticmethod` markers, Eigen/container/map type hints. `mirror_bridge generate --stubs` writes `<module>.pyi` next to the built module. No runtime parsing: stubs cannot drift from the binding.
+- **Header-to-wheel scaffolding**: `mirror_bridge init <name> --wheel` emits pyproject.toml (scikit-build-core), a CMake build consuming mirror_bridge via find_package/FetchContent, an explicit binding TU, and a wheel-building GitHub workflow. Validated end-to-end: `pip wheel . && pip install dist/*.whl && python -c "import <name>"` works from a fresh scaffold.
 - **Stock GCC 16+ support**: mirror_bridge now compiles with upstream GCC's C++26 reflection (`g++ -std=c++26 -freflection`), not just Bloomberg's clang-p2996 fork. The CLI, `mirror_bridge_build`, doctor, and test runner auto-detect the available reflection compiler (override with `MB_CXX`).
+- `mirror_bridge init <name>` scaffolds a ready-to-build project: example header, per-language smoke tests, README, and a GitHub Actions workflow that builds and tests the bindings in the reflection container
+- **Bulk container ingest**: `from_python` for numeric containers accepts any contiguous buffer (`array.array`, NumPy arrays, `memoryview`) via a single memcpy — the ingest mirror of the existing `array.array` return path
+- List/tuple fast paths in container and Eigen conversion (borrowed-reference access, `PyFloat_AS_DOUBLE` for exact floats): the 1M-point `list[[x,y,z]] -> vector<Eigen::Vector3d>` ingest went from 18.4ms to 12.2ms (28x -> 42x vs pybind11 on the fair benchmark)
+- **By-reference argument passing**: lvalue-reference parameters of bound classes (`const T&`, `T&`) now alias the Python-held object instead of copying it — zero copies for `const T&`, and `T&` mutations are visible from Python (matching pybind11 semantics); regression-tested with an instrumented copy counter
+- `find_package(mirror_bridge)` now delivers the same `mirror_bridge_python_module()` / `_lua_module()` / `_js_module()` helper API as add_subdirectory/FetchContent (helpers moved to an installed `MirrorBridgeModules.cmake`); helpers gained an `OUTPUT_DIRECTORY` argument and lazy dependency lookup
+- CMake integration guide (`docs/guides/cmake.md`)
 
 ### Changed
+- **A bound class's `tp_name` is now `<module>.<Class>` rather than the bare class name.** CPython reads a static type's `__module__` out of the text before the last dot, so every bound class claimed to live in `builtins` and pickle could not find the class it had just serialized. `__name__`, `__qualname__` and the generated `__repr__` are unchanged — the first two are defined as the text after the last dot — so what moves is `__module__`, and the type name CPython prints in its own error messages, which now reads `'orders.Book' object is not subscriptable` instead of `'Book' object ...`.
+- **`bool(obj)` on a class that is both iterable and sized is now `len(obj) != 0`.** A length slot is not a neutral addition: with no `nb_bool` CPython derives truthiness from it. Gating `mp_length` on `size()` alone would therefore have redefined `if obj:` for every class that merely has a method spelled `size()` — a gauge reading, a kernel width — so `len()` is offered only where `begin()`/`end()` say that "how many elements" is the question `size()` was already answering. For those classes empty-is-falsy is the correct Python semantics rather than a change of meaning, and `nb_bool` is written out instead of left implicit so the decision lives in the source. A class with `size()` and no range keeps both its truthiness and its absence of `len()`. **This is a silent behavior change for existing code** and it reaches further than `if obj:` — `assert obj`, `obj or fallback`, `filter(None, objs)`, `any`/`all` and a truthiness comprehension filter all change with it. The case to look for is a container-shaped class used as a handle: a `Connection` that exposes a queue through `begin()`/`end()` and `size()`, where `if conn:` used to mean "I have a connection" and now means "my queue is non-empty", which reads the same and silently stops sending. Write `if conn is not None:` for an existence check. There is no per-class opt-out — truthiness follows from the length slot — and a range *without* `size()` has no length slot, so it stays truthy when empty; `docs/reference/type-conversion.md` spells out the asymmetry.
 - Pack expansions over reflected parameter types use alias templates (`method_param_t`, `static_method_param_t`, `*_constructor_param_t`, `virtual_param_t`) instead of inline splices, so the parameter pack is visible to both GCC and clang.
 - `PyTypeObject`/`BufferView` initializers designate `.ob_base` so GCC accepts them alongside the other designated fields.
+- CLI Lua modules are emitted to `<output>/lua/<module>.so` — Python and Lua both produced `<module>.so`, so `generate --lang all` silently overwrote one with the other
+- `ctest` now registers exactly the tests whose modules the CMake build produces (bash-harness-only tests are excluded and remain covered by CI's bash jobs); test files prefer freshly built modules over stale artifacts in `build/`
+- `tests/run_all_tests.sh` no longer treats the template planner's scratch units as bindings. It builds every `.cpp` under `tests/`, which picked up the `discover.cpp`, `probe.cpp` and `request.cpp` the CLI tests leave in their work directories; those only compile with their generated inputs beside them, so every run after the first reported up to ten failed bindings on a tree that was otherwise green.
+- Benchmark documentation consolidated: `docs/internals/benchmarks.md` (CI-regenerated monthly) is the single canonical results page; stale/contradictory results docs removed, and the runner no longer records zero-filled placeholders for frameworks that failed to build
+- CMake compiler check and package config understand GCC 16+ (previously warned that only clang was supported)
+- Removed the unused `ClassMetadata`/`Registry` pair from `core/` — the Python backend's registry (the only one ever used) is the single implementation
+
+### Fixed
+- **`std::vector<bool>` crosses as a list of booleans instead of a list of empty dicts.** Its iterator dereferences to a proxy reference rather than to `bool`, and converting that proxy fell through to the struct path, which walked its (no) visible members and produced `{}` per element. Every container conversion now converts through the container's `value_type` where the dereference type differs from it, so `[{}, {}, {}]` becomes `[True, False, True]` for member reads, method returns and iteration alike.
+
+### Added (real-world header hardening — found by binding Clipper2 cold)
+- **const data members bind as read-only attributes** (readable, assignment raises `AttributeError`, `@property` in stubs) instead of failing to compile
+- **CLI-generated bindings skip unbindable classes with a per-class reason** (`bind_class_when_bindable`) instead of failing the whole module: "31 discovered, 12 bound, 15 skipped (reasons)" — hand-written `bind_class` keeps the hard `static_assert`
+- **Methods/operators with unconvertible return types (raw pointers, iterators) are skipped** like param-unbindable ones, for named methods, static methods, number slots, rich-compare, and subscript
+- **Constructors reflection can see but Python can't call (protected/private) are filtered** via `is_constructible_v`
+- **Auto-discovery tracks access specifiers**: private/protected nested classes are no longer emitted (binding them is ill-formed)
+- `--link-args` on `generate` for libraries that aren't header-only (`--link-args "/path/libFoo.a"`)
+
+### Changed
+- **Calling `__init__` on an object that already holds one is refused.** It used to construct a second object and abandon the first, which leaked it. Writing over the storage in place skips the old object's destructor, and with the inline payload a constructor that throws part way leaves members that unwinding has already destroyed for `tp_dealloc` to destroy again, which aborted the process with a double free. Freeing the old object first fixes both and introduces something worse: a member view holds a raw pointer into the owner's storage, so freeing it leaves the view reading freed memory, and there is no view count to consult. The first `__init__` after `__new__` is unaffected, since the pointer is null there; a second one now raises `TypeError` naming the class and saying to construct a new object. An object whose construction failed outright still reports that it holds no C++ value, and now says why rather than "Invalid C++ object".
+- **Returning a bound class by value is 3.4x faster, and the C++ object now lives inside the Python object.** Returning a bound class cost 111ns against 20ns for returning a `double`, and the gap did not move with the size of the object (264 bytes measured the same as 24), so it was never the copy: every return re-found the type registry in `sys.modules` and then the type in it, two `PyDict_GetItemString` probes that each build a `str`, hash it and throw it away. Both are stable for the life of the process and are now cached, the registry behind a strong reference and the per-type key as an interned `str` that carries its hash. This is deliberately not the inverted-priority fix that was proposed for it: reading the per-module static before the shared dict would break cross-module object identity, because the dict is the canonical type for a class bound in more than one module. On top of that, the payload is placement-constructed inside the Python object instead of behind a second allocation, which `tp_basicsize` now accounts for, so an ordinary bound object costs one allocation rather than two. Abstract classes, over-aligned classes and virtual-override trampolines keep the heap path, and the wrapper tells the two apart in `tp_dealloc` by where the object sits rather than by carrying a flag. Measured on the same machine, floor of 11 over 200k iterations with the collector off and one process per build: returning a 24-byte object 111.4ns to 32.7ns, a 264-byte object 110.8ns to 37.8ns, constructing 38.8ns to 33.0ns, with a null method call and a `double` return unchanged as controls. Covered by `tests/wrapper_alloc/`, which compares the payload's address against the Python object that owns it, because a count of destructions is the same on both paths, and runs clean under `PYTHONMALLOC=debug`. Two things had to be corrected before it was safe. An auto-trampoline class released its object with `delete` whatever the payload was, so the first `bind_class_auto` class returned by value aborted the process with `free(): invalid pointer`, and the same function never released the reference a member view holds to its owner. It now goes through the one function that knows where the object sits, which is what `tp_dealloc` already used. The other is what two modules do when they disagree. `tp_basicsize` now depends on `sizeof(T)`, so two modules built against different revisions of the same header want different wrapper sizes under one `typeid` name, and the module that returns the class by value was handed the other's type object and placement-constructed its larger payload into the smaller allocation. Measured on GCC 16 at 176 bytes into a 48-byte object, which segfaults. Every mechanism that could have caught it was itself a static of a template, which the dynamic linker merges across modules unless they were compiled with hidden visibility, so the first module to load decided the answer for both. The cross-module key, the interned copy of it and the per-module type cache are now named by the wrapper size as well, which makes them different symbols with nothing to merge, and a lookup across a disagreement misses and degrades to a dict snapshot. Where both modules bind the class, the type object itself is the shared static, and `bind_class` now refuses the second import and names both sizes rather than allocating through a type it did not size. The CLI already compiled with `-fvisibility=hidden`. The CMake helper and the test harness did not, and now do, which is also where the 170 exported template instantiations per module were going. Covered by `tests/abi_skew/`, which is two modules whose headers disagree about one class, run both ways, and by `tests/auto_trampoline/`. Both crash rather than fail without the fixes.
+
+### Fixed
+- **A C++ name that is a Python keyword produced a `.pyi` that nothing could parse.** Parameter and member names were emitted verbatim, so one `double scale(double lambda, double vega)` was enough to make the stub invalid Python, and a type checker rejects the whole file over one bad line. It also made the module impossible to put under `mirror_bridge api`: `--update` wrote the unparseable baseline and reported success, and `--check` then failed on every run with no C++ change that could fix it. A parameter is now renamed and marked positional-only with PEP 570's `/`, which is the truthful description -- the runtime still answers to the real C++ name through `f(**{"lambda": x})`, and no Python source can write `lambda=x` either way. A member whose own name is a keyword has no declaration form at all, so it is omitted with a comment saying why and `generate` names it on the console. A parameter called `self` collided with the receiver and is renamed the same way. Stubs for keyword-free modules are byte-for-byte unchanged, on both clang-p2996 and GCC 16. Covered by `tests/pyi_keywords/`.
+- **A static method's and a free function's stub said their parameters could be passed by name.** Neither accepts keyword arguments at runtime -- both raise `TypeError: takes no keyword arguments` -- so a type checker was blessing calls that fail. Both are now rendered positional-only, which is what `/` is for. This changes the committed `.pyi` for any module with a static method or free function that takes parameters, three of the eight example modules, so `mirror_bridge api --update` is needed once; the surface itself has not changed, only the description of it has stopped being wrong. An unnamed C++ parameter is marked the same way, since there is no keyword for it either.
+- **A substituted parameter name could claim a real one.** `double f(double lambda, double lambda_)` rendered as `lambda_, lambda__`, which advertised `lambda__` -- a keyword the module refuses -- and hid `lambda_`, which it accepts. The names the runtime answers to are now reserved before any substitute is invented.
+- **The CLI put the working directory ahead of its own headers.** The compile line read `-I. -I$src_dir -I$PROJECT_ROOT`, so running `mirror_bridge generate` from a directory holding a `mirror_bridge.hpp` -- a vendored copy, or the repository itself while generating for another project -- built the module against that header rather than the installation's, silently and with no diagnostic. `PROJECT_ROOT` now leads, in the module compile and in the planner.
+- `generate --stubs` now parses the stub it just wrote and says so loudly if it does not compile, and `api --update` refuses to store a baseline that does not parse rather than wedging the gate.
+- **`core::type_key` gave two distinct types the same name.** The key is the cross-module identity of a bound class — the registry key Lua's metatable lives under, and the value the JavaScript tag compares — so two types sharing one is exactly the confusion the boundary checks exist to prevent. Two ways in. `spell()` tested `is_pointer_type` before `is_const`, and `remove_pointer` drops the qualifiers on the pointer itself, so `Box<int* const>` spelled as `Box<int*>`; the order is fixed. And a spelling that falls back to `display_string_of` is implementation-defined, which the spelling header's own comment says it avoids for this reason: clang-p2996 renders every enum-valued template argument as `(unsupported-reflection)` and every unnamed type as `(anonymous type)`, so `EnumParam<Colour::Red>` and `EnumParam<Colour::Green>` came out identical. That case is now a `static_assert` in `bind_class` instead of a silently shared identity. `tests/type_key/` pins both, plus the spellings that must not move.
+- **A write through a nested data member was silently discarded.** `o.p.x = 7.0` left `o.p.x` at `0.0` with no error, because the getter handed back a wrapper around a fresh heap copy and the write landed on the copy, which the expression then dropped. A non-static data member is interior to the wrapped object by construction, so the getter now returns a view onto the owner's storage holding a strong reference to the owner. That is settled at compile time from the reflected member list: unlike a method return it needs no return value policy from the author and no runtime instance lookup, which is the part pybind11 and nanobind cannot copy, since they receive a member pointer and nothing else. Reading a member no longer copies at all, measured 1000 copy constructions to 0 with an instrumented copy constructor. Method returns are deliberately unchanged -- interiority cannot be established for them, and the inference that was proposed fails in both directions -- and container elements are deliberately excluded, because a view into a `std::vector` dangles the moment it reallocates. Covered by `tests/member_views/`.
+- **Cross-module type sharing is now keyed on the wrapper layout as well as the type.** The forward registry hands out one `PyTypeObject` per C++ class process-wide and `tp_basicsize` comes from whichever module registered it first, so two modules built against different revisions of the header disagreed about how big a wrapper is and the newer one would write its trailing fields past the end of an allocation the older one sized. That is a heap overflow rather than a wrong answer, and it was reachable as soon as the wrapper grew a field. Every cross-module key now carries a layout tag, so a mismatched pair simply does not recognise each other's objects and the failure is a `TypeError` at the boundary. Matching builds share types exactly as before. Because the resulting conversion failure names a class whose name looks correct, a module that finds another layout already loaded now says so once at import, as a `RuntimeWarning` naming both layouts, rather than leaving the `TypeError` to be puzzled over.
+- **A C++ exception thrown from a bound free function or from a constructor aborted the process.** It unwound past the interpreter and `std::terminate` ended the session with exit 134: no traceback, nothing catchable. Instance methods and static methods were already wrapped; these two paths were not, and a constructor that validates its arguments and throws is ordinary C++.
+- **Constructing with keyword arguments silently produced a default object.** `py_init` read `PyTuple_Size(args)` and never looked at `kwds`, so `Cls(a=1, b=2)` had `nargs == 0`, fell into the default-construct branch and reported success — the caller got an object built from none of their values and no error. Keyword arguments now resolve against the constructor's reflected parameter names, so mixed and out-of-order calls work and an unknown name is refused rather than ignored.
+- **Integer arguments are range-checked.** The old path was an unchecked cast, so `2**31` into a C++ `int` arrived as `-2147483648`, and `2**200` arrived as `-1` with an `OverflowError` left set on the thread to be reported later by whatever unrelated call next entered CPython. Out of range is now a `TypeError` at the boundary with nothing left pending.
+- **A failed call says why.** Four different mistakes previously produced the same line, naming neither the bad keyword, the arity wanted, nor the parameters that exist. Where exactly one overload competed for the call, the message now reads `scale() got an unexpected keyword argument 'bogus' (takes factor, times)` or `pv() takes 2 to 3 argument(s) (cash, periods, spread), got 1`. With a real overload set the generic line is kept, because naming one signature would mean picking an arbitrary member of the set. The error path also got 17% quicker.
+- **`generate` now says what it could not bind.** A build that printed `✓ Successfully built` could still be missing names the user wrote, with the only notice being one line of stderr eight lines earlier, or nothing at all. One report after the banner now names them, grouped by reason and capped: enum types, free functions dropped for being overloaded, and free functions that share a name with a function template. The same records reach `--json` as a typed `unbound` field, since `status` was `"ok"` and `errors` was `[]` for all of them.
+- **Enums are no longer discovered as classes.** The discovery scan matched the token `class` inside `enum class Side`, so every scoped enum was reported as a class to bind and then skipped at import with a message that never said "enum"; a plain `enum Color` was invisible at every stage. Validated across 620 headers in this repo: 94 names removed, none added, every one of them an enum. Generated stubs also annotate enum members and parameters as `int` instead of naming the C++ enum type, which the module never defines and which made the whole `.pyi` unusable to a type checker. `examples/09-enums` documents what does and does not work rather than promising an API that was never implemented.
+- **Two classes with the same unqualified name are caught before codegen.** A module binds every class by its simple name, so `lib::Config` and `lib::detail::Config` made the compiler reject a generated file the CLI then deleted. `generate` now names both declaration sites and explains why `MIRROR_BRIDGE_SKIP` on one does not help.
+- **`mirror_bridge diff` refuses to record a baseline that would pass forever.** Headers in subdirectories, or any header containing the text `MIRROR_BRIDGE_SKIP`, could leave the snapshot empty, after which `--check` passed even once every class was deleted. That is now an error (exit 3) naming the cause and pointing at the generated stub as a check that cannot drift. An unknown flag is rejected (exit 1) instead of being taken as the source directory, which is what the scaffolded README's own `diff src/ --module <name>` did. `--help` now states what `diff` does and does not see.
+- **Class-typed values are identity-checked at the Lua and JavaScript boundaries too** (#18). Same root cause as the Python fix below: every bound class shares one wrapper layout, and conversion read the held pointer out of whatever object arrived. In Lua the only test was `lua_isuserdata`, so `curve.at(label, 2.0)` returned `4.0513382958982e-322`, a denormal read out of the `std::string`'s bytes; in JavaScript `napi_unwrap` says an object was wrapped but never says wrapped as *what*, so `Curve.prototype.at.call(label, 2.0)`, `curve.blend(label)` and a property accessor lifted off the prototype all did the same. Reachable from ordinary script with no unsafe API, and a plausible wrong number rather than an error. Both backends now refuse, naming the class expected and the class that arrived (`blend: argument 1 expected Curve, got Label`), as a Lua error or a `TypeError`. Covered by `tests/lua/type_safety/` and `tests/js/type_safety/`.
+  - The receiver is checked, not just the arguments: `obj.method(x, ...)` in Lua and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as a normal call with whatever the caller put first as `self`. So do metamethods and accessors pulled off a metatable or prototype.
+  - Derived-to-base conversion keeps working and is now offset-adjusted, so `struct Both : First, Second` passed where a `Second` was expected reaches the right subobject instead of returning `First`'s bytes — a silent wrong answer in both backends before. Lua identifies a class by its metatable, which lives in the Lua registry, so a class bound by one `.so` is still recognised in another; the JavaScript backends keep that state per `.node` file, so a *derived* class bound by another module is not convertible there (the exact class still is).
+  - **In Lua the identity is a word written inside the wrapper, not the metatable attached to it.** A metatable looks like the natural choice and is not one: `setmetatable({}, getmetatable(curve))` puts a class's metatable on a plain table from ordinary Lua with no privileged library, and `debug.setmetatable` puts it on any value in the process, the standard library's own file handles included. A check on the attached metatable therefore accepted values with no wrapper behind them and read a C++ object address out of them anyway — a null dereference for the table, and for a file handle a read, a write and a `__gc` free at an address the script chose. Lua has no API in the other direction: nothing in the language or the debug library writes a full userdata's payload, so the payload is where the identity belongs, once `lua_touserdata` and `lua_rawlen` have established the value really is a full userdata long enough to hold a wrapper. That is two C API calls and a load where fetching the metatable was four: `c:at(2.0)` 72.1 -> 75.9 ns/call and `c:nullcall()` 60.7 -> 65.1 ns/call (floor of 7 over 2M iterations, 5 interleaved runs). What remains is a foreign full userdata whose first word happens to equal a registered class metatable's address, which a script can neither learn nor write.
+  - **`napi_unwrap` says an object was wrapped, never by whom.** The private key it reads belongs to the Node environment rather than to a module, so every other native addon in the process hands its wrapped objects back through it with that addon's own payload layout — and the class tag was read from the front of that payload and followed as a `const char*`. A null or small-integer first word crashed the process; anything else copied a page of the other addon's heap into a catchable `TypeError` message. Each wrapper now leads with a magic word and nothing is read out of a payload that does not carry it. JavaScript stays at parity: the check is a load and a comparison on an unwrap that was already happening. `tests/js/type_safety/foreign_addon.cpp` is a second addon built for the test.
+  - **Behaviour change**: script that relied on one bound class silently converting into an unrelated one now gets an error. In Lua a plain table is still accepted where a bound class is expected, which is how nested structs are written from Lua.
+  - The V8 backend (`javascript/mirror_bridge_v8.hpp`) got the same gate, built on `FunctionTemplate::HasInstance`, and **nothing in CI verifies it**. The file has not compiled since before this change against the V8 the image actually has — 7.8, from `libnode-dev`, at `/usr/include/node/v8.h` — because it calls `String::NewFromUtf8Literal` and the one-argument `String::NewFromUtf8`, both V8 8.x. The `test-v8` job gates on `/usr/include/v8.h`, which does not exist, so it skips and says the image needs `libv8-dev`; `tests/run_all_tests.sh` gates on the path that does exist, so it has been attempting the V8 build and reporting the failure non-blockingly for longer than this branch. With those two API calls patched locally the backend compiles and runs as a Node addon, which is how the gate was exercised by hand: a receiver of the wrong class is refused, and a `Multi : Pad, Base` passed as a `Base` reaches the right subobject. Two defects found that way and **not** fixed here, both present on `main`: the `Bindable` overload of `from_v8` is declared after `call_method_impl` and `v8_setter` call it, so a bound-class parameter or data member does not compile at all; and `weak_callback` is defined but never installed, so every JS-constructed object leaks its wrapper and its C++ object.
+  - `describe_v8_value` was outside the gate it documents: it read the internal field behind only an `InternalFieldCount()` test and followed the result as a `const char*`. Ordinary Node objects carry internal fields — `Buffer`, `MessagePort`, `vm.Script` — so `Base.prototype.get_b.call(new vm.Script('1'))` put raw heap bytes into the `TypeError`'s message, and a wild pointer crashed inside the call. It goes through `HasInstance` like everything else now. The slow-path scan also ignored which isolate a class's template belonged to, which an embedder with two isolates would have read through the wrong one.
+- **Class-typed arguments are identity-checked at the Python boundary.** Every bound class shares one wrapper layout, and conversion read the wrapper out of whatever `PyObject` arrived after only a null check, so a wrong type was reinterpreted rather than rejected: passing an `int`, `str`, `dict` or `list` where a bound class was expected **segfaulted the interpreter**, and passing a *different* bound class returned a plausible number computed from that object's bytes. Both now raise `TypeError`. Conversion to a base class is also offset-adjusted, so passing a derived object where a base that is not at offset 0 is expected (`struct Swap : Observable, Priceable`) reaches the right subobject instead of returning garbage. Covered by `tests/type_safety/`.
+  - The same gate now also covers the paths that reached around the conversion functions: binary operator slots (`5 + vec` entered the slot with `5` as `self` and segfaulted), the member-template descriptor (`Cls.tmpl.__get__(5)[T]()`), and `mp_subscript`/`tp_call`, which leaked `NotImplemented` to the caller instead of raising. A `shared_ptr`/`unique_ptr` to an abstract pointee reported a successful conversion while leaving the pointer empty, so the callee dereferenced null; it now fails conversion.
+  - Classes with a conversion function (`explicit operator double() const`) failed the *entire module build*, because a conversion function is not an operator function and reached `identifier_of`. Same cause, same fix, in `core/mirror_bridge_plan.hpp`: one namespace-scope `operator+` ended the planner's consteval evaluation, which silently cost the module every free function and every template instantiation while still reporting success.
+  - **Behaviour change**: code that relied on one bound class silently converting into an unrelated one now raises `TypeError`. Derived-to-base conversions (including virtual and non-first bases), Python subclasses, and the same class bound by two modules all keep working. Not convertible any more: a derived class whose module has not been imported, and a base C++ itself would refuse at that call site (inaccessible, or ambiguous through non-virtual multiple inheritance).
+- A `noexcept` free function failed the whole module build instead of being bound: `noexcept` is part of the function type since C++17 and `FunctionTraits` had no specialization for it, so even the "skip what cannot be bound" guard could not fire (it instantiates the traits itself).
+- Single-header `mirror_bridge_python.hpp` could not compile standalone: it still `#include`d `python/mirror_bridge_stubgen.hpp`, which the amalgamation never inlined. The stubgen header is now spliced in, `amalgamate.sh` fails if any local include survives, and a new `single_header_standalone` ctest compiles the header with no repo include path (#12).
+- `const char*` constructor/method parameters were dereferenced as if they were pointer-holder storage, producing garbage or failing to compile — pointer-typed *values* are now distinguished from pointer-holder storage
+- Virtual-override dispatch (`dispatch_python`/`has_python_override`) now acquires the GIL itself, making overridden virtuals safe to call from pure C++ threads that never held the GIL (previously undefined behavior)
+- Constructor calls with arguments no constructor accepts now raise `TypeError` instead of silently returning a default-constructed object
+- The Python single header shipped raw `#include` lines for `mirror_bridge_annotations.hpp` and `mirror_bridge_eigen.hpp`, so it could not compile standalone; the amalgamation now inlines both at their include site
+- `from_python_pointer` accepted `None` as a "successful" null pointer that was then unconditionally dereferenced; `None` now fails conversion (TypeError / next overload)
+- `T&` parameters of copyable bound classes mutated a temporary copy, silently dropping the mutation
+- CMake helper functions' positional-source parsing leaked `INCLUDE_DIRS` values into the source list
+- `mirror_bridge version` claimed Bloomberg clang-p2996 was required; it now reports both supported compilers and which one auto-detection selected
 
 ### Notes
-- P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) remain clang-p2996 only; under GCC they are ignored (all members bound) until GCC implements P3394. The annotation-specific tests are skipped on GCC.
+- P3394 field annotations (`[[=exclude{}]]`, `[[=readonly{}]]`) are read by the Python backend only. The Lua and JavaScript backends enumerate every named member, so an annotated field is still bound there.
 
 ## [0.3.0] - 2026-06-05
 

@@ -76,6 +76,19 @@ function(mirror_bridge_python_module TARGET_NAME)
         ${ARG_INCLUDE_DIRS}
     )
 
+    # The same visibility the CLI compiles generated modules with, and for a
+    # second reason beyond symbol-table size. bind_class's PyTypeObject and
+    # TypeRegistry's cache are statics of templates, so with default
+    # visibility two modules in one process share whichever copy the dynamic
+    # linker binds first. Two modules built against different revisions of
+    # the same class then share one type object sized for one of them, and
+    # the other constructs its larger payload past the end of it. Measured on
+    # GCC 16 at 176 bytes into a 48-byte object.
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
     if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_python)
         target_precompile_headers(${TARGET_NAME} REUSE_FROM mirror_bridge_pch_python)
     endif()
@@ -109,6 +122,13 @@ function(mirror_bridge_lua_module TARGET_NAME)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${LUA_INCLUDE_DIRS}
         ${ARG_INCLUDE_DIRS}
+    )
+
+    # Same as the Python helper above, and the same as the CLI. The entry
+    # point stays visible on its own attribute.
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
     )
 
     if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_lua)
@@ -146,6 +166,13 @@ function(mirror_bridge_js_module TARGET_NAME)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${NAPI_INCLUDE_DIR}
         ${ARG_INCLUDE_DIRS}
+    )
+
+    # Same as the Python helper above, and the same as the CLI. The entry
+    # point stays visible on its own attribute.
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
     )
 
     if(MIRROR_BRIDGE_USE_PCH AND TARGET mirror_bridge_pch_js)

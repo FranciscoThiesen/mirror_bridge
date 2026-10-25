@@ -185,17 +185,100 @@ class Compiler:
         self.binary = args.cxx
         self.is_clang = "clang" in os.path.basename(args.cxx)
         self.flags = shlex.split(args.cxx_flags)
-        self.flags += ["-w", "-fconstexpr-steps=100000000" if self.is_clang else "-fconstexpr-ops-limit=1000000000"]
+        self.budget_step = 0
+        self.flags += ["-w", self.budget_flag()]
         # The probe needs every diagnostic: an error the compiler never printed
         # would leave a broken candidate approved.
         self.flags += ["-ferror-limit=0" if self.is_clang else "-fmax-errors=0"]
-        self.includes = ["-I" + args.src_dir, "-I.", "-I" + args.project_root] + ["-I" + d for d in args.include_dir]
+        # project_root leads: a mirror_bridge.hpp in the working directory
+        # would otherwise shadow this installation's own headers.
+        self.includes = ["-I" + args.project_root, "-I" + args.src_dir, "-I."] + ["-I" + d for d in args.include_dir]
         if args.eigen_dir:
             self.includes.append("-I" + args.eigen_dir)
         self.src_dir = args.src_dir
         self.log = []
 
+    # Discovery walks every class in the codebase at compile time, so it is the
+    # pass most likely to run out of constexpr budget, and the cost of running
+    # out is worse than a slow build: the CLI falls back to scanning header
+    # text, which cannot see a class declared through an export macro. OpenCV's
+    # core module -- 86k lines of headers, 158 classes -- exceeded the first
+    # budget here and was being discovered by text scan for that reason alone.
+    #
+    # Raising the constant outright would make a genuinely runaway constexpr
+    # loop take twenty times as long to fail, so the budget escalates instead,
+    # and only when the compiler says that is what went wrong.
+    # The first tier is what almost every project needs. The second exists
+    # because an industrial codebase does not fit in the first: OpenCV's core
+    # module needs more than 1e8 steps to be discovered at all.
+    #
+    # Escalating is not free, and the cost is worth stating plainly. The
+    # discovery unit's constexpr work grows with the codebase, so a project
+    # that reaches the second tier waits minutes rather than seconds -- the
+    # same single-translation-unit ceiling that limits everything else here.
+    # It is still the better trade: the alternative is not a faster answer,
+    # it is a text scan that cannot see a class declared through an export
+    # macro, reported as though it were the real class list. So the escalation
+    # happens, and it says on the terminal that it is happening and why,
+    # rather than looking like a hang.
+    #
+    # MB_CONSTEXPR_BUDGET overrides the first tier. It exists so this path can
+    # be tested without a codebase large enough to exhaust a real budget.
+    BUDGETS_CLANG = (100_000_000, 2_000_000_000)
+    BUDGETS_GCC = (1_000_000_000, 20_000_000_000)
+
+    OUT_OF_BUDGET = (
+        # clang
+        "constexpr evaluation hit maximum step limit",
+        "-fconstexpr-steps=",
+        # GCC: "'constexpr' evaluation operation count exceeds limit of N
+        # (use '-fconstexpr-ops-limit=' to increase the limit)"
+        "operation count exceeds limit",
+        "-fconstexpr-ops-limit=",
+        "constexpr loop iteration count exceeds limit",
+    )
+
+    def budgets(self):
+        tiers = self.BUDGETS_CLANG if self.is_clang else self.BUDGETS_GCC
+        override = os.environ.get("MB_CONSTEXPR_BUDGET", "").strip()
+        if override.isdigit():
+            return (int(override),) + tiers[1:]
+        return tiers
+
+    def budget_flag(self):
+        value = self.budgets()[self.budget_step]
+        name = "-fconstexpr-steps" if self.is_clang else "-fconstexpr-ops-limit"
+        return f"{name}={value}"
+
+    def raise_budget(self):
+        """Move to the next budget. False when there is no higher one left."""
+        if self.budget_step + 1 >= len(self.budgets()):
+            return False
+        old = self.budget_flag()
+        self.budget_step += 1
+        self.flags = [self.budget_flag() if f == old else f for f in self.flags]
+        return True
+
+    def out_of_budget(self, r):
+        text = (r.stderr or "") + (r.stdout or "")
+        return any(marker in text for marker in self.OUT_OF_BUDGET)
+
     def run(self, extra, cwd=None):
+        r = self._run_once(extra, cwd)
+        while r.returncode != 0 and self.out_of_budget(r) and self.raise_budget():
+            self.log.append(f"  constexpr budget exhausted; retrying at {self.budget_flag()}")
+            # On stderr rather than only in the log: this retry can take
+            # minutes on a large codebase, and an unexplained wait of that
+            # length is indistinguishable from a hang.
+            print(f"  reflection ran out of constexpr budget for a codebase this "
+                  f"size; retrying at {self.budget_flag()}.\n"
+                  f"  This is slower, and the alternative is a text scan that "
+                  f"cannot see a class declared through an export macro.",
+                  file=sys.stderr, flush=True)
+            r = self._run_once(extra, cwd)
+        return r
+
+    def _run_once(self, extra, cwd=None):
         cmd = [self.binary] + self.flags + self.includes + extra
         t0 = time.time()
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd or self.src_dir)
@@ -247,6 +330,64 @@ consteval auto mb_plan_text() {
 constexpr auto mb_plan = mb_plan_text();
 int main() { std::fputs(mb_plan.data(), stdout); }
 """
+
+
+UNDECLARED_IDENT = re.compile(r"use of undeclared identifier '([A-Za-z_]\w*)'")
+
+
+def roots_the_compiler_rejected(err, namespaces):
+    """Namespace roots the compiler says are not there.
+
+    The roots come from a text scan, which cannot see the preprocessor, so
+    some of them do not exist. Three real cases from the corpus:
+
+        doctest   `namespace ns_name {` inside a macro *definition*
+        glm       `namespace neon {` inside an #if that is false here
+        nlohmann  `namespace detail2 {` whose parent is NLOHMANN_JSON_NAMESPACE_BEGIN
+
+    Any one of them fails the whole discovery unit, and the library then falls
+    back to the text scan that reflection was supposed to replace -- so a
+    cosmetic mistake in the root list costs the real class list.
+
+    Rather than try to out-guess the preprocessor, ask the compiler: it names
+    every identifier it cannot resolve, and those roots are dropped.
+    """
+    # Only diagnostics raised where the roots are spliced count. The roots
+    # appear in exactly one place -- the MIRROR_BRIDGE_PLAN_NAMESPACES
+    # expansion inside core/mirror_bridge_plan.hpp -- and an undeclared
+    # identifier reported anywhere else is a different problem. Matching the
+    # whole log instead dropped `doctest` itself, a root that exists, because
+    # an unrelated cascade happened to mention the name.
+    bad = set()
+    for line in (err or "").splitlines():
+        if "mirror_bridge_plan.hpp" not in line:
+            continue
+        bad.update(UNDECLARED_IDENT.findall(line))
+    if not bad:
+        return []
+    return [ns for ns in namespaces if any(part in bad for part in ns.split("::"))]
+
+
+def discover_resilient(work, cc, headers, namespaces, log, write_roots, max_drops=4):
+    """discover(), retrying without the roots the compiler rejects.
+
+    Returns (plan, err, roots). If every root turns out to be wrong it falls
+    back to the global namespace, which always resolves: slower, because the
+    walk then has the whole standard library in reach, but correct. Falling
+    back to reflection-over-everything beats falling back to a text scan.
+    """
+    roots, plan, err = list(namespaces), None, None
+    for _ in range(max_drops + 1):
+        write_roots(roots)
+        plan, err = discover(work, cc, headers)
+        if not err:
+            return plan, err, roots
+        bad = roots_the_compiler_rejected(err, roots)
+        if not bad:
+            return plan, err, roots
+        log.append("dropping namespace roots the compiler does not have: " + ", ".join(bad))
+        roots = [r for r in roots if r not in bad] or ["::"]
+    return plan, err, roots
 
 
 def discover(work, cc, headers):
@@ -426,8 +567,10 @@ def plan_module(args, cc, work, headers, hints, namespaces, requested, log, foun
     plan, approved, rejected, unbindable, dropped = {"free": [], "needs": [], "cands": []}, [], [], [], []
     before = set()
     for rnd in range(1, max(1, args.max_rounds) + 1):
-        write_inputs(work, headers, hints, approved_spellings, namespaces, args.template_cap, requested, args.src_dir)
-        plan, err = discover(work, cc, headers)
+        plan, err, namespaces = discover_resilient(
+            work, cc, headers, namespaces, log,
+            lambda roots: write_inputs(work, headers, hints, approved_spellings, roots,
+                                       args.template_cap, requested, args.src_dir))
         if err:
             return None, "discovery failed:\n" + err
         # The declared classes do not depend on what the probe approved, so
@@ -713,8 +856,10 @@ def main():
         for i, attempt_headers in enumerate(attempts):
             if i:
                 log.append("retrying with the module's own headers only")
-            write_inputs(work, attempt_headers, hints, set(), namespaces, args.template_cap, [], args.src_dir)
-            plan, err = discover(work, cc, attempt_headers)
+            plan, err, namespaces = discover_resilient(
+                work, cc, attempt_headers, namespaces, log,
+                lambda roots, _h=attempt_headers: write_inputs(
+                    work, _h, hints, set(), roots, args.template_cap, [], args.src_dir))
             if not err:
                 found = {"plain": plan["plain"], "enums": plan["enums"]}
                 break

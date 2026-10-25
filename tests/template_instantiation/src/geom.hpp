@@ -114,4 +114,44 @@ inline int count_true(const Vector3<bool>& v) { return v.count(); }
 inline int overloaded(int v) { return v; }
 inline double overloaded(double v) { return v; }
 
+// A member operator template. It has no identifier, and identifier_of on it is
+// not merely false but ill-formed: it ends the whole consteval evaluation, so
+// the discovery unit does not compile and the CLI falls back to a scan of the
+// header text. googletest declares one and lost every class, every free
+// function and every instantiation in the module to it:
+//
+//   error: non-type template argument is not a constant expression
+//   note: names of operator templates are not identifiers
+//
+// Namespace-scope operators have been guarded since box2d's `operator<<`;
+// these reach the planner through the member loops instead. The real template
+// beside it is what proves the guard skips the operator rather than the class.
+struct Tagged {
+    int tag = 3;
+
+    template <typename T>
+    bool operator==(const T& other) const { return tag == int(other); }
+
+    template <typename T>
+    T scaled(T by) const { return by * T(tag); }
+};
+
+// And one at namespace scope, which is the shape already guarded, so the two
+// cannot drift apart.
+template <typename T>
+bool operator!=(const Tagged& a, const T& b) { return !(a == b); }
+
+// yaml-cpp's shape, and the one PR #45's own comment cites: a conversion
+// template rather than an operator template. It has no identifier either, and
+// it reaches the planner through plan_function_template rather than through
+// the render loop, so it covers the case the fixture above does not.
+struct Convertible {
+    int raw = 7;
+
+    template <typename T>
+    operator T() const { return T(raw); }
+
+    int doubled() const { return raw * 2; }
+};
+
 }  // namespace geom

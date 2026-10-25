@@ -142,6 +142,57 @@ class PublishedRows(unittest.TestCase):
                     f"using it",
                 )
 
+    def test_the_harness_floor_is_not_a_gated_operation(self):
+        """The floor is a property of the machine, not of a framework.
+
+        check_ratios.py turns every key under `mirror_bridge` into a gated
+        operation, and this row test demands a published row for every key
+        the runner writes. So the floor has to live outside both shapes --
+        under `_meta` -- or it becomes a meaningless gate entry and a
+        meaningless table row at the same time.
+        """
+        with open(RUNNERS["python"], encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("harness_floor_ns", src,
+                      "the runner stopped measuring the harness floor")
+        self.assertIn("'_meta'", src,
+                      "the floor is no longer written under _meta, so it will be gated")
+        self.assertNotIn("results['harness_floor", src)
+
+        sys.path.insert(0, BENCH)
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "cr_probe", os.path.join(BENCH, "check_ratios.py"))
+            cr = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cr)
+        finally:
+            sys.path.remove(BENCH)
+        seen = cr.ratios({
+            "_meta": {"harness_floor_ns": {"empty": 30.0, "c_call": 45.0}},
+            "mirror_bridge": {"null_call": 70.0},
+            "pybind11": {"null_call": 170.0},
+        })
+        self.assertEqual(sorted(seen), ["null_call"],
+                         "something under _meta reached the ratio gate")
+
+    def test_the_page_says_the_ratios_are_bounds(self):
+        """A reader who does not know the floor reads a 2% gap as a tie."""
+        data = payload(set(published_keys()))
+        data["_meta"] = {"harness_floor_ns": {"empty": 31.8, "c_call": 48.0}}
+        proc = render(data)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lower** bound", proc.stdout)
+        self.assertIn("31.8 ns", proc.stdout)
+        self.assertIn("48.0 ns", proc.stdout)
+
+        # And a run from before the floor existed still renders, because the
+        # committed page has to keep working while the next refresh lands.
+        older = payload(set(published_keys()))
+        proc = render(older)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("lower** bound", proc.stdout)
+
     def test_the_row_list_has_no_duplicates(self):
         keys = published_keys()
         self.assertEqual(len(keys), len(set(keys)))

@@ -28,6 +28,8 @@
 #include <typeindex>
 #include <shared_mutex>
 
+#include "mirror_bridge_spelling.hpp"
+
 // ============================================================================
 // Feature Detection - Check for P2996 Reflection Support
 // ============================================================================
@@ -230,6 +232,66 @@ consteval std::size_t get_data_member_count() {
     return named_data_members<T>().size();
 }
 
+// The same list, plus the members every base class contributes.
+//
+// nonstatic_data_members_of reports only what T declares directly, which is
+// why the member-function cache below walks bases_of itself. A data member is
+// the same situation: without this, a derived class binds its own fields and
+// silently drops everything it inherited. Splicing a base's member onto a
+// derived object is well-formed and the compiler applies the base offset, the
+// same property the method cache already relies on.
+//
+// Depth-first with the bases before T, so an inherited member keeps a stable
+// index when a derived field is added. A name T redeclares shadows the base's
+// in C++, and binding both would export one name twice, so the derived one
+// wins and the base's is dropped.
+template<typename T>
+consteval std::vector<std::meta::info> data_members_with_bases() {
+    std::vector<std::meta::info> out;
+    std::vector<std::string_view> seen;
+
+    auto already = [&](std::string_view n) {
+        for (auto s : seen) if (s == n) return true;
+        return false;
+    };
+
+    // Collect T's own names first so a base member it shadows can be skipped,
+    // then emit base members before T's for index stability.
+    for (auto m : named_data_members<T>()) {
+        seen.push_back(std::meta::identifier_of(m));
+    }
+
+    auto walk = [&](auto&& self, std::meta::info type) -> void {
+        for (auto b : std::meta::bases_of(type, std::meta::access_context::current())) {
+            self(self, std::meta::type_of(b));
+        }
+        if (type != ^^T) {
+            for (auto m : std::meta::nonstatic_data_members_of(
+                     type, std::meta::access_context::current())) {
+                if (!std::meta::has_identifier(m)) continue;
+                const auto name = std::meta::identifier_of(m);
+                if (already(name)) continue;
+                seen.push_back(name);
+                out.push_back(m);
+            }
+        }
+    };
+    walk(walk, ^^T);
+
+    for (auto m : named_data_members<T>()) out.push_back(m);
+    return out;
+}
+
+template<typename T, std::size_t I>
+consteval auto get_data_member_with_bases() {
+    return data_members_with_bases<T>()[I];
+}
+
+template<typename T>
+consteval std::size_t get_data_member_with_bases_count() {
+    return data_members_with_bases<T>().size();
+}
+
 // Member Function Cache — includes methods inherited from base classes.
 //
 // P2996R13's members_of only returns methods DIRECTLY declared in T. To match
@@ -242,6 +304,44 @@ consteval std::size_t get_data_member_count() {
 // when we splice the base method onto a derived object (P2996 allows
 // `derived.[:base_method_info:](args)` — we verified this compiles and
 // respects overriding).
+// Whether a class is a standard-library *template specialization*, by looking
+// for `::std` among its enclosing namespaces (libc++'s `std::__1` is reached
+// the same way).
+//
+// Methods inherited from such a base are not the API anyone asked to bind,
+// and they are reliably the ones that do not compile. magic_enum::customize_t
+// derives from std::pair, so the method walk picked up std::pair::swap, whose
+// const overload is ill-formed for those members -- "no matching function for
+// call to 'swap'" inside libc++, costing the whole module. The parent_of
+// guards matter: the metafunction has a precondition, and calling it on a
+// non-member is a hard error rather than an empty answer.
+//
+// Two narrowings, each for a case the broad version got wrong:
+//
+// Only a specialization. The reason these bases break is that standard-library
+// templates are written against constraints a reflected call does not satisfy,
+// which is a statement about templates. Skipping every std base as well took
+// `what()` off any class deriving from std::runtime_error -- real API, bound
+// and working today, and removing it is not what this is for.
+//
+// Only `::std`. Just the one namespace is reserved; `namespace mylib {
+// namespace std { ... } }` is legal, and an unanchored name match silently
+// took a user class's inherited methods away. Anchoring to the global
+// namespace costs one comparison.
+consteval bool is_std_library_type(std::meta::info cls) {
+    if (!std::meta::has_template_arguments(cls)) return false;
+    std::meta::info scope = cls;
+    while (std::meta::is_class_member(scope) || std::meta::is_namespace_member(scope)) {
+        scope = std::meta::parent_of(scope);
+        if (std::meta::is_namespace(scope) && std::meta::has_identifier(scope) &&
+            std::meta::identifier_of(scope) == "std" &&
+            std::meta::parent_of(scope) == ^^::) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template<typename T>
 struct MemberFunctionCache {
     static consteval bool is_bindable_method(std::meta::info member) {
@@ -296,7 +396,9 @@ struct MemberFunctionCache {
                     layer_new_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    if (is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
@@ -713,6 +815,113 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
 
     return sig;
 }
+
+// ============================================================================
+// Type Keys
+// ============================================================================
+//
+// A name for a C++ type that reads the same in every module that mentions it,
+// so the backends can agree on which class a wrapper holds across .so
+// boundaries.
+//
+// Not typeid. node-gyp compiles addons with -fno-rtti, following V8's own
+// build settings, so the N-API backend cannot use typeid at all. Reflection
+// answers the same question without RTTI, and spelling::spell is already this
+// project's compiler-independent way to write a type down - fully qualified,
+// aliases resolved, template arguments spelled recursively - so two modules
+// built from the same header produce the same bytes.
+//
+// Not the address of a per-type static, either. Generated modules are built
+// with -fvisibility=hidden, so each .so would get its own copy of that static
+// and cross-module identity would quietly stop matching. Every comparison of
+// these keys is by content; an address comparison is only ever a fast path in
+// front of one.
+//
+// One caveat inherited from the spelling: a class in an unnamed namespace has
+// nothing to qualify it with, so it spells the same as any other class of that
+// name. Such a class is a distinct type in every translation unit and was
+// never shareable between modules to begin with.
+
+// A consteval call returning std::string may only appear inside another
+// constant evaluation, so the string is burned into static storage here and
+// runtime code reads the pointer (see python/mirror_bridge_templates.hpp,
+// which reaches the spelling helpers the same way).
+template<typename T>
+consteval const char* make_type_key() {
+    return std::define_static_string(spelling::spell(^^std::remove_cvref_t<T>));
+}
+
+template<typename T>
+inline constexpr const char* type_key = make_type_key<T>();
+
+// Whether T's key names T and nothing else.
+//
+// spell falls back to display_string_of for a type it cannot write down, and
+// that fallback is implementation-defined: clang-p2996 prints
+// "(unsupported-reflection)" for an enum-valued template argument and
+// "(anonymous type)" for a type with no identifier, so Box<E::P> and
+// Box<E::Q> come out spelled alike. Two classes sharing a key would share a
+// metatable in Lua and compare equal in JavaScript - exactly the confusion
+// the boundary checks exist to prevent - so bind_class refuses such a class
+// rather than giving it an identity it does not own.
+template<typename T>
+consteval bool type_key_is_distinctive() {
+    std::string_view key = type_key<T>;
+    for (std::string_view placeholder : {"(unsupported-reflection)", "(anonymous type)"}) {
+        if (key.find(placeholder) != std::string_view::npos) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Base Class Closure
+// ============================================================================
+//
+// Every class T is transitively derived from, in breadth-first order. Each
+// language backend records one address-adjusting thunk per entry when it
+// binds T, which is what lets a Derived still be passed where a Base is
+// expected once arguments are identity-checked: the held pointer addresses
+// the whole derived object, which is not where a second or virtual base
+// subobject begins.
+//
+// ============================================================================
+
+template<typename T>
+consteval std::vector<std::meta::info> collect_base_closure() {
+    std::vector<std::meta::info> found;
+    std::vector<std::meta::info> layer{^^T};
+    while (!layer.empty()) {
+        std::vector<std::meta::info> next;
+        for (auto cls : layer) {
+            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
+                auto base_type = std::meta::type_of(b);
+                bool seen = false;
+                for (auto f : found) {
+                    if (f == base_type) { seen = true; break; }
+                }
+                if (seen) continue;          // diamond: one entry per base
+                found.push_back(base_type);
+                next.push_back(base_type);
+            }
+        }
+        layer = next;
+    }
+    return found;
+}
+
+template<typename T>
+struct BaseClosure {
+    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
+};
+
+// Alias-template form, because a pack used by the backends appears only
+// inside a splice and GCC does not treat that as expandable (see the note
+// on splice hoisting above).
+template<typename T, std::size_t I>
+consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+
+template<typename T, std::size_t I>
+using base_t = typename [:base_at<T, I>():];
 
 // ============================================================================
 // Compile-Time Binding Validation

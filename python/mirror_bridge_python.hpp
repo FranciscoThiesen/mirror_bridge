@@ -46,11 +46,13 @@
 
 #include <meta>
 #include <Python.h>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <array>
 #include <map>
+#include <new>
 #include <unordered_map>
 #include <set>
 #include <unordered_set>
@@ -69,6 +71,8 @@
 #include <cstdio>   // For snprintf in simple repr functions
 #include <cstring>  // For memcpy in bulk container transfer
 #include <mutex>    // For std::once_flag in thread-safe initialization
+#include <iterator> // For iterator_traits in the iteration slots
+#include <utility>  // For cmp_less/cmp_greater in the length slot
 
 // Include core header for GlobalTypeRegistry
 #include "core/mirror_bridge_core.hpp"
@@ -1779,38 +1783,37 @@ PyObject* create_buffer_view(std::vector<T>& vec, PyObject* owner) {
 // Batch Processing API - Hot Loop Optimization
 // ============================================================================
 //
-// The batch processing API enables keeping iteration entirely in C++,
-// avoiding the overhead of crossing the Python/C++ boundary N times.
+// Taking a method that Python calls in a loop and giving it a sibling that
+// takes the whole sequence keeps the iteration in C++, so the boundary is
+// crossed once instead of N times.
 //
-// Problem: Traditional Python->C++ calls have ~100-500ns overhead per call.
-// For 1M elements, that's 100-500ms of pure overhead!
+//   // called N times from Python
+//   double scale(double x) const { return x * gain + offset; }
 //
-// Solution: Process entire arrays/vectors in a single C++ call.
-//
-// Usage pattern (in C++ class definition):
-//
-//   // Old way (called N times from Python):
-//   double process(double x) { return std::sqrt(x); }
-//
-//   // New batch API (called once, processes N elements):
-//   std::vector<double> process_batch(const std::vector<double>& input) {
-//       std::vector<double> result;
-//       result.reserve(input.size());
-//       for (auto x : input) {
-//           result.push_back(std::sqrt(x));
-//       }
-//       return result;
+//   // called once
+//   std::vector<double> scale_batch(const std::vector<double>& input) const {
+//       std::vector<double> out;
+//       out.reserve(input.size());
+//       for (double x : input) out.push_back(scale(x));
+//       return out;
 //   }
 //
-// From Python:
-//   # Old: ~500ms for 1M calls
-//   results = [sim.process(x) for x in data]
+// What that is worth, measured over 100,000 elements, as
+// [o.m(x) for x in xs] against o.m_batch(xs):
 //
-//   # New: ~5ms for 1M elements (100x faster!)
-//   results = sim.process_batch(data)
+//   x * gain + offset              2.40 ms -> 0.43 ms   5.5x
+//   sqrt(x * gain) + sin(x)        3.23 ms -> 0.81 ms   4.0x
+//   a stateful EWMA update         2.35 ms -> 0.43 ms   5.4x
+//   200 iterations of real work  372.46 ms -> 364.11 ms 1.0x
 //
-// The binding system automatically handles vector<T> conversion, so batch
-// methods work seamlessly with Python lists and NumPy arrays.
+// So the ceiling is about 5x, and it is 5x because that is what the boundary
+// costs relative to a cheap method -- about 24 ns per element here, including
+// the comprehension. The last row is the one to understand before writing a
+// batch method: when the method itself is the expensive part there is nothing
+// to win, because the boundary was never the cost.
+//
+// The binding system handles vector<T> conversion, so a batch method works
+// with Python lists and with array.array.
 
 // Helper to transform a vector element-wise using a functor
 // Returns a new vector - used for methods that return transformed data
@@ -1918,13 +1921,6 @@ PyObject* to_python_result(R& result) {
     return to_python(result);
 #endif
 }
-
-// Trait to detect std::vector specifically (for bulk transfer optimization)
-template<typename T>
-struct is_std_vector : std::false_type {};
-template<typename T, typename A>
-struct is_std_vector<std::vector<T, A>> : std::true_type {};
-
 // How many bytes a numeric vector has to be before its return borrows the
 // container's storage instead of copying it into an intermediate bytes object.
 // Measured crossover, not a guess; the table inside to_python below has the
@@ -1948,11 +1944,12 @@ PyObject* to_python(const T& container) {
 
     // Bulk transfer fast path for numeric vectors.
     // Excluded: unsigned char (already handled as bytes above), bool (the
-    // std::vector<bool> specialization has no .data() and is proxy-based).
-    if constexpr (is_std_vector<std::remove_cvref_t<T>>::value &&
-                  std::is_arithmetic_v<ValueType> &&
-                  !std::is_same_v<ValueType, unsigned char> &&
-                  !std::is_same_v<ValueType, bool>) {
+    // std::vector<bool> specialization has no .data() and is proxy-based),
+    // and anything the array module has no typecode for. The condition lives
+    // in mirror_bridge_stubgen.hpp because the .pyi has to say the same
+    // thing, and saying it twice is how the stub came to claim list[float]
+    // for a return that is an array('d').
+    if constexpr (crosses_as_array_v<T>) {
         // Use Python's array module for typed numeric arrays, so the buffer
         // crosses as a bulk copy instead of N Python object allocations.
         // Initialization is thread-safe via std::call_once (GIL must be held
@@ -1970,16 +1967,7 @@ PyObject* to_python(const T& container) {
         });
 
         if (array_type) {
-            // Map C++ type to Python array typecode
-            const char* typecode = nullptr;
-            if constexpr (std::is_same_v<ValueType, float>) typecode = "f";
-            else if constexpr (std::is_same_v<ValueType, double>) typecode = "d";
-            else if constexpr (std::is_same_v<ValueType, int32_t> || (std::is_same_v<ValueType, int> && sizeof(int) == 4)) typecode = "i";
-            else if constexpr (std::is_same_v<ValueType, int64_t> || (std::is_same_v<ValueType, long long>)) typecode = "q";
-            else if constexpr (std::is_same_v<ValueType, uint32_t> || (std::is_same_v<ValueType, unsigned int> && sizeof(unsigned int) == 4)) typecode = "I";
-            else if constexpr (std::is_same_v<ValueType, uint64_t> || (std::is_same_v<ValueType, unsigned long long>)) typecode = "Q";
-            else if constexpr (std::is_same_v<ValueType, int16_t> || std::is_same_v<ValueType, short>) typecode = "h";
-            else if constexpr (std::is_same_v<ValueType, uint16_t> || std::is_same_v<ValueType, unsigned short>) typecode = "H";
+            constexpr const char* typecode = array_typecode_for<ValueType>();
 
             if (typecode) {
                 // The typecode is a compile-time constant per element type, so
@@ -2111,7 +2099,32 @@ PyObject* to_python(const T& container) {
 
     Py_ssize_t index = 0;
     for (const auto& item : container) {
-        PyObject* py_item = to_python(item);
+        // std::vector<bool> yields a proxy reference rather than a bool, and
+        // converting the proxy itself walks its members and produces an empty
+        // dict. Where the dereference type is not the element type, convert
+        // through the element type.
+        //
+        // Only where the cast exists, though. A class can declare a value_type
+        // that has nothing to do with what iterating it yields: Json::Value
+        // says `std::string` and hands back a Json::Value, and casting one to
+        // the other is a hard error that failed the whole jsoncpp module, not
+        // just that one conversion. Converting the dereferenced item is the
+        // right answer for a case like that and is what this did before the
+        // proxy branch arrived.
+        //
+        // is_constructible_v and not is_convertible_v: a proxy's conversion
+        // operator is usually explicit, which is exactly what the second trait
+        // reports false for, so asking it would send every proxy down the
+        // branch this exists to keep it out of.
+        using DerefT = std::remove_cvref_t<decltype(item)>;
+        PyObject* py_item;
+        if constexpr (std::is_same_v<DerefT, ValueType>) {
+            py_item = to_python(item);
+        } else if constexpr (std::is_constructible_v<ValueType, decltype(item)>) {
+            py_item = to_python(static_cast<ValueType>(item));
+        } else {
+            py_item = to_python(item);
+        }
         if (!py_item) {
             Py_DECREF(list);
             return nullptr;
@@ -2121,10 +2134,65 @@ PyObject* to_python(const T& container) {
     return list;
 }
 
-// Forward declare PyWrapper for use in from_python (will be fully defined later)
-template<typename T> struct PyWrapper;
+// Python object wrapper for C++ classes
+template<typename T>
+struct PyWrapper {
+    PyObject_HEAD
+    T* cpp_object;  // Pointer to the actual C++ object
+    bool owns;      // Whether this wrapper owns the object (for cleanup)
+    PyObject* parent;  // Owner of the storage, when this wrapper is a view
+};
 
-template<typename T> struct TypeRegistry;
+// Whether the C++ object can live inside the Python object instead of behind
+// a second allocation.
+//
+// An abstract class has nothing to place. An over-aligned one cannot rely on
+// what the object allocator returns. A trampoline is excluded at the call
+// site rather than here: it is a different, larger type than the one
+// tp_basicsize was computed for.
+template<typename T>
+inline constexpr bool payload_fits_inline_v =
+    !std::is_abstract_v<T> &&
+    std::is_destructible_v<T> &&
+    alignof(T) <= alignof(std::max_align_t);
+
+template<typename T>
+inline constexpr std::size_t inline_payload_offset =
+    (sizeof(PyWrapper<T>) + alignof(T) - 1) / alignof(T) * alignof(T);
+
+template<typename T>
+inline constexpr std::size_t wrapper_basicsize =
+    payload_fits_inline_v<T> ? inline_payload_offset<T> + sizeof(T)
+                             : sizeof(PyWrapper<T>);
+
+// Incomplete types reach these templates: the member-template planner walks
+// whatever the headers name, and Open3D forward-declares classes it only ever
+// uses behind a pointer. sizeof is ill-formed on one, so the layout of a type
+// that has none is 0, which is a value no real wrapper has.
+template<typename T>
+consteval std::size_t wrapper_layout_id() {
+    if constexpr (requires { sizeof(T); }) {
+        return wrapper_basicsize<T>;
+    } else {
+        return 0;
+    }
+}
+
+// Type-based registry for looking up PyTypeObject* by C++ type.
+//
+// Layout is defaulted and never passed: it is here so that two modules which
+// disagree about sizeof(T) instantiate two different TypeRegistrys. The
+// member is a static of a template, so with default visibility the dynamic
+// linker hands every module in the process the first copy, and a module that
+// never bound T at all would read the type object of a module that built it
+// from a different revision of the header. Naming the layout in the type
+// makes the symbols differ, so there is nothing to merge and the miss falls
+// through to the registry dict, whose key carries the same number. The cost
+// is nothing at runtime: it is the same static reached by a longer name.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
+struct TypeRegistry {
+    static inline PyTypeObject* py_type = nullptr;
+};
 
 // The part of PyWrapper<X> that does not depend on X. Every wrapper starts
 // this way, which is what makes a generic read possible — and why the read
@@ -2133,6 +2201,11 @@ struct WrapperView {
     PyObject_HEAD
     void* cpp_object;
     bool owns;
+    // Non-null when this wrapper borrows a subobject of another Python
+    // object's C++ object instead of owning one. Held as a strong reference:
+    // the borrowed member lives inside the parent's heap storage, so the
+    // parent has to outlive every view of it.
+    PyObject* parent;
 };
 
 // Everything except the common case: a Python subclass, a type registered by
@@ -2140,6 +2213,28 @@ struct WrapperView {
 // base subobject. Defined after the cross-module type registry it consults.
 template<typename Expected>
 bool resolve_wrapper_slow(PyObject* obj, void*& raw);
+
+// Hand back a wrapper that borrows `ref` rather than copying it, keeping
+// `parent` alive for as long as the view lives. Defined after the
+// cross-module type registry it consults.
+template<typename Member>
+PyObject* to_python_member_view(Member& ref, PyObject* parent);
+
+// The same idea for a std::vector member: a live sequence over the vector's
+// own storage rather than a fresh array.array or list on every read. Defined
+// in mirror_bridge_sequence_view.hpp, included below the conversions it uses.
+template<typename C>
+PyObject* to_python_sequence_view(C& ref, PyObject* parent);
+
+// The member types to_python would otherwise heap-copy into a fresh wrapper.
+// A const member keeps the copy: a view of it would hand Python a writable
+// reference to something C++ declared it may not change.
+template<typename M>
+inline constexpr bool is_viewable_member_v =
+    // NestedBindable is that five-term list, declared once above. Spelling it
+    // out again is a fourth copy of something that has to stay in step.
+    NestedBindable<std::remove_cv_t<M>> && !std::is_const_v<M> &&
+    !std::is_array_v<M> && !std::is_reference_v<M>;
 
 // Resolve a Python object to the address of the C++ object it wraps, after
 // checking that it really is a wrapper for Expected (or for a class derived
@@ -2463,13 +2558,6 @@ private:
     std::unordered_map<std::string, ClassMetadata> classes_;
 };
 
-// Type-based registry for looking up PyTypeObject* by C++ type
-// Uses a static variable per type T to store the registered PyTypeObject*
-template<typename T>
-struct TypeRegistry {
-    static inline PyTypeObject* py_type = nullptr;
-};
-
 // ============================================================================
 // Reflection-Based Binding Generator
 // ============================================================================
@@ -2529,7 +2617,12 @@ struct DataMemberCache {
                     layer_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    // See core::is_std_library_type: a base from the standard
+                    // library is not the API anyone asked to bind, and it is
+                    // reliably the one that does not compile.
+                    if (mirror_bridge::core::is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
@@ -2654,7 +2747,12 @@ struct MemberFunctionCache {
                     layer_names.push_back(name);
                 }
                 for (auto b : std::meta::bases_of(cls, ctx)) {
-                    next_layer.push_back(std::meta::type_of(b));
+                    auto base_type = std::meta::type_of(b);
+                    // See core::is_std_library_type: a base from the standard
+                    // library is not the API anyone asked to bind, and it is
+                    // reliably the one that does not compile.
+                    if (mirror_bridge::core::is_std_library_type(base_type)) continue;
+                    next_layer.push_back(base_type);
                 }
             }
 
@@ -3101,13 +3199,54 @@ std::string generate_type_signature(const char* file_hash = nullptr) {
     return sig;
 }
 
-// Python object wrapper for C++ classes
+// Where the payload sits for this wrapper. A constant offset, so the address
+// is one add; a Python subclass only ever extends the tail, which leaves it
+// where it is.
 template<typename T>
-struct PyWrapper {
-    PyObject_HEAD
-    T* cpp_object;  // Pointer to the actual C++ object
-    bool owns;      // Whether this wrapper owns the object (for cleanup)
-};
+T* inline_payload(PyWrapper<T>* w) {
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(w) + inline_payload_offset<T>);
+}
+
+// Destroy whatever this wrapper owns and leave it holding nothing.
+//
+// Shared by tp_dealloc and by py_init, which can be reached a second time on
+// an object that is already built: Python lets __init__ be called directly.
+// Clearing cpp_object is the part that matters for an inline payload. A
+// constructor that throws part way has already had its built sub-objects
+// destroyed by unwinding, so leaving the pointer in place would let
+// tp_dealloc destroy them a second time.
+template<typename T>
+void release_held_object(PyWrapper<T>* wrapper) {
+    if (wrapper->owns && wrapper->cpp_object) {
+        // An inline payload is distinguishable without a flag: it is the only
+        // object that can sit at exactly this address.
+        if constexpr (payload_fits_inline_v<T>) {
+            if (wrapper->cpp_object == inline_payload(wrapper)) {
+                wrapper->cpp_object->~T();
+                wrapper->cpp_object = nullptr;
+                wrapper->owns = false;
+                return;
+            }
+        }
+        delete wrapper->cpp_object;
+    }
+    wrapper->cpp_object = nullptr;
+    wrapper->owns = false;
+}
+
+// Storage for a default construction: the inline slot when the exact type
+// the wrapper was sized for is what is being built, the heap otherwise. A
+// trampoline is a larger type than tp_basicsize accounts for, so it takes
+// the heap path.
+template<typename T, typename Alloc>
+void* payload_storage_for(PyWrapper<T>* wrapper) {
+    if constexpr (payload_fits_inline_v<T> && std::is_same_v<T, Alloc>) {
+        return static_cast<void*>(inline_payload(wrapper));
+    } else {
+        (void)wrapper;
+        return nullptr;
+    }
+}
 
 // ============================================================================
 // Trampoline support — let Python subclasses override C++ virtual methods
@@ -3275,9 +3414,9 @@ public:
 template<typename T>
 void py_dealloc(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
-    if (wrapper->owns && wrapper->cpp_object) {
-        delete wrapper->cpp_object;
-    }
+    release_held_object(wrapper);
+    // A view owns nothing but the reference that keeps the storage alive.
+    Py_XDECREF(wrapper->parent);
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -3439,7 +3578,8 @@ consteval std::string_view constructor_param_name() {
 // constructor. Alloc must inherit from T and expose T's constructors (the
 // canonical idiom is `using T::T;` in the trampoline).
 template<typename T, typename Alloc, std::size_t CtorIndex, std::size_t... Is>
-Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>) {
+Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is...>,
+                                   void* storage) {
     if constexpr (std::is_abstract_v<T>) {
         PyErr_SetString(PyExc_TypeError,
             "Cannot instantiate abstract class. Bind concrete derived classes instead.");
@@ -3469,6 +3609,11 @@ Alloc* call_constructor_impl_alloc(PyObject* const* argv, std::index_sequence<Is
         // exception unwinds past the interpreter and std::terminate aborts
         // the process, giving the caller no traceback and nothing to catch.
         try {
+            if (storage) {
+                return ::new (storage) Alloc(
+                    forward_arg<constructor_param_t<T, CtorIndex, Is>>(
+                        std::get<Is>(cpp_args))...);
+            }
             return new Alloc(forward_arg<constructor_param_t<T, CtorIndex, Is>>(
                 std::get<Is>(cpp_args))...);
         } catch (const std::exception& e) {
@@ -3514,11 +3659,20 @@ inline bool match_ctor_keyword(std::string_view name, PyObject* value,
 template<typename T, typename Trampoline, std::size_t CtorIndex, std::size_t MIN,
          std::size_t... Ns>
 Trampoline* construct_with_supplied(PyObject* const* resolved, std::size_t n_used,
-                                    std::index_sequence<Ns...>) {
+                                    std::index_sequence<Ns...>, void* storage) {
+    // storage is where the payload lives when it fits inside the Python
+    // object, and null when it does not. It has to be threaded through here
+    // rather than passed at the call site: this layer chooses which arity to
+    // construct with, so it is the only place that knows which
+    // call_constructor_impl_alloc actually runs. Dropping it stays correct,
+    // because release_held_object tells the two apart by address, which is
+    // exactly why nothing would report it: the one constructor shape that
+    // takes default arguments would quietly keep allocating twice while
+    // every other shape places inline.
     Trampoline* obj = nullptr;
     ((n_used == Ns + MIN
         ? (obj = call_constructor_impl_alloc<T, Trampoline, CtorIndex>(
-               resolved, std::make_index_sequence<Ns + MIN>{}), void())
+               resolved, std::make_index_sequence<Ns + MIN>{}, storage), void())
         : void()), ...);
     return obj;
 }
@@ -3530,6 +3684,28 @@ template<typename T, typename Trampoline = T>
 int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
 
+    // Re-initialising an object that already holds one is refused rather than
+    // attempted, because there is no safe way to do it.
+    //
+    // Constructing over live storage skips the old object's destructor, and
+    // with an inline payload a constructor that throws part way leaves the
+    // slot already unwound for tp_dealloc to destroy a second time. Freeing
+    // the old object first fixes both of those and introduces something
+    // worse: a member view (py_getter) holds a raw pointer into the owner's
+    // storage, kept alive by a reference to the wrapper rather than to the
+    // C++ object, so freeing it leaves the view reading freed memory. There
+    // is no view count to consult. Refusing costs nothing real -- the first
+    // __init__ after tp_new still has a null pointer here -- and replaces a
+    // leak, a double free and a dangling read with one clear error.
+    if (wrapper->cpp_object) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s is already initialised; calling __init__ again is "
+                     "refused because anything holding a reference into this "
+                     "object would be left dangling. Construct a new one.",
+                     Py_TYPE(self)->tp_name);
+        return -1;
+    }
+
     const Py_ssize_t nargs = args ? PyTuple_GET_SIZE(args) : 0;
     const Py_ssize_t nkw = kwds ? PyDict_GET_SIZE(kwds) : 0;
 
@@ -3540,9 +3716,11 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
     if (nargs == 0 && nkw == 0) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
             try {
-                auto* obj = new Trampoline();
+                void* storage = payload_storage_for<T, Trampoline>(wrapper);
+                auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
                 wrapper->cpp_object = obj;
                 wrapper->owns = true;
+                wrapper->parent = nullptr;
                 if constexpr (!std::is_same_v<T, Trampoline>) {
                     static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(self);
                 }
@@ -3611,13 +3789,17 @@ int py_init(PyObject* self, PyObject* args, PyObject* kwds) {
                 }
 
                 // Dispatch to the variant for the count actually supplied;
-                // params [n_used, P) take their C++ default arguments.
+                // params [n_used, P) take their C++ default arguments. The
+                // storage pointer rides along so the chosen arity still
+                // places the payload inside the Python object.
                 Trampoline* obj = construct_with_supplied<T, Trampoline, Is, MIN>(
-                    resolved, n_used, std::make_index_sequence<P - MIN + 1>{});
+                    resolved, n_used, std::make_index_sequence<P - MIN + 1>{},
+                    payload_storage_for<T, Trampoline>(wrapper));
 
                 if (obj) {
                     wrapper->cpp_object = obj;
                     wrapper->owns = true;
+                    wrapper->parent = nullptr;
                     if constexpr (!std::is_same_v<T, Trampoline>) {
                         obj->_mirror_bridge_set_py_self(self);
                     }
@@ -3648,6 +3830,7 @@ PyObject* py_new_with_init(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     if (self) {
         self->cpp_object = nullptr;  // Will be set by py_init
         self->owns = false;
+        self->parent = nullptr;
     }
     return reinterpret_cast<PyObject*>(self);
 }
@@ -3702,9 +3885,11 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
     auto* self = reinterpret_cast<PyWrapper<T>*>(type->tp_alloc(type, 0));
     if (self) {
         if constexpr (std::is_default_constructible_v<Trampoline>) {
-            auto* obj = new Trampoline();
+            void* storage = payload_storage_for<T, Trampoline>(self);
+            auto* obj = storage ? ::new (storage) Trampoline() : new Trampoline();
             self->cpp_object = obj;
             self->owns = true;
+            self->parent = nullptr;
             if constexpr (!std::is_same_v<T, Trampoline>) {
                 static_cast<Trampoline*>(obj)->_mirror_bridge_set_py_self(
                     reinterpret_cast<PyObject*>(self));
@@ -3713,6 +3898,7 @@ PyObject* py_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
             // Not default constructible — caller should have used tp_init path.
             self->cpp_object = nullptr;
             self->owns = false;
+            self->parent = nullptr;
         }
     }
     return reinterpret_cast<PyObject*>(self);
@@ -3748,7 +3934,9 @@ template<typename T, std::size_t Index>
 PyObject* py_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3769,11 +3957,35 @@ PyObject* py_getter(PyObject* self, void* closure) {
         auto value = (*wrapper->cpp_object).[:member:];
         return to_python(value);
     } else {
-        // Type conversion to Python uses overload resolution:
+        auto& value = (*wrapper->cpp_object).[:member:];
+
+        // A bound-class member is handed back as a view onto the parent
+        // rather than a copy, or `o.p.x = 7` would write to a temporary that
+        // is discarded when the expression ends. Interiority is known here by
+        // construction -- `member` is a non-static data member of the object
+        // this wrapper holds -- so unlike a method return it needs no policy
+        // from the author and no runtime instance lookup to establish.
+        //
+        // A bit-field never reaches this: its member type is integral, so
+        // is_viewable_member_v is false for it, and the branch above already
+        // read it by value.
+        //
+        // Everything else converts by value as before:
         // - Arithmetic → PyLong_FromLong / PyFloat_FromDouble (direct C API)
         // - String → PyUnicode_FromStringAndSize (direct C API)
         // - Container → Recursive to_python for elements
-        auto& value = (*wrapper->cpp_object).[:member:];
+        if constexpr (is_viewable_member_v<MemberType>) {
+            return to_python_member_view(value, self);
+        }
+
+        // A std::vector member is handed back the same way and for the same
+        // reason. Without this, `b.items.append(9)` and `b.items[0] = 9` are
+        // both accepted and both silently discarded, because they mutate a
+        // copy that is thrown away at the end of the expression -- the
+        // container form of the bug PR #32 fixed one level up.
+        if constexpr (is_viewable_sequence_member_v<MemberType>) {
+            return to_python_sequence_view(value, self);
+        }
         return to_python(value);
     }
 }
@@ -3783,7 +3995,9 @@ template<typename T, std::size_t Index>
 int py_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -3839,7 +4053,9 @@ template<typename T, std::size_t VisibleIndex>
 PyObject* py_visible_getter(PyObject* self, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -3854,6 +4070,16 @@ PyObject* py_visible_getter(PyObject* self, void* closure) {
         return to_python(value);
     } else {
         auto& value = (*wrapper->cpp_object).[:member:];
+        // A bound-class member is a view onto the parent, not a copy. A
+        // bit-field cannot reach here: its type is integral, so
+        // is_viewable_member_v is false and the branch above took it.
+        if constexpr (is_viewable_member_v<MemberType>) {
+            return to_python_member_view(value, self);
+        }
+        // And a vector member is a live sequence, for the same reason.
+        if constexpr (is_viewable_sequence_member_v<MemberType>) {
+            return to_python_sequence_view(value, self);
+        }
         return to_python(value);
     }
 }
@@ -3865,7 +4091,9 @@ template<typename T, std::size_t VisibleIndex>
 int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return -1;
     }
 
@@ -3889,6 +4117,15 @@ int py_visible_setter(PyObject* self, PyObject* value, void* closure) {
             PyErr_SetString(PyExc_TypeError, "Type conversion failed");
             return -1;
         }
+    } else if constexpr (!std::is_default_constructible_v<MemberType>) {
+        // Registration points these at py_readonly_setter, so this is
+        // unreachable; it exists so the template still instantiates, as the
+        // const branch above does. Without it the member's type having no
+        // default constructor is a compile error for the whole module.
+        PyErr_SetString(PyExc_AttributeError,
+                        "Attribute cannot be assigned: its C++ type has no "
+                        "default constructor");
+        return -1;
     } else {
         MemberType cpp_value;
         if (!from_python(value, cpp_value)) {
@@ -3976,7 +4213,9 @@ template<typename T, std::size_t Index>
 PyObject* py_method(PyObject* self, PyObject* args) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -4192,6 +4431,36 @@ consteval bool method_fully_bindable() {
     }
 }
 
+// The declined-method lines are behind an environment variable because
+// generate_methods runs at import and a large library declines hundreds of
+// methods. The CLI sets it for its own verification import, so the tool and
+// anything driving it sees them while a user's program stays quiet.
+inline bool report_declined_methods() {
+    static const bool on = [] {
+        const char* v = std::getenv("MIRROR_BRIDGE_REPORT_DECLINED");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
+// Why method_fully_bindable said no. The three arms are the same three, in
+// the same order, so a gate that grows a fourth reason without a string here
+// says "declined" and names no cause -- which is the state this whole
+// diagnostic exists to end.
+template<typename T, std::size_t Index>
+consteval const char* method_decline_reason() {
+    if constexpr (!mirror_bridge::core::method_params_all_bindable<T, Index>()) {
+        return "a parameter type has no conversion from Python";
+    } else if constexpr (!method_out_params_reach_caller<T, Index>()) {
+        return "it writes through a parameter whose writes cannot reach the caller";
+    } else if constexpr (!return_type_convertible<
+                             typename [:get_method_return_type<T, Index>():]>()) {
+        return "its return type has no conversion to Python";
+    } else {
+        return "an overload of the same name was bound instead";
+    }
+}
+
 template<typename T, std::size_t Index>
 consteval bool static_method_fully_bindable() {
     if constexpr (!mirror_bridge::core::static_method_params_all_bindable<T, Index>()) {
@@ -4223,6 +4492,142 @@ consteval bool is_canonical_method() {
                             !method_fully_bindable<T, Earlier>()));
         }(std::make_index_sequence<Index>{});
     }
+}
+
+// ============================================================================
+// Generated batch methods
+// ============================================================================
+//
+// A method Python calls in a loop pays the boundary once per element. Given
+// `double scale(double)`, the generated `scale_batch` takes the whole sequence
+// and loops in C++, so the boundary is crossed once. Measured over 100,000
+// elements: 5.3x from a list, 8.5x from an array.array, and 1.0x when the
+// method itself is the expensive part -- see the batch section above.
+//
+// Generated rather than asked for. The alternative is the C++ author writing
+// scale_batch by hand, which means the team that owns the header doing work
+// for the team that consumes it; reflection already knows the signature.
+//
+// Off unless asked for, with -DMIRROR_BRIDGE_BATCH_METHODS or `generate
+// --batch`, because it is not free to compile. Each sibling is another
+// dispatcher to instantiate, and on one class the cost measured:
+//
+//      3 eligible methods of 13    2.1s -> 2.2s    + 8%
+//     10 eligible methods          1.7s -> 1.9s    +12%
+//     40 eligible methods          3.1s -> 4.8s    +55%
+//
+// A library where most methods qualify would pay most of that for siblings
+// most callers never reach for, and compile time is already the thing this
+// project asks a PCH to hide.
+
+// Does method `Other` already carry the name this would generate for `Index`?
+// If the C++ author wrote their own scale_batch, theirs is the one that binds.
+template<typename T, std::size_t Other, std::size_t Index>
+consteval bool name_is_batch_of() {
+    const std::string_view other = MethodNameCache<T>::names[Other];
+    const std::string_view base = MethodNameCache<T>::names[Index];
+    constexpr std::string_view suffix = "_batch";
+    if (other.size() != base.size() + suffix.size()) return false;
+    return other.substr(0, base.size()) == base &&
+           other.substr(base.size()) == suffix;
+}
+
+// Only a shape where batching means something, and means only one thing.
+//
+// One parameter, because two would need the caller to say how the sequences
+// pair up. Arithmetic in and out, because that is the case where the whole
+// batch is one contiguous buffer each way and the loop touches no Python.
+// bool is excluded on both sides: std::vector<bool> is the proxy
+// specialization, with no data() to hand over.
+//
+// Exactly one overload of the name, because a batch of an overload set would
+// have to resolve per element, and resolving per element is the cost this is
+// removing.
+template<typename T, std::size_t Index>
+consteval bool method_is_batchable() {
+#ifndef MIRROR_BRIDGE_BATCH_METHODS
+    return false;
+#else
+    if constexpr (!is_canonical_method<T, Index>()) {
+        return false;
+    } else if constexpr (get_method_param_count<T, Index>() != 1) {
+        return false;
+    } else {
+        using Param = std::remove_cvref_t<method_param_t<T, Index, 0>>;
+        using Ret = std::remove_cv_t<typename [:get_method_return_type<T, Index>():]>;
+        if constexpr (!std::is_arithmetic_v<Param> || std::is_same_v<Param, bool>) {
+            return false;
+        } else if constexpr (!std::is_arithmetic_v<Ret> || std::is_same_v<Ret, bool>) {
+            return false;
+        } else {
+            // One overload only, and the author's own <name>_batch wins if
+            // they wrote one.
+            return []<std::size_t... Other>(std::index_sequence<Other...>) {
+                return (... && (Other == Index ||
+                                MethodNameCache<T>::names[Other] != MethodNameCache<T>::names[Index]));
+            }(std::make_index_sequence<get_member_function_count<T>()>{}) &&
+            []<std::size_t... Other>(std::index_sequence<Other...>) {
+                return (... && !name_is_batch_of<T, Other, Index>());
+            }(std::make_index_sequence<get_member_function_count<T>()>{});
+        }
+    }
+#endif
+}
+
+template<typename T>
+consteval std::size_t count_batchable_methods() {
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return ((method_is_batchable<T, Is>() ? 1 : 0) + ... + 0);
+    }(std::make_index_sequence<get_member_function_count<T>()>{});
+}
+
+// The generated name, built once per instantiation. identifier_of gives a
+// view into the program's own storage, so the concatenation needs somewhere
+// to live and a function-local static is it.
+template<typename T, std::size_t Index>
+const char* batch_method_name() {
+    static const std::string name =
+        std::string(get_member_function_name<T, Index>()) + "_batch";
+    return name.c_str();
+}
+
+// METH_O: exactly one argument, handed over directly with no unpacking.
+template<typename T, std::size_t Index>
+PyObject* py_batch_dispatch(PyObject* self, PyObject* arg) {
+    using Param = std::remove_cvref_t<method_param_t<T, Index, 0>>;
+    using Ret = std::remove_cv_t<typename [:get_method_return_type<T, Index>():]>;
+
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "object is not initialized");
+        return nullptr;
+    }
+
+    std::vector<Param> input;
+    if (!from_python(arg, input)) {
+        if (!PyErr_Occurred()) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s expects a sequence of %s",
+                         batch_method_name<T, Index>(),
+                         std::is_floating_point_v<Param> ? "numbers" : "integers");
+        }
+        return nullptr;
+    }
+
+    std::vector<Ret> output;
+    output.reserve(input.size());
+
+    constexpr auto member_func = get_member_function<T, Index>();
+    try {
+        for (const Param& value : input) {
+            output.push_back(((*wrapper->cpp_object).[:member_func:])(value));
+        }
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+
+    return to_python(output);
 }
 
 // Count unique method names (number of canonical methods)
@@ -4532,7 +4937,9 @@ PyObject* py_method_dispatch_impl(PyObject* self, PyObject* const* args,
                                    std::index_sequence<AllIndices...>) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -4608,6 +5015,45 @@ consteval bool is_visible_member_const() {
         typename [:std::meta::type_of(get_visible_member_info<T, VisibleIndex>()):]>;
 }
 
+// A member the setter cannot build a temporary of is readable and not
+// assignable, which is the same answer as const and arrived at for a
+// different reason: the setter converts into a local and then moves it into
+// place, and that local needs a default constructor.
+//
+// nlohmann-json is the case. nlohmann::detail::dtoa_impl::diyfp declares only
+// diyfp(uint64_t, int), and one member of that type inside a bound class took
+// the whole module down with "no matching constructor for initialization of
+// 'MemberType'" -- not the class holding it, the module. Reading it is fine;
+// only assignment needs the temporary.
+template<typename T, std::size_t VisibleIndex>
+consteval bool is_visible_member_unassignable() {
+    using MemberType =
+        typename [:std::meta::type_of(get_visible_member_info<T, VisibleIndex>()):];
+    if constexpr (std::is_array_v<MemberType>) {
+        // from_python writes into an array in place, so it never needs one.
+        return false;
+    } else if constexpr (!requires { sizeof(MemberType); }) {
+        // is_default_constructible_v on an incomplete type is undefined
+        // rather than diagnosed, and a forward-declared member type does
+        // reach here -- Open3D's camera types are why c_api_shapes exists.
+        // Say unassignable: the setter could not have built one either.
+        return true;
+    } else {
+        return !std::is_default_constructible_v<MemberType>;
+    }
+}
+
+// Whether Python may assign to this member. The getset table and the .pyi
+// both ask this, because they used to ask different questions: registration
+// weighed the annotation, constness and assignability, while the stub looked
+// at constness alone and so described a [[=readonly{}]] field as writable.
+template<typename T, std::size_t VisibleIndex>
+consteval bool visible_member_is_readonly() {
+    return annotations::is_visible_member_readonly<T, VisibleIndex>() ||
+           is_visible_member_const<T, VisibleIndex>() ||
+           is_visible_member_unassignable<T, VisibleIndex>();
+}
+
 // Generate Python getters/setters for all members of a class
 template<typename T, std::size_t... Indices>
 consteval auto generate_getsetters(std::index_sequence<Indices...>) {
@@ -4646,8 +5092,7 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
         .name = annotations::get_visible_member_name<T, VisibleIndices>(),
         .get = py_visible_getter<T, VisibleIndices>,
         // Read-only when annotated [[=readonly{}]] or const-qualified in C++
-        .set = (annotations::is_visible_member_readonly<T, VisibleIndices>() ||
-                is_visible_member_const<T, VisibleIndices>())
+        .set = visible_member_is_readonly<T, VisibleIndices>()
             ? py_readonly_setter<T, VisibleIndices>
             : py_visible_setter<T, VisibleIndices>,
         .doc = nullptr,
@@ -4663,16 +5108,33 @@ consteval auto generate_visible_getsetters(std::index_sequence<VisibleIndices...
 // Generate Python methods for all member functions of a class
 // Uses dispatch system for overloading - one entry per unique name
 template<typename T, std::size_t... Indices>
-auto generate_methods(std::index_sequence<Indices...>) {
-    // Count unique method names (canonical methods only)
+auto generate_methods(const char* class_name, std::index_sequence<Indices...>) {
+    // Count unique method names (canonical methods only), plus the batch
+    // sibling generated for each method whose shape admits one.
     constexpr std::size_t unique_count = count_unique_method_names<T>();
+    constexpr std::size_t batch_count = count_batchable_methods<T>();
+    constexpr std::size_t total_count = unique_count + batch_count;
 
     // Build methods array - one entry per unique name + sentinel
-    static std::array<PyMethodDef, unique_count + 1> methods{};
+    static std::array<PyMethodDef, total_count + 1> methods{};
     static bool initialized = false;
 
     if (!initialized) {
         std::size_t method_idx = 0;
+
+        // The generated batch siblings come first so a reader of dir() meets
+        // them next to the method they batch rather than in a block at the end.
+        ([&] {
+            if constexpr (method_is_batchable<T, Indices>()) {
+                methods[method_idx] = PyMethodDef{
+                    .ml_name = batch_method_name<T, Indices>(),
+                    .ml_meth = reinterpret_cast<PyCFunction>(py_batch_dispatch<T, Indices>),
+                    .ml_flags = METH_O,
+                    .ml_doc = nullptr
+                };
+                method_idx++;
+            }
+        }(), ...);
 
         // Only add entries for canonical methods (first occurrence of each name)
         ([&] {
@@ -4689,11 +5151,39 @@ auto generate_methods(std::index_sequence<Indices...>) {
                     .ml_doc = nullptr
                 };
                 method_idx++;
+            } else if constexpr (!method_fully_bindable<T, Indices>()) {
+                // A declined method was reported nowhere: not on stderr, not
+                // in --json, not in the stub, and dir() simply does not list
+                // it. docs/guides/accelerating-python.md promises that
+                // generate "reports every name you wrote that is not in the
+                // finished module, with the reason", and for a method that
+                // was never true -- a free function with the same problem is
+                // refused by name.
+                //
+                // Behind an environment variable because this runs at import
+                // and a large library declines hundreds of methods: the CLI
+                // sets it for its own verification import, so the tool sees
+                // them and a user's program does not. Same message shape as
+                // the class-level ones, so the CLI harvests them the same way
+                // rather than growing a second parser.
+                // Materialised into constexpr locals first. A consteval
+                // call left inline in the body makes the whole lambda an
+                // immediate function under P2564, and then calling it at
+                // runtime is "call to immediate function is not a constant
+                // expression". The canonical arm above does the same thing
+                // for the same reason.
+                constexpr const char* declined_name = get_member_function_name<T, Indices>();
+                constexpr const char* declined_why = method_decline_reason<T, Indices>();
+                if (report_declined_methods()) {
+                    std::fprintf(stderr,
+                        "mirror_bridge: skipped method '%s::%s' (%s)\n",
+                        class_name, declined_name, declined_why);
+                }
             }
         }(), ...);
 
         // Sentinel entry
-        methods[unique_count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
+        methods[total_count] = PyMethodDef{nullptr, nullptr, 0, nullptr};
         initialized = true;
     }
 
@@ -4730,6 +5220,551 @@ auto generate_static_methods(std::index_sequence<Indices...>) {
 
     return methods;
 }
+
+// ============================================================================
+// Python Data Model — iteration, len(), `in`, and pickling
+// ============================================================================
+//
+// A bound class used to answer only half of what Python asks of an object:
+// `for x in obj`, `len(obj)`, `x in obj` and `pickle.dumps(obj)` all raised
+// TypeError no matter what the C++ type offered. Each of the four is derived
+// from the type itself, so no per-class glue is needed:
+//
+//   for x in obj   tp_iter/tp_iternext driven by T::begin()/T::end()
+//   x in obj       falls out of tp_iter — with no sq_contains, CPython's
+//                  PySequence_Contains searches by iterating
+//   len(obj)       mp_length/sq_length from T::size()
+//   pickle, copy   __reduce__/__setstate__ over the reflected member list
+//
+// Detection is a requires-expression rather than a reflected search for a
+// method named "begin": what has to compile is `++it`, `*it` and `it != end`,
+// and a requires-expression asks exactly those questions of exactly the
+// iterator type the class hands back.
+
+namespace datamodel {
+
+template<typename T>
+concept HasBeginEnd = requires(T& t) { t.begin(); t.end(); };
+
+// void for a type with no begin(), so the Iterable conjunct below can name
+// the iterator type in its parameter list without that being ill-formed for
+// every class that is not a range.
+template<typename T> struct iterator_of { using type = void; };
+template<HasBeginEnd T> struct iterator_of<T> {
+    using type = decltype(std::declval<T&>().begin());
+};
+template<typename T> using iterator_of_t = typename iterator_of<T>::type;
+
+// end() is not required to return the same type as begin(). A C++20 range may
+// end at a sentinel, which compares against the iterator but is not one, so
+// the type stored for the end of the range is this and not iterator_of_t.
+template<typename T> struct sentinel_of { using type = void; };
+template<HasBeginEnd T> struct sentinel_of<T> {
+    using type = decltype(std::declval<T&>().end());
+};
+template<typename T> using sentinel_of_t = typename sentinel_of<T>::type;
+
+template<typename T>
+concept Iterable = HasBeginEnd<T> && requires(T& t, iterator_of_t<T> it) {
+    { it != t.end() } -> std::convertible_to<bool>;
+    ++it;
+    *it;
+};
+
+// Dereferencing an iterator need not yield the element type: std::vector<bool>
+// hands back a proxy reference, and converting that proxy as a struct produces
+// an empty dict rather than a bool. iterator_traits names the value type, so
+// prefer it, and fall back to the dereference type for a hand-rolled cursor
+// that has no traits.
+template<typename It>
+struct element_of {
+    using type = std::remove_cvref_t<decltype(*std::declval<It&>())>;
+};
+template<typename It>
+    requires requires { typename std::iterator_traits<It>::value_type; }
+struct element_of<It> {
+    using type = typename std::iterator_traits<It>::value_type;
+};
+
+template<typename T>
+using iter_element_t = typename element_of<iterator_of_t<T>>::type;
+
+// Re-reading begin() to detect a reallocation (see py_iter_next) needs the
+// iterator compared against another iterator, which the Iterable concept does
+// not ask for — it only asks for a comparison against end().
+template<typename T>
+concept IteratorSelfComparable = Iterable<T> &&
+    requires(iterator_of_t<T> a, iterator_of_t<T> b) {
+        { a != b } -> std::convertible_to<bool>;
+    };
+
+template<typename T>
+concept HasSize = requires(T& t) {
+    { t.size() };
+    requires std::integral<std::remove_cvref_t<decltype(t.size())>>;
+    requires !std::same_as<std::remove_cvref_t<decltype(t.size())>, bool>;
+};
+
+// Iterable, and every element convertible to Python. The element goes
+// through the same gate named methods do, so a range of raw pointers or of
+// proxy references (vector<bool>) declines the slot instead of failing the
+// module build.
+template<typename T>
+consteval bool is_iterable() {
+    if constexpr (!Iterable<T>) {
+        return false;
+    } else {
+        return return_type_convertible<iter_element_t<T>>();
+    }
+}
+
+// len() is offered to classes that are iterable *and* sized, not to every
+// class with a method spelled size().
+//
+// A length slot is not a neutral addition. CPython derives truthiness from
+// it, so gating on size() alone would silently redefine `if obj:` for a
+// gauge whose size() is a physical dimension, or a kernel whose size() is
+// its width. Requiring begin()/end() as well means a class only gains len()
+// when "how many elements" is the question size() was already answering,
+// and for those classes len()-derived truthiness is the correct Python
+// semantics rather than a change of meaning.
+template<typename T>
+consteval bool is_sized() {
+    return is_iterable<T>() && HasSize<T>;
+}
+
+// ----------------------------------------------------------------------------
+// len() and truthiness
+// ----------------------------------------------------------------------------
+
+template<typename T>
+Py_ssize_t py_length(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return -1;
+    }
+    try {
+        const auto count = wrapper->cpp_object->size();
+        // Py_ssize_t covers half the range of the usual std::size_t, and a
+        // count that does not fit would reach CPython as a negative length.
+        // CPython reports that as "returned NULL without setting an
+        // exception", which tells the caller nothing; an OverflowError names
+        // the class and the value instead. An unsigned size() that underflowed
+        // — items.size() - 1 on an empty container — arrives here too, which
+        // is the realistic way to land in this branch.
+        if (std::cmp_less(count, 0) || std::cmp_greater(count, PY_SSIZE_T_MAX)) {
+            const std::string text = std::to_string(count);
+            PyErr_Format(PyExc_OverflowError,
+                         "%s.size() is %s, which cannot be a Python length",
+                         Py_TYPE(self)->tp_name, text.c_str());
+            return -1;
+        }
+        return static_cast<Py_ssize_t>(count);
+    } catch (const std::exception& e) {
+        set_py_error_from_cpp_exception(e);
+        return -1;
+    } catch (...) {
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return -1;
+    }
+}
+
+// Written out rather than left to CPython's default, which would reach back
+// through mp_length. Stating it here is what makes the truthiness of a sized
+// class a decision in this file instead of a side effect of adding a length
+// slot, and it answers from size() directly with no Py_ssize_t round trip.
+template<typename T>
+int py_bool(PyObject* self) {
+    Py_ssize_t n = py_length<T>(self);
+    if (n < 0) return -1;
+    return n != 0 ? 1 : 0;
+}
+
+// ----------------------------------------------------------------------------
+// Iteration
+// ----------------------------------------------------------------------------
+
+// The iterator object. Never constructed as a whole: tp_alloc hands back raw
+// memory and the two C++ iterators are placement-new'd into it, because an
+// arbitrary iterator type need not be default-constructible.
+template<typename T>
+struct PyIter {
+    PyObject_HEAD
+    PyObject* owner;              // strong reference — see py_get_iter
+    iterator_of_t<T> cursor;
+    sentinel_of_t<T> stop;
+    iterator_of_t<T> start;       // begin() when iteration started
+    std::size_t guard;            // element count when iteration started
+    bool finished;
+};
+
+template<typename T>
+struct IterTypeSlot {
+    static inline PyTypeObject* ptr = nullptr;
+};
+
+template<typename T>
+void py_iter_dealloc(PyObject* self) {
+    auto* it = reinterpret_cast<PyIter<T>*>(self);
+    std::destroy_at(&it->cursor);
+    std::destroy_at(&it->stop);
+    std::destroy_at(&it->start);
+    Py_XDECREF(it->owner);
+    Py_TYPE(self)->tp_free(self);
+}
+
+template<typename T>
+PyObject* py_iter_next(PyObject* self) {
+    auto* it = reinterpret_cast<PyIter<T>*>(self);
+    if (it->finished) return nullptr;
+
+    auto* owner = reinterpret_cast<PyWrapper<T>*>(it->owner);
+    if (!owner->cpp_object) {
+        it->finished = true;
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    // Holding a reference to the container keeps it alive but does not stop
+    // the Python side mutating it, and a reallocation leaves cursor and stop
+    // pointing into freed memory — a read, not a crash, so it would surface
+    // as wrong numbers. Two cheap checks cover what is detectable:
+    //
+    // The element count, the way CPython's own dict and set iterators do it.
+    // This catches an append or a clear.
+    if constexpr (HasSize<T>) {
+        if (static_cast<std::size_t>(owner->cpp_object->size()) != it->guard) {
+            it->finished = true;
+            PyErr_Format(PyExc_RuntimeError, "%s changed size during iteration",
+                         Py_TYPE(it->owner)->tp_name);
+            return nullptr;
+        }
+    }
+
+    // Where begin() is, which the count alone does not cover: reserve() and
+    // shrink_to_fit() move a vector's storage without changing its size, and
+    // that is exactly the case that reads freed memory. Neither check sees a
+    // mutation that keeps both the count and the buffer — an erase paired with
+    // a push_back — so this narrows the window rather than closing it, and the
+    // reference docs say so.
+    if constexpr (IteratorSelfComparable<T>) {
+        try {
+            if (owner->cpp_object->begin() != it->start) {
+                it->finished = true;
+                PyErr_Format(PyExc_RuntimeError,
+                             "%s reallocated its storage during iteration",
+                             Py_TYPE(it->owner)->tp_name);
+                return nullptr;
+            }
+        } catch (const std::exception& e) {
+            it->finished = true;
+            set_py_error_from_cpp_exception(e);
+            return nullptr;
+        }
+    }
+
+    try {
+        if (!(it->cursor != it->stop)) {
+            it->finished = true;
+            return nullptr;
+        }
+        // The gate in is_iterable() accepted the element type, which for a
+        // proxy reference such as std::vector<bool>'s is not what *cursor
+        // yields; convert through the element type so the value, not the
+        // proxy's own layout, is what crosses.
+        decltype(auto) raw = *it->cursor;
+        PyObject* item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(raw)>,
+                                     iter_element_t<T>>) {
+            item = to_python(raw);
+        } else {
+            item = to_python(static_cast<iter_element_t<T>>(raw));
+        }
+        if (!item) {
+            it->finished = true;
+            return nullptr;
+        }
+        ++it->cursor;
+        return item;
+    } catch (const std::exception& e) {
+        it->finished = true;
+        set_py_error_from_cpp_exception(e);
+        return nullptr;
+    } catch (...) {
+        it->finished = true;
+        PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception");
+        return nullptr;
+    }
+}
+
+// One iterator type per bound class, readied once from bind_class. It is not
+// added to the module: nothing constructs it except iter(), and a name in the
+// module that cannot be called is noise in dir() and in the stubs.
+template<typename T>
+PyTypeObject* make_iter_type(const char* owner_qualified_name) {
+    static std::string iter_name = std::string(owner_qualified_name) + "_iterator";
+    static PyTypeObject iter_type = {
+        .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
+        .tp_name = iter_name.c_str(),
+        .tp_basicsize = sizeof(PyIter<T>),
+        .tp_itemsize = 0,
+        .tp_dealloc = py_iter_dealloc<T>,
+        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_doc = "Iterator over a mirror_bridge-bound C++ range",
+        .tp_iter = PyObject_SelfIter,
+        .tp_iternext = py_iter_next<T>,
+        .tp_new = nullptr,
+    };
+    static const bool ready = (PyType_Ready(&iter_type) == 0);
+    return ready ? &iter_type : nullptr;
+}
+
+template<typename T>
+PyObject* py_get_iter(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+    PyTypeObject* iter_type = IterTypeSlot<T>::ptr;
+    if (!iter_type) {
+        PyErr_SetString(PyExc_RuntimeError, "Iterator type was not registered");
+        return nullptr;
+    }
+
+    auto* it = reinterpret_cast<PyIter<T>*>(iter_type->tp_alloc(iter_type, 0));
+    if (!it) return nullptr;
+
+    int built = 0;
+    try {
+        std::construct_at(&it->cursor, wrapper->cpp_object->begin());
+        ++built;
+        std::construct_at(&it->stop, wrapper->cpp_object->end());
+        ++built;
+        std::construct_at(&it->start, wrapper->cpp_object->begin());
+        ++built;
+    } catch (...) {
+        if (built > 2) std::destroy_at(&it->start);
+        if (built > 1) std::destroy_at(&it->stop);
+        if (built > 0) std::destroy_at(&it->cursor);
+        // tp_free rather than Py_DECREF: py_iter_dealloc would destroy
+        // iterators that were never constructed.
+        iter_type->tp_free(it);
+        try { throw; }
+        catch (const std::exception& e) { set_py_error_from_cpp_exception(e); }
+        catch (...) { PyErr_SetString(PyExc_RuntimeError, "Unknown C++ exception"); }
+        return nullptr;
+    }
+
+    it->guard = 0;
+    if constexpr (HasSize<T>) {
+        it->guard = static_cast<std::size_t>(wrapper->cpp_object->size());
+    }
+    it->finished = false;
+
+    // The iterator owns a reference to the object the range belongs to, for
+    // its whole lifetime. This is what pybind11 makes the author request with
+    // keep_alive<0,1> and segfaults without: `for x in make_bag()` drops the
+    // last reference to the container the moment the loop starts, and
+    // py_dealloc would delete the C++ object out from under begin()/end().
+    Py_INCREF(self);
+    it->owner = self;
+    return reinterpret_cast<PyObject*>(it);
+}
+
+// PyIter<T> names the iterator type in a member declaration, so it is only
+// instantiable for a T that has one. Selecting the slot has to be an
+// if constexpr, not a ternary.
+template<typename T>
+getiterfunc build_iter() {
+    if constexpr (is_iterable<T>()) {
+        return py_get_iter<T>;
+    } else {
+        return nullptr;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Pickling
+// ----------------------------------------------------------------------------
+
+template<typename T, std::size_t... Is>
+consteval bool members_restorable(std::index_sequence<Is...>) {
+    // The same question the getset table asks, asked once. Spelling out the
+    // conjuncts here meant missing one: a member whose type has no default
+    // constructor is read-only too, so a class holding one dumped happily and
+    // then raised AttributeError on load.
+    return (true && ... && !visible_member_is_readonly<T, Is>());
+}
+
+// Does this type carry any state of its own, directly or through a base?
+consteval bool type_holds_no_state(std::meta::info type) {
+    if (!std::meta::nonstatic_data_members_of(
+            type, std::meta::access_context::unchecked()).empty()) {
+        return false;
+    }
+    for (auto base : std::meta::bases_of(type, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
+// The state is built from the *visible* member list, and three kinds of member
+// are missing from it: a private one, one marked [[=exclude{}]], and anything
+// a base class declares, because nonstatic_data_members_of reports only direct
+// members. Each of those still holds state that __setstate__ cannot put back,
+// so a class that has one would dump and load into a plausible object that had
+// quietly lost a field — the failure mode this whole gate exists to avoid.
+template<typename T>
+consteval bool every_member_in_state() {
+    const auto all = std::meta::nonstatic_data_members_of(
+        ^^T, std::meta::access_context::unchecked());
+    if (all.size() != annotations::count_visible_members<T>()) return false;
+    for (auto base : std::meta::bases_of(^^T, std::meta::access_context::unchecked())) {
+        if (!type_holds_no_state(std::meta::type_of(base))) return false;
+    }
+    return true;
+}
+
+// Reconstruction is `cls()` followed by __setstate__, so a class qualifies
+// only when Python can default-construct it and put every member back. A
+// const or [[=readonly{}]] member would be read into the state and then
+// silently dropped on the way back in, handing the caller a plausible object
+// that had quietly lost a field; such a class keeps raising at dumps() time,
+// which is at least the truth. A member the state cannot even see is the same
+// bug with less warning, so every_member_in_state() rules those out too.
+template<typename T>
+consteval bool is_picklable() {
+    if constexpr (!std::is_default_constructible_v<T>) {
+        return false;
+    } else if constexpr (!every_member_in_state<T>()) {
+        return false;
+    } else {
+        return members_restorable<T>(
+            std::make_index_sequence<annotations::count_visible_members<T>()>{});
+    }
+}
+
+// The state is the reflected non-static data member list — the same walk
+// __repr__ does, so a member added in C++ joins the pickle automatically
+// instead of being forgotten by a hand-written py::pickle() that lists every
+// field twice.
+template<typename T>
+PyObject* py_member_state(PyObject* self) {
+    auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
+    if (!wrapper->cpp_object) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        return nullptr;
+    }
+
+    PyObject* state = PyDict_New();
+    if (!state) return nullptr;
+
+    bool ok = true;
+    constexpr std::size_t member_count = annotations::count_visible_members<T>();
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            if (!ok) return;
+            constexpr auto member = annotations::get_visible_member<T>(Is);
+            constexpr const char* member_name = std::meta::identifier_of(member).data();
+            PyObject* value = to_python((*wrapper->cpp_object).[:member:]);
+            if (!value) {
+                if (!PyErr_Occurred()) {
+                    PyErr_Format(PyExc_TypeError,
+                                 "cannot pickle %s: member '%s' has no Python "
+                                 "representation", Py_TYPE(self)->tp_name, member_name);
+                }
+                ok = false;
+                return;
+            }
+            if (PyDict_SetItemString(state, member_name, value) < 0) ok = false;
+            Py_DECREF(value);
+        }(), ...);
+    }(std::make_index_sequence<member_count>{});
+
+    if (!ok) {
+        Py_DECREF(state);
+        return nullptr;
+    }
+    return state;
+}
+
+template<typename T>
+PyObject* py_reduce(PyObject* self, PyObject* /*unused*/) {
+    PyObject* members = py_member_state<T>(self);
+    if (!members) return nullptr;
+
+    // A Python subclass of a bound class gets an instance __dict__ of its
+    // own. Carrying it alongside the C++ members is what keeps a subclass's
+    // attributes from disappearing through a round trip; the base type has
+    // no instance dict, and getattr says so.
+    PyObject* instance_dict = PyObject_GetAttrString(self, "__dict__");
+    if (!instance_dict) PyErr_Clear();
+
+    PyObject* state = PyTuple_Pack(2, members, instance_dict ? instance_dict : Py_None);
+    Py_DECREF(members);
+    Py_XDECREF(instance_dict);
+    if (!state) return nullptr;
+
+    PyObject* empty_args = PyTuple_New(0);
+    if (!empty_args) {
+        Py_DECREF(state);
+        return nullptr;
+    }
+
+    // Py_TYPE(self), not the bound type, so a Python subclass pickles as
+    // itself. pickle finds it by __module__ and __qualname__, which is why
+    // bind_class qualifies tp_name with the module name.
+    PyObject* result = PyTuple_Pack(3, reinterpret_cast<PyObject*>(Py_TYPE(self)),
+                                    empty_args, state);
+    Py_DECREF(empty_args);
+    Py_DECREF(state);
+    return result;
+}
+
+template<typename T>
+PyObject* py_setstate(PyObject* self, PyObject* state) {
+    PyObject* members = state;
+    PyObject* instance_dict = nullptr;
+    if (PyTuple_Check(state) && PyTuple_GET_SIZE(state) == 2) {
+        members = PyTuple_GET_ITEM(state, 0);
+        instance_dict = PyTuple_GET_ITEM(state, 1);
+    }
+    if (!PyDict_Check(members)) {
+        PyErr_Format(PyExc_TypeError, "%s.__setstate__ expects the state this "
+                     "type's __reduce__ produces", Py_TYPE(self)->tp_name);
+        return nullptr;
+    }
+
+    PyObject* key = nullptr;
+    PyObject* value = nullptr;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(members, &pos, &key, &value)) {
+        if (PyObject_SetAttr(self, key, value) < 0) {
+            // The setter's own "Type conversion failed" names neither the
+            // member nor the class, and at unpickling time that is all the
+            // caller would get.
+            PyErr_Clear();
+            PyErr_Format(PyExc_TypeError,
+                         "%s: cannot restore member '%U' from pickled state",
+                         Py_TYPE(self)->tp_name, key);
+            return nullptr;
+        }
+    }
+
+    if (instance_dict && instance_dict != Py_None) {
+        PyObject* own = PyObject_GetAttrString(self, "__dict__");
+        if (!own) return nullptr;
+        int rc = PyDict_Update(own, instance_dict);
+        Py_DECREF(own);
+        if (rc < 0) return nullptr;
+    }
+
+    Py_RETURN_NONE;
+}
+
+}  // namespace datamodel
 
 // ============================================================================
 // Operator Overloading — Reflection-Driven Python Slot Binding
@@ -4868,7 +5903,9 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
     if (!resolve_wrapper_object<T>(self, self_raw)) {
         PyTypeObject* mine = TypeRegistry<T>::py_type;
         if (mine && PyObject_TypeCheck(self, mine)) {
-            PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+            PyErr_SetString(PyExc_RuntimeError,
+                            "this object holds no C++ value: its constructor "
+                            "raised, or __init__ was called again and failed");
             return nullptr;
         }
         // Not our left operand: let Python try the reflected operation and
@@ -4925,7 +5962,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* unary_op_wrapper(PyObject* self) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
     using Ret = typename [:std::meta::return_type_of(OperatorCache<T>::at(OpIndex)):];
@@ -4967,7 +6006,9 @@ template<typename T, std::size_t OpIndex>
 PyObject* call_wrapper(PyObject* self, PyObject* args, PyObject* /*kwds*/) {
     auto* wrapper = reinterpret_cast<PyWrapper<T>*>(self);
     if (!wrapper->cpp_object) {
-        PyErr_SetString(PyExc_RuntimeError, "Invalid C++ object");
+        PyErr_SetString(PyExc_RuntimeError,
+                        "this object holds no C++ value: its constructor "
+                        "raised, or __init__ was called again and failed");
         return nullptr;
     }
 
@@ -5063,8 +6104,13 @@ PyNumberMethods* build_number_methods() {
     if constexpr (op_bindable<T, neg_idx>())  nm.nb_negative = unary_op_wrapper<T, neg_idx>;
     if constexpr (op_bindable<T, pos_idx>())  nm.nb_positive = unary_op_wrapper<T, pos_idx>;
 
+    // Adding a length slot hands CPython a definition of truthiness whether
+    // or not one was intended, so a sized class states its own.
+    if constexpr (datamodel::is_sized<T>()) nm.nb_bool = datamodel::py_bool<T>;
+
     // Return null if nothing was populated, so tp_as_number stays null.
-    if constexpr (add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
+    if constexpr (!datamodel::is_sized<T>() &&
+                  add_idx >= N && sub_idx >= N && mul_idx >= N && div_idx >= N &&
                   mod_idx >= N && iadd_idx >= N && isub_idx >= N && imul_idx >= N &&
                   idiv_idx >= N && imod_idx >= N && neg_idx >= N && pos_idx >= N) {
         return nullptr;
@@ -5072,16 +6118,36 @@ PyNumberMethods* build_number_methods() {
     return &nm;
 }
 
-// Build PyMappingMethods with mp_subscript set if operator[] exists.
+// Build PyMappingMethods: mp_subscript if operator[] exists, mp_length if T
+// is a sized range (see datamodel::is_sized for why size() alone is not it).
 template<typename T>
 PyMappingMethods* build_mapping_methods() {
     static PyMappingMethods mm{};
     constexpr std::size_t sub_idx = find_op<T>(Slot::Subscript);
-    if constexpr (op_bindable<T, sub_idx>()) {
+    constexpr bool has_subscript = op_bindable<T, sub_idx>();
+    if constexpr (has_subscript) {
         mm.mp_subscript = subscript_wrapper<T, sub_idx>;
+    }
+    if constexpr (datamodel::is_sized<T>()) {
+        mm.mp_length = datamodel::py_length<T>;
+    }
+    if constexpr (has_subscript || datamodel::is_sized<T>()) {
         return &mm;
     }
     return nullptr;
+}
+
+// sq_length as well as mp_length: len() reads either, but PySequence_Size and
+// the length hint list() uses to presize its result only read this one.
+template<typename T>
+PySequenceMethods* build_sequence_methods() {
+    if constexpr (datamodel::is_sized<T>()) {
+        static PySequenceMethods sm{};
+        sm.sq_length = datamodel::py_length<T>;
+        return &sm;
+    } else {
+        return nullptr;
+    }
 }
 
 template<typename T>
@@ -5336,8 +6402,23 @@ inline PyObject* get_python_named_registry(const char* registry_name) {
     return registry;
 }
 
+// The three registries live in sys.modules for the life of the process, so
+// re-finding them is pure overhead after the first call: PyDict_GetItemString
+// builds and discards a str, hashes it, and probes sys.modules every time,
+// and the outbound conversion path did that twice per returned object. The
+// cache changes nothing about what is returned -- it is the same dict every
+// later lookup would find -- and the strong reference keeps it that way.
+inline PyObject* cached_named_registry(PyObject*& slot, const char* name) {
+    if (!slot) {
+        slot = get_python_named_registry(name);
+        Py_XINCREF(slot);
+    }
+    return slot;
+}
+
 inline PyObject* get_python_type_registry() {
-    return get_python_named_registry("_mirror_bridge_types");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_types");
 }
 
 // ============================================================================
@@ -5363,12 +6444,59 @@ inline PyObject* get_python_type_registry() {
 
 using UpcastThunk = void* (*)(void*);
 
+// Bump whenever the layout of PyWrapper<T> changes.
+//
+// The forward registry hands out one PyTypeObject per C++ class, process
+// wide, and tp_basicsize comes from whichever module registered it first. Two
+// modules built against different revisions of this header therefore disagree
+// about how big a wrapper is, and the newer one would write its own trailing
+// fields past the end of an allocation the older one sized -- a heap
+// overflow, not a wrong answer. Making the tag part of every cross-module key
+// means a mismatched pair simply does not recognise each other's objects, so
+// the failure is a clean TypeError at the boundary. Matching builds are
+// unaffected and still share types as before.
+inline constexpr const char* kWrapperAbiTag = "#mbabi3";
+
+// Layout is defaulted and never passed, for the same reason TypeRegistry
+// takes it: the static below is a local of a function template, so without
+// hidden visibility the first module to call it computes the key for every
+// module, size included. Two modules that disagree about T would then share
+// one key that names one of their sizes, which is the whole thing the size
+// was added to prevent. Naming the layout in the function makes the two
+// statics different symbols.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
+const std::string& wrapper_abi_typeid() {
+    // The tag catches a change to *this* header's wrapper layout. It cannot
+    // catch two modules disagreeing about the user's own class: tp_basicsize
+    // is now inline_payload_offset + sizeof(T), so a module built against an
+    // 8-byte Thing and one built against a 48-byte Thing produce wrappers of
+    // different sizes under the same tag, share one PyTypeObject through the
+    // registry, and the larger one then writes past the end of what the
+    // smaller one allocated. Appending the size makes them simply not
+    // recognise each other, which is a TypeError at the boundary instead.
+    static const std::string name = std::string(typeid(T).name()) + kWrapperAbiTag +
+                                    '.' + std::to_string(Layout);
+    return name;
+}
+
+// The same key as a str, interned once per type. PyDict_GetItemString builds
+// and throws away a str on every call; an interned one also carries its hash
+// already computed, which is the rest of what that probe was costing.
+template<typename T, std::size_t Layout = wrapper_layout_id<T>()>
+PyObject* wrapper_abi_typeid_key() {
+    static PyObject* key =
+        PyUnicode_InternFromString(wrapper_abi_typeid<T, Layout>().c_str());
+    return key;
+}
+
 inline PyObject* get_python_typename_registry() {
-    return get_python_named_registry("_mirror_bridge_type_names");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_type_names");
 }
 
 inline PyObject* get_python_upcast_registry() {
-    return get_python_named_registry("_mirror_bridge_upcasts");
+    static PyObject* slot = nullptr;
+    return cached_named_registry(slot, "_mirror_bridge_upcasts");
 }
 
 // The C++ type behind a Python type object, or nullptr when it is not a
@@ -5424,9 +6552,65 @@ void register_upcast() {
                                           "mirror_bridge.upcast", nullptr);
         if (!capsule) { PyErr_Clear(); return; }
         PyDict_SetItemString(upcasts,
-                             upcast_key(typeid(Base).name(), typeid(Derived).name()).c_str(),
+                             upcast_key(wrapper_abi_typeid<Base>().c_str(),
+                                        wrapper_abi_typeid<Derived>().c_str()).c_str(),
                              capsule);
         Py_DECREF(capsule);
+    }
+}
+
+// Say so once when a module built against a different wrapper layout is
+// already loaded.
+//
+// The layout tag in every key means such a module's objects are simply not
+// recognised, which is the safe outcome but a baffling one to debug: the
+// conversion failure reads "could not convert an argument" for an argument
+// whose class has the name the signature asks for. The first module to
+// register records the layout it was built against, so a later one can name
+// the real problem.
+//
+// A warning rather than an error, and the error state is cleared if warnings
+// are fatal here: the alternative is a half-initialised module, and the
+// per-call TypeError still stops anything incorrect from happening.
+inline void warn_on_layout_mismatch(const char* untagged_name) {
+    static bool warned = false;
+    if (warned) return;
+
+    PyObject* registry = get_python_type_registry();
+    if (!registry) return;
+
+    // Two ways another layout shows up. A module built before the tag existed
+    // registers this very class under its bare typeid name, which nothing
+    // else would ever write. A module built against a later layout leaves a
+    // different tag in the sentinel below.
+    const char* other = nullptr;
+    if (untagged_name && PyDict_GetItemString(registry, untagged_name)) {
+        other = "untagged (a release before the layout tag)";
+    } else {
+        PyObject* seen = PyDict_GetItemString(registry, "__mirror_bridge_layout__");
+        if (!seen) {
+            PyObject* tag = PyUnicode_FromString(kWrapperAbiTag);
+            if (!tag) { PyErr_Clear(); return; }
+            PyDict_SetItemString(registry, "__mirror_bridge_layout__", tag);
+            Py_DECREF(tag);
+            return;
+        }
+        other = PyUnicode_AsUTF8(seen);
+        if (!other) { PyErr_Clear(); return; }
+        if (std::strcmp(other, kWrapperAbiTag) == 0) return;
+    }
+
+    warned = true;
+
+    if (PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
+            "mirror_bridge: a module already imported in this process was "
+            "built against wrapper layout '%s', and this module was built "
+            "against '%s'. The two disagree about the size of a wrapper, so "
+            "objects cannot be passed between them and conversion will fail "
+            "with a TypeError naming the right class. Rebuild every module "
+            "against one version of mirror_bridge.",
+            other, kWrapperAbiTag) < 0) {
+        PyErr_Clear();
     }
 }
 
@@ -5434,21 +6618,21 @@ namespace {
     // Register a type in the Python-based global registry
     template<typename T>
     void register_type_in_python(PyTypeObject* py_type) {
+        warn_on_layout_mismatch(typeid(T).name());
         PyObject* registry = get_python_type_registry();
         if (!registry) return;
 
-        // Use typeid name as the key (unique per type across all modules)
-        const char* type_name = typeid(T).name();
-        PyDict_SetItemString(registry, type_name, reinterpret_cast<PyObject*>(py_type));
+        // Use typeid name as the key (unique per type across all modules),
+        // qualified by the wrapper layout this module was built against.
+        PyObject* key = wrapper_abi_typeid_key<T>();
+        if (!key) { PyErr_Clear(); return; }
+        PyDict_SetItem(registry, key, reinterpret_cast<PyObject*>(py_type));
 
         // And the reverse, so an object arriving from Python whose type we
         // were not expecting can still be identified (see WrapperView).
         PyObject* names = get_python_typename_registry();
         if (!names) return;
-        PyObject* value = PyUnicode_FromString(type_name);
-        if (!value) { PyErr_Clear(); return; }
-        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), value);
-        Py_DECREF(value);
+        PyDict_SetItem(names, reinterpret_cast<PyObject*>(py_type), key);
     }
 
     // Look up a type from the Python-based global registry
@@ -5469,11 +6653,45 @@ namespace {
             PyObject* registry = get_python_type_registry();
             if (!registry) return nullptr;
 
-            const char* type_name = typeid(T).name();
-            PyObject* py_type = PyDict_GetItemString(registry, type_name);
+            // The key carries the wrapper's ABI tag and its size, so two
+            // modules built against different wrapper layouts do not find
+            // each other's types. Interned once per T rather than rebuilt and
+            // re-hashed on every lookup, which is most of what this costs.
+            // It still goes through typeid, so it stays inside the
+            // completeness guard above.
+            PyObject* key = wrapper_abi_typeid_key<T>();
+            if (!key) { PyErr_Clear(); return nullptr; }
+            PyObject* py_type = PyDict_GetItem(registry, key);
 
             return py_type ? reinterpret_cast<PyTypeObject*>(py_type) : nullptr;
         }
+    }
+
+    // Which PyTypeObject represents T in this module.
+    //
+    // This module's own comes first, and that order is what makes the answer
+    // stable. tp_new always produces this module's type, so when the outbound
+    // conversions asked the shared dict first they could label a returned
+    // object with a different type than a construction of the same class in
+    // the same module, and which one depended on module import order: the
+    // dict holds whichever module registered last. `isinstance(m.Maker().make(),
+    // m.Part)` was False, and flipped with the order of the imports above it.
+    //
+    // The shared dict is the fallback, for a class this module returns but
+    // never bound -- bind_class does not recurse into member types, so that is
+    // the ordinary cross-module case and it still resolves. A hit is written
+    // back into the static, which puts every later conversion of that class on
+    // a load and a compare instead of a dict probe. Only a hit is stored,
+    // because the module that binds T may not be imported yet, and storing is
+    // safe because the forward registry holds a reference to that type object
+    // and this module's own bind_class has already run at import.
+    template<typename T>
+    PyTypeObject* type_object_for() {
+        PyTypeObject* mine = TypeRegistry<T>::py_type;
+        if (mine) return mine;
+        PyTypeObject* shared = lookup_type_in_python<T>();
+        if (shared) TypeRegistry<T>::py_type = shared;
+        return shared;
     }
 }
 
@@ -5505,9 +6723,10 @@ WrapperDecision decide_route(PyTypeObject* from) {
 
     WrapperDecision decision;
     if (const char* dynamic_tid = wrapper_typeid_name(from)) {
-        if (std::strcmp(dynamic_tid, typeid(Expected).name()) == 0) {
+        if (wrapper_abi_typeid<Expected>() == dynamic_tid) {
             decision = {WrapperRoute::AsIs, nullptr};
-        } else if (UpcastThunk thunk = find_upcast(typeid(Expected).name(), dynamic_tid)) {
+        } else if (UpcastThunk thunk =
+                       find_upcast(wrapper_abi_typeid<Expected>().c_str(), dynamic_tid)) {
             decision = {WrapperRoute::Adjust, thunk};
         }
     }
@@ -5526,19 +6745,7 @@ template<typename Expected>
 bool resolve_wrapper_slow(PyObject* obj, void*& raw) {
     if (!obj || obj == Py_None) return false;
 
-    // A class this module did not bind itself is absent from its static
-    // registry, so finding it costs a hash of the mangled typeid name. Back
-    // -filling the static puts every later argument of that type on the
-    // one-compare fast path instead, which is what the cross-module case
-    // was paying for on every call. Safe: the forward registry holds a
-    // reference to that type object, and this module's own bind_class runs
-    // at import, before any conversion can get here. Only a hit is stored,
-    // because the module that binds Expected may not be imported yet.
-    PyTypeObject* want = TypeRegistry<Expected>::py_type;
-    if (!want) {
-        want = lookup_type_in_python<Expected>();
-        if (want) TypeRegistry<Expected>::py_type = want;
-    }
+    PyTypeObject* want = type_object_for<Expected>();
 
     // The expected type itself, or a Python subclass of it (a trampoline).
     // Subclasses extend the wrapper at the tail, so cpp_object stays put and
@@ -5606,8 +6813,8 @@ void unregister_type() {
     PyObject* registry = get_python_type_registry();
     if (!registry) return;
 
-    const char* type_name = typeid(T).name();
-    PyDict_DelItemString(registry, type_name);
+    PyObject* key = wrapper_abi_typeid_key<T>();
+    if (key) PyDict_DelItem(registry, key);
     PyErr_Clear();  // Ignore KeyError if type wasn't registered
 }
 
@@ -5640,8 +6847,7 @@ to_python(const T& obj) {
     // the only honest answer for a copy; a wrapper that really holds the
     // derived object (bind_class on the derived type, or pointer storage)
     // reports it correctly because the object itself is a derived one.
-    PyTypeObject* py_type = lookup_type_in_python<CleanT>();
-    if (!py_type) py_type = TypeRegistry<CleanT>::py_type;
+    PyTypeObject* py_type = type_object_for<CleanT>();
 
     if (py_type) {
         // Create a wrapper object.
@@ -5661,14 +6867,50 @@ to_python(const T& obj) {
             if (!wrapper) {
                 return nullptr;
             }
-            wrapper->cpp_object = new CleanT(obj);  // Copy the object
+            // tp_alloc sized this object for an inline payload, so the copy
+            // goes in it rather than behind a second allocation. The type
+            // object comes from the shared registry, and the layout tag in
+            // its key is what guarantees it was sized by a build that agrees
+            // with this one.
+            if constexpr (payload_fits_inline_v<CleanT>) {
+                wrapper->cpp_object = ::new (static_cast<void*>(inline_payload(wrapper)))
+                    CleanT(obj);
+            } else {
+                wrapper->cpp_object = new CleanT(obj);
+            }
             wrapper->owns = true;
+            wrapper->parent = nullptr;
             return reinterpret_cast<PyObject*>(wrapper);
         }
     }
 
     // Fall back to dict conversion for unregistered types
     return ConversionOverloadGenerator<T>::to_python_impl(obj);
+}
+
+// A wrapper over a subobject of some other Python object's C++ object. The
+// member is interior to storage the parent owns, so the view holds a strong
+// reference to the parent and frees nothing of its own.
+template<typename Member>
+PyObject* to_python_member_view(Member& ref, PyObject* parent) {
+    using CleanM = std::remove_cv_t<Member>;
+
+    PyTypeObject* py_type = type_object_for<CleanM>();
+    if (!py_type) {
+        // The member's class was never bound anywhere, so there is no wrapper
+        // type to view it through. The dict snapshot is what this returned
+        // before and is still better than nothing.
+        return to_python(ref);
+    }
+
+    auto* wrapper = reinterpret_cast<PyWrapper<CleanM>*>(py_type->tp_alloc(py_type, 0));
+    if (!wrapper) return nullptr;
+
+    wrapper->cpp_object = std::addressof(ref);
+    wrapper->owns = false;
+    Py_INCREF(parent);
+    wrapper->parent = parent;
+    return reinterpret_cast<PyObject*>(wrapper);
 }
 
 template<typename T>
@@ -5679,6 +6921,15 @@ std::enable_if_t<
 from_python(PyObject* obj, T& out) {
     return ConversionOverloadGenerator<T>::from_python_impl(obj, out);
 }
+
+}  // namespace mirror_bridge
+
+// Live views over std::vector members. Included here rather than at the top
+// because every slot it defines calls to_python, from_python and
+// to_python_member_view, all of which are complete by this point.
+#include "python/mirror_bridge_sequence_view.hpp"
+
+namespace mirror_bridge {
 
 // ============================================================================
 // Automatic stub collection (reflection-exact .pyi metadata)
@@ -5739,6 +6990,21 @@ void collect_method_stub(const char* class_name) {
                 min_required_args<T, FuncIndex>());
         }(std::make_index_sequence<pc>{});
     }
+
+    // A generated sibling is as real as a declared method, and a stub that
+    // omits it is the same drift as a stub that misnames one: the name works
+    // at runtime and a type checker calls it an error.
+    if constexpr (method_is_batchable<T, FuncIndex>()) {
+        using Param = std::remove_cvref_t<method_param_t<T, FuncIndex, 0>>;
+        using Ret = std::remove_cv_t<typename [:get_method_return_type<T, FuncIndex>():]>;
+        // METH_O: one positional argument, no keywords. The stub has to say
+        // so with a `/`, or a type checker approves obj.scale_batch(xs=...)
+        // and the call fails at runtime.
+        stubgen::register_method_stub<std::vector<Ret>, const std::vector<Param>&>(
+            class_name, batch_method_name<T, FuncIndex>(),
+            {std::string(param_name<T, FuncIndex, 0>()) + "s"},
+            /*is_static=*/false, /*min_required=*/1, /*positional_only=*/true);
+    }
 }
 
 template<typename T, std::size_t FuncIndex>
@@ -5760,17 +7026,24 @@ template<typename T>
 void collect_stub_info(const char* class_name) {
     stubgen::register_class_stub<T>(class_name);
 
-    // Data members -> annotated attributes
-    constexpr std::size_t member_count = get_data_member_count<T>();
-    if constexpr (member_count > 0) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    // Data members -> annotated attributes.
+    //
+    // The visible members, which is what bind_class binds. This walked every
+    // data member instead, so a [[=exclude{}]] field appeared in the .pyi
+    // while raising AttributeError at runtime -- on the project's own example
+    // the stub promised password_hash and internal_flag, which is the
+    // opposite of what the annotation is for.
+    constexpr std::size_t visible_count = annotations::count_visible_members<T>();
+    if constexpr (visible_count > 0) {
+        [&]<std::size_t... Vs>(std::index_sequence<Vs...>) {
             ([&] {
-                using MemberType = typename [:std::meta::type_of(get_data_member<T, Is>()):];
+                using MemberType =
+                    typename [:std::meta::type_of(get_visible_member_info<T, Vs>()):];
                 stubgen::register_property_stub<T, MemberType>(
-                    class_name, get_data_member_name<T, Is>(),
-                    /*readonly=*/std::is_const_v<MemberType>);
+                    class_name, annotations::get_visible_member_name<T, Vs>(),
+                    /*readonly=*/visible_member_is_readonly<T, Vs>());
             }(), ...);
-        }(std::make_index_sequence<member_count>{});
+        }(std::make_index_sequence<visible_count>{});
     }
 
     // Constructors (bindable overloads only — what Python can actually call)
@@ -5799,6 +7072,17 @@ void collect_stub_info(const char* class_name) {
             (collect_static_method_stub<T, Is>(class_name), ...);
         }(std::make_index_sequence<static_count>{});
     }
+
+    // The protocol slots bind_class fills from the type's own shape, so a
+    // type checker agrees with what the module actually does.
+    if constexpr (datamodel::is_iterable<T>()) {
+        stubgen::register_dunder_stub(
+            class_name, "__iter__",
+            "Iterator[" + stubgen::return_hint<datamodel::iter_element_t<T>>() + "]");
+    }
+    if constexpr (datamodel::is_sized<T>()) {
+        stubgen::register_dunder_stub(class_name, "__len__", "int");
+    }
 }
 
 // Fluent handle returned by bind_class. Converts implicitly to
@@ -5821,45 +7105,13 @@ struct BoundClass {
     explicit operator bool() const { return type != nullptr; }
 };
 
-// Every class T is transitively derived from, in breadth-first order.
-// bind_class records one upcast thunk per entry, which is what lets a
-// Derived still be passed where a Base is expected once arguments are
-// identity-checked.
-template<typename T>
-consteval std::vector<std::meta::info> collect_base_closure() {
-    std::vector<std::meta::info> found;
-    std::vector<std::meta::info> layer{^^T};
-    while (!layer.empty()) {
-        std::vector<std::meta::info> next;
-        for (auto cls : layer) {
-            for (auto b : std::meta::bases_of(cls, std::meta::access_context::unchecked())) {
-                auto base_type = std::meta::type_of(b);
-                bool seen = false;
-                for (auto f : found) {
-                    if (f == base_type) { seen = true; break; }
-                }
-                if (seen) continue;          // diamond: one entry per base
-                found.push_back(base_type);
-                next.push_back(base_type);
-            }
-        }
-        layer = next;
-    }
-    return found;
-}
-
-template<typename T>
-struct BaseClosure {
-    static constexpr auto types = std::define_static_array(collect_base_closure<T>());
-};
-
-// Alias-template form, because the pack below appears only inside a splice
-// and GCC does not treat that as expandable (see core/mirror_bridge_core.hpp).
-template<typename T, std::size_t I>
-consteval std::meta::info base_at() { return BaseClosure<T>::types[I]; }
+// The base closure itself lives in core/mirror_bridge_core.hpp: all three
+// backends need it to keep derived-to-base conversions working once
+// arguments are identity-checked.
+using core::BaseClosure;
 
 template<typename T, std::size_t I>
-using base_t = typename [:base_at<T, I>():];
+using base_t = core::base_t<T, I>;
 
 template<typename T>
 void register_base_upcasts() {
@@ -5867,6 +7119,27 @@ void register_base_upcasts() {
         (register_upcast<T, base_t<T, Is>>(), ...);
     }(std::make_index_sequence<BaseClosure<T>::types.size()>{});
 }
+
+// The slots bind_class_auto substitutes, handed to bind_class rather than
+// written over the type object afterwards.
+//
+// tp_init is the reason this exists. PyType_Ready builds the __init__ entry
+// in tp_dict from whatever tp_init holds at that moment and stores the
+// function pointer inside the descriptor, so a slot overwritten afterwards
+// is not the one `super().__init__()` reaches -- the object would be
+// constructed without its vtable swap and the Python overrides would
+// silently stop dispatching. tp_new has no such problem, because __new__
+// reads the live slot on every call, but it travels here too so there is one
+// rule instead of two.
+//
+// Declared here, filled in python/mirror_bridge_auto_trampoline.hpp: that
+// header is included after this one and needs bind_class, so the dependency
+// cannot run the other way.
+struct AutoTrampolineSlots {
+    newfunc tp_new = nullptr;
+    initproc tp_init = nullptr;
+    destructor tp_dealloc = nullptr;
+};
 
 // Main binding function — generates Python type object for a C++ class.
 //
@@ -5876,7 +7149,9 @@ void register_base_upcasts() {
 // forwards each virtual call to the Python override if one exists.
 // The `mirror_bridge generate --trampolines` tool emits the trampoline class.
 template<Bindable T, typename Trampoline = T>
-BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_hash = nullptr) {
+BoundClass<T> bind_class(PyObject* module, const char* name,
+                         const char* file_hash = nullptr,
+                         const AutoTrampolineSlots* autos = nullptr) {
     static_assert(std::is_base_of_v<T, Trampoline> || std::is_same_v<T, Trampoline>,
         "Trampoline must derive from T (or be T itself)");
     // Compile-time validation: ensure all member types are convertible
@@ -5901,7 +7176,7 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
 
     // Generate instance methods using reflection
     constexpr std::size_t method_count = get_member_function_count<T>();
-    static auto methods = generate_methods<T>(std::make_index_sequence<method_count>{});
+    static auto methods = generate_methods<T>(name, std::make_index_sequence<method_count>{});
 
     // Generate static methods using reflection (will be added separately to type dict)
     constexpr std::size_t static_method_count = get_static_member_function_count<T>();
@@ -5936,8 +7211,26 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
                 ([&] {
                     constexpr auto member = annotations::get_visible_member<T>(Is);
                     constexpr const char* name = std::meta::identifier_of(member).data();
-                    const auto& value = (*wrapper->cpp_object).[:member:];
-                    PyObject* py_val = to_python(value);
+                    using MemberType = typename [:std::meta::type_of(member):];
+
+                    // Render each member the way reading it renders, or the
+                    // repr claims a type the attribute does not hand back:
+                    // a vector member used to print as array('d', [...]) in
+                    // both places and now prints as a list in one of them.
+                    //
+                    // The two branches differ in constness on purpose. A
+                    // const lvalue reference is what binds to a bit-field,
+                    // so the general path keeps it; a view needs a mutable
+                    // reference, and a bit-field can never reach that branch
+                    // because its type is integral, not a vector.
+                    PyObject* py_val;
+                    if constexpr (is_viewable_sequence_member_v<MemberType>) {
+                        auto& live = (*wrapper->cpp_object).[:member:];
+                        py_val = to_python_sequence_view(live, self);
+                    } else {
+                        const auto& value = (*wrapper->cpp_object).[:member:];
+                        py_val = to_python(value);
+                    }
                     if (py_val) {
                         PyObject* py_val_repr = PyObject_Repr(py_val);
                         Py_DECREF(py_val);
@@ -5968,34 +7261,109 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // pointer only if T declares at least one operator of that category,
     // so types with no operators pay nothing.
     static PyNumberMethods* num_slots = ops::build_number_methods<T>();
+    static PySequenceMethods* seq_slots = ops::build_sequence_methods<T>();
     static PyMappingMethods* map_slots = ops::build_mapping_methods<T>();
     static ternaryfunc call_slot = ops::build_call<T>();
     static richcmpfunc rich_slot = ops::build_richcompare<T>();
+    static getiterfunc iter_slot = datamodel::build_iter<T>();
+
+    // CPython reads a static type's __module__ out of the text before the
+    // last dot in tp_name, so an unqualified name makes every bound class
+    // claim to live in `builtins` and pickle then fails to find the class it
+    // has just serialized. __name__, __qualname__ and __repr__ still show the
+    // plain name: for a static type both are the text after the last dot.
+    static const std::string qualified_name = [&] {
+        const char* module_name = module ? PyModule_GetName(module) : nullptr;
+        if (!module_name) {
+            PyErr_Clear();
+            return std::string(name);
+        }
+        return std::string(module_name) + "." + name;
+    }();
 
     // Define the Python type structure
     // Note: Inheritance is implicitly supported - reflection sees all members including inherited ones
     static PyTypeObject type_object = {
         .ob_base = PyVarObject_HEAD_INIT(nullptr, 0)
-        .tp_name = name,
-        .tp_basicsize = sizeof(PyWrapper<T>),
+        .tp_name = qualified_name.c_str(),
+        .tp_basicsize = static_cast<Py_ssize_t>(wrapper_basicsize<T>),
         .tp_itemsize = 0,
-        .tp_dealloc = py_dealloc<T>,
+        .tp_dealloc = (autos && autos->tp_dealloc) ? autos->tp_dealloc
+                                                   : (destructor)py_dealloc<T>,
         .tp_repr = (reprfunc)py_repr_func,
         .tp_as_number = num_slots,
+        .tp_as_sequence = seq_slots,
         .tp_as_mapping = map_slots,
         .tp_call = call_slot,
         .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  // Allow subclassing
         .tp_doc = "Auto-generated binding via mirror_bridge reflection",
         .tp_richcompare = rich_slot,
+        .tp_iter = iter_slot,
         .tp_methods = methods.data(),
         .tp_getset = getsetters.data(),
-        .tp_init = (ctor_count > 0) ? (initproc)py_init<T, Trampoline> : nullptr,
-        .tp_new = (ctor_count > 0) ? py_new_with_init<T> : py_new<T, Trampoline>,
+        .tp_init = (ctor_count == 0) ? nullptr
+                 : (autos && autos->tp_init) ? autos->tp_init
+                 : (initproc)py_init<T, Trampoline>,
+        // With a parameterized constructor the object is built in tp_init, so
+        // that is where the auto slot has to go; with only a default one it is
+        // built here. Exactly one of the two is ever the auto variant.
+        .tp_new = (ctor_count > 0) ? py_new_with_init<T>
+                : (autos && autos->tp_new) ? autos->tp_new
+                : (newfunc)py_new<T, Trampoline>,
     };
+
+    if constexpr (datamodel::is_iterable<T>()) {
+        datamodel::IterTypeSlot<T>::ptr =
+            datamodel::make_iter_type<T>(qualified_name.c_str());
+    }
+
+    // type_object is a static local of a function template, so it is one
+    // weak symbol and the dynamic linker gives every module that loaded it
+    // the first copy, running only that module's initialiser. If that module
+    // was built against a different revision of T, tp_basicsize is not ours,
+    // and tp_alloc would hand this module an allocation sized for the other
+    // one to construct its own payload into. Measured on GCC 16 at 176 bytes
+    // into a 48-byte object, which segfaults with nothing to catch.
+    //
+    // The CLI, the CMake helper and the test harness all compile with
+    // -fvisibility=hidden, which keeps the copies apart and makes the shared
+    // dict in sys.modules the single cross-module channel it is documented to
+    // be. This is for a build that does none of the three, where refusing the
+    // import is the only honest answer left.
+    if (type_object.tp_basicsize != static_cast<Py_ssize_t>(wrapper_basicsize<T>)) {
+        PyErr_Format(PyExc_ImportError,
+                     "mirror_bridge: '%s' was already bound in this process by a "
+                     "module built against a different definition of it (its wrapper "
+                     "is %zd bytes, this one needs %zd). Rebuild both modules against "
+                     "the same header, or compile them with -fvisibility=hidden so "
+                     "each keeps its own type.",
+                     name, type_object.tp_basicsize,
+                     static_cast<Py_ssize_t>(wrapper_basicsize<T>));
+        return {nullptr};
+    }
 
     // Initialize and register the type with Python
     if (PyType_Ready(&type_object) < 0) {
         return {nullptr};
+    }
+
+    // __reduce__ and __setstate__ go into the type dict as method descriptors
+    // rather than into tp_methods, which reflection sizes exactly to the
+    // class's own methods.
+    if constexpr (datamodel::is_picklable<T>()) {
+        static PyMethodDef reduce_def = {
+            "__reduce__", (PyCFunction)datamodel::py_reduce<T>, METH_NOARGS,
+            "Return the pickle reconstruction tuple for this object."};
+        static PyMethodDef setstate_def = {
+            "__setstate__", (PyCFunction)datamodel::py_setstate<T>, METH_O,
+            "Restore this object from the state __reduce__ produced."};
+        for (PyMethodDef* def : {&reduce_def, &setstate_def}) {
+            PyObject* descr = PyDescr_NewMethod(&type_object, def);
+            if (descr) {
+                PyDict_SetItemString(type_object.tp_dict, def->ml_name, descr);
+                Py_DECREF(descr);
+            }
+        }
     }
 
     // Add static methods to the type dictionary
@@ -6042,6 +7410,10 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
         }(std::make_index_sequence<static_data_member_count>{});
     }
 
+    // Everything above added entries to tp_dict after PyType_Ready finished;
+    // this is what tells CPython's attribute cache about them.
+    PyType_Modified(&type_object);
+
     Py_INCREF(&type_object);
     if (PyModule_AddObject(module, name, reinterpret_cast<PyObject*>(&type_object)) < 0) {
         Py_DECREF(&type_object);
@@ -6054,9 +7426,11 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     // Register type in TypeRegistry for type-based lookup in to_python
     TypeRegistry<T>::py_type = &type_object;
 
-    // Register in Python-based global registry for cross-module type sharing
-    // This allows types bound in one .so file to be properly returned
-    // from methods in another .so file (C++ static variables are per-.so)
+    // Register in Python-based global registry for cross-module type sharing.
+    // This allows types bound in one .so file to be properly returned from
+    // methods in another. A C++ static is per-.so only when the module was
+    // compiled with hidden visibility, which the check above is about; the
+    // dict is per-process either way, which is why it is the channel.
     register_type_in_python<T>(&type_object);
 
     // Record how to reach each base subobject from a T. Done by the derived
@@ -6069,6 +7443,89 @@ BoundClass<T> bind_class(PyObject* module, const char* name, const char* file_ha
     collect_stub_info<T>(name);
 
     return {&type_object};
+}
+
+// ============================================================================
+// Enums
+// ============================================================================
+//
+// An enum value already crosses as a plain int in both directions: to_python
+// sends it through PyLong_FromLong and from_python reads it with
+// PyLong_Check. What was missing was the names. A module with a Color
+// parameter exposed 0, 1 and 2 with nothing in it saying which was which,
+// and the caller had to read the C++ header to find out.
+//
+// Exporting the enum as enum.IntEnum adds the names and changes no
+// conversion, because an IntEnum member IS an int: it goes in wherever a
+// bare int went in, and a function that returns one still returns a bare
+// int, which compares equal to the member.
+
+// Export E as a Python enum.IntEnum named `name`. Returns the new class, or
+// nullptr with the error set.
+template<typename E>
+    requires std::is_enum_v<std::remove_cvref_t<E>>
+PyObject* bind_enum(PyObject* module, const char* name) {
+    using CleanE = std::remove_cvref_t<E>;
+
+    const auto pairs = enum_members<CleanE>();
+    PyObject* members = PyList_New(static_cast<Py_ssize_t>(pairs.size()));
+    if (!members) return nullptr;
+
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+        // Built by hand rather than with Py_BuildValue's "s#": that format
+        // needs PY_SSIZE_T_CLEAN, which this header does not define, and
+        // without it CPython raises a SystemError from inside module init.
+        PyObject* key = PyUnicode_FromStringAndSize(
+            pairs[i].first.data(), static_cast<Py_ssize_t>(pairs[i].first.size()));
+        PyObject* val = key ? PyLong_FromLongLong(pairs[i].second) : nullptr;
+        PyObject* pair = val ? PyTuple_New(2) : nullptr;
+        if (!pair) {
+            Py_XDECREF(key);
+            Py_XDECREF(val);
+            Py_DECREF(members);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(pair, 0, key);
+        PyTuple_SET_ITEM(pair, 1, val);
+        PyList_SET_ITEM(members, static_cast<Py_ssize_t>(i), pair);
+    }
+
+    PyObject* enum_module = PyImport_ImportModule("enum");
+    if (!enum_module) { Py_DECREF(members); return nullptr; }
+    PyObject* int_enum = PyObject_GetAttrString(enum_module, "IntEnum");
+    Py_DECREF(enum_module);
+    if (!int_enum) { Py_DECREF(members); return nullptr; }
+
+    // IntEnum(name, [(member, value), ...]) is the functional API, which is
+    // the only way to build one from values known at runtime.
+    PyObject* cls = PyObject_CallFunction(int_enum, "sO", name, members);
+    Py_DECREF(int_enum);
+    Py_DECREF(members);
+    if (!cls) return nullptr;
+
+    // The functional API stamps the class with the caller's module, which it
+    // guesses from the stack and gets wrong for a C extension. Pickling and
+    // repr both read it.
+    PyObject* module_name = PyModule_GetNameObject(module);
+    if (module_name) {
+        if (PyObject_SetAttrString(cls, "__module__", module_name) < 0) PyErr_Clear();
+        Py_DECREF(module_name);
+    } else {
+        PyErr_Clear();
+    }
+
+    // PyModule_AddObject steals on success only, so this is the shape that
+    // does not leak on failure.
+    Py_INCREF(cls);
+    if (PyModule_AddObject(module, name, cls) < 0) {
+        Py_DECREF(cls);
+        Py_DECREF(cls);
+        return nullptr;
+    }
+    Py_DECREF(cls);
+
+    stubgen::register_enum_stub<CleanE>(name);
+    return cls;
 }
 
 // Auto-discovery-friendly binder. The CLI points mirror_bridge at arbitrary

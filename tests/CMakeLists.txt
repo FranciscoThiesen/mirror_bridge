@@ -20,6 +20,56 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/cross_module_test
     )
 
+    # Two modules whose headers disagree about the size of the same class.
+    # Each includes its own revision, so the skew exists without a compile
+    # flag and the bash harness's generic build reproduces it too.
+    mirror_bridge_python_module(skew_small
+        abi_skew/skew_small_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    mirror_bridge_python_module(skew_big
+        abi_skew/skew_big_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    # The same skew, but with both modules binding the class rather than one
+    # of them only returning it.
+    mirror_bridge_python_module(both_small
+        abi_skew/both_small_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    mirror_bridge_python_module(both_big
+        abi_skew/both_big_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/abi_skew
+    )
+
+    # Two modules binding the same class at the same layout, so each has its
+    # own type object and the shared registry holds whichever registered last.
+    mirror_bridge_python_module(ident_a
+        type_identity/ident_a_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
+    )
+
+    mirror_bridge_python_module(ident_b
+        type_identity/ident_b_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/type_identity
+    )
+
+    # Scoped, unscoped, nested, negative and keyword-named enumerators.
+    mirror_bridge_python_module(enums_test
+        enums/enums_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/enums
+    )
+
+    # Every shape the array.array decision can land on, so the stub has to
+    # mirror the typecode table rather than approximate it.
+    mirror_bridge_python_module(stub_container_types
+        stub_container_types/stub_container_types_binding.cpp
+        INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/stub_container_types
+    )
+
     # Static method test (Vec3)
     mirror_bridge_python_module(vec3_test
         static_method_test/vec3_binding.cpp
@@ -181,6 +231,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A standard-library base contributes no methods to the bound surface
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/std_bases)
+        mirror_bridge_python_module(std_bases
+            std_bases/std_bases_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/std_bases
+        )
+    endif()
+
     # C++ default arguments on constructors, not just on methods
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ctor_defaults)
         mirror_bridge_python_module(ctor_defaults
@@ -215,7 +273,30 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
-    # By-reference argument semantics (zero-copy const T&, visible T& mutation)
+    # A C++ name that is a Python keyword still yields a parseable .pyi
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pyi_keywords)
+        mirror_bridge_python_module(pyi_keywords
+            pyi_keywords/pyi_keywords_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/pyi_keywords
+        )
+    endif()
+
+    # The C++ object lives inside the Python object (one allocation)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc)
+        mirror_bridge_python_module(wrapper_alloc
+            wrapper_alloc/wrapper_alloc_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/wrapper_alloc
+        )
+    endif()
+
+    # A write through a nested data member reaches the owner, not a copy
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/member_views)
+        mirror_bridge_python_module(member_views
+            member_views/member_views_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/member_views
+        )
+    endif()
+
     # P3394 annotations, which both supported toolchains implement under
     # different names. The runtime behaviour is what matters and had no test:
     # a compile-only check cannot tell an honoured [[=exclude{}]] from an
@@ -247,6 +328,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         mirror_bridge_python_module(const_members
             const_members/const_members_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/const_members
+        )
+    endif()
+
+    # Python data model: iteration, len(), `in`, and pickling
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data_model)
+        mirror_bridge_python_module(data_model
+            data_model/data_model_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/data_model
         )
     endif()
 
@@ -312,6 +401,18 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         )
     endif()
 
+    # Class-typed values are identity-checked at the Lua boundary
+    # (wrong class -> Lua error, derived -> base lands on the right subobject)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/type_safety)
+        mirror_bridge_lua_module(type_safety_lua
+            lua/type_safety/type_safety_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/type_safety
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
+        )
+        # require("type_safety") resolves the symbol from the module name
+        set_target_properties(type_safety_lua PROPERTIES OUTPUT_NAME type_safety)
+    endif()
+
 endif()
 
 # ============================================================================
@@ -336,6 +437,33 @@ if(MIRROR_BRIDGE_BUILD_JS AND NAPI_FOUND)
         )
     endif()
 
+    # Class-typed values are identity-checked at the JavaScript boundary
+    # (wrong class -> TypeError, derived -> base lands on the right subobject)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/js/type_safety)
+        mirror_bridge_js_module(type_safety_js
+            js/type_safety/type_safety_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/type_safety
+        )
+
+        # A second native addon, so the test can hand the boundary an object
+        # that napi_unwrap accepts and mirror_bridge did not wrap. Plain C++
+        # against node_api.h, not a mirror_bridge binding.
+        add_library(foreign_addon MODULE js/type_safety/foreign_addon.cpp)
+        target_include_directories(foreign_addon PRIVATE ${NAPI_INCLUDE_DIR})
+        # Plain C++ with no reflection: it must not pick up the project's
+        # -freflection flags or the mirror_bridge headers.
+        set_target_properties(foreign_addon PROPERTIES
+            PREFIX "" SUFFIX ".node"
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+        )
+        # Node resolves the addon's N-API symbols at load time
+        if(APPLE)
+            target_link_options(foreign_addon PRIVATE -Wl,-undefined,dynamic_lookup)
+        endif()
+        add_dependencies(type_safety_js foreign_addon)
+    endif()
+
 endif()
 
 # ============================================================================
@@ -349,6 +477,11 @@ endif()
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
 set(MB_PYTHON_BASH_ONLY_PATTERN
+    # batch_methods' module only exists when built with
+    # -DMIRROR_BRIDGE_BATCH_METHODS, which its own script does; the glob below
+    # would otherwise register the .py as a standalone test with nothing to
+    # import.
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^batch_methods"
     # columnar's module only exists when built with
     # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its own script does; the glob
     # below would otherwise register the .py as a standalone test with nothing
@@ -480,6 +613,25 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/friend_declared)
     )
 endif()
 
+# Batch siblings are generated only under a flag, so the module is built both
+# ways rather than relying on the default build.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_methods)
+    add_test(NAME batch_methods
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/batch_methods/test_batch.sh
+    )
+    set_tests_properties(batch_methods PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
+# A header whose namespaces come from a macro: the text scan cannot see them,
+# so the using-directives derived from it are nonsense and used to fail the
+# whole module.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace)
+    add_test(NAME cli_macro_namespace
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace/build_and_test.sh
+    )
+    set_tests_properties(cli_macro_namespace PROPERTIES
 # A struct's layout read off the type, checked against what numpy makes of it.
 # Not a binding, and it needs numpy, which the test skips itself without.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/columnar)
@@ -506,9 +658,23 @@ endif()
 # libraries, and its usability bar (must_export) and regression ladder are the
 # two pieces of judgement in it. Pure Python, so this runs with no reflection
 # toolchain and no clones.
-if(Python3_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py)
+# It lives under tests/ rather than beside the module because the bash
+# harness, which is the only thing CI runs, discovers tests/**/test_*.py and
+# nothing else. The glob below picks it up; this entry is what puts it in
+# ctest too.
+if(Python3_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/compatibility_matrix/test_classify.py)
     add_test(NAME compat_classify
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../compatibility/test_classify.py
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/compatibility_matrix/test_classify.py
+    )
+endif()
+
+# core::type_key is the cross-module identity of a bound class, so two
+# distinct types sharing a key is a type confusion at the Lua and JavaScript
+# boundaries. All static_assert, so the test is a compile.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/type_key)
+    add_test(NAME type_key_distinctness
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/type_key/check_type_keys.sh
+                ${CMAKE_CXX_COMPILER}
     )
 endif()
 

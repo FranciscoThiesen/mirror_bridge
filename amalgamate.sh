@@ -40,6 +40,23 @@ extract_content() {
     ' "$file"
 }
 
+# core/mirror_bridge_core.hpp now depends on the spelling helpers
+# (core::type_key spells a type without RTTI, which the N-API backend needs
+# because node-gyp builds with -fno-rtti), so every single header carries
+# spelling ahead of core. extract_content strips the #include, so nothing
+# re-emits it later.
+emit_core() {
+    local out="$1"
+    {
+        echo "// ============================================================================"
+        echo "// CORE - Language-Agnostic Reflection Infrastructure"
+        echo "// ============================================================================"
+        echo ""
+    } >> "$out"
+    extract_content "$SCRIPT_DIR/core/mirror_bridge_spelling.hpp" >> "$out"
+    extract_content "$SCRIPT_DIR/core/mirror_bridge_core.hpp" >> "$out"
+}
+
 # ============================================================================
 # Python Single Header
 # ============================================================================
@@ -70,12 +87,7 @@ cat > "$OUTPUT_DIR/mirror_bridge_python.hpp" << 'EOF'
 EOF
 
 # Add core header content
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
-echo "// CORE - Language-Agnostic Reflection Infrastructure" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
-echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
-
-extract_content "$SCRIPT_DIR/core/mirror_bridge_core.hpp" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
+emit_core "$OUTPUT_DIR/mirror_bridge_python.hpp"
 
 # Add Python bindings content
 echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
@@ -90,30 +102,27 @@ echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 # overloads land in the right scope, and the templates header comes last
 # because it builds on everything before it). Leaving the raw #include
 # lines in place shipped a single header that could not compile standalone.
-TMP_SPELLING=$(mktemp)
 TMP_ANNOTATIONS=$(mktemp)
 TMP_COLUMNAR=$(mktemp)
 TMP_STUBGEN=$(mktemp)
 TMP_EIGEN=$(mktemp)
 TMP_TEMPLATES=$(mktemp)
-trap 'rm -f "$TMP_SPELLING" "$TMP_ANNOTATIONS" "$TMP_COLUMNAR" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES"' EXIT
-extract_content "$SCRIPT_DIR/core/mirror_bridge_spelling.hpp" > "$TMP_SPELLING"
+TMP_SEQVIEW=$(mktemp)
+trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_COLUMNAR" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES" "$TMP_SEQVIEW"' EXIT
 extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_columnar.hpp" > "$TMP_COLUMNAR"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_stubgen.hpp" > "$TMP_STUBGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_templates.hpp" > "$TMP_TEMPLATES"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_sequence_view.hpp" > "$TMP_SEQVIEW"
 
 # Extract Python content: skip the core include, splice satellites inline
-awk -v spelling="$TMP_SPELLING" -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
-    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" -v columnar="$TMP_COLUMNAR" '
+awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
+    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" -v columnar="$TMP_COLUMNAR" \
+    -v seqview="$TMP_SEQVIEW" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
-    /^#include "core\/mirror_bridge_spelling\.hpp"/ {
-        while ((getline line < spelling) > 0) print line
-        close(spelling)
-        next
-    }
+    /^#include "core\/mirror_bridge_spelling\.hpp"/ { next }   # emitted with core
     /^#include "python\/mirror_bridge_annotations\.hpp"/ {
         while ((getline line < annotations) > 0) print line
         close(annotations)
@@ -137,6 +146,15 @@ awk -v spelling="$TMP_SPELLING" -v annotations="$TMP_ANNOTATIONS" -v stubgen="$T
     /^#include "python\/mirror_bridge_templates\.hpp"/ {
         while ((getline line < templates) > 0) print line
         close(templates)
+        next
+    }
+    # Every satellite header needs its own rule here. The catch-all in
+    # extract_content deletes any mirror_bridge #include it does not
+    # recognise, so a new header without a rule is not a compile error in
+    # the single-header build -- it is silently missing code.
+    /^#include "python\/mirror_bridge_sequence_view\.hpp"/ {
+        while ((getline line < seqview) > 0) print line
+        close(seqview)
         next
     }
     { print }
@@ -174,12 +192,7 @@ cat > "$OUTPUT_DIR/mirror_bridge_lua.hpp" << 'EOF'
 EOF
 
 # Add core header content
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
-echo "// CORE - Language-Agnostic Reflection Infrastructure" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
-echo "" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
-
-extract_content "$SCRIPT_DIR/core/mirror_bridge_core.hpp" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
+emit_core "$OUTPUT_DIR/mirror_bridge_lua.hpp"
 
 # Add Lua bindings content
 echo "" >> "$OUTPUT_DIR/mirror_bridge_lua.hpp"
@@ -227,12 +240,7 @@ cat > "$OUTPUT_DIR/mirror_bridge_javascript.hpp" << 'EOF'
 EOF
 
 # Add core header content
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
-echo "// CORE - Language-Agnostic Reflection Infrastructure" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
-echo "// ============================================================================" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
-echo "" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
-
-extract_content "$SCRIPT_DIR/core/mirror_bridge_core.hpp" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
+emit_core "$OUTPUT_DIR/mirror_bridge_javascript.hpp"
 
 # Add JavaScript bindings content
 echo "" >> "$OUTPUT_DIR/mirror_bridge_javascript.hpp"

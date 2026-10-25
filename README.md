@@ -64,7 +64,7 @@ mirror_bridge generate src/ --module open3d_geometry --lang all -I /usr/include/
 
 And it's not a slower convenience layer: on the identical C++ compiled with identical flags, ingesting a 1M-point cloud from Python (`list of [x,y,z]` → `std::vector<Eigen::Vector3d>`) runs **42x faster than the pybind11 binding** (12.2ms vs 509ms), because the reflection-generated converter is specialized at compile time instead of dispatching through generic type casters ([fair-comparison methodology](asm_study/)).
 
-### And on sixteen libraries we didn't pick
+### And on thirty-one libraries we didn't pick
 
 Open3D is a case we worked, so on its own it proves only that it can be done.
 To make the claim falsifiable instead, CI runs the same one-line command every
@@ -79,6 +79,26 @@ yaml-cpp, 108 in spdlog — and the matrix then says, per library, exactly what
 stops a module coming out, grouped so the most valuable thing to fix is the
 line with the most libraries on it. pybind11 and nanobind have nothing to put
 in that first column, because the class list is the thing their user writes.
+
+### Pointing it at a large codebase
+
+Large projects do not fail to bind because binding is hard. They fail because their
+headers do not parse without the include paths and defines their own build system
+passes. `--compile-commands` reads those from the build instead of asking you to restate
+them:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+`--discover-only` stops after reading the headers and reports what it found, including
+whether the class list came from reflection or from a fallback text scan. That is the
+number that says whether a codebase is ready, and it costs one pass instead of a module
+per class. MSVC and clang-cl flag spellings are translated, and `--replace-prefix` maps a
+build database written on one machine onto the paths of another.
+[Details](docs/reference/cli.md#large-codebases).
 
 ## Try It Now
 
@@ -129,39 +149,110 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
+| C# (.NET) | Stable for scalars, strings, enums, objects and vectors | `--lang csharp` |
 | Rust | Prototype | Code generation |
+
+C# goes through P/Invoke, so there is no host C API to call the way there is for
+CPython, Lua and Node. `--lang csharp` writes a flat C ABI shim plus the C# that calls
+it, both from one reflection pass, so a member renamed in C++ renames the exported symbol
+and the C# property together. **The shim has no reflection in it**, so it rebuilds with
+whatever compiler you already have — which matters, because MSVC has no reflection
+support.
+
+```csharp
+using var d = new Device();          // IDisposable, over a SafeHandle
+d.calibration = 2.5;                 // real C++ parameter and member names
+d.mode = Mode.Careful;               // a real C# enum, not an int
+d.samples.Add(1.5);                  // the live C++ vector: Add reaches C++
+Console.WriteLine(d.samples.Sum());  // IReadOnlyList<double>, so LINQ works
+d.inner.x = 7.5;                     // a member object is a view, not a copy
+d.replace_samples(new[]{1.0, 2.0});  // and a container crosses inward too
+```
+
+The shim has no reflection in it, so the ABI beside it is callable from any compiler:
+`<module>.h` declares the same entry points, and a plain `g++ -std=c++17` or `gcc -std=c99`
+can use them ([issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3)).
+
+See [the CLI reference](docs/reference/cli.md#csharp-output).
 
 ### Feature Matrix
 
-| Feature | Python | Lua | JavaScript |
-|---------|:------:|:---:|:----------:|
-| **Data Members** | ✅ | ✅ | ✅ |
-| **Methods (any arity)** | ✅ | ✅ | ✅ |
-| **Constructors** | ✅ | ✅ | ✅ |
-| **Containers (vector/array)** | ✅ | ✅ | ✅ |
-| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
-| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
-| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
-| **Variants (std::variant)** | ✅ | ✅ | ✅ |
-| **Nested Objects** | ✅ | ✅ | ✅ |
-| **Enums** | ⚠️ | ⚠️ | ⚠️ |
-| **Inheritance** | ✅ | ✅ | ✅ |
-| **Method Overloading** | ✅ | ⚠️ | ⚠️ |
-| **Smart Pointers** | ✅ | ✅ | ✅ |
-| **Exception Handling** | ✅ | ✅ | ✅ |
-| **Cross-Module Types** | ✅ | ❌ | ❌ |
-| **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
-| **Async/Await** | ✅ | ❌ | ✅ |
-| **std::optional** | ✅ | ✅ | ✅ |
-| **std::expected** | ✅ | ✅ | ✅ |
+| Feature | Python | Lua | JavaScript | C# |
+|---------|:------:|:---:|:----------:|:--:|
+| **Data Members** | ✅ | ✅ | ✅ | ✅ |
+| **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
+| **Constructors** | ✅ | ✅ | ✅ | ✅ |
+| **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
+| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
+| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
+| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
+| **Variants (std::variant)** | ✅ | ✅ | ✅ | ❌ |
+| **Nested Objects** | ✅ | ✅ | ✅ | ✅ |
+| **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ | ❌ |
+| **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ | ❌ |
+| **Enums** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Inheritance** | ✅ | ✅ | ✅ | ⚠️ |
+| **Method Overloading** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| **Exception Handling** | ✅ | ✅ | ✅ | ✅ |
+| **Cross-Module Types** | ✅ | ❌ | ❌ | ❌ |
+| **Zero-Copy Buffers** | ✅ | ❌ | ❌ | ❌ |
+| **Async/Await** | ✅ | ❌ | ✅ | ❌ |
+| **std::optional** | ✅ | ✅ | ✅ | ❌ |
+| **std::expected** | ✅ | ✅ | ✅ | ❌ |
+
+Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
+output and as a comment in the `.cs` at the point the member would have been, so a missing
+member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
+view; `std::array` and `vector<bool>` do not.
+
+**Inheritance** is ⚠️ for C# in the other direction: inherited members and methods are
+flattened onto the derived class, which Lua and JavaScript do not do at all, but a generated
+class has no C# base type, so a `Derived` cannot be passed where a `Base` is expected. Lua and
+JavaScript both have the upcast machinery for that and C# does not yet. The two backends are
+incomplete in opposite directions, and one tick on both would hide it.
+
+Two rows read better for C# than for Lua and JavaScript, and that is not an accident of the
+table. On **overloading**, Lua reaches only the first overload of a name and JavaScript only
+the last, and neither says so; C# emits one exported symbol per overload and lets C#'s own
+resolution pick, refusing only the pair C# genuinely cannot distinguish. On **enums**, Lua
+and JavaScript pass the underlying integer with no enum type at all.
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
 
-⚠️ **Enums**: enum *values* cross the boundary correctly as plain integers, but
-enum *types* are not exported, so there is no Python, Lua or JavaScript object
-for them and an out-of-range integer is accepted rather than rejected.
-`generate` names every enum it skipped. Tracked in
-[#20](https://github.com/FranciscoThiesen/mirror_bridge/issues/20).
+✅ **Python data model**: a class whose `begin()`/`end()` form a range over
+convertible elements iterates and answers `in`; add `size()` and it gains
+`len()`, and an empty one is falsy. A default-constructible class whose members
+are all assignable pickles and deep-copies, with the member list taken from
+reflection so it cannot fall behind the C++ struct; one that cannot be
+reconstructed — a `const` or `[[=readonly{}]]` member, a private or
+`[[=exclude{}]]` one the state cannot see, or a member a base class declares —
+keeps refusing to pickle rather than silently dropping a field.
+
+`hash()` is not generated, and what that leaves differs by class. A class with
+`operator==` is **unhashable**: CPython inherits `tp_hash` from `object` only
+when it also inherits `tp_richcompare`, so defining comparison and no hash
+makes `set`, `dict` and `in` over a set raise
+`TypeError: unhashable type: 'mod.Point'`. Use a list, or key on a member. A
+class without `operator==` keeps the identity hash, so two equal-looking
+objects remain two distinct keys. Hashing the member values instead would be
+worse: every non-`const` member is assignable from Python, and a hash that
+moves corrupts any set or dict already holding the object.
+
+⚠️ **Enums, outside Python**: Python gets the enum type as an `enum.IntEnum`
+carrying the C++ enumerator names and values, so `Color.Red` exists and
+`list(Color)` works. Nothing about the value conversion changed, because an
+`IntEnum` member is an `int`. Lua and JavaScript have no enum object to map
+onto and their values still cross as bare numbers; `generate` says which
+backend does which. An out-of-range integer is still accepted where an enum
+is expected, in every backend.
+
+⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
+`shared_ptr` return gives you a usable object. What does not cross is the
+shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
+parameter is refused. Tracked in
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ### Additional Features
 

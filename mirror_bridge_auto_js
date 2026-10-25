@@ -1,7 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Mirror Bridge Auto (JavaScript) - Auto-discover and bind all classes in a directory
 # Usage: mirror_bridge_auto_js <src_dir> --module <name> [options]
 
+# Associative arrays and name references below need bash 4. macOS still ships
+# bash 3.2 from 2007 and will not ship a newer one, so without this check the
+# first `declare -A` fails with "declare: -A: invalid option" and that is the
+# entire output. env rather than /bin/bash in the shebang so a newer bash
+# earlier in PATH is used when there is one.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "mirror_bridge needs bash 4 or newer. This is ${BASH_VERSION:-not bash}." >&2
+    echo "" >&2
+    echo "macOS ships bash 3.2. Any newer bash on PATH is used automatically:" >&2
+    echo "    brew install bash" >&2
+    echo "" >&2
+    echo "Or run everything inside the container, which has one:" >&2
+    echo "    ./start_dev_container.sh" >&2
+    exit 1
+fi
 set -e
 
 # Colors

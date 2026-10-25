@@ -122,11 +122,7 @@ mirror_bridge::python::bind_class<MyBase, MyBaseTrampoline>(module, "MyBase"); /
 ```
 ✓ Successfully built bindings for: python
 
-⚠ 3 names were not bound into 'book' — Python raises AttributeError on them:
-
-    1 enum type(s) — values still cross as plain int, unchecked
-      trading::Side
-      Fix: mirror each enum as a Python enum.IntEnum; stubs annotate these as int
+⚠ 2 names were not bound into 'book' — Python raises AttributeError on them:
 
     2 free function(s) overloaded in C++ — overload sets are not bound yet
       lib::price, lib::delta
@@ -153,7 +149,7 @@ rather than in your first import:
 
 **Cause** The build succeeded, but some names you wrote are not in the module. Enum *types* are not exported as Python objects, and a free function that is overloaded, or that shares its name with a function template, has no unique address to bind. A class or function the module declined is one whose parameters or return type have no conversion, and the reason given is the specific gate that refused.
 
-**Fix** Each group states its own. An enum's values still cross correctly as plain `int`, so the usual answer is to mirror the enum on the Python side; the generated stub annotates those parameters as `int`. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
+**Fix** Each group states its own. For an overload set, give one overload a distinct name or add a single non-overloaded wrapper and bind that. For a declined name, the reason names the fix: write a converter, change the return type, or stop writing through a parameter. The full list is also in `<output>/<module>_plan.txt`, and in `--json` under `declined`.
 
 ### The module built but does not import
 
