@@ -828,6 +828,15 @@ public:
         p.header = header ? header : "";
         p.default_constructible = std::is_default_constructible_v<T>;
         if (!p.header.empty()) headers_.insert(p.header);
+        if constexpr (!core::type_key_is_distinctive<std::remove_cvref_t<T>>()) {
+            // Leave it out of the ledger rather than give it an identity it
+            // does not own. Anything referring to this class then reports "a
+            // class this module does not bind", which is true and is what the
+            // alternative -- two classes sharing one ClassRef, and a handle
+            // static_cast to the wrong type -- would have hidden.
+            classes_.push_back(std::move(p));
+            return;
+        }
         class_key_[type_key<std::remove_cvref_t<T>>()] =
             ClassRef{p.cs_name, p.cpp_name, p.handle};
         classes_.push_back(std::move(p));
@@ -994,12 +1003,27 @@ private:
     // name rather than the integer it travels as, so the generated API stays
     // typed; an unregistered enum falls back to the integer, which is honest
     // but worth reporting, so callers of this check cs_is_untyped_enum too.
-    // typeid rather than a reflected name: display_string_of prints an alias
-    // as the alias, so any key built from ^^SomeAlias<T> keys on the alias's
-    // own spelling and two sites that spell the type differently never agree.
+    // The REFLECTED key, not typeid, and the reason is a link-time one that
+    // only this backend meets.
+    //
+    // Under the Itanium ABI a polymorphic class's typeinfo object is emitted
+    // only beside its vtable, in whichever translation unit defines the class's
+    // key function. The C# stage-1 generator is an EXECUTABLE built from
+    // headers and linked against nothing, so naming such a class in typeid is
+    // an unresolvable symbol. Measured on the same six-line TU: as an
+    // executable, "undefined reference to `typeinfo for Key'"; as -shared, it
+    // links clean. That asymmetry is the whole reason Python never meets this
+    // -- its artifact is a .so, where the undefined typeinfo is tolerated at
+    // link and resolved at import by whatever --link-args supplied.
+    //
+    // typeid was chosen here originally because display_string_of prints an
+    // alias as the alias, so a key built from ^^SomeAlias<T> keys on the
+    // alias's spelling. But core::spell was written to solve exactly that, and
+    // Lua and JavaScript have used the reflected key since node-gyp forced
+    // -fno-rtti on them. There was never a reason for this backend to differ.
     template<typename U>
     static std::string type_key() {
-        return std::string(typeid(U).name());
+        return std::string(core::type_key<std::remove_cvref_t<U>>);
     }
 
     // Registered on first use, because which vector types exist is a property
