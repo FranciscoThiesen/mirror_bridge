@@ -199,7 +199,7 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Constructors** | ✅ | ✅ | ✅ | ✅ |
 | **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
 | **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
-| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
+| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ⚠️ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
 | **Variants (std::variant)** | ✅ | ✅ | ✅ | ❌ |
@@ -221,6 +221,18 @@ Where C# is ⚠️ or ❌ the generated binding **names what it left out and why
 output and as a comment in the `.cs` at the point the member would have been, so a missing
 member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
 view; `std::array` and `vector<bool>` do not.
+
+**Maps** in C# are `⚠️` rather than `✅` for one reason: a map crosses outward, not inward.
+`std::map` and `std::unordered_map` of a scalar or string key and value bind as a real
+`IReadOnlyDictionary<K, V>` — as a live member whose indexer setter, `Remove` and `Clear`
+reach C++, and as a by-value return the caller owns and disposes — but a method *taking* a
+map is reported as left out, because an inbound map needs the same materialise-or-pass-through
+step a `vector` parameter has and does not have it yet. An enum key is refused for the same
+reason `vector<SomeEnum>` is. `Keys`, `Values` and enumeration take one snapshot in a single
+pass over the C++ map, so key *i* is always paired with the value it had at that moment;
+offering them as two separate calls would let the map change in between with nothing to say
+so. The snapshot's two halves are the `vector` view classes their element types already
+have, so a map costs no second collection implementation.
 
 **Inheritance** in C# works in two halves. Inherited members and methods are flattened onto
 the derived class, which Lua and JavaScript do not do at all. And because a generated class is

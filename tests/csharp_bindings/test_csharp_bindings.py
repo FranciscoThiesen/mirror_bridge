@@ -36,6 +36,7 @@ def _which(name):
 # generated API exactly, so it belongs next to the assertions about that API.
 DRIVER_CS = """
 using System;
+using System.Collections.Generic;
 using csb;
 
 class Driver {
@@ -185,6 +186,52 @@ class Driver {
                 arg.x = 100.0;
                 Console.WriteLine($"class parameter: consume={o.consume(arg)}");
             }
+        }
+        using (var r = new Registry()) {
+            var a0 = r.counts["a"];
+            var hasB = r.counts.ContainsKey("b");
+            var hasZ = r.counts.ContainsKey("z");
+            Console.WriteLine($"map member: Count={r.counts.Count} a={a0} total={r.total()}");
+            Console.WriteLine($"map lookup: hasB={hasB} hasZ={hasZ}");
+
+            int miss;
+            var found = r.counts.TryGetValue("z", out miss);
+            Console.WriteLine($"map absent: found={found} value={miss}");
+
+            r.counts["d"] = 9;
+            var removed = r.counts.Remove("b");
+            Console.WriteLine($"map write reaches C++: total={r.total()} Count={r.counts.Count} removed={removed}");
+
+            var ks = new List<string>(r.counts.Keys);
+            ks.Sort();
+            var vls = new List<int>(r.counts.Values);
+            vls.Sort();
+            Console.WriteLine($"map halves: keys={string.Join(",", ks.ToArray())} values={string.Join(",", vls.ToArray())}");
+
+            var pairs = new List<string>();
+            foreach (var kv in r.counts) pairs.Add(kv.Key + ":" + kv.Value);
+            pairs.Sort();
+            Console.WriteLine($"map pairs: {string.Join(",", pairs.ToArray())}");
+
+            var mode0 = r.labels["mode"];
+            r.labels["mode"] = "slow";
+            var mode1 = r.labels["mode"];
+            Console.WriteLine($"string-valued map: was={mode0} now={mode1}");
+
+            var w1 = r.weights[1];
+            Console.WriteLine($"unordered map: w1={w1} Count={r.weights.Count}");
+
+            using (var dbl = r.doubled()) {
+                var da = dbl["a"];
+                dbl["a"] = 999;
+                var cppA = r.counts["a"];
+                Console.WriteLine($"map return is an owned copy: doubled_a={da} cpp_a={cppA}");
+            }
+
+            Expect<KeyNotFoundException>(() => { var _ = r.counts["nope"]; }, "map missing key");
+
+            r.counts.Clear();
+            Console.WriteLine($"map clear reaches C++: total={r.total()} Count={r.counts.Count}");
         }
         return 0;
     }
@@ -419,6 +466,30 @@ truthy("while the writable member beside them still binds",
 truthy("and a method reading the const member still binds",
        "public double baseline_sum()" in cs)
 
+print("\n=== maps cross as a live view, and a set is not one ===")
+truthy("a string-keyed map is an IReadOnlyDictionary",
+       "public sealed class MbStringIntMap : IReadOnlyDictionary<string, int>" in cs)
+truthy("a string-valued one too",
+       "public sealed class MbStringStringMap : IReadOnlyDictionary<string, string>" in cs)
+truthy("an unordered_map is named apart from an ordered one",
+       "class MbIntDoubleHashMap" in cs)
+truthy("the member is the live map", "public MbStringIntMap counts {" in cs)
+truthy("and a returned map is that same type, owned by the caller",
+       "public MbStringIntMap doubled()" in cs)
+# One traversal, two owned vectors: handing keys and values back through
+# separate calls would let the map change between them and pair key i with a
+# value that is no longer its own, which the caller cannot detect.
+truthy("keys and values come from a single snapshot call",
+       "_snapshot(void* m, void** out_keys, void** out_vals)" in shim_src)
+check("so there is no separate keys entry point", "_keys(void*" in shim_src, False)
+truthy("and the halves reuse the vector view classes rather than new ones",
+       "new MbStringVector(kp, true, null)" in cs)
+truthy("a map parameter is reported rather than emitted wrong",
+       re.search(r"Registry\.sum_of\(\): a parameter type", run.stdout) is not None)
+truthy("a std::set is reported as not crossing",
+       re.search(r"TagSet\.names: type set<", run.stdout) is not None)
+check("and was not quietly bound as a map", "StringSet" in cs, False)
+
 print("\n=== two C++ types the C# wire spells alike keep their own helpers ===")
 # cs_type maps every 64-bit signed type to "long", so the C# spelling cannot
 # name the helper set. The first claimant keeps the plain name so that no
@@ -501,16 +572,19 @@ print("\n=== the handle is a SafeHandle, not a raw IntPtr ===")
 # idempotent and thread-safe and gives the handle a critical finalizer.
 truthy("a SafeHandle subclass is generated per class", "DeviceHandle : SafeHandle" in cs)
 truthy("it releases through the native delete", "protected override bool ReleaseHandle()" in cs)
-# Three legitimately take a raw pointer. Delete and VFree are called from
-# SafeHandle.ReleaseHandle, which is handed the bare handle field and has no
-# SafeHandle to pass; FreeString takes a malloc'd char*, which is not a handle
-# and is never wrapped in one. Everything else must take the typed handle,
-# because an argument crossing as a bare IntPtr can be released by the GC
-# mid-call -- the exact hole that typing `self` closed.
+# Four legitimately take a raw pointer. Delete, VFree and MFree are called
+# from SafeHandle.ReleaseHandle, which is handed the bare handle field and has
+# no SafeHandle to pass; FreeString takes a malloc'd char*, which is not a
+# handle and is never wrapped in one. Everything else must take the typed
+# handle, because an argument crossing as a bare IntPtr can be released by the
+# GC mid-call -- the exact hole that typing `self` closed. This list is the
+# whole point of the check, so a new release path belongs in it by name and
+# nothing else does: adding maps is what first made it four.
 instance_externs = re.findall(
     r"private static extern [^\n(]+ (\w+)\(([^)]*)\)", cs)
 raw_self = [n for n, a in instance_externs
-            if a.startswith("IntPtr ") and n not in ("Delete", "VFree", "FreeString")]
+            if a.startswith("IntPtr ")
+            and n not in ("Delete", "VFree", "MFree", "FreeString")]
 check("only the release paths take a raw pointer", raw_self, [])
 truthy("and the release paths do, because ReleaseHandle has only the field",
        any(n == "Delete" and a == "IntPtr self" for n, a in instance_externs))
@@ -899,6 +973,30 @@ if MCS and MONO:
                "class called Native: id=3" in out)
         truthy("so does one called DoubleVector",
                "class called DoubleVector: n=4" in out)
+        truthy("a map member reads its C++ contents",
+               "map member: Count=3 a=1 total=6" in out)
+        truthy("ContainsKey answers from C++",
+               "map lookup: hasB=True hasZ=False" in out)
+        truthy("an absent key is false, not an exception",
+               "map absent: found=False value=0" in out)
+        # total() is recomputed in C++, so this is the proof that the write
+        # landed in the real map rather than in a copy of it.
+        truthy("writing and removing through the view reach C++",
+               "map write reaches C++: total=13 Count=3 removed=True" in out)
+        truthy("keys and values come back as the two halves",
+               "map halves: keys=a,c,d values=1,3,9" in out)
+        truthy("enumeration pairs each key with its own value",
+               "map pairs: a:1,c:3,d:9" in out)
+        truthy("a string-valued map round-trips both ways",
+               "string-valued map: was=fast now=slow" in out)
+        truthy("an unordered_map with int keys works too",
+               "unordered map: w1=0.5 Count=2" in out)
+        truthy("a returned map is a copy, so writing it leaves C++ alone",
+               "map return is an owned copy: doubled_a=2 cpp_a=1" in out)
+        truthy("a missing key raises KeyNotFoundException",
+               "map missing key -> KeyNotFoundException" in out)
+        truthy("Clear reaches C++",
+               "map clear reaches C++: total=0 Count=0" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
