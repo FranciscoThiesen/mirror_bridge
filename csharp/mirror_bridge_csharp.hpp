@@ -38,6 +38,7 @@
 
 #include "../core/mirror_bridge_core.hpp"
 
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +86,7 @@ enum class Wire {
     Utf8,       // const char* out, const char* in
     Object,     // void* handle to a bound class
     Vector,     // void* handle to a std::vector of a wire-able element
+    Array,      // T* into a std::array's own storage, with N known at generation
     Map,        // void* handle to a std::map/unordered_map of wire-able K and V
     Opt,        // std::optional of a wire-able scalar or string
     Unsupported
@@ -190,6 +192,38 @@ struct map_kv<C, std::void_t<typename C::key_type, typename C::mapped_type>> {
 // Both halves have to cross on their own, and they cross through the vector
 // machinery: a snapshot of a map is two owned vectors. That is why an enum key
 // is excluded for now -- std::vector<SomeEnum> is not a wire vector either.
+template<typename>
+struct array_element {
+    using type = void;
+    static constexpr bool is_array = false;
+    static constexpr std::size_t size = 0;
+};
+
+template<typename E, std::size_t N>
+struct array_element<std::array<E, N>> {
+    using type = E;
+    static constexpr bool is_array = true;
+    static constexpr std::size_t size = N;
+};
+
+// The element rule is the vector one, and for the same reasons: bool is out
+// because it crosses as int32 while the storage is one byte, so a bulk copy
+// would read the wrong bytes. A zero-length array has no storage to point at,
+// so data() may be null and there is nothing to view.
+template<typename C>
+consteval bool is_wire_array() {
+    using AE = array_element<std::remove_cvref_t<C>>;
+    if constexpr (!AE::is_array) {
+        return false;
+    } else if constexpr (AE::size == 0) {
+        return false;
+    } else {
+        using E = std::remove_cvref_t<typename AE::type>;
+        if constexpr (std::is_same_v<E, bool>) return false;
+        else return std::is_arithmetic_v<E> || core::StringLike<E>;
+    }
+}
+
 template<typename C>
 consteval bool is_wire_map() {
     using MK = map_kv<std::remove_cvref_t<C>>;
@@ -234,6 +268,7 @@ consteval Wire wire_of() {
     // borrowed from its owner, a value returned by a method is the caller's.
     else if constexpr (is_wire_optional<U>()) return Wire::Opt;
     else if constexpr (is_wire_vector<U>()) return Wire::Vector;
+    else if constexpr (is_wire_array<U>()) return Wire::Array;
     else if constexpr (is_wire_map<U>()) return Wire::Map;
     else if constexpr (core::NestedBindable<U>) return Wire::Object;
     else if constexpr (std::is_same_v<U, char> || std::is_same_v<U, signed char>) return Wire::I8;
@@ -270,6 +305,7 @@ constexpr const char* c_type(Wire w) {
         case Wire::Utf8: return "const char*";
         case Wire::Object: return "void*";
         case Wire::Vector: return "void*";
+        case Wire::Array:  return "void*";
         case Wire::Map:    return "void*";
         // Never nullptr: these results are streamed straight into the output,
         // and streaming a null const char* is undefined behaviour that has
@@ -301,6 +337,7 @@ constexpr const char* cs_wire_type(Wire w) {
         case Wire::Utf8: return "IntPtr";
         case Wire::Object: return "IntPtr";
         case Wire::Vector: return "IntPtr";
+        case Wire::Array:  return "IntPtr";
         case Wire::Map:    return "IntPtr";
         default:         return "MB_WIRE_UNHANDLED";
     }
@@ -331,7 +368,16 @@ constexpr bool wire_ok(Wire w) { return w != Wire::Unsupported; }
 // A map parameter would need the materialise-or-pass-through prologue that a
 // vector parameter has, and that is not written yet, so a method taking one is
 // reported by name instead of emitted wrong.
-constexpr bool param_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Map; }
+constexpr bool param_wire_ok(Wire w) {
+    return wire_ok(w) && w != Wire::Map && w != Wire::Array;
+}
+
+// And what can be RETURNED, which excludes a fixed array for a different
+// reason than the parameter case: an array returned by value has no identity
+// apart from its storage, so a view of it would be a view of a temporary.
+// The honest surface is a copied T[], which needs an out-buffer signature
+// rather than a handle, and that is its own change.
+constexpr bool ret_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Array; }
 
 // ============================================================================
 // Why a member or method was left out
@@ -1094,6 +1140,39 @@ private:
               << "return vec->empty() ? nullptr : vec->data();\n"
               << "}\n\n";
         }
+
+        // Fixed storage reached as a raw pointer, which is what lets ONE helper
+        // set serve every N: the length travels as an argument instead of in
+        // the symbol name, so std::array<T,3> and std::array<T,16> share these.
+        // Nothing here owns anything, so there is deliberately no _free -- a
+        // fixed view is always a window onto bytes someone else owns. These are
+        // emitted for every registered element type whether or not an array
+        // uses them, so the managed view class can declare both sets of imports
+        // without ever naming a symbol that is not in the library.
+        const std::string fx = "mb_fix_" + vp.tag;
+        o << "MB_EXPORT " << wire << " " << fx << "_get(void* p, int64_t n, int64_t i) {\n"
+          << "mb_clear_error();\n"
+          << "auto* a = static_cast<" << vp.cpp_elem << "*>(p);\n"
+          << "if (i < 0 || i >= n) {\n"
+          << "mb_set_error(\"index out of range\", MB_ERR_OUT_OF_RANGE);\n"
+          << "return " << (vp.is_string ? std::string("nullptr") : vp.wire_c + "{}") << ";\n"
+          << "}\n"
+          << "return " << (vp.is_string ? "mb_dup(a[i])"
+                 : "static_cast<" + vp.wire_c + ">(a[i])") << ";\n"
+          << "}\n\n"
+          << "MB_EXPORT void " << fx << "_set(void* p, int64_t n, int64_t i, "
+          << wire << " x) {\n"
+          << "mb_clear_error();\n"
+          << "auto* a = static_cast<" << vp.cpp_elem << "*>(p);\n"
+          << "if (i < 0 || i >= n) {\n"
+          << "mb_set_error(\"index out of range\", MB_ERR_OUT_OF_RANGE);\n"
+          << "return;\n"
+          << "}\n"
+          << "try { a[i] = "
+          << (vp.is_string ? std::string("(x ? x : \"\")")
+                           : "static_cast<" + vp.cpp_elem + ">(x)") << "; }\n"
+          << "catch (const std::exception& ex) { mb_set_exception(ex); }\n"
+          << "}\n\n";
         return o.str();
     }
 
@@ -1344,6 +1423,17 @@ private:
               : std::string("[DllImport(Lib, EntryPoint = \"") + pre
                 + "_data\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
                 + "private static extern IntPtr VData(H v);\n\n")
+          // The fixed-storage pair. They take H rather than a bare IntPtr for
+          // the same reason everything else does: a pointer crossing as an
+          // IntPtr can be released by the GC mid-call. A fixed view's H is
+          // constructed non-owning, so SafeHandle never tries to free it.
+          << "[DllImport(Lib, EntryPoint = \"mb_fix_" << vp.tag
+          << "_get\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern " << W << " FGet(H p, long n, long i);\n\n"
+          << "[DllImport(Lib, EntryPoint = \"mb_fix_" << vp.tag
+          << "_set\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern void FSet(H p, long n, long i, "
+          << (vp.is_string ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string" : W) << " x);\n\n"
           << "internal sealed class H : SafeHandle {\n"
           << "internal H(IntPtr h, bool owns) : base(IntPtr.Zero, owns) {\n"
           << "SetHandle(h);\n"
@@ -1358,11 +1448,28 @@ private:
           << "private readonly object _parent;\n"
           << "private readonly SafeHandle _pin;\n"
           << "private bool _pinned;\n"
-          << "private volatile bool _disposed;\n\n"
+          << "private volatile bool _disposed;\n"
+          << "// -1 for a std::vector, whose length is whatever C++ says now.\n"
+          << "// Otherwise this is a std::array member and the length is part\n"
+          << "// of its C++ type, so it is known here and never asked for.\n"
+          << "private readonly long _fixed;\n\n"
           << "internal " << N << "(IntPtr v, bool owned, object parent) {\n"
           << "_h = new H(v, owned);\n"
           << "_parent = parent;\n"
+          << "_fixed = -1;\n"
           << "if (!owned && parent is IMbOwner o) {\n"
+          << "_pin = o.MbHandle;\n"
+          << "_pin.DangerousAddRef(ref _pinned);\n"
+          << "}\n"
+          << "}\n\n"
+          << "/// <summary>A view of fixed-length storage: a std::array member.\n"
+          << "/// Reads and writes reach the owner, but the length cannot\n"
+          << "/// change, so Add and Clear are not available.</summary>\n"
+          << "internal " << N << "(IntPtr p, long n, object parent) {\n"
+          << "_h = new H(p, false);\n"
+          << "_parent = parent;\n"
+          << "_fixed = n;\n"
+          << "if (parent is IMbOwner o) {\n"
           << "_pin = o.MbHandle;\n"
           << "_pin.DangerousAddRef(ref _pinned);\n"
           << "}\n"
@@ -1389,28 +1496,53 @@ private:
           << "GC.KeepAlive(_parent);\n"
           << "return _h;\n"
           << "}\n\n"
-          << "public int Count => checked((int)VSize(P()));\n\n"
+          << "public int Count => _fixed >= 0 ? checked((int)_fixed)\n"
+          << ": checked((int)VSize(P()));\n\n"
+          << "/// <summary>True when this is a std::array member, whose length is\n"
+          << "/// part of its C++ type and so cannot change.</summary>\n"
+          << "public bool IsFixedSize => _fixed >= 0;\n\n"
           << "public " << E << " this[int i] {\n"
           << "get {\n"
-          << "var r = VGet(P(), i);\n"
+          << "var r = _fixed >= 0 ? FGet(P(), _fixed, i) : VGet(P(), i);\n"
           << "MbNative.Throw(\"" << N << "[]\");\n"
           << "return " << (vp.is_string ? "MbNative.TakeString(r)" : "r") << ";\n"
           << "}\n"
           << "set {\n"
+          << "if (_fixed >= 0) {\n"
+          << "FSet(P(), _fixed, i, value"
+          << (vp.is_string ? " ?? string.Empty" : "") << ");\n"
+          << "} else {\n"
           << "VSet(P(), i, value" << (vp.is_string ? " ?? string.Empty" : "") << ");\n"
+          << "}\n"
           << "MbNative.Throw(\"" << N << "[]\");\n"
           << "}\n"
           << "}\n\n"
+          << "/// <exception cref=\"NotSupportedException\">on a std::array member,\n"
+          << "/// whose length is fixed by its C++ type.</exception>\n"
           << "public void Add(" << E << " x) {\n"
+          << "if (_fixed >= 0) {\n"
+          << "throw new NotSupportedException(\"" << N
+          << ": this is a fixed-length std::array member\");\n"
+          << "}\n"
           << "VAdd(P(), x" << (vp.is_string ? " ?? string.Empty" : "") << ");\n"
           << "MbNative.Throw(\"" << N << ".Add\");\n"
           << "}\n\n"
+          << "/// <exception cref=\"NotSupportedException\">on a std::array member.\n"
+          << "/// </exception>\n"
           << "public void Clear() {\n"
+          << "if (_fixed >= 0) {\n"
+          << "throw new NotSupportedException(\"" << N
+          << ": this is a fixed-length std::array member\");\n"
+          << "}\n"
           << "VClear(P());\n"
           << "}\n\n"
           << "public " << E << "[] ToArray() {\n"
           << "var n = Count;\n"
           << "var a = new " << E << "[n];\n"
+          << "if (_fixed >= 0) {\n"
+          << "for (int i = 0; i < n; i++) a[i] = this[i];\n"
+          << "return a;\n"
+          << "}\n"
           << (vp.is_string
               ? std::string("for (int i = 0; i < n; i++) a[i] = this[i];\n")
               // One bulk copy out of the vector's own storage instead of a
@@ -1504,6 +1636,13 @@ private:
             if (!op.cs_surface.empty()) return op.cs_surface;
         }
         if (const VectorPlan* v = vector_find<M>()) return v->cs_name;
+        // A std::array surfaces as the view class of its element type, which
+        // is the same class a std::vector<E> uses -- that sharing is the point.
+        if constexpr (is_wire_array<M>()) {
+            using AE = array_element<std::remove_cvref_t<M>>;
+            using E = std::remove_cvref_t<typename AE::type>;
+            if (const VectorPlan* a = vector_find<std::vector<E>>()) return a->cs_name;
+        }
         if (const MapPlan* m = map_find<M>()) return m->cs_name;
         if (const ClassRef* c = class_ref<M>()) return c->cs_name;
         const EnumPlan* e = enum_plan<M>();
@@ -1854,7 +1993,8 @@ private:
                 std::string("type ") + tname
                 + " does not cross the C ABI yet; scalars, bool and std::string do"});
             return;
-        } else if constexpr ((w == Wire::Vector || w == Wire::Map || w == Wire::Object)
+        } else if constexpr ((w == Wire::Vector || w == Wire::Array
+                              || w == Wire::Map || w == Wire::Object)
                              && std::is_const_v<Raw>) {
             // Taking the address of a const member gives a const T*, and
             // static_cast cannot turn that into void*. The scalar branches
@@ -1874,6 +2014,7 @@ private:
             p.skipped.push_back({p.cs_name, name,
                 std::string("it is const (") + ctn + "); a "
                 + (w == Wire::Vector ? "vector"
+                   : w == Wire::Array ? "fixed array"
                    : w == Wire::Map ? "map" : "nested object")
                 + " member crosses as a writable view into the owner, which a "
                   "const member cannot provide"});
@@ -2014,6 +2155,40 @@ private:
                      << "if (_view_" << name << " == null) {\n"
                      << "_view_" << name << " = new " << vp->cs_name << "(Get_"
                      << name << "(Check()), false, this);\n"
+                     << "}\n"
+                     << "return _view_" << name << ";\n"
+                     << "}\n"
+                     << "}\n\n";
+                return;
+            }
+
+            if constexpr (w == Wire::Array) {
+                // One plan per element type, shared with std::vector<E>: the
+                // helpers take a raw E* and the length as an argument, so every
+                // N reuses them and nothing here is per-N but the number
+                // itself, which the C++ type already carries.
+                using AE = array_element<M>;
+                using E = std::remove_cvref_t<typename AE::type>;
+                const VectorPlan* ap = vector_plan<std::vector<E>>();
+                shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
+                     << "return static_cast<void*>(static_cast<" << p.cpp_name
+                     << "*>(self)->" << qualified(owner_id, name) << ".data());\n"
+                     << "}\n\n";
+                externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                        << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                        << "private static extern IntPtr Get_" << name
+                        << "(" << p.handle << " self);\n\n";
+                const std::string aprop = claim_property_name(p, name);
+                body << "private " << ap->cs_name << " _view_" << name << ";\n"
+                     << "/// <summary>The C++ array itself, not a copy: the indexer\n"
+                     << "/// setter reaches the owning object. Its length is part of\n"
+                     << "/// the C++ type, so Add and Clear raise\n"
+                     << "/// NotSupportedException.</summary>\n"
+                     << "public " << ap->cs_name << " " << aprop << " {\n"
+                     << "get {\n"
+                     << "if (_view_" << name << " == null) {\n"
+                     << "_view_" << name << " = new " << ap->cs_name << "(Get_"
+                     << name << "(Check()), " << AE::size << "L, this);\n"
                      << "}\n"
                      << "return _view_" << name << ";\n"
                      << "}\n"
@@ -2418,7 +2593,7 @@ private:
         constexpr std::size_t argc = get_static_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!wire_ok(rw)) {
+        if constexpr (!ret_wire_ok(rw)) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_static_method_return_type<T, I>()).data();
             p.skipped.push_back({p.cs_name, "static " + name + "()",
@@ -2567,7 +2742,7 @@ private:
         constexpr std::size_t argc = get_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!wire_ok(rw)) {
+        if constexpr (!ret_wire_ok(rw)) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_method_return_type<T, I>()).data();
             p.skipped.push_back({p.cs_name, name + "()",
@@ -2929,6 +3104,7 @@ private:
             case Wire::Utf8: return "nullptr";
             case Wire::Object: return "nullptr";
             case Wire::Vector: return "nullptr";
+            case Wire::Array:  return "nullptr";
             case Wire::Map:    return "nullptr";
             case Wire::F32:
             case Wire::F64:  return "0.0";
