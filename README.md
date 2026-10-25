@@ -80,6 +80,26 @@ stops a module coming out, grouped so the most valuable thing to fix is the
 line with the most libraries on it. pybind11 and nanobind have nothing to put
 in that first column, because the class list is the thing their user writes.
 
+### Pointing it at a large codebase
+
+Large projects do not fail to bind because binding is hard. They fail because their
+headers do not parse without the include paths and defines their own build system
+passes. `--compile-commands` reads those from the build instead of asking you to restate
+them:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+`--discover-only` stops after reading the headers and reports what it found, including
+whether the class list came from reflection or from a fallback text scan. That is the
+number that says whether a codebase is ready, and it costs one pass instead of a module
+per class. MSVC and clang-cl flag spellings are translated, and `--replace-prefix` maps a
+build database written on one machine onto the paths of another.
+[Details](docs/reference/cli.md#large-codebases).
+
 ## Try It Now
 
 No installation required — run in your browser or with Docker:
@@ -129,7 +149,17 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
+| C# (.NET) | Early | `--lang csharp` |
 | Rust | Prototype | Code generation |
+
+C# goes through P/Invoke, so there is no host C API to call the way there is for
+CPython, Lua and Node. `--lang csharp` writes a flat C ABI shim plus the C# that calls
+it, both from one reflection pass, so a member renamed in C++ renames the exported symbol
+and the C# property together. **The shim has no reflection in it**, so it rebuilds with
+whatever compiler you already have — which matters, because MSVC has no reflection
+support. Scalars, `bool`, `std::string` and methods over those types cross today;
+anything that cannot is named in the output and in the generated C# rather than quietly
+omitted. See [the CLI reference](docs/reference/cli.md#csharp-output).
 
 ### Feature Matrix
 
