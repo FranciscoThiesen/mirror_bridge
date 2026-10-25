@@ -368,9 +368,7 @@ constexpr bool wire_ok(Wire w) { return w != Wire::Unsupported; }
 // A map parameter would need the materialise-or-pass-through prologue that a
 // vector parameter has, and that is not written yet, so a method taking one is
 // reported by name instead of emitted wrong.
-constexpr bool param_wire_ok(Wire w) {
-    return wire_ok(w) && w != Wire::Map && w != Wire::Array;
-}
+constexpr bool param_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Map; }
 
 // And what can be RETURNED, which excludes a fixed array for a different
 // reason than the parameter case: an array returned by value has no identity
@@ -1835,6 +1833,40 @@ private:
             return a;
         }
 
+        if constexpr (pw == Wire::Array) {
+            using AE = array_element<std::remove_cvref_t<PT>>;
+            using E = std::remove_cvref_t<typename AE::type>;
+            const VectorPlan* ap = vector_plan<std::vector<E>>();
+            const std::string n = std::to_string(AE::size);
+            // The same two wire slots a vector parameter uses, and the same
+            // view class, so an array and a vector of one element type share
+            // everything inbound as well as outbound.
+            a.cs_type = "IReadOnlyList<" + std::string(ap ? ap->cs_elem : "") + ">";
+            a.cs_sig_param = a.cs_type + " " + an;
+            a.c_params = {std::string("const ") + (ap ? ap->cpp_elem : "") + "* "
+                          + cn + "_data",
+                          std::string("int64_t ") + cn + "_n"};
+            a.cs_ext_params = {std::string("[In] ") + (ap ? ap->cs_elem : "")
+                               + "[] " + an + "_data",
+                               std::string("long ") + an + "_n"};
+            a.call_args = {an + "_arr", an + "_arr.LongLength"};
+            // std::array has no range constructor, so the count has to be
+            // checked and the elements copied. mb_to_array does both and
+            // throws on the wrong count, which reaches C# as an ordinary
+            // exception rather than a silently short array.
+            a.fwd_arg = "mb_to_array<" + std::string(ap ? ap->cpp_elem : "")
+                      + ", " + n + ">(" + cn + "_data, " + cn + "_n)";
+            a.prologue = "var " + an + "_arr = " + an + " as "
+                       + std::string(ap ? ap->cs_elem : "") + "[];\n"
+                       + "if (" + an + "_arr == null) {\n"
+                       + an + "_arr = new " + std::string(ap ? ap->cs_elem : "")
+                       + "[" + an + ".Count];\n"
+                       + "for (int i = 0; i < " + an + "_arr.Length; i++) "
+                       + an + "_arr[i] = " + an + "[i];\n"
+                       + "}\n";
+            return a;
+        }
+
         if constexpr (pw == Wire::Vector) {
             const VectorPlan* pv = vector_plan<PT>();
             a.cs_type = "IReadOnlyList<" + pv->cs_elem + ">";
@@ -3280,7 +3312,23 @@ private:
           << "#include <array>\n#include <cstdint>\n#include <cstdlib>\n"
           << "#include <cstring>\n#include <exception>\n#include <memory>\n"
           << "#include <new>\n#include <stdexcept>\n#include <string>\n"
-          << "#include <typeinfo>\n#include <vector>\n\n";
+          << "#include <typeinfo>\n#include <vector>\n\n"
+          // Emitted once whether or not anything uses it: an inbound
+          // std::array needs it, and an unused template costs nothing.
+          << "// std::array has no constructor from a range, so an inbound\n"
+          << "// fixed array is copied element by element once its length has\n"
+          << "// been checked. A wrong length throws rather than quietly\n"
+          << "// binding a short array.\n"
+          << "template <class E, std::size_t N>\n"
+          << "static std::array<E, N> mb_to_array(const E* p, int64_t n) {\n"
+          << "if (n != static_cast<int64_t>(N)) {\n"
+          << "throw std::length_error(\"expected exactly \" + std::to_string(N)\n"
+          << "+ \" elements, got \" + std::to_string(n));\n"
+          << "}\n"
+          << "std::array<E, N> a{};\n"
+          << "for (std::size_t i = 0; i < N; ++i) a[i] = p[i];\n"
+          << "return a;\n"
+          << "}\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";
         o << "\n"
           << "#if defined(_WIN32)\n"

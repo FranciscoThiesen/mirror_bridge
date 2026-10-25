@@ -222,6 +222,9 @@ class Driver {
             Console.WriteLine($"fixed strings: joined={wa.joined()}");
             Console.WriteLine($"fixed ToArray: {string.Join(",", Array.ConvertAll(wa.@fixed.ToArray(), x => ((int)x).ToString()))}");
             Console.WriteLine($"array return: {string.Join(",", Array.ConvertAll(wa.spread(), x => ((int)x).ToString()))}");
+            Console.WriteLine($"array param: sum={wa.sum_of_fixed(new double[] { 1.0, 2.0, 3.0 })}");
+            Expect<ArgumentException>(() => wa.sum_of_fixed(new double[] { 1.0 }),
+                                      "array param wrong length");
             Expect<NotSupportedException>(() => wa.@fixed.Add(1.0), "fixed Add");
             Expect<NotSupportedException>(() => wa.@fixed.Clear(), "fixed Clear");
         }
@@ -920,8 +923,17 @@ truthy("and the count it returns is checked rather than discarded",
        "if (r != 3) throw MbNative.LastError" in cs)
 truthy("an array OF STRINGS returned by value is still refused",
        re.search(r"WithArray\.spread_labels\(\): returns", run.stdout) is not None)
-truthy("and an array parameter is refused",
-       re.search(r"WithArray\.sum_of_fixed\(\): a parameter type", run.stdout) is not None)
+# An array parameter is the vector parameter's two wire slots plus a length
+# check. The count is already known on both sides from the C++ type, so a
+# mismatch throws rather than binding a short array.
+truthy("an array parameter takes the same two wire slots a vector does",
+       "mb_WithArray_sum_of_fixed(void* self, const double* a_data, int64_t a_n)"
+       in shim_src)
+truthy("and the same C# surface",
+       "public double sum_of_fixed(IReadOnlyList<double> a)" in cs)
+truthy("the shim checks the length rather than clamping it",
+       "mb_to_array<double, 3>(a_data, a_n)" in shim_src
+       and "throw std::length_error" in shim_src)
 # The shim re-parses the project's headers. Pinned at C++17 it rejected any
 # header using a C++20 feature, on a project whose subject is modern C++.
 truthy("a header using a C++20 feature still builds through the shim stage",
@@ -1180,6 +1192,10 @@ if MCS and MONO:
                "static opt return: some=9 none=null" in out)
         truthy("and a container the caller owns",
                "static vec return: Count=3 [1]=2" in out)
+        truthy("a std::array parameter crosses inward and C++ sums it",
+               "array param: sum=6" in out)
+        truthy("and the wrong number of elements raises rather than binding short",
+               "array param wrong length -> ArgumentException" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
