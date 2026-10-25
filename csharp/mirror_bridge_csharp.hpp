@@ -1938,7 +1938,13 @@ private:
                  << " threw a non-std exception\");\n"
                  << "}\n";
             if constexpr (rw != Wire::None) {
-                shim << "return " << zero_of(rw) << ";\n";
+                if constexpr (rw == Wire::Opt) {
+                    const OptPlan rop = opt_plan<Ret>();
+                    shim << "return " << (rop.is_string ? std::string("nullptr")
+                                                        : rop.c_wire + "{}") << ";\n";
+                } else {
+                    shim << "return " << zero_of(rw) << ";\n";
+                }
             }
             shim << "}\n\n";
 
@@ -2066,6 +2072,36 @@ private:
                     const std::string an = arg_name(an_id, Ps);
                     using PT = std::remove_cvref_t<
                         typename [:get_method_param_type<T, I, Ps>():]>;
+                    if constexpr (pw == Wire::Opt) {
+                        const OptPlan pop = opt_plan<PT>();
+                        if (pop.is_string) {
+                            // A null pointer is already nullopt, so no flag.
+                            c_params += std::string(", const char* ") + an;
+                            cs_ext_params += std::string(", [MarshalAs(UnmanagedType.LPUTF8Str)] string ") + an;
+                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
+                                      + "(" + an + " ? " + pop.cpp_opt
+                                      + "(std::string(" + an + ")) : " + pop.cpp_opt + "{})";
+                            if (!call_args.empty()) call_args += ", ";
+                            call_args += an;
+                        } else {
+                            c_params += std::string(", int32_t ") + an + "_has, "
+                                      + pop.c_wire + " " + an;
+                            cs_ext_params += std::string(", int ") + an + "_has, "
+                                           + pop.cs_wire + " " + an;
+                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
+                                      + "(" + an + "_has ? " + pop.cpp_opt
+                                      + "(static_cast<" + pop.cpp_inner + ">(" + an
+                                      + ")) : " + pop.cpp_opt + "{})";
+                            if (!call_args.empty()) call_args += ", ";
+                            call_args += an + ".HasValue ? 1 : 0, " + an
+                                       + ".HasValue ? (" + pop.cs_wire + ")" + an
+                                       + ".Value : default(" + pop.cs_wire + ")";
+                        }
+                        if (!cs_sig_params.empty()) cs_sig_params += ", ";
+                        cs_sig_params += pop.cs_surface + " " + an;
+                        cs_types += (cs_types.empty() ? "" : ",") + pop.cs_surface;
+                        return;
+                    }
                     if constexpr (pw == Wire::Vector) {
                         const VectorPlan* pv = vector_plan<PT>();
                         // Two wire parameters for one C# argument: the shim
@@ -2146,7 +2182,27 @@ private:
                                      + "*>(self)->" + qualified(owner_id, name)
                                      + "(" + fwd_args + ")";
 
-            shim << "MB_EXPORT " << rct << " " << sym << "(" << c_params << ") {\n"
+            // An optional return needs the inner type on the wire, plus a
+            // has-value out-param unless a null pointer can carry it. c_type
+            // has no spelling for Wire::Opt, and streaming its nullptr is what
+            // segfaulted the generator before this existed.
+            std::string ret_c = rct ? std::string(rct) : std::string();
+            std::string ret_cs = cs_wire_type(rw) ? std::string(cs_wire_type(rw))
+                                                  : std::string();
+            std::string opt_out_c, opt_out_cs, opt_out_call;
+            if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                ret_c = rop.c_wire;
+                ret_cs = rop.cs_wire;
+                if (!rop.is_string) {
+                    opt_out_c = std::string(", int32_t* has");
+                    opt_out_cs = ", out int has";
+                    opt_out_call = ", out _has";
+                }
+            }
+
+            shim << "MB_EXPORT " << ret_c << " " << sym << "("
+                 << c_params << opt_out_c << ") {\n"
                  << "mb_clear_error();\n"
                  << "try {\n";
             if constexpr (rw == Wire::None) {
@@ -2155,6 +2211,17 @@ private:
                 shim << "return mb_dup(" << invoke << ");\n";
             } else if constexpr (rw == Wire::Bool) {
                 shim << "return " << invoke << " ? 1 : 0;\n";
+            } else if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                if (rop.is_string) {
+                    shim << "{ auto o = " << invoke << ";\n"
+                         << "return o.has_value() ? mb_dup(*o) : nullptr; }\n";
+                } else {
+                    shim << "{ auto o = " << invoke << ";\n"
+                         << "*has = o.has_value() ? 1 : 0;\n"
+                         << "return o.has_value() ? static_cast<" << rop.c_wire
+                         << ">(*o) : " << rop.c_wire << "{}; }\n";
+                }
             } else if constexpr (rw == Wire::Vector) {
                 // Same reasoning as a returned object: the vector is a value,
                 // so the caller gets a heap copy it owns and frees.
@@ -2184,14 +2251,15 @@ private:
 
             externs << "[DllImport(Lib, EntryPoint = \"" << sym
                     << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-                    << "private static extern " << cs_wire_type(rw) << " "
-                    << ext_name << "(" << cs_ext_params << ");\n\n";
+                    << "private static extern " << ret_cs << " "
+                    << ext_name << "(" << cs_ext_params << opt_out_cs << ");\n\n";
 
             body << "public " << cs_name_for<Ret>(rw) << " " << claim_cs_name(p, name)
                  << "(" << cs_sig_params << ") {\n"
                  << vec_prologue;
             const std::string call = ext_name + "(Check()"
-                                   + (call_args.empty() ? "" : ", " + call_args) + ")";
+                                   + (call_args.empty() ? "" : ", " + call_args)
+                                   + opt_out_call + ")";
             if constexpr (rw == Wire::None) {
                 body << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n";
@@ -2203,6 +2271,19 @@ private:
                 body << "var r = " << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n"
                      << "return r != 0;\n";
+            } else if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                if (!rop.is_string) body << "int _has;\n";
+                body << "var r = " << call << ";\n"
+                     << "MbNative.Throw(\"" << name << "\");\n";
+                if (rop.is_string) {
+                    body << "return r == IntPtr.Zero ? null : MbNative.TakeString(r);\n";
+                } else {
+                    const std::string bare =
+                        rop.cs_surface.substr(0, rop.cs_surface.size() - 1);
+                    body << "return _has != 0 ? (" << rop.cs_surface << ")("
+                         << bare << ")r : null;\n";
+                }
             } else if constexpr (rw == Wire::Vector) {
                 body << "var r = " << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n"

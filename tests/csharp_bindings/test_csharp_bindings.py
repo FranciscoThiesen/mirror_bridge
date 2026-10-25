@@ -123,6 +123,12 @@ class Driver {
             op.fallback = Mode.Careful;
             Console.WriteLine($"opt set: limit={op.limit.Value} trim={(op.trim.HasValue ? "set" : "null")} note={(op.note == null ? "null" : op.note)} fallback={op.fallback.Value}");
         }
+        using (var o2 = new Device()) {
+            o2.id = 3;
+            Console.WriteLine($"opt return: {(o2.maybe(true).HasValue ? o2.maybe(true).Value.ToString() : "null")}/{(o2.maybe(false).HasValue ? "set" : "null")}"
+                              + $" name={o2.maybe_name(true)}/{(o2.maybe_name(false) == null ? "null" : "set")}");
+            Console.WriteLine($"opt param: absorb(9)={o2.absorb(9)} absorb(null)={o2.absorb(null)} name={o2.absorb_name(null)}");
+        }
         using (var sq = new Square()) {
             sq.sides = 4;
             sq.weight = 9.5;
@@ -724,6 +730,20 @@ truthy("assigning null calls reset on the C++ side", ".reset();" in shim_src)
 check("an optional is not reported as an unbound class",
       "limit --" in cs or "note --" in cs, False)
 
+print("\n=== an optional in all three positions, not just as a member ===")
+# Claiming the matrix row on members alone was an overclaim, and the generator
+# segfaulted on an optional return: c_type has no spelling for Wire::Opt and
+# the emitter streamed its nullptr.
+truthy("an optional return is nullable", "public int? maybe(bool want)" in cs)
+truthy("an optional string return is a string", "public string maybe_name(bool want)" in cs)
+truthy("an optional parameter is nullable", "public int absorb(int? v)" in cs)
+truthy("and an optional string parameter is a string",
+       "public string absorb_name(string v)" in cs)
+truthy("a scalar return carries the flag as an out-param",
+       "out int has" in cs and "int32_t* has" in shim_src)
+check("a string return does not, because null already says it",
+      "mb_Device_maybe_name(void* self, int32_t want, int32_t* has)" in shim_src, False)
+
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
 # this backend emitted `private static extern intGet_id(IntPtr self)`, which
@@ -822,6 +842,10 @@ if MCS and MONO:
                "opt defaults: limit=null trim=2.5 note=hi" in out)
         truthy("and writing null reaches reset() on the C++ side",
                "opt set: limit=42 trim=null note=null fallback=Careful" in out)
+        truthy("an optional return carries both a value and its absence",
+               "opt return: 6/null name=probe/null" in out)
+        truthy("and an optional parameter carries null through to nullopt",
+               "opt param: absorb(9)=9 absorb(null)=-1 name=none" in out)
         truthy("a borrowed object view refuses to read a disposed owner",
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",

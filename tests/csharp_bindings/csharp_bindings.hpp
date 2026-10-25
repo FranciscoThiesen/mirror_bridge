@@ -74,6 +74,20 @@ struct Device {
     std::optional<std::string> note{"hi"};
     std::optional<Mode> fallback;
 
+    // An optional in the other two positions. Claiming the matrix row on the
+    // strength of members alone was an overclaim, and the generator segfaulted
+    // on a return because c_type has no spelling for an optional.
+    std::optional<int> maybe(bool want) const {
+        return want ? std::optional<int>{id * 2} : std::nullopt;
+    }
+    std::optional<std::string> maybe_name(bool want) const {
+        return want ? std::optional<std::string>{label} : std::nullopt;
+    }
+    int absorb(std::optional<int> v) const { return v.has_value() ? *v : -1; }
+    std::string absorb_name(std::optional<std::string> v) const {
+        return v.has_value() ? *v : std::string("none");
+    }
+
     Mode promote(Mode m) const { return m == Mode::None ? Mode::Fast : Mode::Careful; }
 
     // C# overloads natively, so these need only distinct exported symbols.
