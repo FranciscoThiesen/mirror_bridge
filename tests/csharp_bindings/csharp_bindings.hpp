@@ -271,6 +271,26 @@ struct Pair {
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
 };
 
+// An abstract interface. Every member call is qualified with its declaring
+// class to disambiguate an inherited name, and a qualified call suppresses
+// virtual dispatch -- which for a PURE virtual means naming a symbol that
+// exists nowhere, so the whole library failed to link with "undefined
+// reference to Iface::kind() const". cxxopts::Value is the real one.
+//
+// Only the pure-virtual case drops the qualification. An overridden virtual
+// keeps it and is still correct, because the walk attributes the method to the
+// class that declares the override -- Impl::kind below, not Iface::kind.
+struct Iface {
+    virtual ~Iface() = default;
+    virtual int kind() const = 0;
+    int twice() const { return kind() * 2; }
+};
+
+struct Impl : Iface {
+    int v = 3;
+    int kind() const override { return v; }
+};
+
 // Declared, never defined. std::is_class_v is TRUE for a forward-declared
 // class and core::Bindable only adds a reflection query an incomplete type can
 // still satisfy, so this used to reach typeid -- which does not compile for an

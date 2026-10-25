@@ -3336,8 +3336,11 @@ private:
             }
             p.public_sigs.push_back(public_sig);
 
+            constexpr bool pure_virtual = std::meta::is_pure_virtual(func);
             const std::string invoke = std::string("static_cast<") + p.cpp_name
-                                     + "*>(self)->" + qualified(owner_id, name)
+                                     + "*>(self)->"
+                                     + (pure_virtual ? name
+                                                     : qualified(owner_id, name))
                                      + "(" + fwd_args + ")";
 
             const RetSlot rs = ret_slot<Ret>();

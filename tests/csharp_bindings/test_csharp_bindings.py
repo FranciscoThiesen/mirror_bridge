@@ -540,6 +540,20 @@ truthy("one overload of each pair is refused",
 truthy("and of each static pair",
        cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
 
+print("\n=== a pure virtual is called through the vtable, not by name ===")
+# A qualified call suppresses dispatch, and a pure virtual has no definition
+# anywhere, so `self->Iface::kind()` was an undefined reference that took the
+# whole library with it. Found by pointing the corpus at C#: cxxopts::Value.
+truthy("a pure virtual is called unqualified",
+       "self)->kind()" in shim_src)
+check("not through its declaring class", "->Iface::kind()" in shim_src, False)
+# And the qualification is still there where it disambiguates, which is the
+# half a broader fix would have broken.
+truthy("an override keeps its qualification, naming the deriving class",
+       "->Impl::kind()" in shim_src)
+truthy("and so does an inherited name resolved to a specific base",
+       "->LeftBase::v" in shim_src)
+
 print("\n=== a forward-declared type is reported, not a compiler error ===")
 # std::is_class_v is true for a forward-declared class, so this used to reach
 # typeid and fail to compile INSIDE the generator, naming no method. Found by
