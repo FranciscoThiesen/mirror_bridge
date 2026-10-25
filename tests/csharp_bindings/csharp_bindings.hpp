@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <compare>
 #include <stdexcept>
 #include <string>
@@ -66,6 +67,26 @@ struct Device {
     }
 
     Mode mode = Mode::Fast;
+
+    // std::optional: null in C# is nullopt in C++, both ways.
+    std::optional<int> limit;
+    std::optional<double> trim{2.5};
+    std::optional<std::string> note{"hi"};
+    std::optional<Mode> fallback;
+
+    // An optional in the other two positions. Claiming the matrix row on the
+    // strength of members alone was an overclaim, and the generator segfaulted
+    // on a return because c_type has no spelling for an optional.
+    std::optional<int> maybe(bool want) const {
+        return want ? std::optional<int>{id * 2} : std::nullopt;
+    }
+    std::optional<std::string> maybe_name(bool want) const {
+        return want ? std::optional<std::string>{label} : std::nullopt;
+    }
+    int absorb(std::optional<int> v) const { return v.has_value() ? *v : -1; }
+    std::string absorb_name(std::optional<std::string> v) const {
+        return v.has_value() ? *v : std::string("none");
+    }
 
     Mode promote(Mode m) const { return m == Mode::None ? Mode::Fast : Mode::Careful; }
 
@@ -197,5 +218,28 @@ struct Shadow : HasShadow { double z = 1.0; };
 // prefixed, either one was CS0101 "already contains a definition".
 struct Native { int id = 3; };
 struct DoubleVector { int n = 4; };
+
+// Subtype polymorphism. A generated class is sealed and has no C# base type,
+// so without an upcast a Derived cannot be passed where a Base is expected --
+// which rules out binding a class hierarchy, and most real C++ libraries are
+// one. Two bases, so the pointer adjustment is not trivially zero for both.
+struct ShapeBase {
+    int sides = 0;
+    int describe() const { return sides * 100; }
+};
+
+struct Tagged {
+    double weight = 2.5;
+};
+
+struct Square : Tagged, ShapeBase {
+    double edge = 3.0;
+    double area() const { return edge * edge; }
+};
+
+struct Judge {
+    int count(const ShapeBase& s) const { return s.sides; }
+    double weigh(const Tagged& t) const { return t.weight; }
+};
 
 }  // namespace csb

@@ -192,14 +192,14 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ | ❌ |
 | **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ | ❌ |
 | **Enums** | ✅ | ⚠️ | ⚠️ | ✅ |
-| **Inheritance** | ✅ | ✅ | ✅ | ⚠️ |
+| **Inheritance** | ✅ | ✅ | ✅ | ✅ |
 | **Method Overloading** | ✅ | ⚠️ | ⚠️ | ✅ |
 | **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | **Exception Handling** | ✅ | ✅ | ✅ | ✅ |
 | **Cross-Module Types** | ✅ | ❌ | ❌ | ❌ |
 | **Zero-Copy Buffers** | ✅ | ❌ | ❌ | ❌ |
 | **Async/Await** | ✅ | ❌ | ✅ | ❌ |
-| **std::optional** | ✅ | ✅ | ✅ | ❌ |
+| **std::optional** | ✅ | ✅ | ✅ | ✅ |
 | **std::expected** | ✅ | ✅ | ✅ | ❌ |
 
 Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
@@ -207,11 +207,12 @@ output and as a comment in the `.cs` at the point the member would have been, so
 member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
 view; `std::array` and `vector<bool>` do not.
 
-**Inheritance** is ⚠️ for C# in the other direction: inherited members and methods are
-flattened onto the derived class, which Lua and JavaScript do not do at all, but a generated
-class has no C# base type, so a `Derived` cannot be passed where a `Base` is expected. Lua and
-JavaScript both have the upcast machinery for that and C# does not yet. The two backends are
-incomplete in opposite directions, and one tick on both would hide it.
+**Inheritance** in C# works in two halves. Inherited members and methods are flattened onto
+the derived class, which Lua and JavaScript do not do at all. And because a generated class is
+sealed with no C# base type, each one gets an `AsBase()` view plus an implicit conversion, so
+`judge.count(square)` compiles and reaches the right C++ object. The pointer adjustment is done
+by C++ rather than assumed: for a second or virtual base it is not zero, and assuming it would
+read the wrong bytes without complaint.
 
 Two rows read better for C# than for Lua and JavaScript, and that is not an accident of the
 table. On **overloading**, Lua reaches only the first overload of a name and JavaScript only

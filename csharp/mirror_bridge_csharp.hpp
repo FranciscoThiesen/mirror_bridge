@@ -48,6 +48,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <optional>
 #include <typeinfo>
 #include <vector>
 
@@ -81,11 +82,37 @@ enum class Wire {
     Utf8,       // const char* out, const char* in
     Object,     // void* handle to a bound class
     Vector,     // void* handle to a std::vector of a wire-able element
+    Opt,        // std::optional of a wire-able scalar or string
     Unsupported
 };
 
 template<typename T>
 consteval Wire wire_of();
+
+// std::optional<T> where T itself crosses. A scalar needs a separate
+// has-value flag on the wire; a string does not, because a null pointer is
+// already the natural spelling of "no value".
+template<typename, typename = void>
+struct optional_element { using type = void; static constexpr bool is_optional = false; };
+
+template<typename O>
+struct optional_element<O, std::void_t<typename O::value_type,
+                                       decltype(std::declval<const O&>().has_value())>> {
+    using type = typename O::value_type;
+    static constexpr bool is_optional =
+        std::is_same_v<O, std::optional<typename O::value_type>>;
+};
+
+template<typename O>
+consteval bool is_wire_optional() {
+    using OE = optional_element<std::remove_cvref_t<O>>;
+    if constexpr (!OE::is_optional) {
+        return false;
+    } else {
+        using E = std::remove_cvref_t<typename OE::type>;
+        return std::is_arithmetic_v<E> || core::StringLike<E> || std::is_enum_v<E>;
+    }
+}
 
 // std::vector<E> where E itself crosses as a scalar, bool or string. The guard
 // keeps out the cases that cannot work rather than discovering them later:
@@ -130,8 +157,9 @@ consteval Wire wire_of() {
     // A bound class crosses as an opaque handle. Whether that handle is owned
     // or borrowed is decided at the call site, not by the type: a member is
     // borrowed from its owner, a value returned by a method is the caller's.
-    else if constexpr (core::NestedBindable<U>) return Wire::Object;
+    else if constexpr (is_wire_optional<U>()) return Wire::Opt;
     else if constexpr (is_wire_vector<U>()) return Wire::Vector;
+    else if constexpr (core::NestedBindable<U>) return Wire::Object;
     else if constexpr (std::is_same_v<U, char> || std::is_same_v<U, signed char>) return Wire::I8;
     else if constexpr (std::is_same_v<U, unsigned char>) return Wire::U8;
     else if constexpr (std::is_same_v<U, short>) return Wire::I16;
@@ -252,6 +280,16 @@ consteval const char* cpp_type_name() {
     else if constexpr (std::is_same_v<U, long double>)     return "long double";
     else return nullptr;
 }
+
+struct OptPlan {
+    Wire inner = Wire::Unsupported;
+    std::string cpp_inner;    // the C++ element type
+    std::string cpp_opt;      // the full std::optional<...> spelling
+    std::string c_wire;       // the C ABI type the value crosses as
+    std::string cs_wire;      // the C# type in the DllImport
+    std::string cs_surface;   // the C# type the caller sees
+    bool is_string = false;   // a null pointer already means "no value"
+};
 
 struct VectorPlan {
     std::string tag;          // the symbol infix, e.g. "d" or "str"
@@ -480,7 +518,8 @@ public:
             emit_members<T>(cp, shim, externs, body);
             emit_methods<T>(cp, shim, externs, body);
             emit_static_methods<T>(cp, shim, externs, body);
-            emit_constructors<T>(cp, shim, externs, body);
+                emit_constructors<T>(cp, shim, externs, body);
+            emit_upcasts<T>(cp, shim, externs, body);
             cp.shim = shim.str();
             cp.externs = externs.str();
             cp.body = body.str();
@@ -640,6 +679,49 @@ private:
     // Registered on first use, because which vector types exist is a property
     // of the members and returns actually bound, not of anything the caller
     // declares up front.
+    // No registry: an optional needs no shared helpers, so it is described
+    // where it is used.
+    template<typename O>
+    OptPlan opt_plan() const {
+        using U = std::remove_cvref_t<O>;
+        OptPlan op;
+        if constexpr (is_wire_optional<U>()) {
+            using E = std::remove_cvref_t<typename optional_element<U>::type>;
+            constexpr Wire ew = wire_of<E>();
+            op.inner = ew;
+            const char* in = cpp_type_name<E>();
+            op.cpp_inner = in ? std::string(in) : std::string();
+            if constexpr (std::is_enum_v<E>) {
+                const EnumPlan* ep = enum_plan<E>();
+                op.cpp_inner = ep ? ep->cpp_name : std::string();
+                op.cs_surface = (ep ? ep->cs_name : std::string("int")) + "?";
+            }
+            op.cpp_opt = "std::optional<" + op.cpp_inner + ">";
+            op.is_string = (ew == Wire::Utf8);
+            const char* cw = c_type(ew);
+            const char* sw = cs_wire_type(ew);
+            op.c_wire = cw ? cw : "";
+            op.cs_wire = sw ? sw : "";
+            if (op.cs_surface.empty()) {
+                // A string is already nullable in C#; everything else needs
+                // the nullable spelling.
+                op.cs_surface = op.is_string ? std::string("string")
+                                             : std::string(cs_type(ew)) + "?";
+            }
+        }
+        return op;
+    }
+
+    template<typename O>
+    bool opt_ok() const {
+        using U = std::remove_cvref_t<O>;
+        if constexpr (!is_wire_optional<U>()) return false;
+        else {
+            const OptPlan op = opt_plan<O>();
+            return !op.cpp_inner.empty() && !op.c_wire.empty();
+        }
+    }
+
     template<typename V>
     const VectorPlan* vector_plan() {
         using U = std::remove_cvref_t<V>;
@@ -886,7 +968,10 @@ private:
     template<typename M>
     bool object_unregistered() const {
         using U = std::remove_cvref_t<M>;
-        if constexpr (core::NestedBindable<U>) return class_ref<M>() == nullptr;
+        // An optional or a vector is a class by NestedBindable's definition and
+        // is not an opaque handle, so it must not be judged by this.
+        if constexpr (is_wire_optional<U>() || is_wire_vector<U>()) return false;
+        else if constexpr (core::NestedBindable<U>) return class_ref<M>() == nullptr;
         return false;
     }
 
@@ -916,6 +1001,10 @@ private:
 
     template<typename M>
     std::string cs_name_for(Wire w) const {
+        if (w == Wire::Opt) {
+            const OptPlan op = opt_plan<M>();
+            if (!op.cs_surface.empty()) return op.cs_surface;
+        }
         if (const VectorPlan* v = vector_find<M>()) return v->cs_name;
         if (const ClassRef* c = class_ref<M>()) return c->cs_name;
         const EnumPlan* e = enum_plan<M>();
@@ -1265,6 +1354,108 @@ private:
             // wrapper is marked not-owning so its handle will not free it, and
             // carries a reference to the owner so the owner cannot be
             // collected first.
+            if constexpr (w == Wire::Opt) {
+                const OptPlan op = opt_plan<M>();
+                if (!opt_ok<M>()) {
+                    p.skipped.push_back({p.cs_name, name,
+                        "an optional of a type that does not cross"});
+                    return;
+                }
+                const std::string acc = "static_cast<" + p.cpp_name + "*>(self)->"
+                                      + qualified(owner_id, name);
+                const std::string prop3 = claim_property_name(p, name);
+                const bool writable3 = !std::is_const_v<Raw>;
+
+                if (op.is_string) {
+                    // A null pointer is already the spelling of "no value", so
+                    // a string optional needs no separate flag on the wire.
+                    shim << "MB_EXPORT const char* " << sym << "(void* self) {\n"
+                         << "mb_clear_error();\n"
+                         << "auto& o = " << acc << ";\n"
+                         << "if (!o.has_value()) return nullptr;\n"
+                         << "try { return mb_dup(*o); }\n"
+                         << "catch (...) { mb_set_error(\"" << name
+                         << " getter threw\"); return nullptr; }\n"
+                         << "}\n\n";
+                    externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                            << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                            << "private static extern IntPtr Get_" << name
+                            << "(" << p.handle << " self);\n\n";
+                } else {
+                    shim << "MB_EXPORT " << op.c_wire << " " << sym
+                         << "(void* self, int32_t* has) {\n"
+                         << "auto& o = " << acc << ";\n"
+                         << "*has = o.has_value() ? 1 : 0;\n"
+                         << "return o.has_value() ? static_cast<" << op.c_wire
+                         << ">(*o) : " << op.c_wire << "{};\n"
+                         << "}\n\n";
+                    externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                            << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                            << "private static extern " << op.cs_wire << " Get_" << name
+                            << "(" << p.handle << " self, out int has);\n\n";
+                }
+
+                if (writable3) {
+                    const std::string ssym = claim_symbol(
+                        p, "mb_" + p.symbol + "_set_" + name);
+                    if (op.is_string) {
+                        shim << "MB_EXPORT void " << ssym
+                             << "(void* self, const char* v) {\n"
+                             << "mb_clear_error();\n"
+                             << "try {\n"
+                             << "if (v) " << acc << " = std::string(v);\n"
+                             << "else " << acc << ".reset();\n"
+                             << "} catch (const std::exception& ex) { mb_set_exception(ex); }\n"
+                             << "}\n\n";
+                        externs << "[DllImport(Lib, EntryPoint = \"" << ssym
+                                << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                                << "private static extern void Set_" << name
+                                << "(" << p.handle
+                                << " self, [MarshalAs(UnmanagedType.LPUTF8Str)] string v);\n\n";
+                    } else {
+                        shim << "MB_EXPORT void " << ssym << "(void* self, int32_t has, "
+                             << op.c_wire << " v) {\n"
+                             << "if (has) " << acc << " = static_cast<"
+                             << op.cpp_inner << ">(v);\n"
+                             << "else " << acc << ".reset();\n"
+                             << "}\n\n";
+                        externs << "[DllImport(Lib, EntryPoint = \"" << ssym
+                                << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                                << "private static extern void Set_" << name
+                                << "(" << p.handle << " self, int has, "
+                                << op.cs_wire << " v);\n\n";
+                    }
+                }
+
+                body << "/// <summary>A C++ std::optional: null here is nullopt there.</summary>\n"
+                     << "public " << op.cs_surface << " " << prop3 << " {\n";
+                if (op.is_string) {
+                    body << "get {\n"
+                         << "var r = Get_" << name << "(Check());\n"
+                         << "MbNative.Throw(\"" << name << "\");\n"
+                         << "return r == IntPtr.Zero ? null : MbNative.TakeString(r);\n"
+                         << "}\n";
+                    if (writable3) {
+                        body << "set => Set_" << name << "(Check(), value);\n";
+                    }
+                } else {
+                    const std::string bare = op.cs_surface.substr(0, op.cs_surface.size() - 1);
+                    body << "get {\n"
+                         << "int has;\n"
+                         << "var r = Get_" << name << "(Check(), out has);\n"
+                         << "return has != 0 ? (" << op.cs_surface << ")("
+                         << bare << ")r : null;\n"
+                         << "}\n";
+                    if (writable3) {
+                        body << "set => Set_" << name << "(Check(), value.HasValue ? 1 : 0, "
+                             << "value.HasValue ? (" << op.cs_wire << ")value.Value : default("
+                             << op.cs_wire << "));\n";
+                    }
+                }
+                body << "}\n\n";
+                return;
+            }
+
             if constexpr (w == Wire::Vector) {
                 const VectorPlan* vp = vector_plan<M>();
                 shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
@@ -1402,6 +1593,88 @@ private:
                 }
             }
             body << "}\n\n";
+        }
+    }
+
+    // ---- upcasts to a bound base --------------------------------------
+    //
+    // A generated class is sealed and has no C# base type, so without this a
+    // Derived cannot be passed where a Base is expected -- which rules out
+    // binding a class hierarchy, and most real C++ libraries are one. Lua and
+    // JavaScript both have upcast machinery; this is C#'s.
+    //
+    // The pointer adjustment happens in C++, where the compiler knows the
+    // offsets, rather than by assuming a Derived* is already a Base*: that
+    // assumption holds for single non-virtual inheritance and is silently
+    // wrong for anything else.
+    //
+    // The result is a BORROWED view of the base subobject inside the derived
+    // object, so it carries the same owner pin every other view does.
+
+    template<typename T>
+    static consteval std::size_t base_count() {
+        return std::meta::bases_of(^^T, std::meta::access_context::current()).size();
+    }
+
+    template<typename T, std::size_t I>
+    static consteval auto nth_base_type() {
+        return std::meta::type_of(
+            std::meta::bases_of(^^T, std::meta::access_context::current())[I]);
+    }
+
+    template<typename T>
+    void emit_upcasts(ClassPlan& p, std::ostringstream& shim,
+                      std::ostringstream& externs, std::ostringstream& body) {
+        constexpr std::size_t n = base_count<T>();
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            (emit_upcast<T, Is>(p, shim, externs, body), ...);
+        }(std::make_index_sequence<n>{});
+    }
+
+    template<typename T, std::size_t I>
+    void emit_upcast(ClassPlan& p, std::ostringstream& shim,
+                     std::ostringstream& externs, std::ostringstream& body) {
+        using B = std::remove_cvref_t<typename [:nth_base_type<T, I>():]>;
+        if constexpr (!core::NestedBindable<B>) {
+            return;
+        } else {
+            const ClassRef* br = class_ref<B>();
+            if (!br) {
+                // A base this module does not bind has no C# type to convert
+                // to. Saying so beats a Derived that silently cannot be passed.
+                p.skipped.push_back({p.cs_name, "(base " + std::to_string(I) + ")",
+                    "a base class this module does not bind, so there is no C# "
+                    "type to convert to"});
+                return;
+            }
+            const std::string sym = claim_symbol(
+                p, "mb_" + p.symbol + "_as_" + sanitize_symbol(br->cs_name));
+            const std::string method = claim_cs_name(p, "As" + br->cs_name);
+
+            shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
+                 << "return static_cast<void*>(static_cast<" << br->cpp_name
+                 << "*>(static_cast<" << p.cpp_name << "*>(self)));\n"
+                 << "}\n\n";
+            externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                    << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                    << "private static extern IntPtr " << method << "Raw("
+                    << p.handle << " self);\n\n";
+            body << "/// <summary>This object seen as its <c>" << br->cpp_name
+                 << "</c> base.</summary>\n"
+                 << "/// <remarks>A view of the base subobject, not a copy, with the\n"
+                 << "/// pointer adjusted by C++ rather than assumed. Writes through it\n"
+                 << "/// reach this object, and it is only valid while this object is.</remarks>\n"
+                 << "public " << br->cs_name << " " << method << "() {\n"
+                 << "return new " << br->cs_name << "(" << method
+                 << "Raw(Check()), false, this);\n"
+                 << "}\n\n"
+                 << "/// <summary>So a " << p.cs_name << " can be passed where a "
+                 << br->cs_name << " is expected.</summary>\n"
+                 << "public static implicit operator " << br->cs_name
+                 << "(" << p.cs_name << " value) {\n"
+                 << "if (value == null) throw new ArgumentNullException(nameof(value));\n"
+                 << "return value." << method << "();\n"
+                 << "}\n\n";
         }
     }
 
@@ -1665,7 +1938,13 @@ private:
                  << " threw a non-std exception\");\n"
                  << "}\n";
             if constexpr (rw != Wire::None) {
-                shim << "return " << zero_of(rw) << ";\n";
+                if constexpr (rw == Wire::Opt) {
+                    const OptPlan rop = opt_plan<Ret>();
+                    shim << "return " << (rop.is_string ? std::string("nullptr")
+                                                        : rop.c_wire + "{}") << ";\n";
+                } else {
+                    shim << "return " << zero_of(rw) << ";\n";
+                }
             }
             shim << "}\n\n";
 
@@ -1793,6 +2072,36 @@ private:
                     const std::string an = arg_name(an_id, Ps);
                     using PT = std::remove_cvref_t<
                         typename [:get_method_param_type<T, I, Ps>():]>;
+                    if constexpr (pw == Wire::Opt) {
+                        const OptPlan pop = opt_plan<PT>();
+                        if (pop.is_string) {
+                            // A null pointer is already nullopt, so no flag.
+                            c_params += std::string(", const char* ") + an;
+                            cs_ext_params += std::string(", [MarshalAs(UnmanagedType.LPUTF8Str)] string ") + an;
+                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
+                                      + "(" + an + " ? " + pop.cpp_opt
+                                      + "(std::string(" + an + ")) : " + pop.cpp_opt + "{})";
+                            if (!call_args.empty()) call_args += ", ";
+                            call_args += an;
+                        } else {
+                            c_params += std::string(", int32_t ") + an + "_has, "
+                                      + pop.c_wire + " " + an;
+                            cs_ext_params += std::string(", int ") + an + "_has, "
+                                           + pop.cs_wire + " " + an;
+                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
+                                      + "(" + an + "_has ? " + pop.cpp_opt
+                                      + "(static_cast<" + pop.cpp_inner + ">(" + an
+                                      + ")) : " + pop.cpp_opt + "{})";
+                            if (!call_args.empty()) call_args += ", ";
+                            call_args += an + ".HasValue ? 1 : 0, " + an
+                                       + ".HasValue ? (" + pop.cs_wire + ")" + an
+                                       + ".Value : default(" + pop.cs_wire + ")";
+                        }
+                        if (!cs_sig_params.empty()) cs_sig_params += ", ";
+                        cs_sig_params += pop.cs_surface + " " + an;
+                        cs_types += (cs_types.empty() ? "" : ",") + pop.cs_surface;
+                        return;
+                    }
                     if constexpr (pw == Wire::Vector) {
                         const VectorPlan* pv = vector_plan<PT>();
                         // Two wire parameters for one C# argument: the shim
@@ -1873,7 +2182,27 @@ private:
                                      + "*>(self)->" + qualified(owner_id, name)
                                      + "(" + fwd_args + ")";
 
-            shim << "MB_EXPORT " << rct << " " << sym << "(" << c_params << ") {\n"
+            // An optional return needs the inner type on the wire, plus a
+            // has-value out-param unless a null pointer can carry it. c_type
+            // has no spelling for Wire::Opt, and streaming its nullptr is what
+            // segfaulted the generator before this existed.
+            std::string ret_c = rct ? std::string(rct) : std::string();
+            std::string ret_cs = cs_wire_type(rw) ? std::string(cs_wire_type(rw))
+                                                  : std::string();
+            std::string opt_out_c, opt_out_cs, opt_out_call;
+            if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                ret_c = rop.c_wire;
+                ret_cs = rop.cs_wire;
+                if (!rop.is_string) {
+                    opt_out_c = std::string(", int32_t* has");
+                    opt_out_cs = ", out int has";
+                    opt_out_call = ", out _has";
+                }
+            }
+
+            shim << "MB_EXPORT " << ret_c << " " << sym << "("
+                 << c_params << opt_out_c << ") {\n"
                  << "mb_clear_error();\n"
                  << "try {\n";
             if constexpr (rw == Wire::None) {
@@ -1882,6 +2211,17 @@ private:
                 shim << "return mb_dup(" << invoke << ");\n";
             } else if constexpr (rw == Wire::Bool) {
                 shim << "return " << invoke << " ? 1 : 0;\n";
+            } else if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                if (rop.is_string) {
+                    shim << "{ auto o = " << invoke << ";\n"
+                         << "return o.has_value() ? mb_dup(*o) : nullptr; }\n";
+                } else {
+                    shim << "{ auto o = " << invoke << ";\n"
+                         << "*has = o.has_value() ? 1 : 0;\n"
+                         << "return o.has_value() ? static_cast<" << rop.c_wire
+                         << ">(*o) : " << rop.c_wire << "{}; }\n";
+                }
             } else if constexpr (rw == Wire::Vector) {
                 // Same reasoning as a returned object: the vector is a value,
                 // so the caller gets a heap copy it owns and frees.
@@ -1911,14 +2251,15 @@ private:
 
             externs << "[DllImport(Lib, EntryPoint = \"" << sym
                     << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-                    << "private static extern " << cs_wire_type(rw) << " "
-                    << ext_name << "(" << cs_ext_params << ");\n\n";
+                    << "private static extern " << ret_cs << " "
+                    << ext_name << "(" << cs_ext_params << opt_out_cs << ");\n\n";
 
             body << "public " << cs_name_for<Ret>(rw) << " " << claim_cs_name(p, name)
                  << "(" << cs_sig_params << ") {\n"
                  << vec_prologue;
             const std::string call = ext_name + "(Check()"
-                                   + (call_args.empty() ? "" : ", " + call_args) + ")";
+                                   + (call_args.empty() ? "" : ", " + call_args)
+                                   + opt_out_call + ")";
             if constexpr (rw == Wire::None) {
                 body << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n";
@@ -1930,6 +2271,19 @@ private:
                 body << "var r = " << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n"
                      << "return r != 0;\n";
+            } else if constexpr (rw == Wire::Opt) {
+                const OptPlan rop = opt_plan<Ret>();
+                if (!rop.is_string) body << "int _has;\n";
+                body << "var r = " << call << ";\n"
+                     << "MbNative.Throw(\"" << name << "\");\n";
+                if (rop.is_string) {
+                    body << "return r == IntPtr.Zero ? null : MbNative.TakeString(r);\n";
+                } else {
+                    const std::string bare =
+                        rop.cs_surface.substr(0, rop.cs_surface.size() - 1);
+                    body << "return _has != 0 ? (" << rop.cs_surface << ")("
+                         << bare << ")r : null;\n";
+                }
             } else if constexpr (rw == Wire::Vector) {
                 body << "var r = " << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n"

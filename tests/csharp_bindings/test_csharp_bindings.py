@@ -115,6 +115,31 @@ class Driver {
         catch (ObjectDisposedException) { Console.WriteLine("disposed read raises"); }
         gone.Dispose();
         Console.WriteLine("double dispose is a no-op");
+        using (var op = new Device()) {
+            Console.WriteLine($"opt defaults: limit={(op.limit.HasValue ? op.limit.Value.ToString() : "null")} trim={op.trim.Value} note={op.note}");
+            op.limit = 42;
+            op.trim = null;
+            op.note = null;
+            op.fallback = Mode.Careful;
+            Console.WriteLine($"opt set: limit={op.limit.Value} trim={(op.trim.HasValue ? "set" : "null")} note={(op.note == null ? "null" : op.note)} fallback={op.fallback.Value}");
+        }
+        using (var o2 = new Device()) {
+            o2.id = 3;
+            Console.WriteLine($"opt return: {(o2.maybe(true).HasValue ? o2.maybe(true).Value.ToString() : "null")}/{(o2.maybe(false).HasValue ? "set" : "null")}"
+                              + $" name={o2.maybe_name(true)}/{(o2.maybe_name(false) == null ? "null" : "set")}");
+            Console.WriteLine($"opt param: absorb(9)={o2.absorb(9)} absorb(null)={o2.absorb(null)} name={o2.absorb_name(null)}");
+        }
+        using (var sq = new Square()) {
+            sq.sides = 4;
+            sq.weight = 9.5;
+            sq.edge = 3.0;
+            using (var j = new Judge()) {
+                Console.WriteLine($"upcast implicit: count={j.count(sq)} weigh={j.weigh(sq)}");
+            }
+            var bv = sq.AsShapeBase();
+            bv.sides = 7;
+            Console.WriteLine($"base view writes through: sides={sq.sides} describe={sq.describe()} area={sq.area()}");
+        }
         using (var vi = new Device()) {
             Console.WriteLine($"array in: sum_of={vi.sum_of(new double[]{1.0, 2.5, 3.5})}");
             vi.replace_samples(new double[]{4.0, 5.0});
@@ -670,6 +695,55 @@ truthy("a list that is already an array is passed without a second copy",
 truthy("a container of strings is refused and says which half is missing",
        "count_names() --" in cs and "array of char*" in cs)
 
+print("\n=== a Derived can be passed where a Base is expected ===")
+# A generated class is sealed with no C# base type, so without this a class
+# hierarchy could not be bound at all -- and most real C++ libraries are one.
+truthy("an upcast view is generated per bound base",
+       "public ShapeBase AsShapeBase()" in cs and "public Tagged AsTagged()" in cs)
+truthy("with an implicit conversion so the call site reads like C#",
+       "public static implicit operator ShapeBase(Square value)" in cs)
+truthy("a null conversion names the argument",
+       "throw new ArgumentNullException(nameof(value))" in cs)
+# ShapeBase is Square's SECOND base, so its offset is not zero. Assuming a
+# Derived* is already a Base* would read weight's bytes as sides.
+truthy("the pointer is adjusted by C++, not assumed",
+       "static_cast<csb::ShapeBase*>(static_cast<csb::Square*>(self))" in shim_src)
+truthy("the upcast is a borrowed view, so it carries the owner pin",
+       "AsShapeBaseRaw(Check()), false, this)" in cs)
+
+print("\n=== std::optional is C# nullable, both ways ===")
+truthy("a scalar optional is a nullable", "public int? limit {" in cs
+       and "public double? trim {" in cs)
+truthy("an optional enum keeps the enum type", "public Mode? fallback {" in cs)
+# A string is already nullable in C#, so a null pointer is the whole signal
+# and no separate has-value flag is on the wire for it.
+truthy("an optional string is just a string", "public string note {" in cs)
+truthy("a scalar optional carries a has-value flag",
+       "out int has" in cs and "int32_t* has" in shim_src)
+check("a string optional does not need one",
+      "mb_Device_get_note(void* self, int32_t* has)" in shim_src, False)
+truthy("assigning null calls reset on the C++ side", ".reset();" in shim_src)
+# optional<int> is a reflectable class that is not string-like, not a
+# container, not arithmetic and not a smart pointer, so it satisfies
+# NestedBindable and was classified as an opaque handle before the optional
+# branch was reached.
+check("an optional is not reported as an unbound class",
+      "limit --" in cs or "note --" in cs, False)
+
+print("\n=== an optional in all three positions, not just as a member ===")
+# Claiming the matrix row on members alone was an overclaim, and the generator
+# segfaulted on an optional return: c_type has no spelling for Wire::Opt and
+# the emitter streamed its nullptr.
+truthy("an optional return is nullable", "public int? maybe(bool want)" in cs)
+truthy("an optional string return is a string", "public string maybe_name(bool want)" in cs)
+truthy("an optional parameter is nullable", "public int absorb(int? v)" in cs)
+truthy("and an optional string parameter is a string",
+       "public string absorb_name(string v)" in cs)
+truthy("a scalar return carries the flag as an out-param",
+       "out int has" in cs and "int32_t* has" in shim_src)
+check("a string return does not, because null already says it",
+      "mb_Device_maybe_name(void* self, int32_t want, int32_t* has)" in shim_src, False)
+
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
 # this backend emitted `private static extern intGet_id(IntPtr self)`, which
@@ -758,6 +832,20 @@ if MCS and MONO:
                "a live view passes straight in: sum_of=30" in out)
         truthy("an empty list is a valid empty vector, not a null pointer",
                "empty list: sum_of=0" in out)
+        # Tagged is the first base (offset 0) and ShapeBase the second, so
+        # reading sides correctly proves the non-zero offset was applied.
+        truthy("a Derived converts implicitly to either base, with the right offset",
+               "upcast implicit: count=4 weigh=9.5" in out)
+        truthy("and the base view writes through to the derived object",
+               "base view writes through: sides=7 describe=700 area=9" in out)
+        truthy("an optional reads its C++ value or null",
+               "opt defaults: limit=null trim=2.5 note=hi" in out)
+        truthy("and writing null reaches reset() on the C++ side",
+               "opt set: limit=42 trim=null note=null fallback=Careful" in out)
+        truthy("an optional return carries both a value and its absence",
+               "opt return: 6/null name=probe/null" in out)
+        truthy("and an optional parameter carries null through to nullopt",
+               "opt param: absorb(9)=9 absorb(null)=-1 name=none" in out)
         truthy("a borrowed object view refuses to read a disposed owner",
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",
