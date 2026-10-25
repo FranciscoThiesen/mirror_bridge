@@ -368,25 +368,23 @@ constexpr bool wire_ok(Wire w) { return w != Wire::Unsupported; }
 // A map parameter would need the materialise-or-pass-through prologue that a
 // vector parameter has, and that is not written yet, so a method taking one is
 // reported by name instead of emitted wrong.
-constexpr bool param_wire_ok(Wire w) {
-    return wire_ok(w) && w != Wire::Map && w != Wire::Array;
-}
+constexpr bool param_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Map; }
 
 // And what can be RETURNED, which excludes a fixed array for a different
 // reason than the parameter case: an array returned by value has no identity
 // apart from its storage, so a view of it would be a view of a temporary.
 // The honest surface is a copied T[], which needs an out-buffer signature
 // rather than a handle, and that is its own change.
-constexpr bool ret_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Array; }
-
-// Outbound for the static emitter, which still has no described return. A value returned by value is the
-// caller's copy, so it has to be heap-copied behind a handle before it
-// crosses, and only emit_method emits that copy; the static emitter would hand
-// back a raw IntPtr where the C# signature says the class, which does not
-// compile but kills the module rather than naming the member.
-constexpr bool simple_ret_wire_ok(Wire w) {
-    return ret_wire_ok(w) && w != Wire::Vector && w != Wire::Map
-        && w != Wire::Object && w != Wire::Opt;
+template<typename Ret>
+consteval bool ret_type_ok() {
+    using U = std::remove_cvref_t<Ret>;
+    constexpr Wire rw = wire_of<U>();
+    if constexpr (rw == Wire::Array) {
+        using E = std::remove_cvref_t<typename array_element<U>::type>;
+        return !core::StringLike<E>;
+    } else {
+        return wire_ok(rw);
+    }
 }
 
 // ============================================================================
@@ -501,10 +499,33 @@ struct RetSlot {
     // Trailing out-slots, appended after every argument because the shim
     // signature is positional and a flag or a buffer belongs at the end.
     std::vector<std::string> c_params, cs_ext_params, call_args;
-    std::string pre;         // C# statements before the call
-    std::string post;        // and after it, for a return the wire only sizes
+    // The shim's body, with MB_I standing for the C++ call expression. Every
+    // arm of this is where the OWNERSHIP RULE lives: a value returned by value
+    // is the caller's copy and must be heap-copied here, because a pointer to
+    // the temporary would dangle the moment the shim returned. That is why a
+    // wrong arm is a memory bug rather than a compile error, and why this half
+    // was converted after the parameter half rather than beside it.
+    std::string shim_return;
+    std::string cs_pre;      // C# statements before the call
+    // C# after the error check, with MB_N standing for the method name. A
+    // return the wire only sizes (a count into a buffer) hands back something
+    // other than what the call returned, which is why this is a string and not
+    // derivable from the wire type.
+    std::string cs_post;
     std::string zero = "0";  // what the shim's catch blocks hand back
+    bool captures = true;    // false for void: there is no `var r =`
 };
+
+// MB_I and MB_N are placeholders rather than parameters because a RetSlot is
+// built before the emitter knows the call expression it will be spliced into.
+inline std::string slot_subst(std::string t, const std::string& ph,
+                              const std::string& with) {
+    for (std::size_t at = t.find(ph); at != std::string::npos;
+         at = t.find(ph, at + with.size())) {
+        t.replace(at, ph.size(), with);
+    }
+    return t;
+}
 
 // Exactly the strings the emitters already had, so adopting this changes where
 // they come from, not what they are.
@@ -1713,6 +1734,10 @@ private:
     }
 
     template<typename M>
+    // Find-only on purpose, because it is const: it cannot register a plan.
+    // A caller that may be the FIRST to mention a container type has to
+    // register it first, or this answers with the bare wire type. See
+    // ret_slot, where getting that order wrong was a defect.
     std::string cs_name_for(Wire w) const {
         if (w == Wire::Opt) {
             const OptPlan op = opt_plan<M>();
@@ -1812,6 +1837,40 @@ private:
             return a;
         }
 
+        if constexpr (pw == Wire::Array) {
+            using AE = array_element<std::remove_cvref_t<PT>>;
+            using E = std::remove_cvref_t<typename AE::type>;
+            const VectorPlan* ap = vector_plan<std::vector<E>>();
+            const std::string n = std::to_string(AE::size);
+            // The same two wire slots a vector parameter uses, and the same
+            // view class, so an array and a vector of one element type share
+            // everything inbound as well as outbound.
+            a.cs_type = "IReadOnlyList<" + std::string(ap ? ap->cs_elem : "") + ">";
+            a.cs_sig_param = a.cs_type + " " + an;
+            a.c_params = {std::string("const ") + (ap ? ap->cpp_elem : "") + "* "
+                          + cn + "_data",
+                          std::string("int64_t ") + cn + "_n"};
+            a.cs_ext_params = {std::string("[In] ") + (ap ? ap->cs_elem : "")
+                               + "[] " + an + "_data",
+                               std::string("long ") + an + "_n"};
+            a.call_args = {an + "_arr", an + "_arr.LongLength"};
+            // std::array has no range constructor, so the count has to be
+            // checked and the elements copied. mb_to_array does both and
+            // throws on the wrong count, which reaches C# as an ordinary
+            // exception rather than a silently short array.
+            a.fwd_arg = "mb_to_array<" + std::string(ap ? ap->cpp_elem : "")
+                      + ", " + n + ">(" + cn + "_data, " + cn + "_n)";
+            a.prologue = "var " + an + "_arr = " + an + " as "
+                       + std::string(ap ? ap->cs_elem : "") + "[];\n"
+                       + "if (" + an + "_arr == null) {\n"
+                       + an + "_arr = new " + std::string(ap ? ap->cs_elem : "")
+                       + "[" + an + ".Count];\n"
+                       + "for (int i = 0; i < " + an + "_arr.Length; i++) "
+                       + an + "_arr[i] = " + an + "[i];\n"
+                       + "}\n";
+            return a;
+        }
+
         if constexpr (pw == Wire::Vector) {
             const VectorPlan* pv = vector_plan<PT>();
             a.cs_type = "IReadOnlyList<" + pv->cs_elem + ">";
@@ -1865,6 +1924,142 @@ private:
             a.fwd_arg = cast.empty() ? cn : cast + "(" + cn + ")";
         }
         return a;
+    }
+
+    // One return, as a slot. `nm` is only used for the error label.
+    template<typename Ret>
+    RetSlot ret_slot() {
+        constexpr Wire rw = wire_of<std::remove_cvref_t<Ret>>();
+        RetSlot r;
+
+        if constexpr (rw == Wire::None) {
+            r.captures = false;
+            r.shim_return = "MB_I;\n";
+            return r;
+        }
+
+        // Registration has to happen BEFORE cs_name_for is asked. That
+        // function resolves a container through a find-only lookup and answers
+        // "IntPtr" for a plan nobody has registered yet, which produces a
+        // method declared IntPtr whose body returns an MbIntVector -- CS0029,
+        // in generated code, pointing at a line the reader did not write.
+        //
+        // The 25-class fixture cannot catch this: some other member there
+        // always registers the element type first. It took a scaffolded
+        // single-class project whose only std::vector<int> was this very
+        // return, which is why tests/test_cli_init.sh compiles what it
+        // scaffolds instead of only checking that the files exist.
+        if constexpr (rw == Wire::Vector) {
+            (void)vector_plan<Ret>();
+        } else if constexpr (rw == Wire::Map) {
+            (void)map_plan<Ret>();
+        }
+
+        r.c_ret = c_type(rw);
+        r.cs_ret = cs_wire_type(rw);
+        r.cs_surface = cs_name_for<Ret>(rw);
+        r.zero = zero_of(rw);
+
+        if constexpr (rw == Wire::Utf8) {
+            r.shim_return = "return mb_dup(MB_I);\n";
+            r.cs_post = "return MbNative.TakeString(r);\n";
+        } else if constexpr (rw == Wire::Bool) {
+            r.shim_return = "return MB_I ? 1 : 0;\n";
+            r.cs_post = "return r != 0;\n";
+        } else if constexpr (rw == Wire::Opt) {
+            const OptPlan op = opt_plan<Ret>();
+            r.c_ret = op.c_wire;
+            r.cs_ret = op.cs_wire;
+            r.cs_surface = op.cs_surface;
+            r.zero = op.is_string ? "nullptr" : op.c_wire + "{}";
+            if (op.is_string) {
+                // A null pointer already carries "no value", so no flag slot.
+                r.shim_return = "{ auto o = MB_I;\n"
+                                "return o.has_value() ? mb_dup(*o) : nullptr; }\n";
+                r.cs_post = "return r == IntPtr.Zero ? null : MbNative.TakeString(r);\n";
+            } else {
+                r.c_params = {std::string(op.c_wire) + "* has"};
+                r.cs_ext_params = {"out int has"};
+                r.call_args = {"out _has"};
+                r.shim_return = "{ auto o = MB_I;\n"
+                                "*has = o.has_value() ? 1 : 0;\n"
+                                "return o.has_value() ? static_cast<" + op.c_wire
+                              + ">(*o) : " + op.c_wire + "{}; }\n";
+                r.cs_pre = "int _has;\n";
+                const std::string bare =
+                    op.cs_surface.substr(0, op.cs_surface.size() - 1);
+                r.cs_post = "return _has != 0 ? (" + op.cs_surface + ")("
+                          + bare + ")r : null;\n";
+            }
+        } else if constexpr (rw == Wire::Vector) {
+            const VectorPlan* vp = vector_plan<Ret>();
+            // A value, so the caller gets a heap copy it owns and frees.
+            r.shim_return = "return static_cast<void*>(new "
+                          + std::string(vp ? vp->cpp_vec : "") + "(MB_I));\n";
+            r.cs_post = "if (r == IntPtr.Zero) throw MbNative.LastError(\"MB_N\");\n"
+                        "return new " + std::string(vp ? vp->cs_name : "")
+                      + "(r, true, null);\n";
+        } else if constexpr (rw == Wire::Map) {
+            const MapPlan* mp = map_plan<Ret>();
+            r.shim_return = "return static_cast<void*>(new "
+                          + std::string(mp ? mp->cpp_map : "") + "(MB_I));\n";
+            r.cs_post = "if (r == IntPtr.Zero) throw MbNative.LastError(\"MB_N\");\n"
+                        "return new " + std::string(mp ? mp->cs_name : "")
+                      + "(r, true, null);\n";
+        } else if constexpr (rw == Wire::Object) {
+            const ClassRef* cr = class_ref<Ret>();
+            // A pointer to the temporary would dangle the moment the shim
+            // returned, so a copy is the only correct thing here.
+            r.shim_return = "return static_cast<void*>(new "
+                          + std::string(cr ? cr->cpp_name : "") + "(MB_I));\n";
+            r.cs_post = "if (r == IntPtr.Zero) throw MbNative.LastError(\"MB_N\");\n"
+                        "return new " + std::string(cr ? cr->cs_name : "")
+                      + "(r, true, null);\n";
+        } else if constexpr (rw == Wire::Array) {
+            using AE = array_element<std::remove_cvref_t<Ret>>;
+            using E = std::remove_cvref_t<typename AE::type>;
+            const VectorPlan* ap = vector_plan<std::vector<E>>();
+            const std::string n = std::to_string(AE::size);
+            // An array has no identity apart from its storage, so a view of a
+            // returned one would be a view of a temporary. The honest surface
+            // is a copied E[], filled through a buffer the caller owns; the
+            // wire return only says how many elements were written. No handle
+            // and no free, because nothing was allocated on either side.
+            //
+            // N is known on both sides from the C++ type, so the length is
+            // passed anyway: the .h is a public artifact and a hand-written C
+            // caller is entitled to a bounds check.
+            r.c_ret = "int32_t";
+            r.cs_ret = "int";
+            r.cs_surface = std::string(ap ? ap->cs_elem : "") + "[]";
+            r.zero = "0";
+            r.c_params = {std::string(ap ? ap->cpp_elem : "") + "* out",
+                          "int64_t out_n"};
+            r.cs_ext_params = {std::string("[Out] ") + (ap ? ap->cs_elem : "")
+                               + "[] outv", "long out_n"};
+            r.call_args = {"_out", n + "L"};
+            r.shim_return =
+                "{ auto a = MB_I;\n"
+                "const int64_t m = static_cast<int64_t>(a.size());\n"
+                "const int64_t k = out_n < m ? out_n : m;\n"
+                "for (int64_t i = 0; i < k; ++i) "
+                "out[i] = a[static_cast<std::size_t>(i)];\n"
+                "return static_cast<int32_t>(k); }\n";
+            r.cs_pre = "var _out = new " + std::string(ap ? ap->cs_elem : "")
+                     + "[" + n + "];\n";
+            // Reading the count is what makes the wire return mean anything,
+            // and discarding it was CS0219 under -warnaserror. It can only
+            // differ from N if the shim's clamp fired, which would mean the
+            // two sides disagreed about the length of a C++ type they both
+            // read from reflection.
+            r.cs_post = "if (r != " + n + ") throw MbNative.LastError(\"MB_N\");\n"
+                        "return _out;\n";
+        } else {
+            r.shim_return = std::string("return static_cast<") + c_type(rw)
+                          + ">(MB_I);\n";
+            r.cs_post = "return " + cs_cast_out<Ret>(rw) + "r;\n";
+        }
+        return r;
     }
 
     // An enum nobody registered would silently become a bare integer in the
@@ -2817,15 +3012,12 @@ private:
         constexpr std::size_t argc = get_static_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!simple_ret_wire_ok(rw)) {
+        if constexpr (!ret_type_ok<Ret>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_static_method_return_type<T, I>()).data();
             p.skipped.push_back({p.cs_name, "static " + name + "()",
-                std::string("returns ") + rname + ", which a static method cannot "
-                "return yet. A value returned by value is the caller's copy, so it "
-                "has to be heap-copied behind a handle before it crosses, and only "
-                "an instance method emits that copy -- as an instance method this "
-                "return works"});
+                std::string("returns ") + rname
+                + ", which does not cross the C ABI yet"});
             return;
         } else if constexpr (!static_params_ok<T, I>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name, "static " + name + "()",
@@ -2878,60 +3070,40 @@ private:
             p.public_sigs.push_back(public_sig);
 
             const std::string invoke = p.cpp_name + "::" + name + "(" + fwd_args + ")";
-            shim << "MB_EXPORT " << c_type(rw) << " " << sym
-                 << "(" << (c_params.empty() ? std::string("void") : c_params) << ") {\n"
+            const RetSlot rs = ret_slot<Ret>();
+            const Joined j2 = join_slots(slots, rs);
+
+            shim << "MB_EXPORT " << rs.c_ret << " " << sym
+                 << "(" << (j2.c_params.empty() ? std::string("void") : j2.c_params)
+                 << ") {\n"
                  << "mb_clear_error();\n"
-                 << "try {\n";
-            if constexpr (rw == Wire::None) {
-                shim << invoke << ";\n";
-            } else if constexpr (rw == Wire::Utf8) {
-                shim << "return mb_dup(" << invoke << ");\n";
-            } else if constexpr (rw == Wire::Bool) {
-                shim << "return " << invoke << " ? 1 : 0;\n";
-            } else {
-                shim << "return static_cast<" << c_type(rw) << ">(" << invoke << ");\n";
-            }
-            shim << "} catch (const std::exception& ex) {\n"
+                 << "try {\n"
+                 << slot_subst(rs.shim_return, "MB_I", invoke)
+                 << "} catch (const std::exception& ex) {\n"
                  << "mb_set_exception(ex);\n"
                  << "} catch (...) {\n"
                  << "mb_set_error(\"" << p.cpp_name << "::" << name
                  << " threw a non-std exception\");\n"
                  << "}\n";
             if constexpr (rw != Wire::None) {
-                if constexpr (rw == Wire::Opt) {
-                    const OptPlan rop = opt_plan<Ret>();
-                    shim << "return " << (rop.is_string ? std::string("nullptr")
-                                                        : rop.c_wire + "{}") << ";\n";
-                } else {
-                    shim << "return " << zero_of(rw) << ";\n";
-                }
+                shim << "return " << rs.zero << ";\n";
             }
             shim << "}\n\n";
 
             externs << "[DllImport(Lib, EntryPoint = \"" << sym
                     << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-                    << "private static extern " << cs_wire_type(rw) << " "
-                    << ext_name << "(" << cs_ext_params << ");\n\n";
+                    << "private static extern " << rs.cs_ret << " "
+                    << ext_name << "(" << j2.cs_ext_params << ");\n\n";
 
-            body << "public static " << cs_name_for<Ret>(rw) << " "
+            body << "public static " << rs.cs_surface << " "
                  << claim_cs_name(p, name) << "(" << cs_sig_params << ") {\n"
-                 << j.prologue;
-            const std::string call = ext_name + "(" + call_args + ")";
-            if constexpr (rw == Wire::None) {
-                body << call << ";\n" << "MbNative.Throw(\"" << name << "\");\n";
-            } else if constexpr (rw == Wire::Utf8) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return MbNative.TakeString(r);\n";
-            } else if constexpr (rw == Wire::Bool) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return r != 0;\n";
-            } else {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return " << cs_cast_out<Ret>(rw) << "r;\n";
-            }
+                 << j.prologue
+                 << rs.cs_pre;
+            const std::string call = ext_name + "(" + j2.call_args + ")";
+            if (rs.captures) body << "var r = ";
+            body << call << ";\n"
+                 << "MbNative.Throw(\"" << name << "\");\n"
+                 << slot_subst(rs.cs_post, "MB_N", name);
             body << "}\n\n";
         }
     }
@@ -2963,7 +3135,7 @@ private:
         constexpr std::size_t argc = get_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!ret_wire_ok(rw)) {
+        if constexpr (!ret_type_ok<Ret>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_method_return_type<T, I>()).data();
             p.skipped.push_back({p.cs_name, name + "()",
@@ -2999,8 +3171,6 @@ private:
                 "type to forward it"});
             return;
         } else {
-            const char* rct = c_type(rw);
-
             // C# overloads natively, so an overload set needs nothing special
             // on the managed side -- only the exported symbol has to be
             // unique, and so does the private extern, because two overloads
@@ -3053,131 +3223,40 @@ private:
                                      + "*>(self)->" + qualified(owner_id, name)
                                      + "(" + fwd_args + ")";
 
-            // An optional return needs the inner type on the wire, plus a
-            // has-value out-param unless a null pointer can carry it. c_type
-            // has no spelling for Wire::Opt, and streaming its nullptr is what
-            // segfaulted the generator before this existed.
-            std::string ret_c = rct ? std::string(rct) : std::string();
-            std::string ret_cs = cs_wire_type(rw) ? std::string(cs_wire_type(rw))
-                                                  : std::string();
-            std::string opt_out_c, opt_out_cs, opt_out_call;
-            if constexpr (rw == Wire::Opt) {
-                const OptPlan rop = opt_plan<Ret>();
-                ret_c = rop.c_wire;
-                ret_cs = rop.cs_wire;
-                if (!rop.is_string) {
-                    opt_out_c = std::string(", int32_t* has");
-                    opt_out_cs = ", out int has";
-                    opt_out_call = ", out _has";
-                }
-            }
+            const RetSlot rs = ret_slot<Ret>();
+            const Joined j2 = join_slots(slots, rs, "void* self",
+                                         p.handle + " self", "Check()");
 
-            shim << "MB_EXPORT " << ret_c << " " << sym << "("
-                 << c_params << opt_out_c << ") {\n"
+            shim << "MB_EXPORT " << rs.c_ret << " " << sym << "("
+                 << j2.c_params << ") {\n"
                  << "mb_clear_error();\n"
-                 << "try {\n";
-            if constexpr (rw == Wire::None) {
-                shim << invoke << ";\n";
-            } else if constexpr (rw == Wire::Utf8) {
-                shim << "return mb_dup(" << invoke << ");\n";
-            } else if constexpr (rw == Wire::Bool) {
-                shim << "return " << invoke << " ? 1 : 0;\n";
-            } else if constexpr (rw == Wire::Opt) {
-                const OptPlan rop = opt_plan<Ret>();
-                if (rop.is_string) {
-                    shim << "{ auto o = " << invoke << ";\n"
-                         << "return o.has_value() ? mb_dup(*o) : nullptr; }\n";
-                } else {
-                    shim << "{ auto o = " << invoke << ";\n"
-                         << "*has = o.has_value() ? 1 : 0;\n"
-                         << "return o.has_value() ? static_cast<" << rop.c_wire
-                         << ">(*o) : " << rop.c_wire << "{}; }\n";
-                }
-            } else if constexpr (rw == Wire::Vector) {
-                // Same reasoning as a returned object: the vector is a value,
-                // so the caller gets a heap copy it owns and frees.
-                shim << "return static_cast<void*>(new "
-                     << std::string(vector_plan<Ret>() ? vector_plan<Ret>()->cpp_vec : "")
-                     << "(" << invoke << "));\n";
-            } else if constexpr (rw == Wire::Map) {
-                shim << "return static_cast<void*>(new "
-                     << std::string(map_plan<Ret>() ? map_plan<Ret>()->cpp_map : "")
-                     << "(" << invoke << "));\n";
-            } else if constexpr (rw == Wire::Object) {
-                // Returned by value, so the only correct thing is a copy the
-                // caller owns. A pointer to the temporary would dangle the
-                // moment this function returned.
-                shim << "return static_cast<void*>(new "
-                     << std::string(class_ref<Ret>() ? class_ref<Ret>()->cpp_name : "")
-                     << "(" << invoke << "));\n";
-            } else {
-                shim << "return static_cast<" << rct << ">(" << invoke << ");\n";
-            }
-            shim << "} catch (const std::exception& ex) {\n"
+                 << "try {\n"
+                 << slot_subst(rs.shim_return, "MB_I", invoke)
+                 << "} catch (const std::exception& ex) {\n"
                  << "mb_set_exception(ex);\n"
                  << "} catch (...) {\n"
                  << "mb_set_error(\"" << p.cpp_name << "::" << name
                  << " threw a non-std exception\");\n"
                  << "}\n";
             if constexpr (rw != Wire::None) {
-                shim << "return " << zero_of(rw) << ";\n";
+                shim << "return " << rs.zero << ";\n";
             }
             shim << "}\n\n";
 
             externs << "[DllImport(Lib, EntryPoint = \"" << sym
                     << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-                    << "private static extern " << ret_cs << " "
-                    << ext_name << "(" << cs_ext_params << opt_out_cs << ");\n\n";
+                    << "private static extern " << rs.cs_ret << " "
+                    << ext_name << "(" << j2.cs_ext_params << ");\n\n";
 
-            body << "public " << cs_name_for<Ret>(rw) << " " << claim_cs_name(p, name)
+            body << "public " << rs.cs_surface << " " << claim_cs_name(p, name)
                  << "(" << cs_sig_params << ") {\n"
-                 << vec_prologue;
-            const std::string call = ext_name + "(" + call_args
-                                   + opt_out_call + ")";
-            if constexpr (rw == Wire::None) {
-                body << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n";
-            } else if constexpr (rw == Wire::Utf8) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return MbNative.TakeString(r);\n";
-            } else if constexpr (rw == Wire::Bool) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return r != 0;\n";
-            } else if constexpr (rw == Wire::Opt) {
-                const OptPlan rop = opt_plan<Ret>();
-                if (!rop.is_string) body << "int _has;\n";
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n";
-                if (rop.is_string) {
-                    body << "return r == IntPtr.Zero ? null : MbNative.TakeString(r);\n";
-                } else {
-                    const std::string bare =
-                        rop.cs_surface.substr(0, rop.cs_surface.size() - 1);
-                    body << "return _has != 0 ? (" << rop.cs_surface << ")("
-                         << bare << ")r : null;\n";
-                }
-            } else if constexpr (rw == Wire::Vector) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
-                     << "return new " << vector_plan<Ret>()->cs_name << "(r, true, null);\n";
-            } else if constexpr (rw == Wire::Map) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
-                     << "return new " << map_plan<Ret>()->cs_name << "(r, true, null);\n";
-            } else if constexpr (rw == Wire::Object) {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
-                     << "return new " << cs_name_for<Ret>(rw) << "(r, true, null);\n";
-            } else {
-                body << "var r = " << call << ";\n"
-                     << "MbNative.Throw(\"" << name << "\");\n"
-                     << "return " << cs_cast_out<Ret>(rw) << "r;\n";
-            }
+                 << vec_prologue
+                 << rs.cs_pre;
+            const std::string call = ext_name + "(" + j2.call_args + ")";
+            if (rs.captures) body << "var r = ";
+            body << call << ";\n"
+                 << "MbNative.Throw(\"" << name << "\");\n"
+                 << slot_subst(rs.cs_post, "MB_N", name);
             body << "}\n\n";
         }
     }
@@ -3254,7 +3333,23 @@ private:
           << "#include <array>\n#include <cstdint>\n#include <cstdlib>\n"
           << "#include <cstring>\n#include <exception>\n#include <memory>\n"
           << "#include <new>\n#include <stdexcept>\n#include <string>\n"
-          << "#include <typeinfo>\n#include <vector>\n\n";
+          << "#include <typeinfo>\n#include <vector>\n\n"
+          // Emitted once whether or not anything uses it: an inbound
+          // std::array needs it, and an unused template costs nothing.
+          << "// std::array has no constructor from a range, so an inbound\n"
+          << "// fixed array is copied element by element once its length has\n"
+          << "// been checked. A wrong length throws rather than quietly\n"
+          << "// binding a short array.\n"
+          << "template <class E, std::size_t N>\n"
+          << "static std::array<E, N> mb_to_array(const E* p, int64_t n) {\n"
+          << "if (n != static_cast<int64_t>(N)) {\n"
+          << "throw std::length_error(\"expected exactly \" + std::to_string(N)\n"
+          << "+ \" elements, got \" + std::to_string(n));\n"
+          << "}\n"
+          << "std::array<E, N> a{};\n"
+          << "for (std::size_t i = 0; i < N; ++i) a[i] = p[i];\n"
+          << "return a;\n"
+          << "}\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";
         o << "\n"
           << "#if defined(_WIN32)\n"

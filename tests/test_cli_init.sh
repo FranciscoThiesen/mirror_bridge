@@ -124,13 +124,15 @@ else
     check "the scaffolded namespace is the one the generator emits" \
         file_contains "$proj/build/proj_live.cs" "namespace $ns {"
 
-    if (cd "$proj" && $MCS -out:proj_live.exe Program.cs build/proj_live.cs >/dev/null 2>&1); then
+    build_out=$(cd "$proj" && $MCS -out:proj_live.exe Program.cs build/proj_live.cs 2>&1)
+    if [ $? -eq 0 ]; then
         check "the scaffolded project compiles" true
         run_out=$(cd "$proj" && LD_LIBRARY_PATH=build mono proj_live.exe 2>&1)
         check "and it runs green against C++" \
             assert_contains "$run_out" "all checks passed"
     else
         check "the scaffolded project compiles" false
+        echo "$build_out" | head -12 | sed 's/^/        /'
     fi
 fi
 
