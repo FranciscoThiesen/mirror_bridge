@@ -58,6 +58,11 @@ tools/mirror_bridge generate src/ --module my_module --lang python
 # Choices for --lang: python | lua | js | csharp | all
 # (csharp is NOT in `all`: it writes a .cs source file plus the shared library
 #  that file loads, not a module the CLI can import and verify)
+#
+# For csharp, read <module>.cs the way you would read a .pyi: it IS the typed
+# surface, it carries the real C++ parameter names, and anything that could not
+# cross is a comment at the point the member would have been -- so a missing
+# member can be told from an absent one without rerunning anything.
 tools/mirror_bridge generate src/ --module my_module --lang all
 
 # Useful flags: -o/--output DIR (default build/), -k/--keep-generated,

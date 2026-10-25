@@ -210,16 +210,45 @@ already have — which is the point if that compiler is MSVC.
 Both files come from one reflection pass over one class list, so renaming a member in C++
 renames the exported symbol and the C# property together.
 
-What crosses the boundary today: a default constructor, arithmetic members and parameters,
-`bool`, `std::string`, methods over those types, and `const` members as read-only
-properties. Generated classes are `IDisposable`. A C++ exception is caught at the boundary
-and raised as a C# exception carrying `what()`, because an exception crossing `extern "C"`
-is undefined behaviour.
+What crosses the boundary today:
 
-Anything that cannot cross yet — a container member, a class-typed return, a second
-overload of a name — is **named in the run output and as a comment in the generated C#**,
-at the point where the member would have been. See
-[type-conversion.md](type-conversion.md).
+| C++ | C# |
+|---|---|
+| arithmetic, `bool` | the matching C# primitive (`bool` travels as `int32` and converts at the edge) |
+| `std::string` | `string`, UTF-8, heap copy out with an explicit free; `LPUTF8Str` marshalled in |
+| `enum` / `enum class` | a real C# `enum` over the same underlying type |
+| a bound class, as a **member** | a view of the real subobject: writes reach the owning object |
+| a bound class, **returned by value** | a copy you own and should dispose |
+| a bound class, as a **parameter** | the wrapper, passed by handle |
+| `std::vector<T>` of a scalar or string, as a **member** | the live vector as `IReadOnlyList<T>` with an indexer setter, `Add`, `Clear` and `ToArray`: `Add` reaches C++ |
+| `std::vector<T>`, **returned by value** | a copy you own and should dispose |
+| `const` member | a get-only property |
+| overloaded methods | C# overloads, one exported symbol each |
+| static methods | `public static` |
+| constructors of any arity | C# constructors |
+| inherited members and methods | flattened onto the derived class |
+
+Generated classes are `IDisposable` over a `SafeHandle`, which the runtime ref-counts for
+the duration of each call — with a raw `IntPtr` the GC could release the handle while a
+native call on it was still running.
+
+A C++ exception is caught at every entry point and raised on the managed side carrying
+`what()`, because an exception crossing `extern "C"` is undefined behaviour. The kind is
+carried too, so `std::invalid_argument` arrives as `ArgumentException`, `std::out_of_range`
+as `ArgumentOutOfRangeException`, `std::overflow_error` as `OverflowException` and
+`std::bad_alloc` as `OutOfMemoryException`, rather than one exception type for everything.
+
+**Names are adjusted only when they have to be, and it is always reported.** A C++ member
+called `Dispose` or `Handle` would collide with the generated surface, and a method `get_x`
+beside a member `x` collides with the hidden accessor a C# property compiles to. Either is
+renamed with a trailing underscore, recorded in the run output and written as a comment in
+the generated class.
+
+Anything that cannot cross yet — a map, a set, a tuple, a variant, `std::optional`, a smart
+pointer, `std::array`, `vector<bool>`, a container passed *in*, or a second overload C#
+cannot tell from the first — is **named in the run output and as a comment in the generated
+C#** at the point the member would have been, so a missing member can be told from an
+absent one.
 
 ### `pch` - Build Precompiled Header
 

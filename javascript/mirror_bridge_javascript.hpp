@@ -1191,6 +1191,22 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
     }
     T* self = static_cast<T*>(raw);
 
+    // A const member is readable and never assignable. Without this branch the
+    // declaration below was a default-initialised const and the assignment a
+    // write to a const lvalue, so a class with one const field failed to
+    // compile the whole module rather than failing to set that one field.
+    // tests/const_members had no JavaScript binding, which is why it was never
+    // seen.
+    // Two shapes of the same situation: readable, never assignable. A const
+    // member cannot be written, and a member whose type has no default
+    // constructor cannot even be converted into, because the setter needs a
+    // local to move from. nlohmann::detail::dtoa_impl::diyfp is the real
+    // second case and it took the whole of nlohmann-json down.
+    if constexpr (std::is_const_v<MemberType>
+                  || !std::is_default_constructible_v<MemberType>) {
+        napi_throw_error(env, nullptr, "Property is not assignable from JavaScript");
+        return nullptr;
+    } else {
     MemberType cpp_value;
     if (!from_javascript(env, args[0], cpp_value)) {
         using Member = std::remove_cvref_t<MemberType>;
@@ -1211,6 +1227,7 @@ napi_value js_setter(napi_env env, napi_callback_info info) {
         napi_throw_error(env, nullptr, "Unknown C++ exception in property setter");
         return nullptr;
     }
+    }  // const-member guard
 
     napi_value undefined;
     napi_get_undefined(env, &undefined);
@@ -1491,7 +1508,18 @@ napi_value js_constructor(napi_env env, napi_callback_info info) {
 
     try {
         if (argc == 0) {
-            cpp_object = new T();
+            // A class with no default constructor is still bindable: its other
+            // constructors work and its members read. Calling new T() here
+            // unconditionally made such a class a compile failure for the whole
+            // module -- the same shape as the setter's local, reached from the
+            // constructor instead.
+            if constexpr (std::is_default_constructible_v<T>) {
+                cpp_object = new T();
+            } else {
+                napi_throw_error(env, nullptr,
+                    "This class has no default constructor in C++; pass its arguments");
+                return nullptr;
+            }
         } else {
             constexpr std::size_t ctor_count = get_js_constructor_count<T>();
 
@@ -1508,8 +1536,17 @@ napi_value js_constructor(napi_env env, napi_callback_info info) {
                 }(std::make_index_sequence<ctor_count>{});
             }
 
+            // The fallback when no parameterized constructor matched. Same
+            // guard as above: a class with no default constructor must report
+            // the mismatch rather than make the module uncompilable.
             if (cpp_object == nullptr) {
-                cpp_object = new T();
+                if constexpr (std::is_default_constructible_v<T>) {
+                    cpp_object = new T();
+                } else {
+                    napi_throw_error(env, nullptr,
+                        "No constructor of this class matches those arguments");
+                    return nullptr;
+                }
             }
         }
     } catch (const std::exception& e) {

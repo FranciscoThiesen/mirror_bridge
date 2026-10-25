@@ -838,7 +838,17 @@ build_csharp() {
     local gen_bin="$output_dir/${module_name}_csharp_gen"
     local shim_src="$output_dir/${module_name}_shim.cpp"
     local cs_out="$output_dir/${module_name}.cs"
-    local lib_out="$output_dir/lib${module_name}.so"
+    # The runtime's own probing decides this, so the file name is not cosmetic.
+    # DllImport("csb") tries {"", "lib"} x {"", platform suffix}: on Linux that
+    # reaches libcsb.so, on macOS libcsb.dylib, and on Windows csb.dll with no
+    # lib prefix. Emitting libcsb.so everywhere means a macOS consumer can
+    # never load the library the generator just built for them.
+    local lib_out
+    case "$(uname -s)" in
+        Darwin)           lib_out="$output_dir/lib${module_name}.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) lib_out="$output_dir/${module_name}.dll" ;;
+        *)                lib_out="$output_dir/lib${module_name}.so" ;;
+    esac
 
     mkdir -p "$output_dir"
 
@@ -851,6 +861,15 @@ build_csharp() {
     local header
     declare -A cs_included=()
     for header in "${cs_headers[@]}"; do
+        if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
+            echo "#include \"$header\"" >> "$gen_src"
+            cs_included[$header]=1
+        fi
+    done
+    # An enum can live in a header holding no bound class, in which case the
+    # include list above -- built from classes -- has never seen it. The Python
+    # backend learned this the same way.
+    for header in "${DISCOVERED_ENUM_HEADERS[@]:-}"; do
         if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
             echo "#include \"$header\"" >> "$gen_src"
             cs_included[$header]=1
@@ -869,6 +888,21 @@ build_csharp() {
         echo "    if (argc < 2) { std::fprintf(stderr, \"usage: %s <out-dir>\\n\", argv[0]); return 2; }"
         echo "    mirror_bridge::csharp::Emitter emitter(\"$module_name\", \"$cs_namespace\");"
     } >> "$gen_src"
+
+    # Enums first: a class member of enum type is reported as not crossing
+    # unless its enum is already registered, so registration order matters.
+    local enum_name enum_simple
+    declare -A cs_enum_taken=()
+    for enum_name in "${DISCOVERED_ENUMS[@]:-}"; do
+        [ -z "$enum_name" ] && continue
+        enum_simple="${enum_name##*::}"
+        if [ -n "${BINDING_NAME_WINNER[$enum_simple]:-}" ] || \
+           [ -n "${cs_enum_taken[$enum_simple]:-}" ]; then
+            continue
+        fi
+        cs_enum_taken[$enum_simple]=1
+        echo "    emitter.add_enum<$enum_name>(\"$enum_simple\", \"$enum_name\");" >> "$gen_src"
+    done
 
     local class_name simple_name i=0 emitted=0
     for (( i = 0; i < ${#cs_classes[@]}; i++ )); do
@@ -926,8 +960,16 @@ build_csharp() {
 
     echo -e "${YELLOW}Compiling the shim into lib${module_name}.so...${NC}"
     # No reflection flags here on purpose: this is the step a consumer repeats
-    # with their own compiler, so it must not need one.
-    log=$($CXX_BIN -std=c++17 $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+    # with their own compiler, so it must not need one. It does re-parse the
+    # project's headers, though, so the standard has to be recent enough for
+    # them: pinned at C++17 this step rejected any header using a C++20
+    # feature, on a project whose whole subject is modern C++.
+    local shim_std="-std=c++20"
+    local shim_stdlib=""
+    case "$CXX_BIN" in
+        *clang*) shim_stdlib="-stdlib=libc++" ;;
+    esac
+    log=$($CXX_BIN $shim_std $shim_stdlib $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
           -fPIC -shared -O2 -DNDEBUG -fvisibility=hidden \
           "$shim_src" -o "$lib_out" 2>&1) || {
         echo -e "${RED}✗ the generated shim did not compile${NC}"
@@ -936,9 +978,32 @@ build_csharp() {
         return 1
     }
 
+    local csc_bin=""
+    for cand in csc mcs; do
+        command -v "$cand" >/dev/null 2>&1 && { csc_bin="$cand"; break; }
+    done
+    if [ -n "$csc_bin" ] && [ "$VERIFY_IMPORT" -eq 1 ]; then
+        echo -e "${YELLOW}Checking the generated C# compiles...${NC}"
+        local cs_log
+        cs_log=$("$csc_bin" -target:library -warnaserror \
+                 -out:"$output_dir/${module_name}_check.dll" "$cs_out" 2>&1) || {
+            echo -e "${RED}✗ the generated C# does not compile${NC}"
+            echo "$cs_log" | grep -m8 -E "error" || echo "$cs_log" | head -8
+            LAST_COMPILE_LOG="$cs_log"
+            return 1
+        }
+        rm -f "$output_dir/${module_name}_check.dll"
+        echo -e "${GREEN}✓ the generated C# compiles cleanly${NC}"
+    elif [ -z "$csc_bin" ]; then
+        echo -e "  ${YELLOW}No C# compiler on PATH (csc or mcs), so ${module_name}.cs was not"
+        echo -e "  compiled. It is the one artifact here a human reads directly; check it"
+        echo -e "  in your own build before trusting it.${NC}"
+    fi
+
     echo -e "${GREEN}✓ $lib_out${NC}"
     echo -e "${GREEN}✓ $cs_out${NC}"
-    echo "  Add the .cs to a project and put lib${module_name}.so where the runtime looks for it."
+    echo "  Add the .cs to a project and put $(basename "$lib_out") beside the assembly,"
+    echo "  or anywhere the runtime's library search path reaches."
     LAST_OUTPUT_FILE="$lib_out"
     [ $KEEP_GENERATED -eq 0 ] && rm -f "$gen_src" "$gen_bin"
     return 0
@@ -1280,11 +1345,13 @@ report_unbound() {
     local built_langs="${2:-}"
     # The Python backend binds enums as enum.IntEnum, so for that language
     # they are not missing from the module and do not belong in this list.
-    # Lua and JavaScript have no equivalent yet and their values still cross
-    # as bare numbers.
+    # Python and C# both bind enums as a real enum type; Lua and JavaScript
+    # have no equivalent yet and their values still cross as bare numbers. This
+    # gate named only Python, so a successful csharp run ended with a warning
+    # whose every clause was false.
     local -a unbound_enums=()
     case " $built_langs " in
-        *" python "*) ;;
+        *" python "*|*" csharp "*|*" cs "*) ;;
         *) unbound_enums=("${DISCOVERED_ENUMS[@]}") ;;
     esac
     local -a overloaded=() shares_name=()
@@ -1367,7 +1434,7 @@ report_unbound() {
         echo ""
         echo "    ${#unbound_enums[@]} enum type(s) — values still cross as plain numbers, unchecked"
         print_group unbound_enums
-        echo "      The Python backend binds these as enum.IntEnum; Lua and JavaScript do not yet"
+        echo "      Python binds these as enum.IntEnum and C# as a real enum; Lua and JavaScript do not yet"
     fi
     if [ ${#overloaded[@]} -gt 0 ]; then
         echo ""
