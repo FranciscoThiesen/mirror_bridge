@@ -193,6 +193,38 @@ struct WithArray {
     double total() const { return fixed[0] + fixed[1] + fixed[2]; }
 };
 
+// A const member of container or class type cannot cross the way a non-const
+// one does -- as a pointer into the owner that writes reach -- because taking
+// its address gives a const T* and static_cast cannot drop that. Before this
+// was guarded the run reported "0 member(s) left out" and then failed inside
+// the C++ compiler, which the consumer cannot act on without editing the const
+// off their own header. Clipper2 and nlohmann-json both ship members of this
+// shape, which is why tests/const_members exists for the other backends.
+struct Frozen {
+    const std::vector<double> baseline{1.0, 2.0, 3.0};
+    const Counter origin{};
+    double drift = 0.25;
+
+    double baseline_sum() const {
+        return baseline[0] + baseline[1] + baseline[2];
+    }
+};
+
+// long and long long are distinct C++ types that the C# side spells
+// identically, and the plan is keyed on the C++ type, so these two used to
+// register two plans that minted one set of mb_vec_long_* helpers and one
+// MbLongVector class: a duplicate native symbol and CS0101 in the same build.
+struct Widths {
+    std::vector<long> narrow{1, 2};
+    std::vector<long long> wide{3, 4, 5};
+
+    long narrow_sum() const {
+        long t = 0;
+        for (auto v : narrow) t += v;
+        return t;
+    }
+};
+
 // A C++20 feature in the bound header. The shim re-parses this header, so
 // pinning that compile at C++17 rejected it.
 struct Modern {

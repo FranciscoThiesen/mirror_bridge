@@ -50,6 +50,7 @@
 #include <string>
 #include <optional>
 #include <typeinfo>
+#include <deque>
 #include <vector>
 
 namespace mirror_bridge {
@@ -194,7 +195,13 @@ constexpr const char* c_type(Wire w) {
         case Wire::Utf8: return "const char*";
         case Wire::Object: return "void*";
         case Wire::Vector: return "void*";
-        default:         return nullptr;
+        // Never nullptr: these results are streamed straight into the output,
+        // and streaming a null const char* is undefined behaviour that has
+        // already crashed this generator once (Wire::Opt returning nullptr
+        // from a site that had not special-cased it yet). A poison spelling
+        // turns the same slip into a shim that fails to compile and names the
+        // symbol it failed on, which is a bug report instead of a core dump.
+        default:         return "MB_WIRE_UNHANDLED";
     }
 }
 
@@ -218,7 +225,7 @@ constexpr const char* cs_wire_type(Wire w) {
         case Wire::Utf8: return "IntPtr";
         case Wire::Object: return "IntPtr";
         case Wire::Vector: return "IntPtr";
-        default:         return nullptr;
+        default:         return "MB_WIRE_UNHANDLED";
     }
 }
 
@@ -661,7 +668,10 @@ private:
     // Keyed on the vector type, so std::vector<double> used by three classes
     // produces one set of element helpers and one view class rather than three.
     std::map<std::string, std::size_t> vector_key_;
-    std::vector<VectorPlan> vectors_;
+    // A deque, not a vector: vector_plan hands out pointers into this
+    // container and a later registration must not invalidate them.
+    std::deque<VectorPlan> vectors_;
+    std::map<std::string, int> helper_tags_;
     std::set<std::string> headers_;
 
     // The type the C# caller sees. For an enum that is the registered enum
@@ -744,10 +754,18 @@ private:
             vp.cs_wire = cs_wire_type(ew);
             vp.is_string = (ew == Wire::Utf8);
             vp.wire_c = vp.is_string ? "const char*" : c_type(ew);
-            vp.tag = sanitize_symbol(vp.cs_elem);
-            vp.cs_name = std::string(1, static_cast<char>(std::toupper(vp.cs_elem[0])))
-                       + vp.cs_elem.substr(1) + "Vector";
-            vp.cs_name = "Mb" + vp.cs_name;
+            // The tag names this element type's helper symbols and its C#
+            // class, so it has to be unique per C++ type. The C# spelling is
+            // not: cs_type maps every 64-bit signed type to "long", so
+            // vector<long> and vector<long long> are two plans (the key is the
+            // C++ type) that would mint one set of mb_vec_long_* symbols and
+            // one MbLongVector class -- a duplicate symbol in the shim and
+            // CS0101 in the C#. The first claimant keeps the plain name, so
+            // every name that exists today is unchanged.
+            vp.tag = claim_helper_tag(sanitize_symbol(vp.cs_elem));
+            vp.cs_name = "Mb"
+                       + std::string(1, static_cast<char>(std::toupper(vp.tag[0])))
+                       + vp.tag.substr(1) + "Vector";
             vp.shim = vector_shim(vp);
             vector_key_[key] = vectors_.size();
             vectors_.push_back(std::move(vp));
@@ -1127,6 +1145,19 @@ private:
         return out;
     }
 
+    // Module-wide, unlike claim_symbol, because a helper set is shared by every
+    // class that mentions the element type. Not static: the ledger has to reset
+    // between Emitters or a second module in one process would start numbering
+    // where the first left off.
+    std::string claim_helper_tag(const std::string& base) {
+        auto it = helper_tags_.find(base);
+        if (it == helper_tags_.end()) {
+            helper_tags_.emplace(base, 1);
+            return base;
+        }
+        return base + std::to_string(++it->second);
+    }
+
     // A C# property X compiles to hidden get_X and set_X methods, so declaring
     // a property `x` and a method `get_x` is "a member is already reserved" --
     // a C# error the native symbol ledger cannot see, because the two names do
@@ -1341,6 +1372,29 @@ private:
             p.skipped.push_back({p.cs_name, name,
                 std::string("type ") + tname
                 + " does not cross the C ABI yet; scalars, bool and std::string do"});
+            return;
+        } else if constexpr ((w == Wire::Vector || w == Wire::Object)
+                             && std::is_const_v<Raw>) {
+            // Taking the address of a const member gives a const T*, and
+            // static_cast cannot turn that into void*. The scalar branches
+            // below bind a const member read-only, which is the honest answer
+            // there because the value is copied out. A vector or nested-object
+            // member is different: it crosses as a pointer INTO the owner
+            // precisely so that writes reach the owner, so there is no
+            // read-only version of it to hand back without a read-only view
+            // type that does not exist yet.
+            //
+            // Reporting it is what matters. Before this guard the run printed
+            // "0 member(s) or method(s) left out" and then failed inside the
+            // C++ compiler on the generated shim, which the consumer cannot
+            // act on without editing the const off their own header.
+            constexpr const char* ctn =
+                std::meta::display_string_of(std::meta::type_of(member)).data();
+            p.skipped.push_back({p.cs_name, name,
+                std::string("it is const (") + ctn + "); a "
+                + (w == Wire::Vector ? "vector" : "nested object")
+                + " member crosses as a writable view into the owner, which a "
+                  "const member cannot provide"});
             return;
         } else {
             const bool writable = !std::is_const_v<Raw>;
