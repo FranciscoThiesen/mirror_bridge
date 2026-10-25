@@ -486,8 +486,13 @@ truthy("and the halves reuse the vector view classes rather than new ones",
        "new MbStringVector(kp, true, null)" in cs)
 truthy("a map parameter is reported rather than emitted wrong",
        re.search(r"Registry\.sum_of\(\): a parameter type", run.stdout) is not None)
+# Deliberately not matching the type spelling: display_string_of prints what
+# the compiler calls the type, and that differs -- clang says `set<basic_string
+# <...>>` where GCC says `std::set<std::__cxx11::basic_string<char> >`. The
+# member name and the refusal are ours; the spelling is the compiler's.
 truthy("a std::set is reported as not crossing",
-       re.search(r"TagSet\.names: type set<", run.stdout) is not None)
+       re.search(r"TagSet\.names: type .*\bset<", run.stdout) is not None
+       and "does not cross the C ABI yet" in run.stdout)
 check("and was not quietly bound as a map", "StringSet" in cs, False)
 
 print("\n=== two C++ types the C# wire spells alike keep their own helpers ===")
