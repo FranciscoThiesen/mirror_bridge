@@ -839,6 +839,18 @@ header_is_excluded() {
 # build the shared library C# loads with whatever compiler they already have,
 # which matters here more than anywhere else: the people who want C# bindings
 # are usually on MSVC, which has no reflection support at all.
+# The C# namespace is the module name with its separators removed, which keeps
+# it a legal identifier without inventing a name nobody asked for. init and
+# build_csharp must agree on this: a scaffolded Program.cs names the namespace
+# that the generator will later emit, so the two reading it differently would
+# produce a project that does not compile.
+cs_namespace_for() {
+    local ns
+    ns="$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]//g')"
+    [ -z "$ns" ] && ns="MirrorBridge"
+    printf '%s' "$ns"
+}
+
 build_csharp() {
     local module_name="$1"
     local output_dir="$2"
@@ -890,11 +902,8 @@ build_csharp() {
         fi
     done
 
-    # The C# namespace is the module name with its separators removed, which
-    # keeps it a legal identifier without inventing a name nobody asked for.
     local cs_namespace
-    cs_namespace="$(printf '%s' "$module_name" | sed 's/[^A-Za-z0-9]//g')"
-    [ -z "$cs_namespace" ] && cs_namespace="MirrorBridge"
+    cs_namespace="$(cs_namespace_for "$module_name")"
 
     {
         echo ""
@@ -3072,7 +3081,7 @@ ${YELLOW}Required:${NC}
   --module, -m <name>   Name for the generated module
 
 ${YELLOW}Options:${NC}
-  --lang, -l <lang>     Target language (python|lua|js|all) [default: python]
+  --lang, -l <lang>     Target language (python|lua|js|csharp|all) [default: python]
   --output, -o <dir>    Output directory [default: build]
   --interval, -i <sec>  Poll interval in seconds [default: 2]
   --pch                 Use precompiled header for faster builds
@@ -3095,7 +3104,10 @@ target language, a README with build instructions, and a GitHub Actions
 workflow that builds and tests the bindings in the reflection container.
 
 ${YELLOW}Options:${NC}
-  --lang, -l <lang>   Target language: python, lua, js, or all [default: python]
+  --lang, -l <lang>   Target language: python, lua, js, csharp, or all
+                      [default: python]. As with generate, csharp is not part
+                      of \`all\`: it scaffolds a .csproj rather than a module
+                      the host runtime can load directly.
   --wheel             Also scaffold pip packaging: pyproject.toml with
                       scikit-build-core, a CMake build for the extension,
                       and a wheel-building GitHub workflow
@@ -3136,8 +3148,10 @@ cmd_init() {
         show_init_help
         exit 1
     fi
-    case "$lang" in python|lua|js|all) ;; *)
-        echo -e "${RED}Error: Invalid language '$lang' (python|lua|js|all)${NC}"; exit 1 ;;
+    [ "$lang" = "cs" ] && lang="csharp"
+    [ "$lang" = "javascript" ] && lang="js"
+    case "$lang" in python|lua|js|csharp|all) ;; *)
+        echo -e "${RED}Error: Invalid language '$lang' (python|lua|js|csharp|all)${NC}"; exit 1 ;;
     esac
 
     # Module names become C identifiers (module init symbol) — enforce here
@@ -3231,12 +3245,85 @@ console.log('all checks passed');
 JS_EOF
     fi
 
+    if [ "$lang" = "csharp" ]; then
+        local cs_ns
+        cs_ns="$(cs_namespace_for "$module_name")"
+
+        cat > "$project_name/Program.cs" << CS_EOF
+using System;
+using ${cs_ns};
+
+// Every class in src/ is bound automatically, so this file only has to use
+// them. The generated build/${module_name}.cs is compiled alongside it, and
+// lib${module_name}.so has to be loadable at run time -- the .csproj copies it
+// next to the assembly, which is the first place DllImport looks.
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string what) {
+        Console.WriteLine((ok ? "  PASS  " : "  FAIL  ") + what);
+        if (!ok) failures++;
+    }
+
+    static int Main() {
+        // A bound object owns C++ memory, so it is IDisposable. using() is how
+        // that memory comes back at a point you choose rather than whenever the
+        // GC next runs.
+        using (var g = new Greeter()) {
+            Check(g.greet() == "Hello, world!", "the default greeting");
+            g.name = "mirror_bridge";
+            Check(g.greet() == "Hello, mirror_bridge!", "a write reaches C++");
+            Check(g.greet_count == 2, "and C++ counted both calls");
+
+            // A vector returned by value is a copy this side owns, so it is
+            // disposable too. A vector *member* would instead be a borrowed
+            // window onto the object's own storage, and disposing one of those
+            // would be wrong -- the generated code tells the two apart for you.
+            using (var counts = g.counts_up_to(4)) {
+                Check(counts.Count == 4, "a returned vector carries its length");
+                Check(counts[2] == 2, "and its elements read");
+            }
+        }
+
+        Console.WriteLine(failures == 0
+            ? "all checks passed"
+            : failures + " check(s) failed");
+        return failures == 0 ? 0 : 1;
+    }
+}
+CS_EOF
+
+        cat > "$project_name/${project_name}.csproj" << PROJ_EOF
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <!-- The generated build/${module_name}.cs needs no entry here: the SDK's
+       default **/*.cs glob already picks it up. The native library is not a
+       compile item, so it is copied beside the assembly instead. -->
+  <ItemGroup>
+    <None Include="build/lib${module_name}.so"
+          Condition="Exists('build/lib${module_name}.so')"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
+PROJ_EOF
+    fi
+
     local gen_lang="$lang"
     local test_cmd=""
     case "$lang" in
         python) test_cmd="python3 test_${module_name}.py" ;;
         lua)    test_cmd="lua5.4 test_${module_name}.lua" ;;
         js)     test_cmd="node test_${module_name}.js" ;;
+        # The reflection container ships mono rather than the .NET SDK, so the
+        # instructions that have to run there use mcs. dotnet run works too and
+        # is what the .csproj is for; the README gives both.
+        csharp) test_cmd="mcs -out:${module_name}.exe Program.cs build/${module_name}.cs && LD_LIBRARY_PATH=build mono ${module_name}.exe" ;;
         all)    test_cmd="python3 test_${module_name}.py" ;;
     esac
 
@@ -3267,11 +3354,50 @@ mirror_bridge diff src/
 \`\`\`
 README_EOF
 
+    if [ "$lang" = "csharp" ]; then
+        cat >> "$project_name/README.md" << CSREADME_EOF
+
+## What the C# backend writes
+
+\`generate\` leaves three files in \`build/\`:
+
+| File | What it is |
+| --- | --- |
+| \`${module_name}.cs\` | the bindings -- add it to any project, or let the .csproj glob find it |
+| \`lib${module_name}.so\` | the native library the bindings call into |
+| \`${module_name}.h\` | the same flat C ABI as a header, for C or C++ callers |
+
+With the .NET SDK, the scaffolded project builds and runs as it stands:
+
+\`\`\`bash
+mirror_bridge generate src/ --module ${module_name} --lang csharp
+dotnet run
+\`\`\`
+
+The reflection container ships mono rather than the .NET SDK, so inside it
+(and in the generated CI workflow) the same thing is two commands:
+
+\`\`\`bash
+mcs -out:${module_name}.exe Program.cs build/${module_name}.cs
+LD_LIBRARY_PATH=build mono ${module_name}.exe
+\`\`\`
+
+A bound object holds C++ memory, so it implements \`IDisposable\`. Dispose it,
+or wrap it in \`using\`, to decide when that memory goes back rather than
+leaving it to the GC. Values returned *by value* are copies you own and
+dispose; values read from a *member* are borrowed windows onto the object's own
+storage, so writes through them reach C++ and you do not dispose them.
+CSREADME_EOF
+    fi
+
     cat > "$project_name/.gitignore" << 'GI_EOF'
 build/
 *.so
 *.node
 __pycache__/
+bin/
+obj/
+*.exe
 GI_EOF
 
     if [ $with_ci -eq 1 ]; then
