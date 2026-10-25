@@ -1,6 +1,6 @@
 # mirror_bridge
 
-> mirror_bridge is a C++26 reflection-based binding generator: write your C++ once and get Python, Lua, and JavaScript bindings auto-generated with zero boilerplate. Classes and functions are discovered automatically via reflection, so there is no per-binding glue code to maintain. It requires the Bloomberg clang-p2996 reflection compiler, most easily used through the provided Docker image.
+> mirror_bridge is a C++26 reflection-based binding generator: write your C++ once and get Python, Lua, JavaScript and C# bindings auto-generated with zero boilerplate. Classes and functions are discovered automatically via reflection, so there is no per-binding glue code to maintain. It needs a C++26 reflection compiler: stock GCC 16.1+ or Bloomberg's clang-p2996, whichever the CLI finds, and the provided Docker image is the easiest way to get one.
 
 ## Docs
 - [README](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/README.md): Project overview, value proposition, and quick example
@@ -10,7 +10,7 @@
 - [Development Workflow](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/workflow.md): Recommended day-to-day workflow
 - [Replacing a hot Python function with C++](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/accelerating-python.md): Measured workflow for taking one slow function out of a Python program, which shapes pay and which do not, and how to read the build report
 - [Returning a vector of structs without building a list](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/columnar-returns.md): `--columnar` returns a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying; about 200x on the return above a thousand elements, 500x end to end
-- [Multi-Language Support](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/multi-language.md): Generate Python, Lua, and JavaScript from one source
+- [Multi-Language Support](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/multi-language.md): Generate Python, Lua, JavaScript and C# from one source
 - [Packaging](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/packaging.md): Distribute bindings as installable packages
 - [Single-Header](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/single-header.md): Integrate via amalgamated single-header builds
 - [PCH Optimization](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/guides/pch-optimization.md): Cut compile times with precompiled headers

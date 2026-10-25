@@ -1,7 +1,7 @@
 # AGENTS.md
 
 `mirror_bridge` is a C++26 reflection-based binding generator: it inspects C++ structs/classes at
-compile time (via P2996 reflection) and emits zero-overhead Python, Lua, and JavaScript bindings —
+compile time (via P2996 reflection) and emits zero-overhead Python, Lua, JavaScript and C# bindings —
 no hand-written binding code. **The one critical constraint: it requires a C++26 reflection
 compiler** — either stock **GCC 16+** (`g++ -std=c++26 -freflection`) or Bloomberg's
 [clang-p2996](https://github.com/bloomberg/clang-p2996) (with libc++ and the `<meta>` header).

@@ -4,7 +4,7 @@ This document describes the internal architecture of mirror_bridge for developer
 
 ## Overview
 
-Mirror Bridge is a **compile-time C++ binding generator** that uses C++26 reflection (P2996) to automatically create foreign function interfaces for Python, Lua, and JavaScript. The key principle is that **all binding logic is resolved at compile-time**, resulting in zero-overhead runtime performance.
+Mirror Bridge is a **compile-time C++ binding generator** that uses C++26 reflection (P2996) to automatically create foreign function interfaces for Python, Lua, JavaScript and C#. The key principle is that **all binding logic is resolved at compile-time**, resulting in zero-overhead runtime performance.
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐

@@ -6,13 +6,13 @@
 [![Release](https://img.shields.io/github/v/release/FranciscoThiesen/mirror_bridge)](https://github.com/FranciscoThiesen/mirror_bridge/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Generate Python, Lua, and JavaScript bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
+Generate Python, Lua, JavaScript and C# bindings from C++ using C++26 reflection. Zero boilerplate, zero runtime overhead, zero binding code.
 
 ![mirror_bridge demo: one command generates Python, Lua and JavaScript modules](docs/assets/mirror_bridge_demo.svg)
 
 > C++26 reflection ships in **stock GCC 16.1+** (`g++ -std=c++26 -freflection`); [Bloomberg's clang-p2996](https://github.com/bloomberg/clang-p2996) also works. The CLI auto-detects whichever is present. Reflection was voted into C++26 in June 2025 — this is standard C++, not a fork-only experiment.
 
-## One C++ Class, Three Languages
+## One C++ Class, Four Languages
 
 ```cpp
 struct Calculator {
@@ -23,10 +23,11 @@ struct Calculator {
 ```
 
 ```bash
-mirror_bridge generate src/ --module calc --lang all
+mirror_bridge generate src/ --module calc --lang all     # Python, Lua, JavaScript
+mirror_bridge generate src/ --module calc --lang csharp  # C# (a .cs + .so + .h, so not part of `all`)
 ```
 
-That command is the entire binding process — no `.def()`, no macros in your class, no wrapper files. The same `Calculator` is now native in all three languages:
+That is the entire binding process — no `.def()`, no macros in your class, no wrapper files. The same `Calculator` is now native in all four languages:
 
 **Python**
 ```python
@@ -51,6 +52,16 @@ const calc = require('./build/calc.node');
 const c = new calc.Calculator();
 c.add(10);
 console.log(c.value);   // 10.0
+```
+
+**C#**
+```csharp
+using calc;
+
+// The object owns C++ memory, so it is IDisposable.
+using var c = new Calculator();
+c.add(10);
+Console.WriteLine(c.value);   // 10
 ```
 
 ## Proof on a Real Library: Open3D

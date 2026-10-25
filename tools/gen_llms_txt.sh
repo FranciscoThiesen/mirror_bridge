@@ -33,7 +33,7 @@ link() {
 cat > "$INDEX" << 'EOF'
 # mirror_bridge
 
-> mirror_bridge is a C++26 reflection-based binding generator: write your C++ once and get Python, Lua, and JavaScript bindings auto-generated with zero boilerplate. Classes and functions are discovered automatically via reflection, so there is no per-binding glue code to maintain. It requires the Bloomberg clang-p2996 reflection compiler, most easily used through the provided Docker image.
+> mirror_bridge is a C++26 reflection-based binding generator: write your C++ once and get Python, Lua, JavaScript and C# bindings auto-generated with zero boilerplate. Classes and functions are discovered automatically via reflection, so there is no per-binding glue code to maintain. It needs a C++26 reflection compiler: stock GCC 16.1+ or Bloomberg's clang-p2996, whichever the CLI finds, and the provided Docker image is the easiest way to get one.
 
 ## Docs
 EOF
@@ -46,7 +46,7 @@ link "docs/guides/accelerating-python.md" "Replacing a hot Python function with 
 # Single-quoted because the description contains backticks, which the shell
 # would otherwise treat as a command substitution and drop.
 link "docs/guides/columnar-returns.md"     "Returning a vector of structs without building a list" '`--columnar` returns a vector of plain structs as a sequence that describes its own memory, so numpy reads it without copying; about 200x on the return above a thousand elements, 500x end to end'
-link "docs/guides/multi-language.md"      "Multi-Language Support" "Generate Python, Lua, and JavaScript from one source"
+link "docs/guides/multi-language.md"      "Multi-Language Support" "Generate Python, Lua, JavaScript and C# from one source"
 link "docs/guides/packaging.md"           "Packaging"            "Distribute bindings as installable packages"
 link "docs/guides/single-header.md"       "Single-Header"        "Integrate via amalgamated single-header builds"
 link "docs/guides/pch-optimization.md"    "PCH Optimization"     "Cut compile times with precompiled headers"

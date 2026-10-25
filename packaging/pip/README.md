@@ -1,6 +1,6 @@
 # mirror-bridge
 
-Write your C++ once. Get Python, Lua, and JavaScript bindings for free.
+Write your C++ once. Get Python, Lua, JavaScript and C# bindings for free.
 
 `mirror_bridge` is a binding generator built on C++26 reflection (P2996): it
 discovers your classes at compile time and generates zero-overhead bindings

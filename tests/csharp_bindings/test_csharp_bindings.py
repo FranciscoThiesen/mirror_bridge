@@ -403,6 +403,39 @@ truthy("the generate run names the member and its reason on one line",
 check("samples is no longer in the skipped list", "samples --" in cs, False)
 check("history() is no longer in the skipped list", "history() --" in cs, False)
 
+print("\n=== a const container or object member is refused, not miscompiled ===")
+# The failure this replaces was the worst kind: nothing reported as left out,
+# then "static_cast from 'const std::vector<double> *' to 'void *' is not
+# allowed" from the C++ compiler on generated code.
+truthy("a const vector member is named with its reason",
+       re.search(r"Frozen\.baseline: it is const", run.stdout) is not None)
+truthy("a const nested object member is too",
+       re.search(r"Frozen\.origin: it is const", run.stdout) is not None)
+check("the const vector member gets no property",
+      "public MbDoubleVector baseline" in cs, False)
+check("nor does the const object member", "public Counter origin" in cs, False)
+truthy("while the writable member beside them still binds",
+       "public double drift {" in cs)
+truthy("and a method reading the const member still binds",
+       "public double baseline_sum()" in cs)
+
+print("\n=== two C++ types the C# wire spells alike keep their own helpers ===")
+# cs_type maps every 64-bit signed type to "long", so the C# spelling cannot
+# name the helper set. The first claimant keeps the plain name so that no
+# existing generated name changes.
+truthy("the first vector keeps the plain class name", "class MbLongVector :" in cs)
+truthy("and the second gets a distinct one", "class MbLong2Vector :" in cs)
+truthy("each with its own native helper set", "mb_vec_long2_size" in shim_src)
+truthy("the two members have the two types",
+       "public MbLongVector narrow {" in cs and "public MbLong2Vector wide {" in cs)
+
+print("\n=== an unhandled wire kind cannot stream a null pointer ===")
+# c_type and cs_wire_type used to return nullptr for anything they had not
+# enumerated, which is undefined behaviour at the ostringstream and has
+# segfaulted this generator before. The poison spelling fails loudly instead.
+check("no null was streamed into the shim", "MB_WIRE_UNHANDLED" in shim_src, False)
+check("nor into the C#", "MB_WIRE_UNHANDLED" in cs, False)
+
 print("\n=== C# indentation is produced by one formatter ===")
 # Every line in a generated class body sits at a multiple of four, which the
 # brace-depth formatter guarantees and forty careful call sites did not.
