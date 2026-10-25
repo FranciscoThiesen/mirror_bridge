@@ -115,6 +115,17 @@ class Driver {
         catch (ObjectDisposedException) { Console.WriteLine("disposed read raises"); }
         gone.Dispose();
         Console.WriteLine("double dispose is a no-op");
+        using (var vi = new Device()) {
+            Console.WriteLine($"array in: sum_of={vi.sum_of(new double[]{1.0, 2.5, 3.5})}");
+            vi.replace_samples(new double[]{4.0, 5.0});
+            Console.WriteLine($"replaced the C++ vector: Count={vi.samples.Count} [1]={vi.samples[1]}");
+            using (var other = new Device()) {
+                other.samples.Add(10.0);
+                other.samples.Add(20.0);
+                Console.WriteLine($"a live view passes straight in: sum_of={vi.sum_of(other.samples)}");
+            }
+            Console.WriteLine($"empty list: sum_of={vi.sum_of(new double[0])}");
+        }
         using (var v = new Device()) {
             v.samples.Add(1.5);
             v.samples.Add(2.5);
@@ -641,6 +652,24 @@ truthy("the class around it still binds", "public sealed class WithArray" in cs)
 truthy("a header using a C++20 feature still builds through the shim stage",
        "public sealed class Modern" in cs)
 
+print("\n=== containers crossing inward ===")
+# The shape a real caller writes, and the direction this backend refused
+# longest. Two wire parameters for one C# argument -- a pointer and a length --
+# so the shim builds the vector from the range and nothing is allocated or
+# freed on the managed side.
+truthy("a vector parameter takes a read-only list",
+       "public double sum_of(IReadOnlyList<double> values)" in cs)
+truthy("and crosses as a pointer plus a length",
+       "Call_sum_of(DeviceHandle self, [In] double[] values_data, long values_n)" in cs)
+truthy("the shim builds the vector from the range",
+       "std::vector<double>(values_data, values_data + values_n)" in shim_src)
+truthy("a list that is already an array is passed without a second copy",
+       "values as double[]" in cs)
+# A vector of strings would need an array of char* with its own marshalling.
+# Refusing half the feature by name beats refusing both.
+truthy("a container of strings is refused and says which half is missing",
+       "count_names() --" in cs and "array of char*" in cs)
+
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
 # this backend emitted `private static extern intGet_id(IntPtr self)`, which
@@ -719,6 +748,16 @@ if MCS and MONO:
                "string vector: [0]=gamma Count=1" in out)
         truthy("an out-of-range index raises rather than reading past the end",
                "vector range check raises" in out)
+        truthy("an array crosses inward and C++ sums it",
+               "array in: sum_of=7" in out)
+        truthy("and can replace the C++ vector wholesale",
+               "replaced the C++ vector: Count=2 [1]=5" in out)
+        # The generated view implements IReadOnlyList<T>, so one object's
+        # member reaches another object's method with no copy on this side.
+        truthy("another object's live view passes straight in",
+               "a live view passes straight in: sum_of=30" in out)
+        truthy("an empty list is a valid empty vector, not a null pointer",
+               "empty list: sum_of=0" in out)
         truthy("a borrowed object view refuses to read a disposed owner",
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",

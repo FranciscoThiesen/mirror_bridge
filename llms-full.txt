@@ -170,7 +170,12 @@ d.mode = Mode.Careful;               // a real C# enum, not an int
 d.samples.Add(1.5);                  // the live C++ vector: Add reaches C++
 Console.WriteLine(d.samples.Sum());  // IReadOnlyList<double>, so LINQ works
 d.inner.x = 7.5;                     // a member object is a view, not a copy
+d.replace_samples(new[]{1.0, 2.0});  // and a container crosses inward too
 ```
+
+The shim has no reflection in it, so the ABI beside it is callable from any compiler:
+`<module>.h` declares the same entry points, and a plain `g++ -std=c++17` or `gcc -std=c99`
+can use them ([issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3)).
 
 See [the CLI reference](docs/reference/cli.md#csharp-output).
 
@@ -3281,10 +3286,15 @@ there is no host C API to call. `--lang csharp` writes two things:
 
 ```bash
 mirror_bridge generate src/ --module mylib --lang csharp -o build/
-# build/libmylib.so   the flat C ABI, compiled
-# build/mylib.cs      the C# that calls it
+# build/libmylib.so     the flat C ABI, compiled (.dylib on macOS, .dll on Windows)
+# build/mylib.cs        the C# that calls it
+# build/mylib.h         the same ABI as a C header
 # build/mylib_shim.cpp  the generated C ABI source
 ```
+
+`generate` compiles the `.cs` itself when `csc` or `mcs` is on PATH, so a codegen
+bug fails the build rather than shipping as source that looks fine. It says so when
+no C# compiler is available.
 
 Add the `.cs` to a dotnet project and put the shared library where the runtime looks for
 it. **The shim contains no reflection**, so you can rebuild it with whatever compiler you
@@ -3305,6 +3315,7 @@ What crosses the boundary today:
 | a bound class, as a **parameter** | the wrapper, passed by handle |
 | `std::vector<T>` of a scalar or string, as a **member** | the live vector as `IReadOnlyList<T>` with an indexer setter, `Add`, `Clear` and `ToArray`: `Add` reaches C++ |
 | `std::vector<T>`, **returned by value** | a copy you own and should dispose |
+| `std::vector<T>` of a **scalar**, as a **parameter** | `IReadOnlyList<T>`, crossing as a pointer and a length so nothing is allocated managed-side; a generated vector view can be passed straight through |
 | `const` member | a get-only property |
 | overloaded methods | C# overloads, one exported symbol each |
 | static methods | `public static` |
@@ -3328,10 +3339,41 @@ renamed with a trailing underscore, recorded in the run output and written as a 
 the generated class.
 
 Anything that cannot cross yet — a map, a set, a tuple, a variant, `std::optional`, a smart
-pointer, `std::array`, `vector<bool>`, a container passed *in*, or a second overload C#
-cannot tell from the first — is **named in the run output and as a comment in the generated
-C#** at the point the member would have been, so a missing member can be told from an
-absent one.
+pointer, `std::array`, `vector<bool>`, a container of **strings** passed in, a
+`vector<BoundClass>`, or a second overload C# cannot tell from the first — is **named in the
+run output and as a comment in the generated C#** at the point the member would have been,
+so a missing member can be told from an absent one.
+
+#### Using the bindings from C or C++17
+
+The shim contains no reflection, which means the ABI beside it is callable by any compiler,
+not only one that can do C++26. `<module>.h` declares it:
+
+```cpp
+#include "mylib.h"            // only <stdint.h> behind it
+
+void* r = mb_Reading_new();
+mb_Reading_set_id(r, 21);
+double xs[3] = {1.0, 2.5, 3.5};
+double total = mb_Reading_sum_of(r, xs, 3);
+const char* tag = mb_Reading_get_tag(r);   // malloc'd UTF-8
+mb_free_string(tag);
+mb_Reading_delete(r);
+```
+
+```bash
+g++ -std=c++17 -Wall use.cpp -lmylib     # or: gcc -std=c99
+```
+
+Every declaration in the header is a signature lifted from `<module>_shim.cpp` with its
+body removed, so the two cannot drift. Ownership is in the entry point's name: `mb_<C>_new`
+and a by-value return hand you something to free with `mb_<C>_delete`, while a member
+accessor returns a pointer interior to its owner that must not be freed and must not outlive
+it. After any call that can fail, `mb_last_error()` is non-NULL and `mb_last_error_kind()`
+says which C++ exception it was.
+
+This is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked
+for: generate with a reflection compiler, consume with an ordinary one.
 
 ### `pch` - Build Precompiled Header
 
@@ -6387,6 +6429,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A container can be passed into C#, not only read out of it, and the ABI is now usable from C or C++17.** A `std::vector<T>` of a scalar crosses inward as two wire parameters for one C# argument — a pointer and a length — so the shim builds the vector from that range and nothing is allocated or freed on the managed side. The C# surface takes `IReadOnlyList<T>`, which means a generated vector view passes straight through: `a.sum_of(b.samples)` reaches C++ with no copy on this side. An array already of the right type is forwarded without a second copy. A vector of *strings* would need an array of `char*` with its own marshalling and is still refused — by name, saying which half is missing, rather than refusing both directions as before. Separately, `<module>.h` is now emitted beside the shim, declaring the same flat C ABI; every declaration in it is a signature lifted from `<module>_shim.cpp` with the body removed, so the header cannot drift from the library. The shim has never contained any reflection, which is what makes this worth having: a plain `g++ -std=c++17 -Wall -Wextra` and a plain `gcc -std=c99` both compile and run against it, with ownership stated in the entry point's name and the C++ exception kind readable through `mb_last_error_kind()`. That is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked for in December — generate with a reflection compiler, consume with an ordinary one — and `tests/c_abi_consumer/` pins it by building the consumer at `-std=c++17` and `-std=c99` with a compiler that does not know what reflection is. `generate` also compiles the generated `.cs` itself when `csc` or `mcs` is present, so a managed-side codegen bug fails the build instead of shipping as source that looks fine.
 - **The C# backend reaches the other backends, and passes two of them.** It began as scalars, bool and strings. It now also carries enums as real C# enums over the same underlying type, method overloading (one exported symbol per overload, with C#'s own resolution picking, refusing only the pair C# genuinely cannot distinguish), static methods, constructors of any arity, inherited data members and methods, nested objects, and `std::vector<T>` of a scalar or string. A class-typed **member** is a view of the real subobject so writes reach the owning object, while one **returned by value** is a copy the caller owns, because a pointer to the temporary would dangle; the same split governs vectors, so `obj.samples.Add(x)` reaches the C++ vector and `obj.history()` hands back a copy. The view holds a strong reference to its owner, which is what stops the GC collecting the owner first, and that reference is read through `GC.KeepAlive` rather than merely stored, because a field written and never read is `CS0414` and an error in any project built with warnings-as-errors. The generated vector view implements `IReadOnlyList<T>` so LINQ works on it, and reads `Count` from C++ on every access rather than caching it. Inherited data members needed a new walk: `nonstatic_data_members_of` reports only direct members, so `core` gained `data_members_with_bases` beside the member-function cache that already walked `bases_of` for exactly the same reason. Two rows now read better for C# than for Lua and JavaScript, and not by accident of the table: Lua reaches only the first overload of a name and JavaScript only the last, neither says so, and both pass an enum as a bare integer with no enum type at all.
 - **The generated C# is what a .NET engineer would accept, which took finding three things that were wrong.** A review of the real generated output, compiled with `mcs` and run under `mono`, found that the wrapper could be finalized mid-call: with an `IntPtr` field the last read of the instance is inside the argument list, so the JIT may report it dead and the finalizer may run `Delete` while the native call is still on the stack. Every class now wraps a `SafeHandle`, which the runtime ref-counts across the call and which makes `Dispose` idempotent and thread-safe besides. Second, a C++ name that collides with the generated surface produced C# that does not compile — `int Handle` and a method called `Dispose()` are house style at several large shops — and there is a second, independent collision the native ledger cannot see, because a C# property `X` compiles to hidden `get_X`/`set_X` and so a method `get_x` beside a member `x` is "already reserved". Both are resolved by renaming with a trailing underscore, reported in the run output and written into the generated class. Third, the library was named `lib<module>.so` on every platform, which `DllImport` probing can never find on macOS; it is now `.dylib` on Darwin and `<module>.dll` on Windows. Smaller things from the same review: the exception kind is carried across the boundary through a `dynamic_cast` ladder so a caller can catch `ArgumentException` for `std::invalid_argument` instead of one `InvalidOperationException` for everything; `mb_*_delete` catches, which the shim's own comment already claimed every entry point did; a failed string allocation records an error instead of arriving as a successful empty string; `ExactSpelling = true` stops the runtime probing a second, non-existent name; parameter names are the real C++ ones rather than `a0`, `a1`, which this project's Python stubs have carried all along; and the generated file compiles under `-warnaserror` with no warnings.
 - **One P/Invoke transition per call instead of two.** The generated code asked the library whether an error was pending after every call, which is itself a transition. The error slot's address is now cached per managed thread and tested with `Marshal.ReadInt32`. Measured 58.1 to 49.2 ns/call under mono, which is 1.18x rather than the 2x it looks like, because the second transition carried no arguments.

@@ -198,10 +198,15 @@ there is no host C API to call. `--lang csharp` writes two things:
 
 ```bash
 mirror_bridge generate src/ --module mylib --lang csharp -o build/
-# build/libmylib.so   the flat C ABI, compiled
-# build/mylib.cs      the C# that calls it
+# build/libmylib.so     the flat C ABI, compiled (.dylib on macOS, .dll on Windows)
+# build/mylib.cs        the C# that calls it
+# build/mylib.h         the same ABI as a C header
 # build/mylib_shim.cpp  the generated C ABI source
 ```
+
+`generate` compiles the `.cs` itself when `csc` or `mcs` is on PATH, so a codegen
+bug fails the build rather than shipping as source that looks fine. It says so when
+no C# compiler is available.
 
 Add the `.cs` to a dotnet project and put the shared library where the runtime looks for
 it. **The shim contains no reflection**, so you can rebuild it with whatever compiler you
@@ -222,6 +227,7 @@ What crosses the boundary today:
 | a bound class, as a **parameter** | the wrapper, passed by handle |
 | `std::vector<T>` of a scalar or string, as a **member** | the live vector as `IReadOnlyList<T>` with an indexer setter, `Add`, `Clear` and `ToArray`: `Add` reaches C++ |
 | `std::vector<T>`, **returned by value** | a copy you own and should dispose |
+| `std::vector<T>` of a **scalar**, as a **parameter** | `IReadOnlyList<T>`, crossing as a pointer and a length so nothing is allocated managed-side; a generated vector view can be passed straight through |
 | `const` member | a get-only property |
 | overloaded methods | C# overloads, one exported symbol each |
 | static methods | `public static` |
@@ -245,10 +251,41 @@ renamed with a trailing underscore, recorded in the run output and written as a 
 the generated class.
 
 Anything that cannot cross yet — a map, a set, a tuple, a variant, `std::optional`, a smart
-pointer, `std::array`, `vector<bool>`, a container passed *in*, or a second overload C#
-cannot tell from the first — is **named in the run output and as a comment in the generated
-C#** at the point the member would have been, so a missing member can be told from an
-absent one.
+pointer, `std::array`, `vector<bool>`, a container of **strings** passed in, a
+`vector<BoundClass>`, or a second overload C# cannot tell from the first — is **named in the
+run output and as a comment in the generated C#** at the point the member would have been,
+so a missing member can be told from an absent one.
+
+#### Using the bindings from C or C++17
+
+The shim contains no reflection, which means the ABI beside it is callable by any compiler,
+not only one that can do C++26. `<module>.h` declares it:
+
+```cpp
+#include "mylib.h"            // only <stdint.h> behind it
+
+void* r = mb_Reading_new();
+mb_Reading_set_id(r, 21);
+double xs[3] = {1.0, 2.5, 3.5};
+double total = mb_Reading_sum_of(r, xs, 3);
+const char* tag = mb_Reading_get_tag(r);   // malloc'd UTF-8
+mb_free_string(tag);
+mb_Reading_delete(r);
+```
+
+```bash
+g++ -std=c++17 -Wall use.cpp -lmylib     # or: gcc -std=c99
+```
+
+Every declaration in the header is a signature lifted from `<module>_shim.cpp` with its
+body removed, so the two cannot drift. Ownership is in the entry point's name: `mb_<C>_new`
+and a by-value return hand you something to free with `mb_<C>_delete`, while a member
+accessor returns a pointer interior to its owner that must not be freed and must not outlive
+it. After any call that can fail, `mb_last_error()` is non-NULL and `mb_last_error_kind()`
+says which C++ exception it was.
+
+This is what [issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3) asked
+for: generate with a reflection compiler, consume with an ordinary one.
 
 ### `pch` - Build Precompiled Header
 

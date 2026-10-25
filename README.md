@@ -166,7 +166,12 @@ d.mode = Mode.Careful;               // a real C# enum, not an int
 d.samples.Add(1.5);                  // the live C++ vector: Add reaches C++
 Console.WriteLine(d.samples.Sum());  // IReadOnlyList<double>, so LINQ works
 d.inner.x = 7.5;                     // a member object is a view, not a copy
+d.replace_samples(new[]{1.0, 2.0});  // and a container crosses inward too
 ```
+
+The shim has no reflection in it, so the ABI beside it is callable from any compiler:
+`<module>.h` declares the same entry points, and a plain `g++ -std=c++17` or `gcc -std=c99`
+can use them ([issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3)).
 
 See [the CLI reference](docs/reference/cli.md#csharp-output).
 

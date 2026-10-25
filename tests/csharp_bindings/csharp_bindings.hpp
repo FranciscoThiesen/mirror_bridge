@@ -51,6 +51,20 @@ struct Device {
     void rename(std::string next) { label = next; }
     int sum(int a, int b) const { return a + b; }
 
+    // A container crossing INWARD, which is the shape a real caller writes
+    // and the one this backend refused longest.
+    double sum_of(const std::vector<double>& values) const {
+        double t = 0.0;
+        for (double v : values) t += v;
+        return t;
+    }
+
+    void replace_samples(const std::vector<double>& values) { samples = values; }
+
+    int count_names(const std::vector<std::string>& who) const {
+        return static_cast<int>(who.size());
+    }
+
     Mode mode = Mode::Fast;
 
     Mode promote(Mode m) const { return m == Mode::None ? Mode::Fast : Mode::Careful; }
