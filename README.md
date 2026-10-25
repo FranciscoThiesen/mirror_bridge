@@ -216,7 +216,11 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
 output and as a comment in the `.cs` at the point the member would have been, so a missing
 member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
-view; `std::array` and `vector<bool>` do not.
+view in all three positions; `std::array<T, N>` crosses as a live **member** — the same view
+class, with `Add` and `Clear` raising `NotSupportedException` because the length is part of
+the C++ type — while an array returned by value or taken as a parameter is reported by name.
+`vector<bool>` does not cross at all: it stores bits and hands back a proxy, so there is no
+element to address.
 
 **Maps** in C# are `⚠️` rather than `✅` for one reason: a map crosses outward, not inward.
 `std::map` and `std::unordered_map` of a scalar or string key and value bind as a real

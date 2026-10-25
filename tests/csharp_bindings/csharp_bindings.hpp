@@ -192,8 +192,25 @@ struct Collide {
 // generator rather than a member reported as not crossing.
 struct WithArray {
     std::array<double, 3> fixed{1.0, 2.0, 3.0};
+    std::array<std::string, 2> labels{"lo", "hi"};
+    // Readable, never a writable window: see Frozen.
+    const std::array<int, 2> pinned{1, 2};
     int tag = 4;
+
+    // Recomputed in C++, so it proves a write through the fixed view landed in
+    // the owner's own storage.
     double total() const { return fixed[0] + fixed[1] + fixed[2]; }
+    std::string joined() const { return labels[0] + "/" + labels[1]; }
+
+    // Returned by value: the array has no identity apart from its storage, so
+    // a view of this would be a view of a temporary. Reported, not viewed.
+    std::array<double, 3> spread() const { return fixed; }
+
+    // Inbound needs the vector parameter's prologue plus an arity check and
+    // does not have it yet, so this is reported too.
+    double sum_of_fixed(std::array<double, 3> a) const {
+        return a[0] + a[1] + a[2];
+    }
 };
 
 // A string-keyed map is the most common non-vector container in a real public

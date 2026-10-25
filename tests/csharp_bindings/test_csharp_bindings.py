@@ -187,6 +187,19 @@ class Driver {
                 Console.WriteLine($"class parameter: consume={o.consume(arg)}");
             }
         }
+        using (var wa = new WithArray()) {
+            Console.WriteLine($"fixed view: Count={wa.@fixed.Count} IsFixedSize={wa.@fixed.IsFixedSize} [1]={wa.@fixed[1]}");
+            wa.@fixed[2] = 7.0;
+            Console.WriteLine($"fixed write reaches C++: total={wa.total()}");
+            wa.labels[1] = "HI";
+            Console.WriteLine($"fixed strings: joined={wa.joined()}");
+            Console.WriteLine($"fixed ToArray: {string.Join(",", Array.ConvertAll(wa.@fixed.ToArray(), x => ((int)x).ToString()))}");
+            Expect<NotSupportedException>(() => wa.@fixed.Add(1.0), "fixed Add");
+            Expect<NotSupportedException>(() => wa.@fixed.Clear(), "fixed Clear");
+        }
+        using (var vfix = new Device()) {
+            Console.WriteLine($"vector IsFixedSize={vfix.samples.IsFixedSize}");
+        }
         using (var r = new Registry()) {
             var a0 = r.counts["a"];
             var hasB = r.counts.ContainsKey("b");
@@ -781,9 +794,35 @@ print("\n=== what used to break the generator itself ===")
 # std::array has value_type and .data() but no allocator_type. Naming
 # allocator_type outside the detection guard made this a hard compile error in
 # the generator rather than a member reported as not crossing.
-truthy("a std::array member is reported, not fatal", "fixed --" in cs)
-truthy("and names the type", "array<double" in cs)
+print("\n=== a std::array member is a live fixed view ===")
+# The helpers take a raw E* and the length as an argument, so std::array<E,3>
+# and std::array<E,16> share one set and one view class with std::vector<E>.
+# Generating a second MbDoubleFixed alongside MbDoubleVector would have
+# duplicated the indexer, ToArray, the SafeHandle and the owner pin.
+truthy("it binds as the element type's own view class",
+       "public MbDoubleVector @fixed {" in cs)
+truthy("and there is still exactly one view class for that element type",
+       cs.count("public sealed class MbDoubleVector") == 1)
+truthy("one helper set serves every N, keyed on the element type alone",
+       shim_src.count("mb_fix_double_get") == 1)
+truthy("the length comes from the C++ type rather than a native call",
+       "new MbDoubleVector(Get_fixed(Check()), 3L, this)" in cs)
+truthy("the getter hands out the array's own storage",
+       "fixed.data());" in shim_src)
+truthy("a C# keyword member name is escaped, not renamed", "@fixed" in cs)
+truthy("an array of strings works the same way",
+       "public MbStringVector labels {" in cs)
 truthy("the class around it still binds", "public sealed class WithArray" in cs)
+check("and no fixed helper is given a free, because a view owns nothing",
+      "mb_fix_double_free" in shim_src, False)
+
+# Two refusals, each for its own reason and each named.
+truthy("a const array member is refused like a const vector",
+       re.search(r"WithArray\.pinned: it is const", run.stdout) is not None)
+truthy("an array returned by value is refused, not viewed",
+       re.search(r"WithArray\.spread\(\): returns", run.stdout) is not None)
+truthy("and an array parameter is refused",
+       re.search(r"WithArray\.sum_of_fixed\(\): a parameter type", run.stdout) is not None)
 # The shim re-parses the project's headers. Pinned at C++17 it rejected any
 # header using a C++20 feature, on a project whose subject is modern C++.
 truthy("a header using a C++20 feature still builds through the shim stage",
@@ -1002,6 +1041,20 @@ if MCS and MONO:
                "map missing key -> KeyNotFoundException" in out)
         truthy("Clear reaches C++",
                "map clear reaches C++: total=0 Count=0" in out)
+        truthy("a fixed view reports the length from the C++ type",
+               "fixed view: Count=3 IsFixedSize=True [1]=2" in out)
+        truthy("a write through it reaches the owner's own storage",
+               "fixed write reaches C++: total=10" in out)
+        truthy("a fixed array of strings reads and writes too",
+               "fixed strings: joined=lo/HI" in out)
+        truthy("ToArray copies the fixed storage out",
+               "fixed ToArray: 1,2,7" in out)
+        truthy("growing it is refused rather than silently ignored",
+               "fixed Add -> NotSupportedException" in out)
+        truthy("and so is clearing it",
+               "fixed Clear -> NotSupportedException" in out)
+        truthy("a plain vector view is still not fixed",
+               "vector IsFixedSize=False" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
