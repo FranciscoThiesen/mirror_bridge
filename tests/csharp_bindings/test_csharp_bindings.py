@@ -540,6 +540,24 @@ truthy("one overload of each pair is refused",
 truthy("and of each static pair",
        cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
 
+print("\n=== a forward-declared type is reported, not a compiler error ===")
+# std::is_class_v is true for a forward-declared class, so this used to reach
+# typeid and fail to compile INSIDE the generator, naming no method. Found by
+# pointing the compatibility corpus at C#: yaml-cpp has exactly this shape.
+truthy("a method returning an incomplete type says so precisely",
+       re.search(r"Forward\.make\(\): returns .*declared but not defined",
+                 run.stdout) is not None)
+check("and does not blame a deleted copy constructor for it",
+      re.search(r"Forward\.make\(\): returns .*copy constructor",
+                run.stdout) is not None, False)
+truthy("and one taking it", 
+       re.search(r"Forward\.take\(\): takes a class this module does not bind",
+                 run.stdout) is not None)
+truthy("while the rest of the class still binds",
+       "public sealed class Forward" in cs and "public int doubled()" in cs)
+check("and the generator did not mention its own source",
+      "mirror_bridge_csharp.hpp" in run.stdout, False)
+
 print("\n=== one slot description serves all three emitters ===")
 # A constructor and a static method used to be able to spell strictly less than
 # an instance method, and what they could not spell was emitted wrong rather

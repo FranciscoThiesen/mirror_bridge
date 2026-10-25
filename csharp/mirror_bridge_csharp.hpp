@@ -192,6 +192,22 @@ struct map_kv<C, std::void_t<typename C::key_type, typename C::mapped_type>> {
 // Both halves have to cross on their own, and they cross through the vector
 // machinery: a snapshot of a map is two owned vectors. That is why an enum key
 // is excluded for now -- std::vector<SomeEnum> is not a wire vector either.
+// std::is_class_v is TRUE for a forward-declared class, and core::Bindable
+// only adds a reflection query an incomplete type can still satisfy, so a
+// member whose type is declared but never defined in the headers this module
+// was given reaches code that needs its typeid -- and typeid of an incomplete
+// type is a hard error, inside the generator, with no member named.
+// yaml-cpp's YAML::detail::iterator_value is the real one: it took the whole
+// module down with a compiler error pointing into mirror_bridge's own source.
+template<typename, typename = void>
+struct is_complete_type : std::false_type {};
+
+template<typename T>
+struct is_complete_type<T, std::void_t<decltype(sizeof(T))>> : std::true_type {};
+
+template<typename T>
+constexpr bool complete_v = is_complete_type<std::remove_cvref_t<T>>::value;
+
 template<typename>
 struct array_element {
     using type = void;
@@ -370,6 +386,31 @@ constexpr bool wire_ok(Wire w) { return w != Wire::Unsupported; }
 // reported by name instead of emitted wrong.
 constexpr bool param_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Map; }
 
+// Whether a parameter's REFERENCE-NESS survives the wire, which wire_of cannot
+// answer because it strips cv and ref first.
+//
+// Almost everything the shim passes on is a temporary it just built: a vector
+// from a pointer and a length, a std::string from a const char*, a bool from
+// an int32. A non-const lvalue reference cannot bind to a temporary, so the
+// shim does not compile -- and that is the lucky case. The unlucky one is a
+// signature where it does bind, because then the function mutates something
+// that dies at the end of the call and the caller is never told.
+// `void Node::Scalar(std::vector<char>&)` in yaml-cpp is the real one.
+//
+// A bound class is the exception: the shim dereferences a handle, which is an
+// lvalue that outlives the call, so `T&` there genuinely reaches the caller's
+// object and is the whole point of passing one.
+template<typename P>
+consteval bool param_ref_ok() {
+    if constexpr (!std::is_lvalue_reference_v<P>) {
+        return true;
+    } else if constexpr (std::is_const_v<std::remove_reference_t<P>>) {
+        return true;
+    } else {
+        return wire_of<std::remove_cvref_t<P>>() == Wire::Object;
+    }
+}
+
 // And what can be RETURNED, which excludes a fixed array for a different
 // reason than the parameter case: an array returned by value has no identity
 // apart from its storage, so a view of it would be a view of a temporary.
@@ -382,6 +423,23 @@ consteval bool ret_type_ok() {
     if constexpr (rw == Wire::Array) {
         using E = std::remove_cvref_t<typename array_element<U>::type>;
         return !core::StringLike<E>;
+    } else if constexpr (rw == Wire::Object) {
+        // complete_v FIRST. is_copy_constructible has to instantiate the type
+        // to answer, so asking it about an undefined template is a hard error
+        // -- the same trap as typeid, one trait further along. yaml-cpp's
+        // YAML::detail::iterator_base<iterator_value> is declared and never
+        // defined, and this check broke on it the moment it was added.
+        //
+        // Every trait that needs a definition belongs behind this guard, not
+        // just the one that bit first.
+        if constexpr (!complete_v<U>) {
+            return false;
+        } else {
+            // The shim heap-copies a returned class, because a pointer to the
+            // temporary would dangle the moment it returned. A class whose
+            // copy constructor is deleted cannot cross that way at all.
+            return std::is_copy_constructible_v<U>;
+        }
     } else {
         return wire_ok(rw);
     }
@@ -1681,7 +1739,10 @@ private:
     template<typename M>
     const ClassRef* class_ref() const {
         using U = std::remove_cvref_t<M>;
-        if constexpr (core::NestedBindable<U>) {
+        // complete_v before type_key, because type_key is typeid and typeid of
+        // an incomplete type does not compile. A forward-declared class cannot
+        // have been registered anyway, so nullptr is also the right answer.
+        if constexpr (core::NestedBindable<U> && complete_v<U>) {
             const auto it = class_key_.find(type_key<U>());
             if (it != class_key_.end()) return &it->second;
         }
@@ -1696,6 +1757,16 @@ private:
         if constexpr (is_wire_optional<U>() || is_wire_vector<U>()) return false;
         else if constexpr (core::NestedBindable<U>) return class_ref<M>() == nullptr;
         return false;
+    }
+
+    // Declared but not defined here, which is a different problem from an
+    // unregistered class and has a different fix: include the header that
+    // defines it, rather than bind it too.
+    template<typename M>
+    static constexpr bool object_incomplete() {
+        using U = std::remove_cvref_t<M>;
+        if constexpr (is_wire_optional<U>() || is_wire_vector<U>()) return false;
+        else return core::NestedBindable<U> && !complete_v<U>;
     }
 
     template<typename M>
@@ -1915,7 +1986,9 @@ private:
             a.cs_ext_params = {(pr ? pr->cs_name + "." + pr->handle
                                    : std::string("IntPtr")) + " " + an};
             a.call_args = {"MbNative.NotNull(" + an + ", \"" + an + "\").Borrow()"};
-            a.fwd_arg = "(*static_cast<" + (pr ? pr->cpp_name : "") + "*>(" + cn + "))";
+            a.fwd_arg = "(*static_cast<"
+                      + (pr ? pr->cpp_name : "MB_CLASS_UNREGISTERED")
+                      + "*>(" + cn + "))";
         } else {
             a.c_params = {std::string(c_type(pw)) + " " + cn};
             a.cs_ext_params = {std::string(cs_param_type(pw)) + " " + an};
@@ -2392,6 +2465,16 @@ private:
         constexpr Wire w = wire_of<M>();
         const std::string name(std::meta::identifier_of(member));
 
+        if constexpr (object_incomplete<M>()) {
+            constexpr const char* tn =
+                std::meta::display_string_of(std::meta::type_of(member)).data();
+            p.skipped.push_back({p.cs_name, name,
+                std::string("its type ") + tn + " is declared but not defined in "
+                "the headers this module was given, so nothing about it can be "
+                "read -- not its size, not its members. Include the header that "
+                "defines it, or leave this member out"});
+            return;
+        }
         if (object_unregistered<M>()) {
             constexpr const char* tn =
                 std::meta::display_string_of(std::meta::type_of(member)).data();
@@ -2901,8 +2984,9 @@ private:
 
     template<typename T, std::size_t Index, std::size_t... Ps>
     static consteval bool ctor_params_ok(std::index_sequence<Ps...>) {
-        return (param_wire_ok(wire_of<std::remove_cvref_t<
-                    typename [:ctor_param_type<T, Index, Ps>():]>>()) && ... && true);
+        return ((param_wire_ok(wire_of<std::remove_cvref_t<
+                     typename [:ctor_param_type<T, Index, Ps>():]>>())
+                 && param_ref_ok<typename [:ctor_param_type<T, Index, Ps>():]>()) && ... && true);
     }
 
     template<typename T, std::size_t Index, std::size_t... Ps>
@@ -2925,6 +3009,12 @@ private:
                 "bool, std::string, a bound enum or class, std::vector and "
                 "std::optional -- but not a std::map or a std::array, which have "
                 "no inbound form yet in any position"});
+            return;
+        } else if (ctor_param_object_unregistered<T, Index>(std::make_index_sequence<argc>{})) {
+            p.skipped.push_back({p.cs_name,
+                p.cs_name + "(" + std::to_string(argc) + " args)",
+                "a constructor parameter is a class this module does not bind, "
+                "so the shim has no type name to dereference it through"});
             return;
         } else if (ctor_param_enum_unregistered<T, Index>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name,
@@ -3015,9 +3105,22 @@ private:
         if constexpr (!ret_type_ok<Ret>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_static_method_return_type<T, I>()).data();
-            p.skipped.push_back({p.cs_name, "static " + name + "()",
-                std::string("returns ") + rname
-                + ", which does not cross the C ABI yet"});
+            if constexpr (wire_of<Ret>() == Wire::Object) {
+                p.skipped.push_back({p.cs_name, "static " + name + "()",
+                    std::string("returns ") + rname
+                    + (complete_v<Ret>
+                       ? ", whose copy constructor is deleted. A value returned "
+                         "by value is heap-copied so the caller owns it, because "
+                         "a pointer to the temporary would dangle, and a "
+                         "non-copyable class cannot cross that way"
+                       : ", which is declared but not defined in the headers "
+                         "this module was given, so nothing about it can be "
+                         "read. Include the header that defines it")});
+            } else {
+                p.skipped.push_back({p.cs_name, "static " + name + "()",
+                    std::string("returns ") + rname
+                    + ", which does not cross the C ABI yet"});
+            }
             return;
         } else if constexpr (!static_params_ok<T, I>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name, "static " + name + "()",
@@ -3110,8 +3213,9 @@ private:
 
     template<typename T, std::size_t I, std::size_t... Ps>
     static consteval bool static_params_ok(std::index_sequence<Ps...>) {
-        return (param_wire_ok(wire_of<std::remove_cvref_t<
-                    typename [:get_static_method_param_type<T, I, Ps>():]>>()) && ... && true);
+        return ((param_wire_ok(wire_of<std::remove_cvref_t<
+                     typename [:get_static_method_param_type<T, I, Ps>():]>>())
+                 && param_ref_ok<typename [:get_static_method_param_type<T, I, Ps>():]>()) && ... && true);
     }
 
     // ---- methods ------------------------------------------------------
@@ -3138,9 +3242,22 @@ private:
         if constexpr (!ret_type_ok<Ret>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_method_return_type<T, I>()).data();
-            p.skipped.push_back({p.cs_name, name + "()",
-                std::string("returns ") + rname
-                + ", which does not cross the C ABI yet"});
+            if constexpr (wire_of<Ret>() == Wire::Object) {
+                p.skipped.push_back({p.cs_name, name + "()",
+                    std::string("returns ") + rname
+                    + (complete_v<Ret>
+                       ? ", whose copy constructor is deleted. A value returned "
+                         "by value is heap-copied so the caller owns it, because "
+                         "a pointer to the temporary would dangle, and a "
+                         "non-copyable class cannot cross that way"
+                       : ", which is declared but not defined in the headers "
+                         "this module was given, so nothing about it can be "
+                         "read. Include the header that defines it")});
+            } else {
+                p.skipped.push_back({p.cs_name, name + "()",
+                    std::string("returns ") + rname
+                    + ", which does not cross the C ABI yet"});
+            }
             return;
         } else if constexpr (!params_ok<T, I>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name, name + "()",
@@ -3278,6 +3395,14 @@ private:
                 || ... || false);
     }
 
+    template<typename T, std::size_t Index, std::size_t... Ps>
+    bool ctor_param_object_unregistered(std::index_sequence<Ps...>) const {
+        bool bad = false;
+        ((bad = bad || object_unregistered<std::remove_cvref_t<
+              typename [:ctor_param_type<T, Index, Ps>():]>>()), ...);
+        return bad;
+    }
+
     template<typename T, std::size_t I, std::size_t... Ps>
     bool method_param_object_unregistered(std::index_sequence<Ps...>) const {
         bool bad = false;
@@ -3304,8 +3429,9 @@ private:
 
     template<typename T, std::size_t I, std::size_t... Ps>
     static consteval bool params_ok(std::index_sequence<Ps...>) {
-        return (param_wire_ok(wire_of<std::remove_cvref_t<
-                    typename [:get_method_param_type<T, I, Ps>():]>>()) && ... && true);
+        return ((param_wire_ok(wire_of<std::remove_cvref_t<
+                     typename [:get_method_param_type<T, I, Ps>():]>>())
+                 && param_ref_ok<typename [:get_method_param_type<T, I, Ps>():]>()) && ... && true);
     }
 
     static constexpr const char* zero_of(Wire w) {

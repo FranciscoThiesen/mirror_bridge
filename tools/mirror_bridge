@@ -961,13 +961,36 @@ build_csharp() {
 
     echo -e "${YELLOW}Compiling the C# generator (reflection)...${NC}"
     local log
-    log=$($CXX_BIN $CXX_REFLECT_FLAGS $CXX_CONSTEXPR_BUDGET $inc_flags \
+    local gen_budget="$CXX_CONSTEXPR_BUDGET"
+    log=$($CXX_BIN $CXX_REFLECT_FLAGS $gen_budget $inc_flags \
           ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
           -O1 "$gen_src" -o "$gen_bin" 2>&1) || {
-        echo -e "${RED}✗ the C# generator did not compile${NC}"
-        echo "$log" | grep -m8 -E "error" || true
-        LAST_COMPILE_LOG="$log"
-        return 1
+        # Discovery and the Python module compile both retry at a higher
+        # constexpr budget when the compiler says it ran out, and this pass has
+        # to as well or the fix is only two thirds applied: discovery would
+        # escalate and report a clean class list, and then this step would die
+        # on the identical cause with no retry. Clipper2 is the library that
+        # showed it -- constexpr-limit for C# and a clean build for Python, off
+        # the same headers.
+        if budget_exhausted "$log"; then
+            local bigger
+            case "$CXX_BIN" in
+                *clang*) bigger="-fconstexpr-steps=2000000000" ;;
+                *)       bigger="-fconstexpr-ops-limit=20000000000" ;;
+            esac
+            if [ "$gen_budget" != "$bigger" ]; then
+                echo -e "  ${YELLOW}the C# generator ran out of constexpr budget; retrying at $bigger${NC}"
+                log=$($CXX_BIN $CXX_REFLECT_FLAGS $bigger $inc_flags \
+                      ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+                      -O1 "$gen_src" -o "$gen_bin" 2>&1) && gen_budget="$bigger"
+            fi
+        fi
+        if [ ! -x "$gen_bin" ]; then
+            echo -e "${RED}✗ the C# generator did not compile${NC}"
+            echo "$log" | grep -m8 -E "error" || true
+            LAST_COMPILE_LOG="$log"
+            return 1
+        fi
     }
 
     echo -e "${YELLOW}Writing the C ABI shim and the C# source...${NC}"
