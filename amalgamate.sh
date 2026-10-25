@@ -103,12 +103,14 @@ echo "" >> "$OUTPUT_DIR/mirror_bridge_python.hpp"
 # because it builds on everything before it). Leaving the raw #include
 # lines in place shipped a single header that could not compile standalone.
 TMP_ANNOTATIONS=$(mktemp)
+TMP_COLUMNAR=$(mktemp)
 TMP_STUBGEN=$(mktemp)
 TMP_EIGEN=$(mktemp)
 TMP_TEMPLATES=$(mktemp)
 TMP_SEQVIEW=$(mktemp)
-trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES" "$TMP_SEQVIEW"' EXIT
+trap 'rm -f "$TMP_ANNOTATIONS" "$TMP_COLUMNAR" "$TMP_STUBGEN" "$TMP_EIGEN" "$TMP_TEMPLATES" "$TMP_SEQVIEW"' EXIT
 extract_content "$SCRIPT_DIR/python/mirror_bridge_annotations.hpp" > "$TMP_ANNOTATIONS"
+extract_content "$SCRIPT_DIR/python/mirror_bridge_columnar.hpp" > "$TMP_COLUMNAR"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_stubgen.hpp" > "$TMP_STUBGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_eigen.hpp" > "$TMP_EIGEN"
 extract_content "$SCRIPT_DIR/python/mirror_bridge_templates.hpp" > "$TMP_TEMPLATES"
@@ -116,7 +118,7 @@ extract_content "$SCRIPT_DIR/python/mirror_bridge_sequence_view.hpp" > "$TMP_SEQ
 
 # Extract Python content: skip the core include, splice satellites inline
 awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
-    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" \
+    -v eigen="$TMP_EIGEN" -v templates="$TMP_TEMPLATES" -v columnar="$TMP_COLUMNAR" \
     -v seqview="$TMP_SEQVIEW" '
     /^#include ".*core\/mirror_bridge_core\.hpp"/ { next }
     /^#pragma once/ { next }
@@ -124,6 +126,11 @@ awk -v annotations="$TMP_ANNOTATIONS" -v stubgen="$TMP_STUBGEN" \
     /^#include "python\/mirror_bridge_annotations\.hpp"/ {
         while ((getline line < annotations) > 0) print line
         close(annotations)
+        next
+    }
+    /^#include "python\/mirror_bridge_columnar\.hpp"/ {
+        while ((getline line < columnar) > 0) print line
+        close(columnar)
         next
     }
     /^#include "python\/mirror_bridge_stubgen\.hpp"/ {

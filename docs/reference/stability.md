@@ -43,6 +43,9 @@ These may change or be removed in any release; pin a tag if you depend on them:
 - `--batch` and the `<name>_batch` methods it generates: which signatures
   qualify is expected to widen
 - The `.mirror` config-file format
+- `--columnar` and the `ColumnView` type it returns: the dtype spelling, the
+  names of the padding fields, and which sequence operations the view supports
+  are all expected to move as adopters find shapes this does not handle yet
 - Any header or function not documented in [api.md](api.md)
 
 ## Versioning

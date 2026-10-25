@@ -64,6 +64,8 @@ RELEASE_GIL=0
 # never written unless someone already knew to ask: --stubs and .pyi appear
 # nowhere in AGENTS.md, quickstart.md or workflow.md. --no-stubs opts out.
 GEN_STUBS=1
+COLUMNAR=0
+GEN_STUBS=0
 NO_TEMPLATES=0
 # Enum types found while scanning. The Python backend binds them as
 # enum.IntEnum (an IntEnum member is an int, so no conversion changes); the
@@ -277,6 +279,18 @@ ${YELLOW}Options:${NC}
                       the expensive part. Off by default because each sibling
                       costs compile time: +12% on a class with ten eligible
                       methods, +55% with forty
+  --columnar          Python: return a vector of plain structs as a sequence
+                      that also describes its own memory, so numpy can read it
+                      without copying, instead of building one Python object
+                      per element. Measured 21x at ten elements rising to
+                      ~200x from a thousand up, and 500x end to end into
+                      numpy. Off by default because
+                      it changes what a method returns: the result indexes,
+                      iterates and len()s like the list it replaces, and
+                      .tolist() gives the list back, but it is not a list.
+                      Only structs honestly described by their own bytes are
+                      affected; anything else still returns a list. See
+                      docs/guides/columnar-returns.md
   --release-gil       Python: drop the GIL while C++ method bodies run, so
                       long-running native calls stop blocking other threads
                       (argument/result conversion still holds the GIL; safe
@@ -2134,6 +2148,7 @@ cmd_generate() {
             --no-verify) VERIFY_IMPORT=0; shift ;;
             --json) JSON_MODE=1; shift ;;
             --batch) EXTRA_DEFINES+=("-DMIRROR_BRIDGE_BATCH_METHODS"); shift ;;
+            --columnar) COLUMNAR=1; EXTRA_DEFINES+=("-DMIRROR_BRIDGE_COLUMNAR_VECTORS"); shift ;;
             --release-gil) RELEASE_GIL=1; shift ;;
             --stubs) GEN_STUBS=1; shift ;;
             --no-stubs) GEN_STUBS=0; shift ;;
@@ -2216,6 +2231,19 @@ cmd_generate() {
         python|lua|js|javascript|csharp|cs) languages=("$LANG") ;;
         *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, csharp, all" ;;
     esac
+
+    # Only the Python backend reads the flag, so say so rather than letting it
+    # look like it did something. Lua and JavaScript build their tables element
+    # by element and have nothing to hand a buffer to.
+    if [ "${COLUMNAR:-0}" -eq 1 ]; then
+        local has_python=0 l
+        for l in "${languages[@]}"; do
+            [ "$l" = "python" ] && has_python=1
+        done
+        if [ $has_python -eq 0 ]; then
+            echo -e "${YELLOW}Note: --columnar applies to the Python backend only; it does nothing for ${LANG}${NC}"
+        fi
+    fi
 
     # Python modules also get free functions and template instantiations,
     # so a header with no plain classes can still produce a module.

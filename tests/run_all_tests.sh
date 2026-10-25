@@ -185,6 +185,11 @@ while IFS= read -r -d '' binding_file; do
 # Exclude batch_methods_binding.cpp - a binding, but one whose point is what
 # -DMIRROR_BRIDGE_BATCH_METHODS adds, which tests/batch_methods/test_batch.sh
 # builds both ways.
+# Exclude columnar_binding.cpp - a binding, but one that only means anything
+# built with -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which test_columnar.sh does.
+# Exclude columnar_layout_check.cpp - a standalone program, not a binding. It
+# asks numpy what it made of a reflected struct layout, which needs no module.
+# tests/columnar/test_columnar.sh compiles and runs it in Step 3.
 # Exclude buffer_shape_check.cpp - a standalone program, not a binding: the
 # buffer-protocol behaviour it checks cannot be reached from Python, because
 # memoryview copies shape out of the Py_buffer and numpy holds only one at a
@@ -208,7 +213,9 @@ done < <(find . -name "*.cpp" -type f -not -path "*/v8/*" -not -path "*/.mirror_
               -not -path "*/.worktrees/*" \
               -not -name "test_validation.cpp" \
               -not -name "buffer_shape_check.cpp" \
-              -not -name "batch_methods_binding.cpp" -print0)
+              -not -name "batch_methods_binding.cpp" \
+              -not -name "columnar_layout_check.cpp" \
+              -not -name "columnar_binding.cpp" -print0)
 
 # Step 2: Run all Python tests
 echo -e "${YELLOW}[STEP 2/5] Running Python tests...${NC}"
@@ -233,6 +240,9 @@ SKIP_TESTS=(
     # batch_methods' module exists only when built with
     # -DMIRROR_BRIDGE_BATCH_METHODS, and its script builds it both ways
     "batch_methods/test_batched.py:Run via batch_methods/test_batch.sh (built twice, with the flag and without)"
+    # columnar's module exists only when built with
+    # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its script builds
+    "columnar/test_columnar_runtime.py:Run via columnar/test_columnar.sh (module needs the flag)"
 )
 
 # Function to check if test should be skipped (uses path pattern matching)

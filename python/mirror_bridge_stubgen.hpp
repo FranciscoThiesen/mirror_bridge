@@ -391,6 +391,9 @@ private:
         if (rendered.find("_array[") != std::string::npos) {
             ss << "from array import array as _array\n";
         }
+        if (rendered.find("_Sequence[") != std::string::npos) {
+            ss << "from collections.abc import Sequence as _Sequence\n";
+        }
         if (rendered.find("_MutableSequence[") != std::string::npos) {
             ss << "from collections.abc import MutableSequence as _MutableSequence\n";
         }
@@ -771,6 +774,18 @@ std::string type_hint() {
             if constexpr (P == Position::MemberRead && is_viewable_sequence_member_v<T>) {
                 return "_MutableSequence[" + type_hint<ValueT, Position::Return>() + "]";
             }
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+            // Under --columnar a vector of plain structs RETURNED from a method
+            // is a ColumnView, not a list. Saying list[T] would let a type
+            // checker approve .append, + and json.dumps, every one of which
+            // fails at runtime, which is the drift the .pyi gate exists to
+            // prevent. Returns only: to_python_result is the method-result
+            // path, so a member of the same type still reads as the live
+            // MutableSequence view above.
+            if constexpr (P == Position::Return && columnar::ColumnarReturn<CleanT>) {
+                return "_Sequence[" + type_hint<ValueT, Position::Return>() + "]";
+            }
+#endif
             if constexpr ((P == Position::Return || P == Position::MemberRead) &&
                           crosses_as_array_v<CleanT>) {
                 return "_array[" + type_hint<ValueT, Position::Return>() + "]";

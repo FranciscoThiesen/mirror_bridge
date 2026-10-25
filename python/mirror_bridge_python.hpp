@@ -83,6 +83,7 @@
 // Include P3394 annotations support for field-level binding control
 // Requires -freflection-latest with Bloomberg's clang-p2996
 #include "python/mirror_bridge_annotations.hpp"
+#include "python/mirror_bridge_columnar.hpp"
 #include "python/mirror_bridge_stubgen.hpp"
 
 // ============================================================================
@@ -1897,6 +1898,29 @@ PyObject* vector_to_numpy_view(std::vector<T>& vec, PyObject* owner) {
     return create_buffer_view(vec, owner);
 }
 
+// The conversion for a result the caller has just computed and is about to
+// drop. Everything except a columnar vector goes to the same overload it
+// always did, by lvalue, so this cannot change which overload is selected for
+// any other type -- to_python(std::future<T>&&) exists, and moving
+// indiscriminately here would start selecting it. A columnar vector is moved,
+// which is the difference between the view owning the method's copy and the
+// view owning a copy of the method's copy.
+template<typename R>
+PyObject* to_python_result(R& result) {
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+    if constexpr (columnar::ColumnarReturn<R>) {
+        using ValueType = typename std::remove_cvref_t<R>::value_type;
+        return columnar::to_columnar<ValueType>(
+            std::move(result), +[](const ValueType& element) {
+                return to_python(element);
+            });
+    } else {
+        return to_python(result);
+    }
+#else
+    return to_python(result);
+#endif
+}
 // How many bytes a numeric vector has to be before its return borrows the
 // container's storage instead of copying it into an intermediate bytes object.
 // Measured crossover, not a guess; the table inside to_python below has the
@@ -2054,6 +2078,20 @@ PyObject* to_python(const T& container) {
         }
         // Fall through to element-by-element if array module unavailable
     }
+
+#ifdef MIRROR_BRIDGE_COLUMNAR_VECTORS
+    // A vector of plain structs can be handed over as the bytes it already is,
+    // with the layout read off the type, instead of becoming one Python object
+    // and one `new` per element. Opt-in, because it changes what the caller
+    // gets: a sequence that indexes and iterates like the list it replaces,
+    // but not a list. See python/mirror_bridge_columnar.hpp.
+    if constexpr (columnar::ColumnarReturn<T>) {
+        return columnar::to_columnar<ValueType>(
+            container, +[](const ValueType& element) {
+                return to_python(element);
+            });
+    }
+#endif
 
     // General path: element-by-element conversion
     PyObject* list = PyList_New(container.size());
@@ -4166,7 +4204,7 @@ PyObject* call_method_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_seq
                 forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
             );
         });
-        return to_python(result);
+        return to_python_result(result);
     }
 }
 
@@ -4256,7 +4294,7 @@ PyObject* call_static_method_impl(PyObject* const* args, std::index_sequence<Is.
                 forward_arg<static_method_param_t<T, Index, Is>>(std::get<Is>(cpp_args))...
             );
         });
-        return to_python(result);
+        return to_python_result(result);
     }
 }
 
@@ -4641,7 +4679,7 @@ PyObject* try_overload_impl(PyWrapper<T>* wrapper, PyObject* args, std::index_se
             ReturnType result = ((*wrapper->cpp_object).[:member_func:])(
                 forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
             );
-            return to_python(result);
+            return to_python_result(result);
         }
     } catch (const std::exception& e) {
         set_py_error_from_cpp_exception(e);
@@ -4733,7 +4771,7 @@ PyObject* invoke_with_n_args(PyWrapper<T>* wrapper, PyObject* const* resolved) {
                         forward_arg<method_param_t<T, FuncIndex, Is>>(std::get<Is>(cpp_args))...
                     );
                 });
-                return to_python(result);
+                return to_python_result(result);
             }
         } catch (const std::exception& e) {
             set_py_error_from_cpp_exception(e);
@@ -5909,7 +5947,7 @@ PyObject* binary_op_wrapper(PyObject* self, PyObject* other) {
                         return ((*self_object).[:OperatorCache<T>::at(OpIndex):])(
                             forward_arg<OtherParam>(storage));
                     });
-                    return to_python(result);
+                    return to_python_result(result);
                 }
             }
         } catch (const std::exception& e) {
@@ -5936,7 +5974,7 @@ PyObject* unary_op_wrapper(PyObject* self) {
             Py_RETURN_NONE;
         } else {
             Ret result = ((*wrapper->cpp_object).[:OperatorCache<T>::at(OpIndex):])();
-            return to_python(result);
+            return to_python_result(result);
         }
     } catch (const std::exception& e) {
         set_py_error_from_cpp_exception(e);
@@ -7623,7 +7661,7 @@ PyObject* call_free_function_impl(PyObject* const* args, Py_ssize_t nargs, std::
         } else {
             auto result = FuncPtr(forward_arg<std::tuple_element_t<Is, ArgsTuple>>(
                                       std::get<Is>(cpp_args))...);
-            return to_python(result);
+            return to_python_result(result);
         }
     } catch (const std::exception& e) {
         set_py_error_from_cpp_exception(e);

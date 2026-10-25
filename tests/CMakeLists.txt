@@ -482,6 +482,11 @@ set(MB_PYTHON_BASH_ONLY_PATTERN
     # would otherwise register the .py as a standalone test with nothing to
     # import.
     "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^batch_methods"
+    # columnar's module only exists when built with
+    # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its own script does; the glob
+    # below would otherwise register the .py as a standalone test with nothing
+    # to import.
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^columnar"
 )
 
 # The same contract for the other two backends. These were spelled out at
@@ -627,6 +632,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace/build_and_test.sh
     )
     set_tests_properties(cli_macro_namespace PROPERTIES
+# A struct's layout read off the type, checked against what numpy makes of it.
+# Not a binding, and it needs numpy, which the test skips itself without.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/columnar)
+    add_test(NAME columnar_layout
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/columnar/test_columnar.sh
+    )
+    set_tests_properties(columnar_layout PROPERTIES
         ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
     )
 endif()
