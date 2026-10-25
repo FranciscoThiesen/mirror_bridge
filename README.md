@@ -80,6 +80,26 @@ stops a module coming out, grouped so the most valuable thing to fix is the
 line with the most libraries on it. pybind11 and nanobind have nothing to put
 in that first column, because the class list is the thing their user writes.
 
+### Pointing it at a large codebase
+
+Large projects do not fail to bind because binding is hard. They fail because their
+headers do not parse without the include paths and defines their own build system
+passes. `--compile-commands` reads those from the build instead of asking you to restate
+them:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+mirror_bridge generate include/mylib --module mylib --lang python \
+    --compile-commands build/compile_commands.json --discover-only --json
+```
+
+`--discover-only` stops after reading the headers and reports what it found, including
+whether the class list came from reflection or from a fallback text scan. That is the
+number that says whether a codebase is ready, and it costs one pass instead of a module
+per class. MSVC and clang-cl flag spellings are translated, and `--replace-prefix` maps a
+build database written on one machine onto the paths of another.
+[Details](docs/reference/cli.md#large-codebases).
+
 ## Try It Now
 
 No installation required — run in your browser or with Docker:
@@ -129,34 +149,70 @@ python3 test_greeter.py
 | Python | Stable | `--lang python` |
 | Lua | Stable | `--lang lua` |
 | JavaScript (Node.js) | Stable | `--lang js` |
+| C# (.NET) | Stable for scalars, strings, enums, objects and vectors | `--lang csharp` |
 | Rust | Prototype | Code generation |
+
+C# goes through P/Invoke, so there is no host C API to call the way there is for
+CPython, Lua and Node. `--lang csharp` writes a flat C ABI shim plus the C# that calls
+it, both from one reflection pass, so a member renamed in C++ renames the exported symbol
+and the C# property together. **The shim has no reflection in it**, so it rebuilds with
+whatever compiler you already have — which matters, because MSVC has no reflection
+support.
+
+```csharp
+using var d = new Device();          // IDisposable, over a SafeHandle
+d.calibration = 2.5;                 // real C++ parameter and member names
+d.mode = Mode.Careful;               // a real C# enum, not an int
+d.samples.Add(1.5);                  // the live C++ vector: Add reaches C++
+Console.WriteLine(d.samples.Sum());  // IReadOnlyList<double>, so LINQ works
+d.inner.x = 7.5;                     // a member object is a view, not a copy
+```
+
+See [the CLI reference](docs/reference/cli.md#csharp-output).
 
 ### Feature Matrix
 
-| Feature | Python | Lua | JavaScript |
-|---------|:------:|:---:|:----------:|
-| **Data Members** | ✅ | ✅ | ✅ |
-| **Methods (any arity)** | ✅ | ✅ | ✅ |
-| **Constructors** | ✅ | ✅ | ✅ |
-| **Containers (vector/array)** | ✅ | ✅ | ✅ |
-| **Live `std::vector` members** | ✅ | ❌ | ❌ |
-| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ |
-| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ |
-| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ |
-| **Variants (std::variant)** | ✅ | ✅ | ✅ |
-| **Nested Objects** | ✅ | ✅ | ✅ |
-| **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ |
-| **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ |
-| **Enums** | ✅ | ⚠️ | ⚠️ |
-| **Inheritance** | ✅ | ✅ | ✅ |
-| **Method Overloading** | ✅ | ⚠️ | ⚠️ |
-| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ |
-| **Exception Handling** | ✅ | ✅ | ✅ |
-| **Cross-Module Types** | ✅ | ❌ | ❌ |
-| **Zero-Copy Buffers** | ✅ | ❌ | ❌ |
-| **Async/Await** | ✅ | ❌ | ✅ |
-| **std::optional** | ✅ | ✅ | ✅ |
-| **std::expected** | ✅ | ✅ | ✅ |
+| Feature | Python | Lua | JavaScript | C# |
+|---------|:------:|:---:|:----------:|:--:|
+| **Data Members** | ✅ | ✅ | ✅ | ✅ |
+| **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
+| **Constructors** | ✅ | ✅ | ✅ | ✅ |
+| **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
+| **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
+| **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
+| **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
+| **Variants (std::variant)** | ✅ | ✅ | ✅ | ❌ |
+| **Nested Objects** | ✅ | ✅ | ✅ | ✅ |
+| **Iteration, `len()`, `in`** | ✅ | ❌ | ❌ | ❌ |
+| **Pickling / `copy.deepcopy`** | ✅ | ❌ | ❌ | ❌ |
+| **Enums** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Inheritance** | ✅ | ✅ | ✅ | ⚠️ |
+| **Method Overloading** | ✅ | ⚠️ | ⚠️ | ✅ |
+| **Smart Pointers** | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| **Exception Handling** | ✅ | ✅ | ✅ | ✅ |
+| **Cross-Module Types** | ✅ | ❌ | ❌ | ❌ |
+| **Zero-Copy Buffers** | ✅ | ❌ | ❌ | ❌ |
+| **Async/Await** | ✅ | ❌ | ✅ | ❌ |
+| **std::optional** | ✅ | ✅ | ✅ | ❌ |
+| **std::expected** | ✅ | ✅ | ✅ | ❌ |
+
+Where C# is ⚠️ or ❌ the generated binding **names what it left out and why**, in the run
+output and as a comment in the `.cs` at the point the member would have been, so a missing
+member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
+view; `std::array` and `vector<bool>` do not.
+
+**Inheritance** is ⚠️ for C# in the other direction: inherited members and methods are
+flattened onto the derived class, which Lua and JavaScript do not do at all, but a generated
+class has no C# base type, so a `Derived` cannot be passed where a `Base` is expected. Lua and
+JavaScript both have the upcast machinery for that and C# does not yet. The two backends are
+incomplete in opposite directions, and one tick on both would hide it.
+
+Two rows read better for C# than for Lua and JavaScript, and that is not an accident of the
+table. On **overloading**, Lua reaches only the first overload of a name and JavaScript only
+the last, and neither says so; C# emits one exported symbol per overload and lets C#'s own
+resolution pick, refusing only the pair C# genuinely cannot distinguish. On **enums**, Lua
+and JavaScript pass the underlying integer with no enum type at all.
 
 ✅ Full support  ⚠️ Partial support  ❌ Not supported
 

@@ -1142,14 +1142,31 @@ int lua_newindex(lua_State* L) {
                     return;
                 }
 
-                MemberType cpp_value;
-                if (!from_lua(L, 3, cpp_value)) {
-                    lua_bad_field_error(L, member_name,
-                                        core::type_key<MemberType>, 3);
+                // A const member is readable and never assignable. Without this
+                // branch the declaration below was a default-initialised const
+                // and the assignment a write to a const lvalue, so a class with
+                // one const field failed to compile the whole module rather
+                // than failing to set that one field.
+                // Two shapes of the same situation: readable, never
+                // assignable. A const member cannot be written, and a member
+                // whose type has no default constructor cannot even be
+                // converted into, because the setter needs a local to move
+                // from. nlohmann::detail::dtoa_impl::diyfp is the real second
+                // case and it took the whole of nlohmann-json down.
+                if constexpr (std::is_const_v<MemberType>
+                              || !std::is_default_constructible_v<MemberType>) {
+                    luaL_error(L, "Field is not assignable from Lua: %s", member_name);
                     return;
-                }
+                } else {
+                    MemberType cpp_value;
+                    if (!from_lua(L, 3, cpp_value)) {
+                        lua_bad_field_error(L, member_name,
+                                            core::type_key<MemberType>, 3);
+                        return;
+                    }
 
-                (*static_cast<T*>(raw)).[:member:] = std::move(cpp_value);
+                    (*static_cast<T*>(raw)).[:member:] = std::move(cpp_value);
+                }
                 found = true;
             }
         }(), ...);

@@ -79,6 +79,16 @@ TEMPLATE_CAP=64
 INSTANTIATE=()
 EXCLUDE_PATTERNS=()
 EXTRA_DEFINES=()
+# Include paths and defines harvested from a project's compile_commands.json.
+# Kept separate from EXTRA_DEFINES so a failure to read the compile database is
+# reported against the right flag, and so --json can say how many flags came
+# from the build system rather than from the command line.
+COMPDB_FLAGS=()
+COMPDB_PATH=""
+COMPDB_FOR=()
+COMPDB_REPLACE=()
+COMPDB_REPORT=""
+DISCOVER_ONLY=0
 
 # Reflection compiler detection. clang-p2996 is preferred when present;
 # stock GCC 16+ with -freflection works as well (probed with a syntax-only
@@ -109,6 +119,25 @@ case "$CXX_BIN" in
     *)       CXX_REFLECT_FLAGS="-std=c++26 -freflection"
              CXX_CONSTEXPR_BUDGET="-fconstexpr-ops-limit=1000000000" ;;
 esac
+
+# Same override the discovery pass honours, for the same reason: this path only
+# runs on a codebase large enough to exhaust a real budget, which is too large
+# to put in a test.
+# Both compilers' real wording. GCC says "'constexpr' evaluation operation
+# count exceeds limit of N (use '-fconstexpr-ops-limit=' ...)" and clang says
+# "constexpr evaluation hit maximum step limit"; the flag names are matched too
+# because both compilers name the flag in the hint, which is the most stable
+# part of either message.
+budget_exhausted() {
+    echo "$1" | grep -qE "constexpr evaluation hit maximum step limit|operation count exceeds limit|fconstexpr-(steps|ops-limit)="
+}
+
+if [[ -n "${MB_CONSTEXPR_BUDGET:-}" && "${MB_CONSTEXPR_BUDGET}" =~ ^[0-9]+$ ]]; then
+    case "$CXX_BIN" in
+        *clang*) CXX_CONSTEXPR_BUDGET="-fconstexpr-steps=${MB_CONSTEXPR_BUDGET}" ;;
+        *)       CXX_CONSTEXPR_BUDGET="-fconstexpr-ops-limit=${MB_CONSTEXPR_BUDGET}" ;;
+    esac
+fi
 
 # JSON output support (--json on generate/diff/doctor). Contract: in JSON
 # mode stdout carries exactly one JSON object and all human-readable
@@ -222,7 +251,10 @@ ${YELLOW}Usage:${NC}
 ${YELLOW}Required:${NC}
   <src_dir>           Directory containing C++ headers
   --module NAME       Output module name
-  --lang LANG         Target language: python, lua, js, or all
+  --lang LANG         Target language: python, lua, js, csharp, or all
+                      (csharp is not part of `all`: it writes a .cs source
+                      file to add to a dotnet project plus the shared library
+                      it loads, rather than a module the CLI can import)
 
 ${YELLOW}Options:${NC}
   -o, --output DIR    Output directory (default: build/)
@@ -261,6 +293,32 @@ ${YELLOW}Options:${NC}
                       macros needs it for both or neither: glm will not
                       parse without GLM_FORCE_ALIGNED_GENTYPES on a compiler
                       whose language extensions it cannot detect (repeatable)
+  --compile-commands PATH
+                      Read include paths and defines from a project's
+                      compile_commands.json instead of restating them as
+                      -I/-D. CMake writes one with
+                      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; for a Make build,
+                      use bear -- make. MSVC and clang-cl spellings (/I, /D,
+                      /external:I, /FI) are translated. The project's own
+                      -std= is dropped because the reflection pass sets its
+                      own, and a flag carrying whitespace is refused rather
+                      than silently split
+  --compile-commands-for PATH
+                      Only use compile-database entries whose source file is
+                      under PATH (repeatable). On a monorepo the union of
+                      every subsystem's flags is both enormous and
+                      self-contradictory; scope it to the subtree being bound
+  --replace-prefix OLD=NEW
+                      Rewrite a leading path prefix in every harvested path
+                      (repeatable, first match wins). A compile database
+                      written on another machine names directories this one
+                      does not have, which is the normal case for a Windows
+                      project: MSVC cannot do reflection, so the build runs
+                      there and generation runs here
+  --discover-only     Report what reflection found and stop: no codegen, no
+                      compile. The answer to "can this codebase be read at
+                      all" without paying for a module per class. Pairs with
+                      --json
   --exclude GLOB      Skip headers matching this shell glob. Matched against
                       the path as an include spells it, and -- like
                       .gitignore -- a pattern without a leading / matches at
@@ -757,6 +815,201 @@ header_is_excluded() {
 }
 
 # Generate binding file for a specific language
+# C# is built in two compiles rather than one, and the reason is a hard limit
+# rather than a preference: P2996 cannot declare a function whose name is
+# computed, and every P/Invoke target needs its own exported symbol. So a
+# generator built with reflection writes the flat C ABI as text, and that text
+# is then compiled by an ordinary compiler.
+#
+# The payoff is that the shim has no reflection in it at all. A consumer can
+# build the shared library C# loads with whatever compiler they already have,
+# which matters here more than anywhere else: the people who want C# bindings
+# are usually on MSVC, which has no reflection support at all.
+build_csharp() {
+    local module_name="$1"
+    local output_dir="$2"
+    local src_dir="$3"
+    local -n cs_classes=$4
+    local -n cs_headers=$5
+    shift 5
+    local extra_includes=("$@")
+
+    local gen_src="$output_dir/${module_name}_csharp_gen.cpp"
+    local gen_bin="$output_dir/${module_name}_csharp_gen"
+    local shim_src="$output_dir/${module_name}_shim.cpp"
+    local cs_out="$output_dir/${module_name}.cs"
+    # The runtime's own probing decides this, so the file name is not cosmetic.
+    # DllImport("csb") tries {"", "lib"} x {"", platform suffix}: on Linux that
+    # reaches libcsb.so, on macOS libcsb.dylib, and on Windows csb.dll with no
+    # lib prefix. Emitting libcsb.so everywhere means a macOS consumer can
+    # never load the library the generator just built for them.
+    local lib_out
+    case "$(uname -s)" in
+        Darwin)           lib_out="$output_dir/lib${module_name}.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) lib_out="$output_dir/${module_name}.dll" ;;
+        *)                lib_out="$output_dir/lib${module_name}.so" ;;
+    esac
+
+    mkdir -p "$output_dir"
+
+    {
+        echo "// Auto-generated by mirror_bridge. Writes the C ABI shim and the C# source."
+        echo "// Source: $src_dir"
+        echo "#include \"csharp/mirror_bridge_csharp.hpp\""
+    } > "$gen_src"
+
+    local header
+    declare -A cs_included=()
+    for header in "${cs_headers[@]}"; do
+        if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
+            echo "#include \"$header\"" >> "$gen_src"
+            cs_included[$header]=1
+        fi
+    done
+    # An enum can live in a header holding no bound class, in which case the
+    # include list above -- built from classes -- has never seen it. The Python
+    # backend learned this the same way.
+    for header in "${DISCOVERED_ENUM_HEADERS[@]:-}"; do
+        if [ -n "$header" ] && [ -z "${cs_included[$header]:-}" ]; then
+            echo "#include \"$header\"" >> "$gen_src"
+            cs_included[$header]=1
+        fi
+    done
+
+    # The C# namespace is the module name with its separators removed, which
+    # keeps it a legal identifier without inventing a name nobody asked for.
+    local cs_namespace
+    cs_namespace="$(printf '%s' "$module_name" | sed 's/[^A-Za-z0-9]//g')"
+    [ -z "$cs_namespace" ] && cs_namespace="MirrorBridge"
+
+    {
+        echo ""
+        echo "int main(int argc, char** argv) {"
+        echo "    if (argc < 2) { std::fprintf(stderr, \"usage: %s <out-dir>\\n\", argv[0]); return 2; }"
+        echo "    mirror_bridge::csharp::Emitter emitter(\"$module_name\", \"$cs_namespace\");"
+    } >> "$gen_src"
+
+    # Enums first: a class member of enum type is reported as not crossing
+    # unless its enum is already registered, so registration order matters.
+    local enum_name enum_simple
+    declare -A cs_enum_taken=()
+    for enum_name in "${DISCOVERED_ENUMS[@]:-}"; do
+        [ -z "$enum_name" ] && continue
+        enum_simple="${enum_name##*::}"
+        if [ -n "${BINDING_NAME_WINNER[$enum_simple]:-}" ] || \
+           [ -n "${cs_enum_taken[$enum_simple]:-}" ]; then
+            continue
+        fi
+        cs_enum_taken[$enum_simple]=1
+        echo "    emitter.add_enum<$enum_name>(\"$enum_simple\", \"$enum_name\");" >> "$gen_src"
+    done
+
+    local class_name simple_name i=0 emitted=0
+    for (( i = 0; i < ${#cs_classes[@]}; i++ )); do
+        class_name="${cs_classes[$i]}"
+        simple_name="${class_name##*::}"
+        if [ -n "${BINDING_NAME_WINNER[$simple_name]:-}" ] && \
+           [ "${BINDING_NAME_WINNER[$simple_name]}" != "$class_name" ]; then
+            continue
+        fi
+        # The qualified name is passed as a string as well as a template
+        # argument: the shim is a separate translation unit with no using
+        # directives, so every type it names has to be spelled in full.
+        echo "    emitter.add_class<$class_name>(\"$simple_name\", \"${cs_headers[$i]}\", \"$class_name\");" >> "$gen_src"
+        emitted=$((emitted + 1))
+    done
+
+    {
+        echo "    return emitter.write(argv[1]) ? 0 : 1;"
+        echo "}"
+    } >> "$gen_src"
+
+    if [ "$emitted" -eq 0 ]; then
+        echo -e "${RED}Error: no bindable class for C#${NC}"
+        LAST_COMPILE_LOG="no bindable class"
+        return 1
+    fi
+
+    local inc_flags="-I$PROJECT_ROOT -I$src_dir -I."
+    local inc
+    for inc in "${extra_includes[@]}"; do
+        [ -n "$inc" ] && inc_flags="$inc_flags -I$inc"
+    done
+
+    echo -e "${YELLOW}Compiling the C# generator (reflection)...${NC}"
+    local log
+    log=$($CXX_BIN $CXX_REFLECT_FLAGS $CXX_CONSTEXPR_BUDGET $inc_flags \
+          ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+          -O1 "$gen_src" -o "$gen_bin" 2>&1) || {
+        echo -e "${RED}✗ the C# generator did not compile${NC}"
+        echo "$log" | grep -m8 -E "error" || true
+        LAST_COMPILE_LOG="$log"
+        return 1
+    }
+
+    echo -e "${YELLOW}Writing the C ABI shim and the C# source...${NC}"
+    # Run from the header directory so the #include spellings the generator
+    # writes into the shim resolve the same way they did for discovery.
+    log=$(cd "$src_dir" && "$gen_bin" "$output_dir" 2>&1) || {
+        echo -e "${RED}✗ the C# generator ran but failed${NC}"
+        echo "$log"
+        LAST_COMPILE_LOG="$log"
+        return 1
+    }
+    echo "$log" | sed 's/^/  /'
+
+    echo -e "${YELLOW}Compiling the shim into lib${module_name}.so...${NC}"
+    # No reflection flags here on purpose: this is the step a consumer repeats
+    # with their own compiler, so it must not need one. It does re-parse the
+    # project's headers, though, so the standard has to be recent enough for
+    # them: pinned at C++17 this step rejected any header using a C++20
+    # feature, on a project whose whole subject is modern C++.
+    local shim_std="-std=c++20"
+    local shim_stdlib=""
+    case "$CXX_BIN" in
+        *clang*) shim_stdlib="-stdlib=libc++" ;;
+    esac
+    log=$($CXX_BIN $shim_std $shim_stdlib $inc_flags ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
+          -fPIC -shared -O2 -DNDEBUG -fvisibility=hidden \
+          "$shim_src" -o "$lib_out" 2>&1) || {
+        echo -e "${RED}✗ the generated shim did not compile${NC}"
+        echo "$log" | grep -m8 -E "error" || true
+        LAST_COMPILE_LOG="$log"
+        return 1
+    }
+
+    local csc_bin=""
+    for cand in csc mcs; do
+        command -v "$cand" >/dev/null 2>&1 && { csc_bin="$cand"; break; }
+    done
+    if [ -n "$csc_bin" ] && [ "$VERIFY_IMPORT" -eq 1 ]; then
+        echo -e "${YELLOW}Checking the generated C# compiles...${NC}"
+        local cs_log
+        cs_log=$("$csc_bin" -target:library -warnaserror \
+                 -out:"$output_dir/${module_name}_check.dll" "$cs_out" 2>&1) || {
+            echo -e "${RED}✗ the generated C# does not compile${NC}"
+            echo "$cs_log" | grep -m8 -E "error" || echo "$cs_log" | head -8
+            LAST_COMPILE_LOG="$cs_log"
+            return 1
+        }
+        rm -f "$output_dir/${module_name}_check.dll"
+        echo -e "${GREEN}✓ the generated C# compiles cleanly${NC}"
+    elif [ -z "$csc_bin" ]; then
+        echo -e "  ${YELLOW}No C# compiler on PATH (csc or mcs), so ${module_name}.cs was not"
+        echo -e "  compiled. It is the one artifact here a human reads directly; check it"
+        echo -e "  in your own build before trusting it.${NC}"
+    fi
+
+    echo -e "${GREEN}✓ $lib_out${NC}"
+    echo -e "${GREEN}✓ $cs_out${NC}"
+    echo "  Add the .cs to a project and put $(basename "$lib_out") beside the assembly,"
+    echo "  or anywhere the runtime's library search path reaches."
+    LAST_OUTPUT_FILE="$lib_out"
+    [ $KEEP_GENERATED -eq 0 ] && rm -f "$gen_src" "$gen_bin"
+    return 0
+}
+
+
 generate_binding_file() {
     local lang="$1"
     local module_name="$2"
@@ -1092,11 +1345,13 @@ report_unbound() {
     local built_langs="${2:-}"
     # The Python backend binds enums as enum.IntEnum, so for that language
     # they are not missing from the module and do not belong in this list.
-    # Lua and JavaScript have no equivalent yet and their values still cross
-    # as bare numbers.
+    # Python and C# both bind enums as a real enum type; Lua and JavaScript
+    # have no equivalent yet and their values still cross as bare numbers. This
+    # gate named only Python, so a successful csharp run ended with a warning
+    # whose every clause was false.
     local -a unbound_enums=()
     case " $built_langs " in
-        *" python "*) ;;
+        *" python "*|*" csharp "*|*" cs "*) ;;
         *) unbound_enums=("${DISCOVERED_ENUMS[@]}") ;;
     esac
     local -a overloaded=() shares_name=()
@@ -1179,7 +1434,7 @@ report_unbound() {
         echo ""
         echo "    ${#unbound_enums[@]} enum type(s) — values still cross as plain numbers, unchecked"
         print_group unbound_enums
-        echo "      The Python backend binds these as enum.IntEnum; Lua and JavaScript do not yet"
+        echo "      Python binds these as enum.IntEnum and C# as a real enum; Lua and JavaScript do not yet"
     fi
     if [ ${#overloaded[@]} -gt 0 ]; then
         echo ""
@@ -1287,6 +1542,165 @@ resolve_binding_name_collisions() {
 # here into PLANNER_WORK and PLANNER_ARGS.
 PLANNER_WORK=""
 PLANNER_ARGS=()
+# What --discover-only reports instead of building a module.
+#
+# The numbers chosen are the ones that decide whether a codebase is worth
+# attempting. `source` matters most: `reflection` means the headers were read
+# after the preprocessor and the class list is real, while `text scan` means
+# the reflection unit failed and every name below came from reading the header
+# text, which cannot see an export macro or a typedef. A large codebase that
+# reports `text scan` is not a slow problem, it is a blocked one, and the
+# planner log says why.
+emit_discovery_report() {
+    local module_name="$1" src_dir="$2"
+    local -n rep_classes=$3
+    local -n rep_headers=$4
+
+    local -a uniq_headers=()
+    local h seen_h
+    declare -A header_seen=()
+    for h in "${rep_headers[@]:-}"; do
+        [ -z "$h" ] && continue
+        if [ -z "${header_seen[$h]:-}" ]; then
+            header_seen[$h]=1
+            uniq_headers+=("$h")
+        fi
+    done
+
+    echo -e "${YELLOW}Discovery report${NC} (--discover-only: nothing was generated or compiled)"
+    echo "  classes:   ${#rep_classes[@]}"
+    echo "  enums:     ${#DISCOVERED_ENUMS[@]}"
+    echo "  headers:   ${#uniq_headers[@]} holding a bound class"
+    echo "  source:    ${DISCOVERY_SOURCE}"
+    echo "  seconds:   ${DISCOVERY_SECONDS:-0}"
+    if [ -n "${COMPDB_PATH:-}" ]; then
+        echo "  compile_commands.json: ${#COMPDB_FLAGS[@]} flag(s) from $COMPDB_PATH"
+    fi
+    if [ "$DISCOVERY_SOURCE" != "reflection" ]; then
+        echo ""
+        echo -e "  ${YELLOW}Reflection did not read these headers, so this list is a text scan.${NC}"
+        echo "  Why: ${PLANNER_WORK:-<no planner work dir>}/planner.log"
+        echo "  Until that reads 'reflection', a generated module would bind the wrong names."
+    fi
+
+    if [ $JSON_MODE -eq 1 ]; then
+        local classes_json="" enums_json="" headers_json="" item
+        for item in "${rep_classes[@]:-}"; do
+            [ -n "$item" ] && classes_json="$classes_json,\"$(json_escape "$item")\""
+        done
+        for item in "${DISCOVERED_ENUMS[@]:-}"; do
+            [ -n "$item" ] && enums_json="$enums_json,\"$(json_escape "$item")\""
+        done
+        for item in "${uniq_headers[@]:-}"; do
+            [ -n "$item" ] && headers_json="$headers_json,\"$(json_escape "$item")\""
+        done
+        printf '{"status":"ok","action":"discover","module":"%s","src_dir":"%s","source":"%s","seconds":%s,"counts":{"classes":%d,"enums":%d,"headers":%d},"classes":[%s],"enums":[%s],"headers":[%s],"compile_commands":%s}\n' \
+            "$(json_escape "$module_name")" "$(json_escape "$src_dir")" \
+            "$(json_escape "$DISCOVERY_SOURCE")" "${DISCOVERY_SECONDS:-0}" \
+            "${#rep_classes[@]}" "${#DISCOVERED_ENUMS[@]}" "${#uniq_headers[@]}" \
+            "${classes_json#,}" "${enums_json#,}" "${headers_json#,}" \
+            "${COMPDB_REPORT:-null}" >&3
+    fi
+}
+
+
+# Harvest include paths and defines from a project's compile_commands.json.
+#
+# The corpus notes are the argument for this: opencv needs a generated
+# opencv_modules.hpp written into its checkout, open3d is reachable only for
+# geometry/ because core/ wants MKL and ml/ wants CUDA, eigen needs sixteen
+# exclude patterns. Each of those is a hand-written rediscovery of something
+# the project's own build system already knows. At a few hundred thousand
+# lines that is a chore; at twenty million it is the whole job, which is why
+# this reads the answer instead of asking for it again.
+load_compile_commands() {
+    [ -z "$COMPDB_PATH" ] && return 0
+
+    if [ ! -f "$COMPDB_PATH" ]; then
+        echo -e "${RED}Error: no compile_commands.json at $COMPDB_PATH${NC}"
+        json_fail "args" "no compile_commands.json at $COMPDB_PATH" \
+            "CMake writes one with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; for a Make build, bear -- make"
+    fi
+
+    local -a reader=(python3 "$PROJECT_ROOT/tools/mirror_bridge_compdb.py" "$COMPDB_PATH")
+    local item
+    for item in "${COMPDB_FOR[@]:-}"; do
+        [ -n "$item" ] && reader+=(--for "$item")
+    done
+    for item in "${COMPDB_REPLACE[@]:-}"; do
+        [ -n "$item" ] && reader+=(--replace-prefix "$item")
+    done
+
+    # One pass, not two. A compile database for a codebase this feature exists
+    # for runs to tens of megabytes, so reading it once for the flags and again
+    # for the report would double the most expensive part of the step.
+    #
+    # Shape of the reader's output here: the report as a single JSON line
+    # first, then one flag per line. A leading line rather than a trailing one
+    # because the flag count is unbounded and the report is exactly one line,
+    # so the split needs no sentinel and no second parse.
+    local warn_file out_file rc=0
+    warn_file="$(mktemp)"
+    out_file="$(mktemp)"
+    "${reader[@]}" --json 2>"$warn_file" \
+        | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+report = doc["report"]
+print(json.dumps(report))
+for f in doc["flags"]:
+    print(f)
+for c in report["define_conflicts"]:
+    sys.stderr.write("%s is defined as both %s and %s; kept the first\n"
+                     % (c["macro"], c["kept"] or "<empty>", c["ignored"] or "<empty>"))
+for f in report["dropped_for_whitespace"]:
+    sys.stderr.write("dropped %s: a flag containing whitespace cannot be "
+                     "passed through the generate pipeline\n" % f)
+if report["entries_scanned"] == 0:
+    sys.stderr.write("no entries matched; --compile-commands-for may not name "
+                     "a source path in this database\n")
+' >"$out_file" 2>>"$warn_file" || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo -e "${RED}Error: could not read $COMPDB_PATH${NC}"
+        cat "$warn_file" >&2
+        rm -f "$warn_file" "$out_file"
+        json_fail "args" "could not read $COMPDB_PATH" \
+            "the file must be a JSON array of compile_commands entries"
+    fi
+
+    COMPDB_FLAGS=()
+    local first=1
+    while IFS= read -r item; do
+        if [ "$first" -eq 1 ]; then
+            COMPDB_REPORT="$item"
+            first=0
+        elif [ -n "$item" ]; then
+            COMPDB_FLAGS+=("$item")
+        fi
+    done < "$out_file"
+
+    # The warnings are the interesting half: a macro defined two ways in one
+    # build, or a flag dropped because it carries a space, both change what
+    # the reflection pass sees.
+    if [ -s "$warn_file" ]; then
+        while IFS= read -r item; do
+            [ -n "$item" ] && echo -e "  ${YELLOW}warning: $item${NC}"
+        done < "$warn_file"
+    fi
+    rm -f "$warn_file" "$out_file"
+
+    local n=${#COMPDB_FLAGS[@]}
+    echo -e "${GREEN}✓ compile_commands.json${NC}: $n flag(s) from $COMPDB_PATH"
+    if [ ${#COMPDB_FOR[@]} -gt 0 ]; then
+        echo "  scoped to: ${COMPDB_FOR[*]}"
+    fi
+    if [ "$n" -eq 0 ]; then
+        echo -e "  ${YELLOW}No flags harvested. If --compile-commands-for was given, check it names a real source path.${NC}"
+    fi
+}
+
+
 planner_setup() {
     local module_name="$1"
     local src_dir="$2"
@@ -1321,8 +1735,9 @@ planner_setup() {
     # exactly as the module is. A library configured by macros needs both or
     # neither: glm parses only with GLM_FORCE_ALIGNED_GENTYPES, and a
     # discovery unit without it reports a different library from the one the
-    # module compiles.
-    PLANNER_ARGS=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS ${EXTRA_DEFINES[*]:-}" --project-root "$PROJECT_ROOT"
+    # module compiles. Flags harvested from a compile_commands.json ride along
+    # for the same reason and must reach both of this script's compile sites.
+    PLANNER_ARGS=(--cxx "$CXX_BIN" --cxx-flags "$CXX_REFLECT_FLAGS ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-}" --project-root "$PROJECT_ROOT"
                   --src-dir "$src_dir" --module "$module_name" --work "$PLANNER_WORK"
                   --headers-file "$PLANNER_WORK/headers.txt" --classes-file "$PLANNER_WORK/classes.txt"
                   --classes-out "$PLANNER_WORK/declared.tsv")
@@ -1543,7 +1958,7 @@ compile_binding() {
     # other project -- built the module against that header instead of
     # this installation's, silently and with no diagnostic.
     local cmd="$CXX_BIN $CXX_REFLECT_FLAGS $CXX_CONSTEXPR_BUDGET \
-        -I$PROJECT_ROOT -I$src_dir -I. ${EXTRA_DEFINES[*]:-} \
+        -I$PROJECT_ROOT -I$src_dir -I. ${EXTRA_DEFINES[*]:-} ${COMPDB_FLAGS[*]:-} \
         -fPIC -shared -O3 -DNDEBUG \
         -fvisibility=hidden -fvisibility-inlines-hidden \
         -Wno-deprecated-declarations"
@@ -1578,13 +1993,50 @@ compile_binding() {
     # would let a stale .so from a previous run mask a failed compile.
     LAST_COMPILE_LOG=""
     local compile_rc=0
-    if [ $VERBOSE -eq 1 ]; then
-        echo -e "${BLUE}$cmd${NC}"
-        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
-        [ -n "$LAST_COMPILE_LOG" ] && echo "$LAST_COMPILE_LOG"
-    else
-        LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
-        echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+    [ $VERBOSE -eq 1 ] && echo -e "${BLUE}$cmd${NC}"
+    LAST_COMPILE_LOG=$(eval "$cmd" 2>&1) || compile_rc=$?
+
+    # Whether to show this attempt's output is decided after looking at it,
+    # not before. A compile that is about to be retried at a higher constexpr
+    # budget prints a wall of errors that are not the reason anything failed,
+    # and following them with a success reads as the tool contradicting itself.
+    local show_log=1
+    if [ $compile_rc -ne 0 ] && budget_exhausted "$LAST_COMPILE_LOG"; then
+        show_log=0
+    fi
+    if [ "$show_log" -eq 1 ]; then
+        if [ $VERBOSE -eq 1 ]; then
+            [ -n "$LAST_COMPILE_LOG" ] && echo "$LAST_COMPILE_LOG"
+        else
+            echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+        fi
+    fi
+
+    # The discovery pass escalates its constexpr budget when the compiler says
+    # it ran out (see Compiler.raise_budget in mirror_bridge_templates.py), and
+    # this compile has to do the same or the fix is half-applied: discovery
+    # would escalate, report a clean class list, and the module build would
+    # then die on the identical cause with no retry, which reads as the two
+    # steps disagreeing about the same headers.
+    if [ $compile_rc -ne 0 ] && budget_exhausted "$LAST_COMPILE_LOG"; then
+        local bigger
+        case "$CXX_BIN" in
+            *clang*) bigger="-fconstexpr-steps=2000000000" ;;
+            *)       bigger="-fconstexpr-ops-limit=20000000000" ;;
+        esac
+        if [ "$CXX_CONSTEXPR_BUDGET" != "$bigger" ]; then
+            echo -e "  ${YELLOW}the module compile ran out of constexpr budget; retrying at $bigger${NC}"
+            local retry_cmd="${cmd/$CXX_CONSTEXPR_BUDGET/$bigger}"
+            compile_rc=0
+            LAST_COMPILE_LOG=$(eval "$retry_cmd" 2>&1) || compile_rc=$?
+            if [ $compile_rc -ne 0 ]; then
+                echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+            fi
+        else
+            # No higher budget to try, so the errors held back above are the
+            # real ones and have to be shown after all.
+            echo "$LAST_COMPILE_LOG" | grep -E "(error|Error)" || true
+        fi
     fi
 
     if [ $compile_rc -eq 0 ] && [ -f "$output_file" ]; then
@@ -1686,6 +2138,10 @@ cmd_generate() {
             --instantiate) INSTANTIATE+=("$2"); shift 2 ;;
             --exclude) EXCLUDE_PATTERNS+=("$2"); shift 2 ;;
             -D|--define) EXTRA_DEFINES+=("-D$2"); shift 2 ;;
+            --compile-commands) COMPDB_PATH="$2"; shift 2 ;;
+            --compile-commands-for) COMPDB_FOR+=("$2"); shift 2 ;;
+            --replace-prefix) COMPDB_REPLACE+=("$2"); shift 2 ;;
+            --discover-only) DISCOVER_ONLY=1; shift ;;
             --template-cap) TEMPLATE_CAP="$2"; shift 2 ;;
             --no-templates) NO_TEMPLATES=1; shift ;;
             -I) include_dirs+=("$2"); shift 2 ;;
@@ -1740,6 +2196,8 @@ cmd_generate() {
     echo -e "Lang:    ${YELLOW}$LANG${NC}"
     echo ""
 
+    load_compile_commands
+
     # Discover classes (pass include dirs so headers get proper paths)
     echo -e "${YELLOW}Scanning for classes...${NC}"
     declare -a CLASSES
@@ -1752,8 +2210,8 @@ cmd_generate() {
     local languages=()
     case "$LANG" in
         all) languages=("python" "lua" "js") ;;
-        python|lua|js|javascript) languages=("$LANG") ;;
-        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, all" ;;
+        python|lua|js|javascript|csharp|cs) languages=("$LANG") ;;
+        *) echo -e "${RED}Error: Unknown language: $LANG${NC}"; json_fail "args" "Unknown language: $LANG" "Valid values: python, lua, js, csharp, all" ;;
     esac
 
     # Python modules also get free functions and template instantiations,
@@ -1766,6 +2224,7 @@ cmd_generate() {
     fi
 
     local DISCOVERY_SOURCE="text scan" i
+    local _discovery_start=$SECONDS
 
     # The class list the module is built from comes from reflection, which
     # reads the headers after the preprocessor has run. The planner's own
@@ -1777,6 +2236,7 @@ cmd_generate() {
         reflect_classes "$module_name" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}" || true
     fi
 
+    DISCOVERY_SECONDS=$(( SECONDS - _discovery_start ))
     if adopt_reflected_classes CLASSES HEADERS "$src_dir"; then
         DISCOVERY_SOURCE="reflection"
     else
@@ -1809,6 +2269,15 @@ cmd_generate() {
     echo -e "${GREEN}Discovered ${#CLASSES[@]} classes${NC} (${DISCOVERY_SOURCE})"
     resolve_binding_name_collisions CLASSES HEADERS
     echo ""
+
+    # Triage mode. Reading a large codebase's headers is the expensive and
+    # interesting half; generating and compiling a module for every class
+    # found is what turns minutes into hours. Stopping here answers "can
+    # reflection read this at all, and what did it see" on its own.
+    if [ $DISCOVER_ONLY -eq 1 ]; then
+        emit_discovery_report "$module_name" "$src_dir" CLASSES HEADERS
+        return 0
+    fi
 
     if [ $plans_templates -eq 1 ]; then
         if [ ${#CLASSES[@]} -eq 0 ] && { [ -z "$TEMPLATE_LINES_FILE" ] || [ ! -s "$TEMPLATE_LINES_FILE" ]; }; then
@@ -1848,6 +2317,15 @@ cmd_generate() {
     local errors_json=""
     for lang in "${languages[@]}"; do
         echo -e "${YELLOW}Generating $lang bindings...${NC}"
+
+        if [ "$lang" = "csharp" ] || [ "$lang" = "cs" ]; then
+            if build_csharp "$module_name" "$OUTPUT_DIR" "$src_dir" CLASSES HEADERS "${include_dirs[@]:-}"; then
+                built_outputs+=("$LAST_OUTPUT_FILE")
+            else
+                failed_langs+=("$lang")
+            fi
+            continue
+        fi
 
         local binding_file="$OUTPUT_DIR/${module_name}_${lang}_binding.cpp"
         generate_binding_file "$lang" "$module_name" "$binding_file" CLASSES HEADERS "$src_dir"
