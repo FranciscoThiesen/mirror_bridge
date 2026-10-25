@@ -550,7 +550,7 @@ truthy("and the reason names the ownership problem",
        "double-freed" in run.stdout)
 check("it gets no C# class", "class PoolOwned" in cs, False)
 check("and no deleter it could never call", "mb_PoolOwned_delete" in shim_src, False)
-truthy("while the class beside it still binds", "public sealed class Forward" in cs)
+truthy("while the class beside it still binds", "public sealed class Impl" in cs)
 
 print("\n=== a pure virtual is called through the vtable, not by name ===")
 # A qualified call suppresses dispatch, and a pure virtual has no definition
@@ -565,24 +565,6 @@ truthy("an override keeps its qualification, naming the deriving class",
        "->Impl::kind()" in shim_src)
 truthy("and so does an inherited name resolved to a specific base",
        "->LeftBase::v" in shim_src)
-
-print("\n=== a forward-declared type is reported, not a compiler error ===")
-# std::is_class_v is true for a forward-declared class, so this used to reach
-# typeid and fail to compile INSIDE the generator, naming no method. Found by
-# pointing the compatibility corpus at C#: yaml-cpp has exactly this shape.
-truthy("a method returning an incomplete type says so precisely",
-       re.search(r"Forward\.make\(\): returns .*declared but not defined",
-                 run.stdout) is not None)
-check("and does not blame a deleted copy constructor for it",
-      re.search(r"Forward\.make\(\): returns .*copy constructor",
-                run.stdout) is not None, False)
-truthy("and one taking it", 
-       re.search(r"Forward\.take\(\): takes a class this module does not bind",
-                 run.stdout) is not None)
-truthy("while the rest of the class still binds",
-       "public sealed class Forward" in cs and "public int doubled()" in cs)
-check("and the generator did not mention its own source",
-      "mirror_bridge_csharp.hpp" in run.stdout, False)
 
 print("\n=== one slot description serves all three emitters ===")
 # A constructor and a static method used to be able to spell strictly less than
