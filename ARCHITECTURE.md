@@ -197,6 +197,54 @@ Nested C++ objects become Python dicts, not wrapper objects:
 - No need to pre-register nested types
 - Works consistently across all languages
 
+### C# Slots: One Description of a Parameter, Three Emitters
+
+The C# backend is the one that emits its ABI as *text* (see `csharp/mirror_bridge_csharp.hpp`),
+and it has three places that build a parameter list: `emit_method`, `emit_static_method` and
+the constructor path. They used to do it by appending to seven parallel strings in a fixed
+order, and **that order was the correctness condition** — which is why the two shorter
+emitters never learned the cases where one C# argument occupies more than one wire slot
+(an optional scalar needs a has-flag, a vector needs a pointer and a length). What they
+could not spell they did not refuse: a vector fell to their generic arm, was declared as a
+bare `void*`, and `void*` converts to `bool`, so a constructor beside a `T(bool)` overload
+compiled and ran the wrong one.
+
+`ArgSlot` is one C# argument expanded into the slots it occupies, so a slot carries its own
+order and an emitter can only get it right:
+
+```cpp
+struct ArgSlot {
+    std::vector<std::string> c_params;       // C++ declarations, in wire order
+    std::vector<std::string> cs_ext_params;  // the DllImport's, same order
+    std::string cs_sig_param;                // the one public C# parameter
+    std::string cs_type;                     // its type alone, for the overload key
+    std::string fwd_arg;                     // the one C++ expression passed on
+    std::vector<std::string> call_args;      // one C# expression per wire slot
+    std::string prologue;                    // C# statements needed before the call
+};
+```
+
+`join_slots(args, ret, c_self, cs_ext_self, cs_call_self)` assembles them. The leading self
+parameter is the only structural difference between the three lists, so it is the only thing
+passed in. Adding a parameter kind means one arm in `arg_slot`, and all three emitters gain
+it at once — which is how a constructor taking a `std::vector` started working without a
+line written for the constructor case.
+
+**Returns are not converted yet.** `RetSlot` is defined, with the fields the return side
+needs — `c_ret`, `cs_ret`, `cs_surface`, trailing out-slots, `pre`/`post` C# statements and
+the `zero` the shim's catch blocks hand back — and every emitter currently passes an empty
+one. Until it is filled in:
+
+- a static method cannot return a `std::optional`, a container or a bound class, and says so
+  by name via `simple_ret_wire_ok`;
+- a `std::array` returned by value is refused, because the honest surface is a copied `T[]`
+  behind an out-buffer rather than a view of a temporary, and the out-buffer is a `RetSlot`.
+
+Both fall out of the same change. Note that a return's body carries the **ownership rule**
+(a by-value return is the caller's copy; a member is a borrowed view), so `RetSlot` has to
+describe the body and not only the signature — getting one wrong is a memory bug rather than
+a compile error, which is why the parameter side went first.
+
 ### Python-Based Global Type Registry
 Cross-module type sharing uses Python's `sys.modules`:
 ```python
