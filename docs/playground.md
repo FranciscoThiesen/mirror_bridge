@@ -265,7 +265,7 @@ Color enum has 4 values:
 
 ## How mirror_bridge Uses Reflection
 
-The examples above show the core C++26 reflection features. mirror_bridge combines these to automatically generate Python, Lua, and JavaScript bindings.
+The examples above show the core C++26 reflection features. mirror_bridge combines these to automatically generate Python, Lua, JavaScript and C# bindings.
 
 Here's the equivalent mirror_bridge code for binding a Calculator class:
 

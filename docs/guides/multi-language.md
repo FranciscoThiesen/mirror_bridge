@@ -1,12 +1,19 @@
 # Multi-Language Support
 
-Mirror Bridge supports **three languages** using a single, elegant reflection-based architecture:
+Mirror Bridge supports **four languages** using a single, elegant reflection-based architecture:
 
 - **Python** (Python C API)
 - **JavaScript** (Node.js N-API)
 - **Lua** (Lua C API)
+- **C#** (P/Invoke over a generated flat C ABI)
 
-All three share the same core reflection infrastructure, ensuring consistent behavior and minimal code duplication.
+All four share the same core reflection infrastructure, ensuring consistent
+behavior and minimal code duplication. C# is the one that cannot call into a
+reflection-compiled translation unit directly, because every P/Invoke target
+needs its own exported symbol and reflection cannot declare a function whose
+name is computed; it therefore emits its C ABI as text and compiles that in a
+second, ordinary pass. See [the CLI reference](../reference/cli.md) for what
+that means in practice.
 
 ## Quick Start
 
@@ -123,7 +130,7 @@ The core reflection logic is shared across all languages. Each language binding 
 - Language-specific module macros
 
 **3. Consistent API Surface**
-All three languages expose the same C++ API:
+All four languages expose the same C++ API:
 - Data members as properties
 - Methods with full type conversion
 - Constructors (default + parameterized)
