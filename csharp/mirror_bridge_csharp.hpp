@@ -2946,8 +2946,8 @@ private:
           << "// separate translation unit from the reflection pass that wrote it, so it\n"
           << "// compiles with an ordinary compiler and no reflection support.\n\n"
           << "#include <cstdint>\n#include <cstdlib>\n#include <cstring>\n"
-          << "#include <exception>\n#include <new>\n#include <stdexcept>\n"
-          << "#include <string>\n#include <typeinfo>\n\n";
+          << "#include <exception>\n#include <memory>\n#include <new>\n"
+          << "#include <stdexcept>\n#include <string>\n#include <typeinfo>\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";
         o << "\n"
           << "#if defined(_WIN32)\n"
