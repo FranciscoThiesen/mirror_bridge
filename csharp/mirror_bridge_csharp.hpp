@@ -480,7 +480,8 @@ public:
             emit_members<T>(cp, shim, externs, body);
             emit_methods<T>(cp, shim, externs, body);
             emit_static_methods<T>(cp, shim, externs, body);
-            emit_constructors<T>(cp, shim, externs, body);
+                emit_constructors<T>(cp, shim, externs, body);
+            emit_upcasts<T>(cp, shim, externs, body);
             cp.shim = shim.str();
             cp.externs = externs.str();
             cp.body = body.str();
@@ -1402,6 +1403,88 @@ private:
                 }
             }
             body << "}\n\n";
+        }
+    }
+
+    // ---- upcasts to a bound base --------------------------------------
+    //
+    // A generated class is sealed and has no C# base type, so without this a
+    // Derived cannot be passed where a Base is expected -- which rules out
+    // binding a class hierarchy, and most real C++ libraries are one. Lua and
+    // JavaScript both have upcast machinery; this is C#'s.
+    //
+    // The pointer adjustment happens in C++, where the compiler knows the
+    // offsets, rather than by assuming a Derived* is already a Base*: that
+    // assumption holds for single non-virtual inheritance and is silently
+    // wrong for anything else.
+    //
+    // The result is a BORROWED view of the base subobject inside the derived
+    // object, so it carries the same owner pin every other view does.
+
+    template<typename T>
+    static consteval std::size_t base_count() {
+        return std::meta::bases_of(^^T, std::meta::access_context::current()).size();
+    }
+
+    template<typename T, std::size_t I>
+    static consteval auto nth_base_type() {
+        return std::meta::type_of(
+            std::meta::bases_of(^^T, std::meta::access_context::current())[I]);
+    }
+
+    template<typename T>
+    void emit_upcasts(ClassPlan& p, std::ostringstream& shim,
+                      std::ostringstream& externs, std::ostringstream& body) {
+        constexpr std::size_t n = base_count<T>();
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+            (emit_upcast<T, Is>(p, shim, externs, body), ...);
+        }(std::make_index_sequence<n>{});
+    }
+
+    template<typename T, std::size_t I>
+    void emit_upcast(ClassPlan& p, std::ostringstream& shim,
+                     std::ostringstream& externs, std::ostringstream& body) {
+        using B = std::remove_cvref_t<typename [:nth_base_type<T, I>():]>;
+        if constexpr (!core::NestedBindable<B>) {
+            return;
+        } else {
+            const ClassRef* br = class_ref<B>();
+            if (!br) {
+                // A base this module does not bind has no C# type to convert
+                // to. Saying so beats a Derived that silently cannot be passed.
+                p.skipped.push_back({p.cs_name, "(base " + std::to_string(I) + ")",
+                    "a base class this module does not bind, so there is no C# "
+                    "type to convert to"});
+                return;
+            }
+            const std::string sym = claim_symbol(
+                p, "mb_" + p.symbol + "_as_" + sanitize_symbol(br->cs_name));
+            const std::string method = claim_cs_name(p, "As" + br->cs_name);
+
+            shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
+                 << "return static_cast<void*>(static_cast<" << br->cpp_name
+                 << "*>(static_cast<" << p.cpp_name << "*>(self)));\n"
+                 << "}\n\n";
+            externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                    << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                    << "private static extern IntPtr " << method << "Raw("
+                    << p.handle << " self);\n\n";
+            body << "/// <summary>This object seen as its <c>" << br->cpp_name
+                 << "</c> base.</summary>\n"
+                 << "/// <remarks>A view of the base subobject, not a copy, with the\n"
+                 << "/// pointer adjusted by C++ rather than assumed. Writes through it\n"
+                 << "/// reach this object, and it is only valid while this object is.</remarks>\n"
+                 << "public " << br->cs_name << " " << method << "() {\n"
+                 << "return new " << br->cs_name << "(" << method
+                 << "Raw(Check()), false, this);\n"
+                 << "}\n\n"
+                 << "/// <summary>So a " << p.cs_name << " can be passed where a "
+                 << br->cs_name << " is expected.</summary>\n"
+                 << "public static implicit operator " << br->cs_name
+                 << "(" << p.cs_name << " value) {\n"
+                 << "if (value == null) throw new ArgumentNullException(nameof(value));\n"
+                 << "return value." << method << "();\n"
+                 << "}\n\n";
         }
     }
 

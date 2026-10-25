@@ -198,4 +198,27 @@ struct Shadow : HasShadow { double z = 1.0; };
 struct Native { int id = 3; };
 struct DoubleVector { int n = 4; };
 
+// Subtype polymorphism. A generated class is sealed and has no C# base type,
+// so without an upcast a Derived cannot be passed where a Base is expected --
+// which rules out binding a class hierarchy, and most real C++ libraries are
+// one. Two bases, so the pointer adjustment is not trivially zero for both.
+struct ShapeBase {
+    int sides = 0;
+    int describe() const { return sides * 100; }
+};
+
+struct Tagged {
+    double weight = 2.5;
+};
+
+struct Square : Tagged, ShapeBase {
+    double edge = 3.0;
+    double area() const { return edge * edge; }
+};
+
+struct Judge {
+    int count(const ShapeBase& s) const { return s.sides; }
+    double weigh(const Tagged& t) const { return t.weight; }
+};
+
 }  // namespace csb

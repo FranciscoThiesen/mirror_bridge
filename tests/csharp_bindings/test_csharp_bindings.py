@@ -115,6 +115,17 @@ class Driver {
         catch (ObjectDisposedException) { Console.WriteLine("disposed read raises"); }
         gone.Dispose();
         Console.WriteLine("double dispose is a no-op");
+        using (var sq = new Square()) {
+            sq.sides = 4;
+            sq.weight = 9.5;
+            sq.edge = 3.0;
+            using (var j = new Judge()) {
+                Console.WriteLine($"upcast implicit: count={j.count(sq)} weigh={j.weigh(sq)}");
+            }
+            var bv = sq.AsShapeBase();
+            bv.sides = 7;
+            Console.WriteLine($"base view writes through: sides={sq.sides} describe={sq.describe()} area={sq.area()}");
+        }
         using (var vi = new Device()) {
             Console.WriteLine($"array in: sum_of={vi.sum_of(new double[]{1.0, 2.5, 3.5})}");
             vi.replace_samples(new double[]{4.0, 5.0});
@@ -670,6 +681,22 @@ truthy("a list that is already an array is passed without a second copy",
 truthy("a container of strings is refused and says which half is missing",
        "count_names() --" in cs and "array of char*" in cs)
 
+print("\n=== a Derived can be passed where a Base is expected ===")
+# A generated class is sealed with no C# base type, so without this a class
+# hierarchy could not be bound at all -- and most real C++ libraries are one.
+truthy("an upcast view is generated per bound base",
+       "public ShapeBase AsShapeBase()" in cs and "public Tagged AsTagged()" in cs)
+truthy("with an implicit conversion so the call site reads like C#",
+       "public static implicit operator ShapeBase(Square value)" in cs)
+truthy("a null conversion names the argument",
+       "throw new ArgumentNullException(nameof(value))" in cs)
+# ShapeBase is Square's SECOND base, so its offset is not zero. Assuming a
+# Derived* is already a Base* would read weight's bytes as sides.
+truthy("the pointer is adjusted by C++, not assumed",
+       "static_cast<csb::ShapeBase*>(static_cast<csb::Square*>(self))" in shim_src)
+truthy("the upcast is a borrowed view, so it carries the owner pin",
+       "AsShapeBaseRaw(Check()), false, this)" in cs)
+
 print("\n=== the generated C# compiles and runs ===")
 # Structural checks pass on source no compiler accepts: the first version of
 # this backend emitted `private static extern intGet_id(IntPtr self)`, which
@@ -758,6 +785,12 @@ if MCS and MONO:
                "a live view passes straight in: sum_of=30" in out)
         truthy("an empty list is a valid empty vector, not a null pointer",
                "empty list: sum_of=0" in out)
+        # Tagged is the first base (offset 0) and ShapeBase the second, so
+        # reading sides correctly proves the non-zero offset was applied.
+        truthy("a Derived converts implicitly to either base, with the right offset",
+               "upcast implicit: count=4 weigh=9.5" in out)
+        truthy("and the base view writes through to the derived object",
+               "base view writes through: sides=7 describe=700 area=9" in out)
         truthy("a borrowed object view refuses to read a disposed owner",
                "disposed owner: view raises" in out)
         truthy("a borrowed vector view refuses too",
