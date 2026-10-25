@@ -45,6 +45,8 @@
 #include <functional>
 #include <algorithm>
 #include <map>
+#include <memory>
+#include <unordered_map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -83,6 +85,7 @@ enum class Wire {
     Utf8,       // const char* out, const char* in
     Object,     // void* handle to a bound class
     Vector,     // void* handle to a std::vector of a wire-able element
+    Map,        // void* handle to a std::map/unordered_map of wire-able K and V
     Opt,        // std::optional of a wire-able scalar or string
     Unsupported
 };
@@ -132,6 +135,77 @@ struct vector_element<C, std::void_t<typename C::value_type,
                                       typename C::allocator_type>>;
 };
 
+// std::map and std::unordered_map, told apart from std::set by mapped_type:
+// a set has key_type and value_type but no mapped_type. The void_t guard is
+// not optional, for the same reason it is not optional for vectors -- naming
+// mapped_type outside it makes any member whose type lacks one a hard error in
+// the generator instead of a member reported as not crossing.
+//
+// The two shapes need separate guards because their template parameter lists
+// differ: std::map names key_compare, unordered_map names hasher and key_equal,
+// and mentioning either on the wrong one is itself a hard error.
+template<typename, typename = void>
+struct is_ordered_map_t : std::false_type {};
+
+template<typename C>
+struct is_ordered_map_t<C, std::void_t<typename C::key_type, typename C::mapped_type,
+                                       typename C::key_compare, typename C::allocator_type>>
+    : std::bool_constant<std::is_same_v<C, std::map<typename C::key_type,
+                                                    typename C::mapped_type,
+                                                    typename C::key_compare,
+                                                    typename C::allocator_type>>> {};
+
+template<typename, typename = void>
+struct is_hashed_map_t : std::false_type {};
+
+template<typename C>
+struct is_hashed_map_t<C, std::void_t<typename C::key_type, typename C::mapped_type,
+                                      typename C::hasher, typename C::key_equal,
+                                      typename C::allocator_type>>
+    : std::bool_constant<std::is_same_v<C, std::unordered_map<typename C::key_type,
+                                                              typename C::mapped_type,
+                                                              typename C::hasher,
+                                                              typename C::key_equal,
+                                                              typename C::allocator_type>>> {};
+
+template<typename, typename = void>
+struct map_kv {
+    using key = void;
+    using mapped = void;
+    static constexpr bool is_map = false;
+    static constexpr bool ordered = false;
+};
+
+template<typename C>
+struct map_kv<C, std::void_t<typename C::key_type, typename C::mapped_type>> {
+    using key = typename C::key_type;
+    using mapped = typename C::mapped_type;
+    static constexpr bool ordered = is_ordered_map_t<C>::value;
+    // A custom comparator, hash or allocator makes both checks false, so the
+    // map is reported as not crossing rather than bound with a type name this
+    // generator cannot spell.
+    static constexpr bool is_map = ordered || is_hashed_map_t<C>::value;
+};
+
+// Both halves have to cross on their own, and they cross through the vector
+// machinery: a snapshot of a map is two owned vectors. That is why an enum key
+// is excluded for now -- std::vector<SomeEnum> is not a wire vector either.
+template<typename C>
+consteval bool is_wire_map() {
+    using MK = map_kv<std::remove_cvref_t<C>>;
+    if constexpr (!MK::is_map) {
+        return false;
+    } else {
+        using K = std::remove_cvref_t<typename MK::key>;
+        using V = std::remove_cvref_t<typename MK::mapped>;
+        constexpr bool k_ok = (std::is_arithmetic_v<K> && !std::is_same_v<K, bool>)
+                              || core::StringLike<K>;
+        constexpr bool v_ok = (std::is_arithmetic_v<V> && !std::is_same_v<V, bool>)
+                              || core::StringLike<V>;
+        return k_ok && v_ok;
+    }
+}
+
 template<typename C>
 consteval bool is_wire_vector() {
     using VE = vector_element<std::remove_cvref_t<C>>;
@@ -160,6 +234,7 @@ consteval Wire wire_of() {
     // borrowed from its owner, a value returned by a method is the caller's.
     else if constexpr (is_wire_optional<U>()) return Wire::Opt;
     else if constexpr (is_wire_vector<U>()) return Wire::Vector;
+    else if constexpr (is_wire_map<U>()) return Wire::Map;
     else if constexpr (core::NestedBindable<U>) return Wire::Object;
     else if constexpr (std::is_same_v<U, char> || std::is_same_v<U, signed char>) return Wire::I8;
     else if constexpr (std::is_same_v<U, unsigned char>) return Wire::U8;
@@ -195,6 +270,7 @@ constexpr const char* c_type(Wire w) {
         case Wire::Utf8: return "const char*";
         case Wire::Object: return "void*";
         case Wire::Vector: return "void*";
+        case Wire::Map:    return "void*";
         // Never nullptr: these results are streamed straight into the output,
         // and streaming a null const char* is undefined behaviour that has
         // already crashed this generator once (Wire::Opt returning nullptr
@@ -225,6 +301,7 @@ constexpr const char* cs_wire_type(Wire w) {
         case Wire::Utf8: return "IntPtr";
         case Wire::Object: return "IntPtr";
         case Wire::Vector: return "IntPtr";
+        case Wire::Map:    return "IntPtr";
         default:         return "MB_WIRE_UNHANDLED";
     }
 }
@@ -249,6 +326,12 @@ constexpr const char* cs_type(Wire w) {
 }
 
 constexpr bool wire_ok(Wire w) { return w != Wire::Unsupported; }
+
+// What can cross INWARD, which is a smaller set than what can cross outward.
+// A map parameter would need the materialise-or-pass-through prologue that a
+// vector parameter has, and that is not written yet, so a method taking one is
+// reported by name instead of emitted wrong.
+constexpr bool param_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Map; }
 
 // ============================================================================
 // Why a member or method was left out
@@ -307,6 +390,29 @@ struct VectorPlan {
     std::string cs_name;      // the generated view class
     std::string wire_c;       // the C ABI type one element crosses as
     bool is_string = false;
+    std::string shim;
+};
+
+// A map is not a third collection: its snapshot is two owned vectors, so the
+// key and value halves ARE VectorPlans and the generated C# reuses their view
+// classes rather than growing a second indexable type.
+struct MapPlan {
+    std::string tag;          // the symbol infix, unique per C++ map type
+    std::string cpp_key;
+    std::string cpp_val;
+    std::string cpp_map;      // the full std::map<...>/std::unordered_map<...>
+    std::string cs_key;       // the C# surface type of a key
+    std::string cs_val;
+    std::string cs_key_wire;  // what a key crosses as, C# side
+    std::string cs_val_wire;
+    std::string wire_key_c;   // and C side
+    std::string wire_val_c;
+    bool key_is_string = false;
+    bool val_is_string = false;
+    bool ordered = true;      // std::map, as opposed to std::unordered_map
+    std::string cs_name;      // the generated view class
+    const VectorPlan* keys = nullptr;
+    const VectorPlan* vals = nullptr;
     std::string shim;
 };
 
@@ -672,6 +778,8 @@ private:
     // container and a later registration must not invalidate them.
     std::deque<VectorPlan> vectors_;
     std::map<std::string, int> helper_tags_;
+    std::map<std::string, std::size_t> map_key_;
+    std::deque<MapPlan> maps_;
     std::set<std::string> headers_;
 
     // The type the C# caller sees. For an enum that is the registered enum
@@ -773,6 +881,157 @@ private:
         }
     }
 
+    template<typename C>
+    const MapPlan* map_plan() {
+        using U = std::remove_cvref_t<C>;
+        if constexpr (!is_wire_map<U>()) {
+            return nullptr;
+        } else {
+            const std::string key = type_key<U>();
+            const auto it = map_key_.find(key);
+            if (it != map_key_.end()) return &maps_[it->second];
+
+            using MK = map_kv<U>;
+            using K = std::remove_cvref_t<typename MK::key>;
+            using V = std::remove_cvref_t<typename MK::mapped>;
+            constexpr Wire kw = wire_of<K>();
+            constexpr Wire vw = wire_of<V>();
+            static_assert(cpp_type_name<K>() != nullptr && cpp_type_name<V>() != nullptr,
+                          "is_wire_map admitted a half cpp_type_name cannot spell");
+
+            MapPlan mp;
+            mp.cpp_key = cpp_type_name<K>();
+            mp.cpp_val = cpp_type_name<V>();
+            mp.ordered = MK::ordered;
+            mp.cpp_map = std::string(mp.ordered ? "std::map<" : "std::unordered_map<")
+                       + mp.cpp_key + ", " + mp.cpp_val + ">";
+            mp.cs_key = cs_type(kw);
+            mp.cs_val = cs_type(vw);
+            mp.cs_key_wire = cs_wire_type(kw);
+            mp.cs_val_wire = cs_wire_type(vw);
+            mp.key_is_string = (kw == Wire::Utf8);
+            mp.val_is_string = (vw == Wire::Utf8);
+            mp.wire_key_c = mp.key_is_string ? "const char*" : c_type(kw);
+            mp.wire_val_c = mp.val_is_string ? "const char*" : c_type(vw);
+
+            // Registering the halves here is what makes the snapshot free: the
+            // two view classes and their helper sets already exist, and a
+            // module that also has a plain std::vector<K> member shares them.
+            mp.keys = vector_plan<std::vector<K>>();
+            mp.vals = vector_plan<std::vector<V>>();
+
+            mp.tag = claim_helper_tag(sanitize_symbol(mp.cs_key + "_" + mp.cs_val));
+            mp.cs_name = "Mb"
+                       + std::string(1, static_cast<char>(std::toupper(mp.cs_key[0])))
+                       + mp.cs_key.substr(1)
+                       + std::string(1, static_cast<char>(std::toupper(mp.cs_val[0])))
+                       + mp.cs_val.substr(1)
+                       + (mp.ordered ? "Map" : "HashMap");
+            mp.shim = map_shim(mp);
+            map_key_[key] = maps_.size();
+            maps_.push_back(std::move(mp));
+            return &maps_[map_key_[key]];
+        }
+    }
+
+    // One traversal, two owned vectors. Handing back keys and values as two
+    // separate calls would let the map change between them and pair key i with
+    // a value that is no longer its own; there is no way for the caller to
+    // detect that, so the API does not offer it.
+    static std::string map_shim(const MapPlan& mp) {
+        std::ostringstream o;
+        const std::string M = mp.cpp_map;
+        const std::string pre = "mb_map_" + mp.tag;
+        const std::string kw = mp.key_is_string ? "const char*" : mp.wire_key_c;
+        const std::string vw = mp.val_is_string ? "const char*" : mp.wire_val_c;
+        // A string arriving from C# can be null if the caller passed null; the
+        // empty string is the only sane reading and matches the vector helpers.
+        const std::string k_in = mp.key_is_string
+            ? "std::string(k ? k : \"\")"
+            : "static_cast<" + mp.cpp_key + ">(k)";
+        const std::string v_in = mp.val_is_string
+            ? "std::string(v ? v : \"\")"
+            : "static_cast<" + mp.cpp_val + ">(v)";
+
+        o << "MB_EXPORT int64_t " << pre << "_size(void* m) {\n"
+          << "return static_cast<int64_t>(static_cast<" << M << "*>(m)->size());\n"
+          << "}\n\n"
+          << "MB_EXPORT int32_t " << pre << "_contains(void* m, " << kw << " k) {\n"
+          << "mb_clear_error();\n"
+          << "try { return static_cast<" << M << "*>(m)->count(" << k_in << ") ? 1 : 0; }\n"
+          << "catch (const std::exception& ex) { mb_set_exception(ex); return 0; }\n"
+          << "}\n\n";
+
+        // A string value needs no out-parameter: a null pointer is already the
+        // spelling of "absent", and an empty string is a non-null pointer to a
+        // zero byte, so the two stay distinguishable.
+        if (mp.val_is_string) {
+            o << "MB_EXPORT const char* " << pre << "_get(void* m, " << kw << " k) {\n"
+              << "mb_clear_error();\n"
+              << "try {\n"
+              << "auto* map = static_cast<" << M << "*>(m);\n"
+              << "const auto it = map->find(" << k_in << ");\n"
+              << "return it == map->end() ? nullptr : mb_dup(it->second);\n"
+              << "} catch (const std::exception& ex) { mb_set_exception(ex); return nullptr; }\n"
+              << "}\n\n";
+        } else {
+            o << "MB_EXPORT int32_t " << pre << "_get(void* m, " << kw << " k, "
+              << mp.wire_val_c << "* out) {\n"
+              << "mb_clear_error();\n"
+              << "try {\n"
+              << "auto* map = static_cast<" << M << "*>(m);\n"
+              << "const auto it = map->find(" << k_in << ");\n"
+              << "if (it == map->end()) return 0;\n"
+              << "*out = static_cast<" << mp.wire_val_c << ">(it->second);\n"
+              << "return 1;\n"
+              << "} catch (const std::exception& ex) { mb_set_exception(ex); return 0; }\n"
+              << "}\n\n";
+        }
+
+        o << "MB_EXPORT void " << pre << "_set(void* m, " << kw << " k, " << vw << " v) {\n"
+          << "mb_clear_error();\n"
+          << "try { static_cast<" << M << "*>(m)->insert_or_assign("
+          << k_in << ", " << v_in << "); }\n"
+          << "catch (const std::exception& ex) { mb_set_exception(ex); }\n"
+          << "}\n\n"
+          << "MB_EXPORT int32_t " << pre << "_erase(void* m, " << kw << " k) {\n"
+          << "mb_clear_error();\n"
+          << "try { return static_cast<int32_t>(static_cast<" << M << "*>(m)->erase("
+          << k_in << ")); }\n"
+          << "catch (const std::exception& ex) { mb_set_exception(ex); return 0; }\n"
+          << "}\n\n"
+          << "MB_EXPORT void " << pre << "_clear(void* m) {\n"
+          << "static_cast<" << M << "*>(m)->clear();\n"
+          << "}\n\n"
+          << "// Both halves in one pass, so key i and value i are from the same\n"
+          << "// state of the map. The caller owns both vectors and frees them\n"
+          << "// through the vector helpers for their element types.\n"
+          << "MB_EXPORT int32_t " << pre << "_snapshot(void* m, void** out_keys, void** out_vals) {\n"
+          << "mb_clear_error();\n"
+          << "try {\n"
+          << "auto* map = static_cast<" << M << "*>(m);\n"
+          << "auto ks = std::make_unique<std::vector<" << mp.cpp_key << ">>();\n"
+          << "auto vs = std::make_unique<std::vector<" << mp.cpp_val << ">>();\n"
+          << "ks->reserve(map->size());\n"
+          << "vs->reserve(map->size());\n"
+          << "for (const auto& kv : *map) {\n"
+          << "ks->push_back(kv.first);\n"
+          << "vs->push_back(kv.second);\n"
+          << "}\n"
+          << "*out_keys = static_cast<void*>(ks.release());\n"
+          << "*out_vals = static_cast<void*>(vs.release());\n"
+          << "return 1;\n"
+          << "} catch (const std::exception& ex) { mb_set_exception(ex); return 0; }\n"
+          << "}\n\n"
+          << "// Only an owned copy is freed here. A borrowed member view points\n"
+          << "// into its owner and must never reach this.\n"
+          << "MB_EXPORT void " << pre << "_free(void* m) {\n"
+          << "try { delete static_cast<" << M << "*>(m); }\n"
+          << "catch (...) {}\n"
+          << "}\n\n";
+        return o.str();
+    }
+
     // The element helpers. They take the vector by void*, so one set serves a
     // borrowed member and an owned copy alike -- the difference is only who
     // calls _free, and that is decided where the handle was handed out.
@@ -835,6 +1094,216 @@ private:
               << "return vec->empty() ? nullptr : vec->data();\n"
               << "}\n\n";
         }
+        return o.str();
+    }
+
+    // The managed view. Mutation is deliberately not IDictionary: that
+    // interface promises Add/Remove/Count semantics over a snapshot, and this
+    // is a window onto a live C++ map whose Count is a fresh native read every
+    // time. IReadOnlyDictionary is the honest interface, and the mutators are
+    // declared beside it so the compiler does not claim more than is true.
+    static std::string map_cs(const MapPlan& mp) {
+        std::ostringstream o;
+        const std::string pre = "mb_map_" + mp.tag;
+        const std::string K = mp.cs_key;
+        const std::string V = mp.cs_val;
+        const std::string N = mp.cs_name;
+        const std::string KV = "KeyValuePair<" + K + ", " + V + ">";
+        const std::string k_param = mp.key_is_string
+            ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string k"
+            : mp.cs_key_wire + " k";
+        const std::string k_arg = mp.key_is_string ? "key ?? string.Empty" : "key";
+
+        o << "/// <summary>A view of a C++ " << (mp.ordered ? "std::map<" : "std::unordered_map<")
+          << mp.cpp_key << ", " << mp.cpp_val << ">.</summary>\n"
+          << "/// <remarks>Obtained from a member, this is the real map and writes\n"
+          << "/// reach C++. Returned from a method, it is a copy you own and should\n"
+          << "/// dispose. Count, ContainsKey and the indexer each read C++ when you\n"
+          << "/// call them, so nothing here is a cached snapshot -- but Keys, Values\n"
+          << "/// and enumeration take one, in a single pass, so that key i is always\n"
+          << "/// paired with the value it had at that moment.</remarks>\n"
+          << "public sealed class " << N << " : IReadOnlyDictionary<" << K << ", " << V
+          << ">, IDisposable, IMbOwner {\n"
+          << "private const string Lib = MbNative.Lib;\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_size\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern long MSize(H m);\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_contains\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern int MHas(H m, " << k_param << ");\n\n";
+
+        if (mp.val_is_string) {
+            o << "[DllImport(Lib, EntryPoint = \"" << pre << "_get\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+              << "private static extern IntPtr MGet(H m, " << k_param << ");\n\n";
+        } else {
+            o << "[DllImport(Lib, EntryPoint = \"" << pre << "_get\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+              << "private static extern int MGet(H m, " << k_param << ", out "
+              << mp.cs_val_wire << " outv);\n\n";
+        }
+
+        o << "[DllImport(Lib, EntryPoint = \"" << pre << "_set\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern void MSet(H m, " << k_param << ", "
+          << (mp.val_is_string ? "[MarshalAs(UnmanagedType.LPUTF8Str)] string v"
+                               : mp.cs_val_wire + " v") << ");\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_erase\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern int MErase(H m, " << k_param << ");\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_clear\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern void MClear(H m);\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_snapshot\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern int MSnap(H m, out IntPtr keys, out IntPtr vals);\n\n"
+          << "[DllImport(Lib, EntryPoint = \"" << pre << "_free\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+          << "private static extern void MFree(IntPtr m);\n\n"
+          << "internal sealed class H : SafeHandle {\n"
+          << "internal H(IntPtr h, bool owns) : base(IntPtr.Zero, owns) {\n"
+          << "SetHandle(h);\n"
+          << "}\n"
+          << "public override bool IsInvalid => handle == IntPtr.Zero;\n"
+          << "protected override bool ReleaseHandle() {\n"
+          << "MFree(handle);\n"
+          << "return true;\n"
+          << "}\n"
+          << "}\n\n"
+          << "private readonly H _h;\n"
+          << "private readonly object _parent;\n"
+          << "private readonly SafeHandle _pin;\n"
+          << "private bool _pinned;\n"
+          << "private volatile bool _disposed;\n\n"
+          << "internal " << N << "(IntPtr m, bool owned, object parent) {\n"
+          << "_h = new H(m, owned);\n"
+          << "_parent = parent;\n"
+          << "if (!owned && parent is IMbOwner o) {\n"
+          << "_pin = o.MbHandle;\n"
+          << "_pin.DangerousAddRef(ref _pinned);\n"
+          << "}\n"
+          << "}\n\n"
+          << "SafeHandle IMbOwner.MbHandle => _h;\n\n"
+          << "bool IMbOwner.MbAlive {\n"
+          << "get {\n"
+          << "if (_disposed || _h.IsInvalid || _h.IsClosed) return false;\n"
+          << "return (_parent as IMbOwner)?.MbAlive != false;\n"
+          << "}\n"
+          << "}\n\n"
+          << "private H P() {\n"
+          << "if (_disposed || _h.IsInvalid || _h.IsClosed) {\n"
+          << "throw new ObjectDisposedException(\"" << N << "\");\n"
+          << "}\n"
+          << "if ((_parent as IMbOwner)?.MbAlive == false) {\n"
+          << "throw new ObjectDisposedException(\"" << N
+          << "\", \"the object this map belongs to has been disposed\");\n"
+          << "}\n"
+          << "GC.KeepAlive(_parent);\n"
+          << "return _h;\n"
+          << "}\n\n"
+          << "public int Count => checked((int)MSize(P()));\n\n"
+          << "public bool ContainsKey(" << K << " key) {\n"
+          << "var r = MHas(P(), " << k_arg << ");\n"
+          << "MbNative.Throw(\"" << N << ".ContainsKey\");\n"
+          << "return r != 0;\n"
+          << "}\n\n";
+
+        // The getter. For a string value the absent case is already a null
+        // pointer, so there is no second return channel to keep in step; for
+        // anything else the found flag and the out-parameter are separate and
+        // the flag is the only thing that may be read first.
+        if (mp.val_is_string) {
+            o << "public bool TryGetValue(" << K << " key, out " << V << " value) {\n"
+              << "var r = MGet(P(), " << k_arg << ");\n"
+              << "MbNative.Throw(\"" << N << ".TryGetValue\");\n"
+              << "if (r == IntPtr.Zero) {\n"
+              << "value = null;\n"
+              << "return false;\n"
+              << "}\n"
+              << "value = MbNative.TakeString(r);\n"
+              << "return true;\n"
+              << "}\n\n";
+        } else {
+            o << "public bool TryGetValue(" << K << " key, out " << V << " value) {\n"
+              << "var found = MGet(P(), " << k_arg << ", out value);\n"
+              << "MbNative.Throw(\"" << N << ".TryGetValue\");\n"
+              << "if (found == 0) {\n"
+              << "value = default(" << V << ");\n"
+              << "return false;\n"
+              << "}\n"
+              << "return true;\n"
+              << "}\n\n";
+        }
+
+        o << "/// <summary>The value for <paramref name=\"key\"/>.</summary>\n"
+          << "/// <exception cref=\"KeyNotFoundException\">if the C++ map has no such\n"
+          << "/// key. The setter is insert_or_assign, so it never throws for that\n"
+          << "/// reason.</exception>\n"
+          << "public " << V << " this[" << K << " key] {\n"
+          << "get {\n"
+          << V << " v;\n"
+          << "if (!TryGetValue(key, out v)) {\n"
+          << "throw new KeyNotFoundException(\"" << N << ": no such key\");\n"
+          << "}\n"
+          << "return v;\n"
+          << "}\n"
+          << "set {\n"
+          << "MSet(P(), " << k_arg << ", value"
+          << (mp.val_is_string ? " ?? string.Empty" : "") << ");\n"
+          << "MbNative.Throw(\"" << N << "[]\");\n"
+          << "}\n"
+          << "}\n\n"
+          << "/// <summary>Removes the key if present.</summary>\n"
+          << "/// <returns>true if something was removed.</returns>\n"
+          << "public bool Remove(" << K << " key) {\n"
+          << "var n = MErase(P(), " << k_arg << ");\n"
+          << "MbNative.Throw(\"" << N << ".Remove\");\n"
+          << "return n != 0;\n"
+          << "}\n\n"
+          << "public void Clear() {\n"
+          << "MClear(P());\n"
+          << "}\n\n"
+          // The two halves come back as owned vectors, read through the view
+          // classes their element types already have, and are disposed here.
+          // Nothing else in the generated code allocates a pair array.
+          << "/// <summary>Every pair, taken in one pass over the C++ map.</summary>\n"
+          << "public " << KV << "[] ToArray() {\n"
+          << "IntPtr kp, vp;\n"
+          << "if (MSnap(P(), out kp, out vp) == 0) {\n"
+          << "throw MbNative.LastError(\"" << N << ".ToArray\");\n"
+          << "}\n"
+          << "using (var ks = new " << mp.keys->cs_name << "(kp, true, null))\n"
+          << "using (var vs = new " << mp.vals->cs_name << "(vp, true, null)) {\n"
+          << "var n = ks.Count;\n"
+          << "var a = new " << KV << "[n];\n"
+          << "for (int i = 0; i < n; i++) {\n"
+          << "a[i] = new " << KV << "(ks[i], vs[i]);\n"
+          << "}\n"
+          << "return a;\n"
+          << "}\n"
+          << "}\n\n"
+          << "public IEnumerable<" << K << "> Keys {\n"
+          << "get {\n"
+          << "var a = ToArray();\n"
+          << "var r = new " << K << "[a.Length];\n"
+          << "for (int i = 0; i < a.Length; i++) r[i] = a[i].Key;\n"
+          << "return r;\n"
+          << "}\n"
+          << "}\n\n"
+          << "public IEnumerable<" << V << "> Values {\n"
+          << "get {\n"
+          << "var a = ToArray();\n"
+          << "var r = new " << V << "[a.Length];\n"
+          << "for (int i = 0; i < a.Length; i++) r[i] = a[i].Value;\n"
+          << "return r;\n"
+          << "}\n"
+          << "}\n\n"
+          << "public IEnumerator<" << KV << "> GetEnumerator() {\n"
+          << "foreach (var kv in ToArray()) yield return kv;\n"
+          << "}\n\n"
+          << "IEnumerator IEnumerable.GetEnumerator() {\n"
+          << "return GetEnumerator();\n"
+          << "}\n\n"
+          << "public void Dispose() {\n"
+          << "_disposed = true;\n"
+          << "_h.Dispose();\n"
+          << "if (_pinned) {\n"
+          << "_pinned = false;\n"
+          << "_pin.DangerousRelease();\n"
+          << "}\n"
+          << "}\n"
+          << "}\n\n";
         return o.str();
     }
 
@@ -1017,6 +1486,17 @@ private:
         }
     }
 
+    template<typename C>
+    const MapPlan* map_find() const {
+        using U = std::remove_cvref_t<C>;
+        if constexpr (!is_wire_map<U>()) {
+            return nullptr;
+        } else {
+            const auto it = map_key_.find(type_key<U>());
+            return it == map_key_.end() ? nullptr : &maps_[it->second];
+        }
+    }
+
     template<typename M>
     std::string cs_name_for(Wire w) const {
         if (w == Wire::Opt) {
@@ -1024,6 +1504,7 @@ private:
             if (!op.cs_surface.empty()) return op.cs_surface;
         }
         if (const VectorPlan* v = vector_find<M>()) return v->cs_name;
+        if (const MapPlan* m = map_find<M>()) return m->cs_name;
         if (const ClassRef* c = class_ref<M>()) return c->cs_name;
         const EnumPlan* e = enum_plan<M>();
         return e ? e->cs_name : std::string(cs_type(w));
@@ -1373,7 +1854,7 @@ private:
                 std::string("type ") + tname
                 + " does not cross the C ABI yet; scalars, bool and std::string do"});
             return;
-        } else if constexpr ((w == Wire::Vector || w == Wire::Object)
+        } else if constexpr ((w == Wire::Vector || w == Wire::Map || w == Wire::Object)
                              && std::is_const_v<Raw>) {
             // Taking the address of a const member gives a const T*, and
             // static_cast cannot turn that into void*. The scalar branches
@@ -1392,7 +1873,8 @@ private:
                 std::meta::display_string_of(std::meta::type_of(member)).data();
             p.skipped.push_back({p.cs_name, name,
                 std::string("it is const (") + ctn + "); a "
-                + (w == Wire::Vector ? "vector" : "nested object")
+                + (w == Wire::Vector ? "vector"
+                   : w == Wire::Map ? "map" : "nested object")
                 + " member crosses as a writable view into the owner, which a "
                   "const member cannot provide"});
             return;
@@ -1531,6 +2013,35 @@ private:
                      << "get {\n"
                      << "if (_view_" << name << " == null) {\n"
                      << "_view_" << name << " = new " << vp->cs_name << "(Get_"
+                     << name << "(Check()), false, this);\n"
+                     << "}\n"
+                     << "return _view_" << name << ";\n"
+                     << "}\n"
+                     << "}\n\n";
+                return;
+            }
+
+            if constexpr (w == Wire::Map) {
+                const MapPlan* mp = map_plan<M>();
+                shim << "MB_EXPORT void* " << sym << "(void* self) {\n"
+                     << "return static_cast<void*>(&static_cast<" << p.cpp_name
+                     << "*>(self)->" << qualified(owner_id, name) << ");\n"
+                     << "}\n\n";
+                externs << "[DllImport(Lib, EntryPoint = \"" << sym
+                        << "\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                        << "private static extern IntPtr Get_" << name
+                        << "(" << p.handle << " self);\n\n";
+                const std::string mprop = claim_property_name(p, name);
+                body << "private " << mp->cs_name << " _view_" << name << ";\n"
+                     << "/// <summary>The C++ map itself, not a copy: the indexer\n"
+                     << "/// setter, Remove and Clear reach the owning object.</summary>\n"
+                     << "/// <remarks>Cached for the same reason as a member vector\n"
+                     << "/// view: the map sits at a fixed offset inside the owner.\n"
+                     << "/// Count is still read from C++ on every access.</remarks>\n"
+                     << "public " << mp->cs_name << " " << mprop << " {\n"
+                     << "get {\n"
+                     << "if (_view_" << name << " == null) {\n"
+                     << "_view_" << name << " = new " << mp->cs_name << "(Get_"
                      << name << "(Check()), false, this);\n"
                      << "}\n"
                      << "return _view_" << name << ";\n"
@@ -1791,7 +2302,7 @@ private:
 
     template<typename T, std::size_t Index, std::size_t... Ps>
     static consteval bool ctor_params_ok(std::index_sequence<Ps...>) {
-        return (wire_ok(wire_of<std::remove_cvref_t<
+        return (param_wire_ok(wire_of<std::remove_cvref_t<
                     typename [:ctor_param_type<T, Index, Ps>():]>>()) && ... && true);
     }
 
@@ -2031,7 +2542,7 @@ private:
 
     template<typename T, std::size_t I, std::size_t... Ps>
     static consteval bool static_params_ok(std::index_sequence<Ps...>) {
-        return (wire_ok(wire_of<std::remove_cvref_t<
+        return (param_wire_ok(wire_of<std::remove_cvref_t<
                     typename [:get_static_method_param_type<T, I, Ps>():]>>()) && ... && true);
     }
 
@@ -2282,6 +2793,10 @@ private:
                 shim << "return static_cast<void*>(new "
                      << std::string(vector_plan<Ret>() ? vector_plan<Ret>()->cpp_vec : "")
                      << "(" << invoke << "));\n";
+            } else if constexpr (rw == Wire::Map) {
+                shim << "return static_cast<void*>(new "
+                     << std::string(map_plan<Ret>() ? map_plan<Ret>()->cpp_map : "")
+                     << "(" << invoke << "));\n";
             } else if constexpr (rw == Wire::Object) {
                 // Returned by value, so the only correct thing is a copy the
                 // caller owns. A pointer to the temporary would dangle the
@@ -2343,6 +2858,11 @@ private:
                      << "MbNative.Throw(\"" << name << "\");\n"
                      << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
                      << "return new " << vector_plan<Ret>()->cs_name << "(r, true, null);\n";
+            } else if constexpr (rw == Wire::Map) {
+                body << "var r = " << call << ";\n"
+                     << "MbNative.Throw(\"" << name << "\");\n"
+                     << "if (r == IntPtr.Zero) throw MbNative.LastError(\"" << name << "\");\n"
+                     << "return new " << map_plan<Ret>()->cs_name << "(r, true, null);\n";
             } else if constexpr (rw == Wire::Object) {
                 body << "var r = " << call << ";\n"
                      << "MbNative.Throw(\"" << name << "\");\n"
@@ -2400,7 +2920,7 @@ private:
 
     template<typename T, std::size_t I, std::size_t... Ps>
     static consteval bool params_ok(std::index_sequence<Ps...>) {
-        return (wire_ok(wire_of<std::remove_cvref_t<
+        return (param_wire_ok(wire_of<std::remove_cvref_t<
                     typename [:get_method_param_type<T, I, Ps>():]>>()) && ... && true);
     }
 
@@ -2409,6 +2929,7 @@ private:
             case Wire::Utf8: return "nullptr";
             case Wire::Object: return "nullptr";
             case Wire::Vector: return "nullptr";
+            case Wire::Map:    return "nullptr";
             case Wire::F32:
             case Wire::F64:  return "0.0";
             default:         return "0";
@@ -2425,8 +2946,8 @@ private:
           << "// separate translation unit from the reflection pass that wrote it, so it\n"
           << "// compiles with an ordinary compiler and no reflection support.\n\n"
           << "#include <cstdint>\n#include <cstdlib>\n#include <cstring>\n"
-          << "#include <exception>\n#include <new>\n#include <stdexcept>\n"
-          << "#include <string>\n#include <typeinfo>\n\n";
+          << "#include <exception>\n#include <memory>\n#include <new>\n"
+          << "#include <stdexcept>\n#include <string>\n#include <typeinfo>\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";
         o << "\n"
           << "#if defined(_WIN32)\n"
@@ -2511,6 +3032,10 @@ private:
         for (const auto& v : vectors_) {
             o << "// ---- std::vector<" << v.cpp_elem << "> element access ----\n\n"
               << reindent_braced(v.shim);
+        }
+        for (const auto& m : maps_) {
+            o << "// ---- " << m.cpp_map << " access ----\n\n"
+              << reindent_braced(m.shim);
         }
         for (const auto& c : classes_) {
             o << "// ---- " << c.cpp_name << " ----\n\n"
@@ -2611,6 +3136,9 @@ private:
           << "}\n\n";
         for (const auto& v : vectors_) {
             o << reindent_braced(vector_cs(v));
+        }
+        for (const auto& m : maps_) {
+            o << reindent_braced(map_cs(m));
         }
         // Enums first, so a class referring to one is reading a type already
         // declared above it. C# does not require that, but a reader does.

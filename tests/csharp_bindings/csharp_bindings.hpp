@@ -1,10 +1,13 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <optional>
 #include <compare>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace csb {
@@ -191,6 +194,48 @@ struct WithArray {
     std::array<double, 3> fixed{1.0, 2.0, 3.0};
     int tag = 4;
     double total() const { return fixed[0] + fixed[1] + fixed[2]; }
+};
+
+// A string-keyed map is the most common non-vector container in a real public
+// API. Its snapshot is two owned vectors rather than a third indexable type,
+// so the key and value halves reuse the view classes their element types
+// already have -- a map<string,int> member in a module that also has a
+// vector<int> member shares that vector's helper set.
+struct Registry {
+    std::map<std::string, int> counts{{"a", 1}, {"b", 2}, {"c", 3}};
+    std::map<std::string, std::string> labels{{"mode", "fast"}, {"tier", "gold"}};
+    std::unordered_map<int, double> weights{{1, 0.5}, {2, 1.5}};
+
+    std::map<std::string, int> doubled() const {
+        std::map<std::string, int> out;
+        for (const auto& kv : counts) out[kv.first] = kv.second * 2;
+        return out;
+    }
+
+    // Recomputed in C++ every call, so it is the proof that a write made
+    // through the C# view reached the real map rather than a copy of it.
+    int total() const {
+        int t = 0;
+        for (const auto& kv : counts) t += kv.second;
+        return t;
+    }
+
+    // Inbound is a smaller set than outbound: a map parameter needs the
+    // materialise-or-pass-through prologue a vector parameter has, and does
+    // not have it yet, so this must be reported rather than emitted wrong.
+    int sum_of(const std::map<std::string, int>& m) const {
+        int t = 0;
+        for (const auto& kv : m) t += kv.second;
+        return t;
+    }
+};
+
+// key_type and value_type but no mapped_type, which is exactly how a set is
+// told apart from a map. It has to be reported as not crossing, not quietly
+// bound as one.
+struct TagSet {
+    std::set<std::string> names{"x", "y"};
+    int count = 2;
 };
 
 // A const member of container or class type cannot cross the way a non-const
