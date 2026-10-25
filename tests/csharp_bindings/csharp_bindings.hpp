@@ -255,14 +255,35 @@ struct NarrowFirst {
 };
 
 // A constructor taking a container, beside one taking bool. The constructor
-// emitter has no vector arm, so the vector overload was declared as a bare
+// emitter had no vector arm, so the vector overload was declared as a bare
 // void* and `new Pair(xs)` resolved through the pointer-to-bool conversion:
-// it compiled, ran the bool constructor, and reported nothing.
+// it compiled, ran the bool constructor, and reported nothing. Both now bind,
+// because all three emitters build their parameter lists from one arg_slot.
 struct Pair {
     int which = 0;
     int n = 0;
     Pair(std::vector<double> xs) : which(1), n(static_cast<int>(xs.size())) {}
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
+};
+
+// A std::vector and a std::optional parameter on a STATIC method. Neither was
+// expressible before the three emitters shared one slot description: the static
+// emitter had no second wire slot for a length or a has-flag, so a vector
+// parameter arrived as a bare void* and an optional reached the
+// MB_WIRE_UNHANDLED poison. Nothing was written for the static case to make
+// these work -- they fall out of the same arg_slot a method uses.
+struct Shared {
+    int seen = 0;
+
+    static int total(std::vector<int> xs) {
+        int t = 0;
+        for (auto x : xs) t += x;
+        return t;
+    }
+
+    static int fallback(std::optional<int> v) { return v.value_or(-1); }
+
+    static std::string shout(std::string s) { return s + "!"; }
 };
 
 // A string-keyed map is the most common non-vector container in a real public

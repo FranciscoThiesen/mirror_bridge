@@ -379,22 +379,7 @@ constexpr bool param_wire_ok(Wire w) {
 // rather than a handle, and that is its own change.
 constexpr bool ret_wire_ok(Wire w) { return wire_ok(w) && w != Wire::Array; }
 
-// What the CONSTRUCTOR and STATIC emitters can spell inbound, which is less
-// than emit_method can. Both have a Bool arm, a Utf8 arm and a generic arm and
-// nothing else, so a std::vector or a bound class reaching that generic arm is
-// declared as a bare void* and forwarded raw. C++ then converts the pointer to
-// bool if the target has a bool overload, which means it compiles, calls the
-// wrong function, and reports nothing -- `new VecOrBool(xs)` with `void* xs`
-// beside a `VecOrBool(bool)` ran the bool constructor and left the vector one
-// unreachable. An optional is caught by the MB_WIRE_UNHANDLED poison instead,
-// loudly, but it is refused here so the reason is a sentence rather than a
-// compile error in generated code.
-constexpr bool simple_param_wire_ok(Wire w) {
-    return param_wire_ok(w) && w != Wire::Vector && w != Wire::Object
-        && w != Wire::Opt;
-}
-
-// And outbound, for the static emitter. A value returned by value is the
+// Outbound for the static emitter, which still has no described return. A value returned by value is the
 // caller's copy, so it has to be heap-copied behind a handle before it
 // crosses, and only emit_method emits that copy; the static emitter would hand
 // back a raw IntPtr where the C# signature says the class, which does not
@@ -486,6 +471,79 @@ struct MapPlan {
     const VectorPlan* vals = nullptr;
     std::string shim;
 };
+
+// One C# argument, expanded into the wire slots it actually occupies. A scalar
+// is one slot; an optional scalar is two, the value and its has-flag; a vector
+// is two, a pointer and a length.
+//
+// Before this, each of the three emitters appended to seven parallel strings in
+// a fixed order, and that ORDER was the correctness condition. It is why the
+// two shorter emitters never learned the multi-slot cases: there was nothing to
+// copy but a convention. Here a slot carries its own order, so an emitter can
+// only get it right.
+struct ArgSlot {
+    std::vector<std::string> c_params;       // C++ declarations, in wire order
+    std::vector<std::string> cs_ext_params;  // the DllImport's, same order
+    std::string cs_sig_param;                // the one public C# parameter
+    std::string cs_type;                     // its type alone, for the overload key
+    std::string fwd_arg;                     // the one C++ expression passed on
+    std::vector<std::string> call_args;      // one C# expression per wire slot
+    std::string prologue;                    // C# statements needed before the call
+};
+
+// A return, expanded the same way. Putting the out-parameter here is the point:
+// it moves out of emit_method's locals and into the vocabulary all three
+// emitters speak, which is what lets a static method ever return an optional.
+struct RetSlot {
+    std::string c_ret = "void";
+    std::string cs_ret = "void";
+    std::string cs_surface = "void";
+    // Trailing out-slots, appended after every argument because the shim
+    // signature is positional and a flag or a buffer belongs at the end.
+    std::vector<std::string> c_params, cs_ext_params, call_args;
+    std::string pre;         // C# statements before the call
+    std::string post;        // and after it, for a return the wire only sizes
+    std::string zero = "0";  // what the shim's catch blocks hand back
+};
+
+// Exactly the strings the emitters already had, so adopting this changes where
+// they come from, not what they are.
+struct Joined {
+    std::string c_params, cs_ext_params, cs_sig_params, call_args, fwd_args,
+                cs_types, prologue;
+};
+
+inline void slot_append(std::string& into, const std::string& what,
+                        const char* sep) {
+    if (what.empty()) return;
+    if (!into.empty()) into += sep;
+    into += what;
+}
+
+// The leading self parameter is the only structural difference between the
+// three parameter lists, so it is the only thing passed in.
+inline Joined join_slots(const std::vector<ArgSlot>& args, const RetSlot& ret,
+                         const std::string& c_self = {},
+                         const std::string& cs_ext_self = {},
+                         const std::string& cs_call_self = {}) {
+    Joined j;
+    j.c_params = c_self;
+    j.cs_ext_params = cs_ext_self;
+    j.call_args = cs_call_self;
+    for (const ArgSlot& a : args) {
+        for (const std::string& x : a.c_params) slot_append(j.c_params, x, ", ");
+        for (const std::string& x : a.cs_ext_params) slot_append(j.cs_ext_params, x, ", ");
+        slot_append(j.cs_sig_params, a.cs_sig_param, ", ");
+        slot_append(j.cs_types, a.cs_type, ",");
+        slot_append(j.fwd_args, a.fwd_arg, ", ");
+        for (const std::string& x : a.call_args) slot_append(j.call_args, x, ", ");
+        j.prologue += a.prologue;
+    }
+    for (const std::string& x : ret.c_params) slot_append(j.c_params, x, ", ");
+    for (const std::string& x : ret.cs_ext_params) slot_append(j.cs_ext_params, x, ", ");
+    for (const std::string& x : ret.call_args) slot_append(j.call_args, x, ", ");
+    return j;
+}
 
 struct ClassRef {
     std::string cs_name;
@@ -1721,6 +1779,94 @@ private:
         }
     }
 
+    // One parameter, as slots. `an` is the C# spelling (keyword-escaped, renamed
+    // off a generated local); `cn` is what C++ declared it. The two differ on
+    // purpose -- see cpp_arg_name.
+    template<typename PT>
+    ArgSlot arg_slot(const std::string& an, const std::string& cn) {
+        constexpr Wire pw = wire_of<std::remove_cvref_t<PT>>();
+        ArgSlot a;
+
+        if constexpr (pw == Wire::Opt) {
+            const OptPlan op = opt_plan<PT>();
+            a.cs_type = op.cs_surface;
+            a.cs_sig_param = op.cs_surface + " " + an;
+            if (op.is_string) {
+                // A null pointer is already nullopt, so there is no flag.
+                a.c_params = {std::string("const char* ") + cn};
+                a.cs_ext_params = {std::string("[MarshalAs(UnmanagedType.LPUTF8Str)] string ") + an};
+                a.call_args = {an};
+                a.fwd_arg = "(" + cn + " ? " + op.cpp_opt + "(std::string(" + cn
+                          + ")) : " + op.cpp_opt + "{})";
+            } else {
+                a.c_params = {std::string("int32_t ") + cn + "_has",
+                              op.c_wire + " " + cn};
+                a.cs_ext_params = {std::string("int ") + an + "_has",
+                                   op.cs_wire + " " + an};
+                a.call_args = {an + ".HasValue ? 1 : 0",
+                               an + ".HasValue ? (" + op.cs_wire + ")" + an
+                               + ".Value : default(" + op.cs_wire + ")"};
+                a.fwd_arg = "(" + cn + "_has ? " + op.cpp_opt + "(static_cast<"
+                          + op.cpp_inner + ">(" + cn + ")) : " + op.cpp_opt + "{})";
+            }
+            return a;
+        }
+
+        if constexpr (pw == Wire::Vector) {
+            const VectorPlan* pv = vector_plan<PT>();
+            a.cs_type = "IReadOnlyList<" + pv->cs_elem + ">";
+            a.cs_sig_param = a.cs_type + " " + an;
+            a.c_params = {std::string("const ") + pv->cpp_elem + "* " + cn + "_data",
+                          std::string("int64_t ") + cn + "_n"};
+            a.cs_ext_params = {std::string("[In] ") + pv->cs_elem + "[] " + an + "_data",
+                               std::string("long ") + an + "_n"};
+            a.call_args = {an + "_arr", an + "_arr.LongLength"};
+            // The shim builds the vector from the range, so nothing is
+            // allocated on this side and nothing has to be freed.
+            a.fwd_arg = pv->cpp_vec + "(" + cn + "_data, " + cn + "_data + " + cn + "_n)";
+            // Our own view implements IReadOnlyList<T>, so another object's
+            // member passes straight through without a second copy.
+            a.prologue = "var " + an + "_arr = " + an + " as " + pv->cs_elem + "[];\n"
+                       + "if (" + an + "_arr == null) {\n"
+                       + an + "_arr = new " + pv->cs_elem + "[" + an + ".Count];\n"
+                       + "for (int i = 0; i < " + an + "_arr.Length; i++) "
+                       + an + "_arr[i] = " + an + "[i];\n"
+                       + "}\n";
+            return a;
+        }
+
+        a.cs_type = cs_name_for<PT>(pw);
+        a.cs_sig_param = a.cs_type + " " + an;
+
+        if constexpr (pw == Wire::Bool) {
+            a.c_params = {std::string(c_type(pw)) + " " + cn};
+            a.cs_ext_params = {std::string(cs_param_type(pw)) + " " + an};
+            a.call_args = {an + " ? 1 : 0"};
+            a.fwd_arg = "(" + cn + " != 0)";
+        } else if constexpr (pw == Wire::Utf8) {
+            a.c_params = {std::string(c_type(pw)) + " " + cn};
+            a.cs_ext_params = {std::string(cs_param_type(pw)) + " " + an};
+            a.call_args = {an + " ?? \"\""};   // LPUTF8Str marshals it
+            a.fwd_arg = "(" + cn + " ? " + cn + " : \"\")";
+        } else if constexpr (pw == Wire::Object) {
+            const ClassRef* pr = class_ref<PT>();
+            a.c_params = {std::string(c_type(pw)) + " " + cn};
+            // Named rather than IntPtr, so the marshaller holds a reference for
+            // the duration of the call.
+            a.cs_ext_params = {(pr ? pr->cs_name + "." + pr->handle
+                                   : std::string("IntPtr")) + " " + an};
+            a.call_args = {"MbNative.NotNull(" + an + ", \"" + an + "\").Borrow()"};
+            a.fwd_arg = "(*static_cast<" + (pr ? pr->cpp_name : "") + "*>(" + cn + "))";
+        } else {
+            a.c_params = {std::string(c_type(pw)) + " " + cn};
+            a.cs_ext_params = {std::string(cs_param_type(pw)) + " " + an};
+            a.call_args = {cs_cast_in<PT>(pw) + an};
+            const std::string cast = cpp_cast<PT>(pw);
+            a.fwd_arg = cast.empty() ? cn : cast + "(" + cn + ")";
+        }
+        return a;
+    }
+
     // An enum nobody registered would silently become a bare integer in the
     // generated C#, losing the one thing that made it worth binding.
     template<typename M>
@@ -2560,7 +2706,7 @@ private:
 
     template<typename T, std::size_t Index, std::size_t... Ps>
     static consteval bool ctor_params_ok(std::index_sequence<Ps...>) {
-        return (simple_param_wire_ok(wire_of<std::remove_cvref_t<
+        return (param_wire_ok(wire_of<std::remove_cvref_t<
                     typename [:ctor_param_type<T, Index, Ps>():]>>()) && ... && true);
     }
 
@@ -2580,11 +2726,10 @@ private:
             p.skipped.push_back({p.cs_name,
                 p.cs_name + "(" + std::to_string(argc) + " args)",
                 "a constructor parameter type does not cross the C ABI yet. A "
-                "constructor takes arithmetic types, bool, std::string and bound "
-                "enums; a std::vector, a bound class or a std::optional parameter "
-                "needs extra wire slots and C# statements before the call that only "
-                "an instance method emits today. Construct the object and then "
-                "assign the member, or add a setter"});
+                "constructor takes everything a method does -- arithmetic types, "
+                "bool, std::string, a bound enum or class, std::vector and "
+                "std::optional -- but not a std::map or a std::array, which have "
+                "no inbound form yet in any position"});
             return;
         } else if (ctor_param_enum_unregistered<T, Index>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name,
@@ -2595,35 +2740,24 @@ private:
             const std::string sym = claim_symbol(p, "mb_" + p.symbol + "_new_" + std::to_string(Index));
             const std::string ext_name = "New_" + std::to_string(Index);
 
-            std::string c_params, cs_ext_params, cs_sig_params;
-            std::string call_args, fwd_args, cs_types;
+            std::vector<ArgSlot> slots;
             [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
                 ([&] {
                     using PT = std::remove_cvref_t<typename [:ctor_param_type<T, Index, Ps>():]>;
-                    constexpr Wire pw = wire_of<PT>();
                     constexpr const char* an_id = ctor_param_ident<T, Index, Ps>();
-                    const std::string an = arg_name(an_id, Ps);
-                    const std::string cn = cpp_arg_name(an_id, Ps);
-                    const std::string sep = c_params.empty() ? "" : ", ";
-                    c_params += sep + c_type(pw) + " " + cn;
-                    cs_ext_params += sep + cs_param_type(pw) + " " + an;
-                    cs_sig_params += sep + cs_name_for<PT>(pw) + " " + an;
-                    cs_types += (cs_types.empty() ? "" : ",") + cs_name_for<PT>(pw);
-                    if (!call_args.empty()) call_args += ", ";
-                    if constexpr (pw == Wire::Bool) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " != 0)";
-                        call_args += an + " ? 1 : 0";
-                    } else if constexpr (pw == Wire::Utf8) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " ? " + cn + " : \"\")";
-                        call_args += an + " ?? \"\"";
-                    } else {
-                        const std::string cast = cpp_cast<PT>(pw);
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                  + (cast.empty() ? cn : cast + "(" + cn + ")");
-                        call_args += cs_cast_in<PT>(pw) + an;
-                    }
+                    slots.push_back(arg_slot<PT>(arg_name(an_id, Ps),
+                                                 cpp_arg_name(an_id, Ps)));
                 }(), ...);
             }(std::make_index_sequence<argc>{});
+            // A constructor has no described return: it always hands back a
+            // handle, which is not a value the caller chose.
+            const Joined j = join_slots(slots, RetSlot{});
+            const std::string& c_params = j.c_params;
+            const std::string& cs_ext_params = j.cs_ext_params;
+            const std::string& cs_sig_params = j.cs_sig_params;
+            const std::string& call_args = j.call_args;
+            const std::string& fwd_args = j.fwd_args;
+            const std::string& cs_types = j.cs_types;
 
             const std::string public_sig = "ctor(" + cs_types + ")";
             if (std::count(p.public_sigs.begin(), p.public_sigs.end(), public_sig)) {
@@ -2648,6 +2782,7 @@ private:
                     << "(" << cs_ext_params << ");\n\n";
 
             body << "public " << p.cs_name << "(" << cs_sig_params << ") {\n"
+                 << j.prologue
                  << "var p = " << ext_name << "(" << call_args << ");\n"
                  << "if (p == IntPtr.Zero) throw MbNative.LastError(\""
                  << p.cs_name << " constructor\");\n"
@@ -2695,11 +2830,10 @@ private:
         } else if constexpr (!static_params_ok<T, I>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name, "static " + name + "()",
                 "a parameter type does not cross the C ABI yet. A static method "
-                "takes arithmetic types, bool, std::string and bound enums; a "
-                "std::vector, a bound class or a std::optional parameter needs "
-                "extra wire slots and C# statements before the call that only an "
-                "instance method emits today -- as an instance method this "
-                "parameter works"});
+                "takes everything an instance method does -- arithmetic types, "
+                "bool, std::string, a bound enum or class, std::vector and "
+                "std::optional -- but not a std::map or a std::array, which have "
+                "no inbound form yet in any position"});
             return;
         } else if (enum_unregistered<Ret>()) {
             p.skipped.push_back({p.cs_name, "static " + name + "()",
@@ -2717,36 +2851,23 @@ private:
             const std::string ext_name = "SCall_" + name + suffix;
             p.emitted_statics.push_back(name);
 
-            std::string c_params, cs_ext_params, cs_sig_params;
-            std::string call_args, fwd_args, cs_types;
+            std::vector<ArgSlot> slots;
             [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
                 ([&] {
                     using PT = std::remove_cvref_t<
                         typename [:get_static_method_param_type<T, I, Ps>():]>;
-                    constexpr Wire pw = wire_of<PT>();
                     constexpr const char* an_id = static_param_ident<T, I, Ps>();
-                    const std::string an = arg_name(an_id, Ps);
-                    const std::string cn = cpp_arg_name(an_id, Ps);
-                    const std::string sep = c_params.empty() ? "" : ", ";
-                    c_params += sep + c_type(pw) + " " + cn;
-                    cs_ext_params += sep + cs_param_type(pw) + " " + an;
-                    cs_sig_params += sep + cs_name_for<PT>(pw) + " " + an;
-                    cs_types += (cs_types.empty() ? "" : ",") + cs_name_for<PT>(pw);
-                    if (!call_args.empty()) call_args += ", ";
-                    if constexpr (pw == Wire::Bool) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " != 0)";
-                        call_args += an + " ? 1 : 0";
-                    } else if constexpr (pw == Wire::Utf8) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " ? " + cn + " : \"\")";
-                        call_args += an + " ?? \"\"";
-                    } else {
-                        const std::string cast = cpp_cast<PT>(pw);
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                  + (cast.empty() ? cn : cast + "(" + cn + ")");
-                        call_args += cs_cast_in<PT>(pw) + an;
-                    }
+                    slots.push_back(arg_slot<PT>(arg_name(an_id, Ps),
+                                                 cpp_arg_name(an_id, Ps)));
                 }(), ...);
             }(std::make_index_sequence<argc>{});
+            const Joined j = join_slots(slots, RetSlot{});
+            const std::string& c_params = j.c_params;
+            const std::string& cs_ext_params = j.cs_ext_params;
+            const std::string& cs_sig_params = j.cs_sig_params;
+            const std::string& call_args = j.call_args;
+            const std::string& fwd_args = j.fwd_args;
+            const std::string& cs_types = j.cs_types;
 
             const std::string public_sig = "static " + name + "(" + cs_types + ")";
             if (std::count(p.public_sigs.begin(), p.public_sigs.end(), public_sig)) {
@@ -2793,7 +2914,8 @@ private:
                     << ext_name << "(" << cs_ext_params << ");\n\n";
 
             body << "public static " << cs_name_for<Ret>(rw) << " "
-                 << claim_cs_name(p, name) << "(" << cs_sig_params << ") {\n";
+                 << claim_cs_name(p, name) << "(" << cs_sig_params << ") {\n"
+                 << j.prologue;
             const std::string call = ext_name + "(" + call_args + ")";
             if constexpr (rw == Wire::None) {
                 body << call << ";\n" << "MbNative.Throw(\"" << name << "\");\n";
@@ -2816,7 +2938,7 @@ private:
 
     template<typename T, std::size_t I, std::size_t... Ps>
     static consteval bool static_params_ok(std::index_sequence<Ps...>) {
-        return (simple_param_wire_ok(wire_of<std::remove_cvref_t<
+        return (param_wire_ok(wire_of<std::remove_cvref_t<
                     typename [:get_static_method_param_type<T, I, Ps>():]>>()) && ... && true);
     }
 
@@ -2891,118 +3013,27 @@ private:
             const std::string ext_name = "Call_" + name + suffix;
             p.emitted_methods.push_back(name);
 
-            std::string c_params = "void* self";
-            std::string cs_ext_params = p.handle + " self";
-            std::string cs_sig_params;
-            std::string call_args;
-            std::string fwd_args;
-            // The public C# signature, used to refuse a second overload that
-            // would be indistinguishable to a C# caller even though C++ told
-            // them apart -- long and long long are both `long` here.
-            std::string cs_types;
-            // Statements the C# body needs before the call, for an argument
-            // that has to be materialised as an array first.
-            std::string vec_prologue;
+            std::vector<ArgSlot> slots;
             [&]<std::size_t... Ps>(std::index_sequence<Ps...>) {
                 ([&] {
-                    constexpr Wire pw = wire_of<
-                        std::remove_cvref_t<typename [:get_method_param_type<T, I, Ps>():]>>();
-                    constexpr const char* an_id = method_param_ident<T, I, Ps>();
-                    const std::string an = arg_name(an_id, Ps);
-                    const std::string cn = cpp_arg_name(an_id, Ps);
                     using PT = std::remove_cvref_t<
                         typename [:get_method_param_type<T, I, Ps>():]>;
-                    if constexpr (pw == Wire::Opt) {
-                        const OptPlan pop = opt_plan<PT>();
-                        if (pop.is_string) {
-                            // A null pointer is already nullopt, so no flag.
-                            c_params += std::string(", const char* ") + cn;
-                            cs_ext_params += std::string(", [MarshalAs(UnmanagedType.LPUTF8Str)] string ") + an;
-                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                      + "(" + cn + " ? " + pop.cpp_opt
-                                      + "(std::string(" + cn + ")) : " + pop.cpp_opt + "{})";
-                            if (!call_args.empty()) call_args += ", ";
-                            call_args += an;
-                        } else {
-                            c_params += std::string(", int32_t ") + cn + "_has, "
-                                      + pop.c_wire + " " + cn;
-                            cs_ext_params += std::string(", int ") + an + "_has, "
-                                           + pop.cs_wire + " " + an;
-                            fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                      + "(" + cn + "_has ? " + pop.cpp_opt
-                                      + "(static_cast<" + pop.cpp_inner + ">(" + cn
-                                      + ")) : " + pop.cpp_opt + "{})";
-                            if (!call_args.empty()) call_args += ", ";
-                            call_args += an + ".HasValue ? 1 : 0, " + an
-                                       + ".HasValue ? (" + pop.cs_wire + ")" + an
-                                       + ".Value : default(" + pop.cs_wire + ")";
-                        }
-                        if (!cs_sig_params.empty()) cs_sig_params += ", ";
-                        cs_sig_params += pop.cs_surface + " " + an;
-                        cs_types += (cs_types.empty() ? "" : ",") + pop.cs_surface;
-                        return;
-                    }
-                    if constexpr (pw == Wire::Vector) {
-                        const VectorPlan* pv = vector_plan<PT>();
-                        // Two wire parameters for one C# argument: the shim
-                        // builds the vector from the range, so nothing is
-                        // allocated on this side and nothing has to be freed.
-                        c_params += std::string(", const ") + pv->cpp_elem + "* "
-                                  + cn + "_data, int64_t " + cn + "_n";
-                        cs_ext_params += std::string(", [In] ") + pv->cs_elem + "[] "
-                                       + an + "_data, long " + an + "_n";
-                        if (!cs_sig_params.empty()) cs_sig_params += ", ";
-                        cs_sig_params += "IReadOnlyList<" + pv->cs_elem + "> " + an;
-                        cs_types += (cs_types.empty() ? "" : ",")
-                                  + ("IReadOnlyList<" + pv->cs_elem + ">");
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                  + pv->cpp_vec + "(" + cn + "_data, " + cn
-                                  + "_data + " + cn + "_n)";
-                        if (!call_args.empty()) call_args += ", ";
-                        call_args += an + "_arr, " + an + "_arr.LongLength";
-                        // Materialised once before the call. Our own vector
-                        // view implements IReadOnlyList<T>, so passing another
-                        // object's member straight through works.
-                        vec_prologue += "var " + an + "_arr = " + an + " as "
-                                      + pv->cs_elem + "[];\n"
-                                      + "if (" + an + "_arr == null) {\n"
-                                      + an + "_arr = new " + pv->cs_elem + "["
-                                      + an + ".Count];\n"
-                                      + "for (int i = 0; i < " + an + "_arr.Length; i++) "
-                                      + an + "_arr[i] = " + an + "[i];\n"
-                                      + "}\n";
-                        return;
-                    }
-                    c_params += std::string(", ") + c_type(pw) + " " + cn;
-                    cs_ext_params += std::string(", ") + cs_param_type(pw) + " " + an;
-                    if (!cs_sig_params.empty()) cs_sig_params += ", ";
-                    cs_sig_params += cs_name_for<PT>(pw) + " " + an;
-                    cs_types += (cs_types.empty() ? "" : ",") + cs_name_for<PT>(pw);
-                    if (!call_args.empty()) call_args += ", ";
-                    if constexpr (pw == Wire::Bool) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " != 0)";
-                        call_args += an + " ? 1 : 0";
-                    } else if constexpr (pw == Wire::Utf8) {
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ") + "(" + cn + " ? " + cn + " : \"\")";
-                        call_args += an + " ?? \"\"";   // LPUTF8Str marshals it
-                    } else if constexpr (pw == Wire::Object) {
-                        const ClassRef* pr = class_ref<PT>();
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                  + "(*static_cast<" + (pr ? pr->cpp_name : "") + "*>(" + cn + "))";
-                        // Named rather than IntPtr, so the marshaller holds a
-                        // reference for the duration of the call.
-                        cs_ext_params = cs_ext_params.substr(
-                            0, cs_ext_params.size() - (std::string(cs_param_type(pw)) + " " + an).size())
-                            + (pr ? pr->cs_name + "." + pr->handle : std::string("IntPtr")) + " " + an;
-                        call_args += "MbNative.NotNull(" + an + ", \"" + an + "\").Borrow()";
-                    } else {
-                        const std::string cast = cpp_cast<PT>(pw);
-                        fwd_args += std::string(fwd_args.empty() ? "" : ", ")
-                                  + (cast.empty() ? cn : cast + "(" + cn + ")");
-                        call_args += cs_cast_in<PT>(pw) + an;
-                    }
+                    constexpr const char* an_id = method_param_ident<T, I, Ps>();
+                    slots.push_back(arg_slot<PT>(arg_name(an_id, Ps),
+                                                 cpp_arg_name(an_id, Ps)));
                 }(), ...);
             }(std::make_index_sequence<argc>{});
+            // The leading self parameter is the only structural difference
+            // between this parameter list and the other two emitters'.
+            const Joined j = join_slots(slots, RetSlot{}, "void* self",
+                                        p.handle + " self", "Check()");
+            const std::string& c_params = j.c_params;
+            const std::string& cs_ext_params = j.cs_ext_params;
+            const std::string& cs_sig_params = j.cs_sig_params;
+            const std::string& call_args = j.call_args;
+            const std::string& fwd_args = j.fwd_args;
+            const std::string& cs_types = j.cs_types;
+            const std::string& vec_prologue = j.prologue;
 
             // Checked before anything is emitted: refusing after the shim
             // was written left a live entry point in the library that no
@@ -3101,8 +3132,7 @@ private:
             body << "public " << cs_name_for<Ret>(rw) << " " << claim_cs_name(p, name)
                  << "(" << cs_sig_params << ") {\n"
                  << vec_prologue;
-            const std::string call = ext_name + "(Check()"
-                                   + (call_args.empty() ? "" : ", " + call_args)
+            const std::string call = ext_name + "(" + call_args
                                    + opt_out_call + ")";
             if constexpr (rw == Wire::None) {
                 body << call << ";\n"

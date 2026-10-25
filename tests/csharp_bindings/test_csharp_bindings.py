@@ -200,8 +200,13 @@ class Driver {
             Console.WriteLine($"narrow-first: pick={nf.pick(5)} spick={NarrowFirst.spick(5)}");
         }
         using (var pr = new Pair(true)) {
-            Console.WriteLine($"ctor kept: which={pr.which} n={pr.n}");
+            Console.WriteLine($"ctor bool: which={pr.which} n={pr.n}");
         }
+        using (var pv = new Pair(new double[] { 1.0, 2.0, 3.0 })) {
+            Console.WriteLine($"ctor vector: which={pv.which} n={pv.n}");
+        }
+        Console.WriteLine($"static container: total={Shared.total(new int[] { 1, 2, 3 })}");
+        Console.WriteLine($"static optional: some={Shared.fallback(7)} none={Shared.fallback(null)}");
         using (var wa = new WithArray()) {
             Console.WriteLine($"fixed view: Count={wa.@fixed.Count} IsFixedSize={wa.@fixed.IsFixedSize} [1]={wa.@fixed[1]}");
             wa.@fixed[2] = 7.0;
@@ -524,17 +529,30 @@ truthy("one overload of each pair is refused",
 truthy("and of each static pair",
        cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
 
-print("\n=== a constructor refuses what it cannot spell ===")
-# The constructor emitter has no vector arm, so the vector overload used to be
-# declared void* and resolve through pointer-to-bool: it compiled and ran the
-# bool constructor.
-truthy("the container constructor is refused by name",
-       re.search(r"Pair\.Pair\(1 args\): a constructor parameter type", run.stdout)
-       is not None)
-truthy("and says which form does work",
-       "assign the member, or add a setter" in run.stdout)
+print("\n=== one slot description serves all three emitters ===")
+# A constructor and a static method used to be able to spell strictly less than
+# an instance method, and what they could not spell was emitted wrong rather
+# than refused: a vector parameter arrived as a bare void*, which converts to
+# bool. Both now build their parameter lists from the same arg_slot, so a
+# container parameter costs two wire slots and a prologue wherever it appears.
+truthy("a constructor takes a container as IReadOnlyList",
+       "public Pair(IReadOnlyList<double> xs)" in cs)
+truthy("as two wire slots, not one pointer",
+       "mb_Pair_new_0(const double* xs_data, int64_t xs_n)" in shim_src)
+truthy("and builds the vector from the range",
+       "Pair(std::vector<double>(xs_data, xs_data + xs_n))" in shim_src)
 check("no constructor takes a bare pointer", "public Pair(IntPtr" in cs, False)
-truthy("the bool constructor still binds", "public Pair(bool b)" in cs)
+truthy("the bool constructor still binds beside it", "public Pair(bool b)" in cs)
+
+truthy("a static method takes a container too",
+       "public static int total(IReadOnlyList<int> xs)" in cs)
+truthy("and an optional, with its has-flag as a second slot",
+       "public static int fallback(int? v)" in cs
+       and "mb_Shared_s_fallback(int32_t v_has, int32_t v)" in shim_src)
+truthy("a static string parameter still works",
+       "public static string shout(string s)" in cs)
+check("no static method mentions the unhandled-wire poison",
+      "MB_WIRE_UNHANDLED" in shim_src, False)
 
 print("\n=== maps cross as a live view, and a set is not one ===")
 truthy("a string-keyed map is an IReadOnlyDictionary",
@@ -1124,8 +1142,14 @@ if MCS and MONO:
                "locals: add=12" in out)
         truthy("a C# keyword parameter name still works",
                "keyword param: echo=p:hi" in out)
-        truthy("the constructor that was kept is the one that runs",
-               "ctor kept: which=2 n=1" in out)
+        truthy("the bool constructor runs when it is the one chosen",
+               "ctor bool: which=2 n=1" in out)
+        truthy("and the container constructor runs when it is",
+               "ctor vector: which=1 n=3" in out)
+        truthy("a static method receives a container",
+               "static container: total=6" in out)
+        truthy("and an optional, present and absent",
+               "static optional: some=7 none=-1" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
