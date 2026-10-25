@@ -203,8 +203,13 @@ struct WithArray {
     std::string joined() const { return labels[0] + "/" + labels[1]; }
 
     // Returned by value: the array has no identity apart from its storage, so
-    // a view of this would be a view of a temporary. Reported, not viewed.
+    // a view of this would be a view of a temporary. The honest surface is a
+    // copied double[], filled through a buffer the caller owns.
     std::array<double, 3> spread() const { return fixed; }
+
+    // An array OF STRINGS returned by value is still refused: it would need an
+    // array of char* out-slots and a free per element.
+    std::array<std::string, 2> spread_labels() const { return labels; }
 
     // Inbound needs the vector parameter's prologue plus an arity check and
     // does not have it yet, so this is reported too.
@@ -284,6 +289,18 @@ struct Shared {
     static int fallback(std::optional<int> v) { return v.value_or(-1); }
 
     static std::string shout(std::string s) { return s + "!"; }
+
+    // Returns, which needed RetSlot: the has-flag and the heap copy are
+    // trailing out-slots and a shim body, and both lived inside emit_method.
+    static std::optional<int> maybe(bool want) {
+        return want ? std::optional<int>(9) : std::nullopt;
+    }
+
+    static std::vector<int> spread(int n) {
+        std::vector<int> out;
+        for (int i = 0; i < n; ++i) out.push_back(i * 2);
+        return out;
+    }
 };
 
 // A string-keyed map is the most common non-vector container in a real public

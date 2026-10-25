@@ -207,6 +207,13 @@ class Driver {
         }
         Console.WriteLine($"static container: total={Shared.total(new int[] { 1, 2, 3 })}");
         Console.WriteLine($"static optional: some={Shared.fallback(7)} none={Shared.fallback(null)}");
+        var _some = Shared.maybe(true);
+        var _none = Shared.maybe(false);
+        var _noneTxt = _none.HasValue ? _none.Value.ToString() : "null";
+        Console.WriteLine($"static opt return: some={_some} none={_noneTxt}");
+        using (var _sv = Shared.spread(3)) {
+            Console.WriteLine($"static vec return: Count={_sv.Count} [1]={_sv[1]}");
+        }
         using (var wa = new WithArray()) {
             Console.WriteLine($"fixed view: Count={wa.@fixed.Count} IsFixedSize={wa.@fixed.IsFixedSize} [1]={wa.@fixed[1]}");
             wa.@fixed[2] = 7.0;
@@ -214,6 +221,7 @@ class Driver {
             wa.labels[1] = "HI";
             Console.WriteLine($"fixed strings: joined={wa.joined()}");
             Console.WriteLine($"fixed ToArray: {string.Join(",", Array.ConvertAll(wa.@fixed.ToArray(), x => ((int)x).ToString()))}");
+            Console.WriteLine($"array return: {string.Join(",", Array.ConvertAll(wa.spread(), x => ((int)x).ToString()))}");
             Expect<NotSupportedException>(() => wa.@fixed.Add(1.0), "fixed Add");
             Expect<NotSupportedException>(() => wa.@fixed.Clear(), "fixed Clear");
         }
@@ -551,6 +559,14 @@ truthy("and an optional, with its has-flag as a second slot",
        and "mb_Shared_s_fallback(int32_t v_has, int32_t v)" in shim_src)
 truthy("a static string parameter still works",
        "public static string shout(string s)" in cs)
+# Returns needed RetSlot: the has-flag is a trailing out-slot and the container
+# is a heap copy, and both lived inside emit_method until it was shared.
+truthy("a static method returns an optional",
+       "public static int? maybe(bool want)" in cs)
+truthy("with its has-flag as a trailing out-slot",
+       "mb_Shared_s_maybe(int32_t want, int32_t* has)" in shim_src)
+truthy("and a static method returns a container the caller owns",
+       "public static MbIntVector spread(int n)" in cs)
 check("no static method mentions the unhandled-wire poison",
       "MB_WIRE_UNHANDLED" in shim_src, False)
 
@@ -894,8 +910,16 @@ check("and no fixed helper is given a free, because a view owns nothing",
 # Two refusals, each for its own reason and each named.
 truthy("a const array member is refused like a const vector",
        re.search(r"WithArray\.pinned: it is const", run.stdout) is not None)
-truthy("an array returned by value is refused, not viewed",
-       re.search(r"WithArray\.spread\(\): returns", run.stdout) is not None)
+# An array has no identity apart from its storage, so it comes back as a
+# copied double[] rather than a view of a temporary -- no handle, no free.
+truthy("an array returned by value is a copied array",
+       "public double[] spread()" in cs)
+truthy("filled through a buffer the caller owns",
+       "mb_WithArray_spread(void* self, double* out, int64_t out_n)" in shim_src)
+truthy("and the count it returns is checked rather than discarded",
+       "if (r != 3) throw MbNative.LastError" in cs)
+truthy("an array OF STRINGS returned by value is still refused",
+       re.search(r"WithArray\.spread_labels\(\): returns", run.stdout) is not None)
 truthy("and an array parameter is refused",
        re.search(r"WithArray\.sum_of_fixed\(\): a parameter type", run.stdout) is not None)
 # The shim re-parses the project's headers. Pinned at C++17 it rejected any
@@ -1150,6 +1174,12 @@ if MCS and MONO:
                "static container: total=6" in out)
         truthy("and an optional, present and absent",
                "static optional: some=7 none=-1" in out)
+        truthy("an array comes back by value as a copied array",
+               "array return: 1,2,7" in out)
+        truthy("a static method returns an optional, present and absent",
+               "static opt return: some=9 none=null" in out)
+        truthy("and a container the caller owns",
+               "static vec return: Count=3 [1]=2" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:

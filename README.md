@@ -194,6 +194,7 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
 | **Constructors** | ✅ | ✅ | ✅ | ✅ |
 | **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Static methods & constructors: full parameter and return set** | ✅ | ✅ | ✅ | ✅ |
 | **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ⚠️ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
@@ -218,7 +219,9 @@ output and as a comment in the `.cs` at the point the member would have been, so
 member can be told from an absent one. `vector<T>` of a scalar or string crosses as a live
 view in all three positions; `std::array<T, N>` crosses as a live **member** — the same view
 class, with `Add` and `Clear` raising `NotSupportedException` because the length is part of
-the C++ type — while an array returned by value or taken as a parameter is reported by name.
+the C++ type — and **returned by value** as a copied `T[]`, because an array has no identity
+apart from its storage and a view of a returned one would point at a temporary. An array
+*parameter*, and an array of strings returned by value, are still reported by name.
 `vector<bool>` does not cross at all: it stores bits and hands back a proxy, so there is no
 element to address.
 
