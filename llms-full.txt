@@ -182,6 +182,7 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
 | **Constructors** | ✅ | ✅ | ✅ | ✅ |
 | **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
@@ -749,8 +750,9 @@ python3 test_greeter.py
 
 A `greeter.pyi` is written next to the module. It is the fastest way to see
 what crossed: real C++ parameter names, exact member types, and the types that
-actually come back (a numeric vector is an `array.array`, not a `list`). Pass
-`--no-stubs` to skip it.
+actually come back (a method returning a numeric vector gives an
+`array.array`, not a `list`; a vector *member* gives a live view of the C++
+vector that you can append to). Pass `--no-stubs` to skip it.
 
 ## Step 4: Create Your Own
 
@@ -936,7 +938,9 @@ than silently misbehaving:
 
 ## Two results that will surprise you
 
-**A numeric vector comes back as `array.array`, not a `list`.** This is
+**A numeric vector comes back as `array.array`, not a `list`.** This applies
+to a method return; a vector *data member* is a live view of the C++ vector
+instead, which you can append to and which numpy reads without copying. This is
 deliberate: the conversion is a bulk copy of the buffer rather than building a
 list of boxed floats, which is where a good part of the speedup above comes
 from. From 1 KB up it is one copy, straight out of the C++ container; below
@@ -4479,9 +4483,21 @@ one minor release, an entry in the CHANGELOG, and a migration note:
 | Discovery opt-outs | `// MIRROR_BRIDGE_SKIP`, `// MIRROR_BRIDGE_SKIP_FILE` |
 | CLI commands & flags | `generate`, `build`, `pch`, `diff`, `watch`, `doctor`, `version` and their documented options |
 | `--json` output | Existing fields keep their names and types; changes are additive only |
-| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` → `array.array` |
+| Type-conversion contract | The mappings in [type-conversion.md](type-conversion.md), including `std::vector<numeric>` returned from a method → `array.array` |
 | Umbrella headers | `mirror_bridge.hpp`, `lua/mirror_bridge_lua.hpp`, `javascript/mirror_bridge_javascript.hpp` |
 | CMake target | `mirror_bridge::mirror_bridge` via `find_package`/FetchContent |
+
+### Changed in 0.4.0
+
+Reading a `std::vector` **data member** gives a live view of the C++ vector
+rather than a copy. A method returning the same type is unchanged. The view is
+a `collections.abc.MutableSequence`, so code that iterates, indexes, slices,
+takes `len` or compares against a list keeps working; code that asserted
+`isinstance(obj.field, list)` or `isinstance(obj.field, array.array)`, or that
+passed the member straight to `json.dumps`, needs `list(obj.field)`.
+
+This was a bug fix with a visible type change: the copy meant
+`obj.field.append(x)` was accepted and silently discarded.
 
 ## Experimental
 
@@ -4550,11 +4566,40 @@ Mirror Bridge automatically converts types between C++ and target languages. Thi
 
 | C++ Type | Python | Lua | JavaScript |
 |----------|--------|-----|------------|
-| `std::vector<T>` (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
-| `std::vector<T>` (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (numeric T) | `array.array` (bulk memcpy) | `table` (array) | `Array` |
+| `std::vector<T>` returned from a method (other T) | `list` | `table` (array) | `Array` |
+| `std::vector<T>` read as a **data member** | live view (see below) | `table` (array) | `Array` |
 | `std::array<T, N>` | `list` | `table` (array) | `Array` |
 | `std::deque<T>` | `list` | `table` (array) | `Array` |
 | `std::list<T>` | `list` | `table` (array) | `Array` |
+
+**A vector data member is a live view, not a copy.** Reading one gives an
+object that holds a pointer to the C++ vector itself and a reference to its
+owner, so `obj.points.append(p)` and `obj.points[0] = p` reach the C++ object
+instead of mutating a temporary that is then discarded. It registers as a
+`collections.abc.MutableSequence`, which is what the `.pyi` says it is, and
+supports `len`, indexing, negative indices, iteration, `in`, `==` against any
+sequence, `append`, `extend`, `insert`, `pop`, `clear`, `del` and `tolist()`.
+A numeric one also exports the buffer protocol, so `numpy.asarray(obj.xs)`
+shares the vector's own storage rather than copying it.
+
+Because the view does not copy, reading a member is O(1) instead of O(n):
+measured on a `vector<double>` member, 122 ns to 44 ns at ten elements and
+54.0 us to 44 ns at a hundred thousand.
+
+Three cases deliberately keep the copy they always had:
+
+- **A method return.** A reference out of a method cannot be shown to point
+  inside the receiver, so there is nothing to keep alive and nothing to view.
+- **A `const` member.** A writable view of one would get around what C++ said.
+- **`std::vector<bool>`.** It packs its elements and yields a proxy, so there
+  is no element to take a reference to.
+
+A slice (`v[:]`), `list(v)` and `v.tolist()` each give a real copy, which is
+how you take a snapshot. Resizing is refused with `BufferError` while a
+`memoryview` or numpy array is outstanding, because it would reallocate the
+storage they point at. Holding an element of a vector of classes across an
+`append` has the same hazard the underlying C++ reference would.
 
 **Bulk transfer optimization**: For `vector<float>`, `vector<double>`, `vector<int>`, and other numeric types, Python bindings copy the buffer in bulk into an `array.array` object instead of converting element by element. This is ~10-50x faster for large arrays. At or above 1 KB the buffer is copied once, out of the C++ container through a borrowed `memoryview`; below that it goes through an intermediate `bytes` object, which is two copies but one fewer call into the interpreter and measurably cheaper at that size. The crossover is a measured one and can be moved with `-DMIRROR_BRIDGE_ARRAY_BORROW_BYTES=<n>`. The `from_python` direction accepts both `list` and `array.array` inputs.
 
@@ -6348,6 +6393,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The CLI reads a project's `compile_commands.json` instead of asking for its build configuration again.** The argument for this is written in the compatibility corpus' own manifest: opencv needs a hand-generated `opencv_modules.hpp` written into its checkout before its headers parse, open3d is reachable only for `geometry/` because `core/` wants MKL and `ml/` wants CUDA, eigen needs sixteen `--exclude` patterns, abseil needs a bespoke build command. Every one of those is a person rediscovering, as `-I` and `-D` flags, something the project's own build system already recorded. At a few hundred thousand lines that is a chore; at twenty million it is the entire job, and it is the reason pointing a generator at a large codebase fails for a dull reason rather than an interesting one. `--compile-commands PATH` harvests the include paths and defines by allowlist — `-I`, `-isystem`, `-iquote`, `-idirafter`, `-iframework`, `-F`, `-D`, `-U`, `-include` — because an unrecognised flag in a large project's build is far likelier to be an optimisation, a sanitiser or a dependency-generation flag than something the reflection pass needs, and taking it on faith is how a generator ends up passing `-flto` to a syntax-only probe. The flags reach both compile sites the script has, for the same reason the existing `-D` handling does: a discovery unit preprocessed differently from the module reports a different library from the one that gets built. Three deliberate decisions. The project's own `-std=` is **dropped**, because reflection needs C++26 and the project is on something older, so its standard flag winning would break the pass outright; that is reported rather than silent. MSVC and clang-cl spellings — `/I`, `/D`, `/U`, `/external:I`, `/FI` — are translated, which is not politeness but the point: MSVC has no reflection support, so a Windows project's build runs there while generation runs on a machine that has a reflection compiler, and the database handed over is full of MSVC flags. And a flag carrying whitespace is **refused with a warning** rather than passed, because the CLI interpolates these into a string that word-splits, so one `-D` with a spaced value would silently become two flags and change what the compiler was told. A macro defined two ways across one build is reported the same way instead of being resolved quietly. `--compile-commands-for PATH` scopes the database to a subtree, because on a monorepo the union of every subsystem's flags is both enormous and self-contradictory, and `--replace-prefix OLD=NEW` maps a database written on one machine onto the paths of another. That last flag exists because of what the tests found: `os.path.isabs("C:/proj/inc")` is **false** on POSIX, so every Windows path was being joined onto the entry's build directory, producing `-I/linux/build/C:/proj/inc` — an include path that can match nothing and reports no error. That is the normal case for this feature, not an edge case.
 - **`--discover-only` answers "can this codebase be read at all" without building a module per class.** Reading a large project's headers is the expensive and interesting half of the work; generating and compiling a module for everything found is what turns minutes into hours, and the corpus records 138 seconds for Open3D's geometry subtree alone. `--discover-only` stops after discovery and reports the class count, the enum count, the header count, the seconds the reflection pass took, and the harvested-flag count. The field that matters is `source`: `reflection` means the headers were read after the preprocessor and the class list is real, while `text scan` means the reflection unit failed and every name came from reading header text, which cannot see a class declared through an export macro (`class MYLIB_API Widget`) or resolve a typedef. A large codebase reporting `text scan` is not a slow problem, it is a blocked one, and generating from that list would bind the wrong names — so the report says that outright and names the planner log that explains the failure. Pairs with `--json`, which emits one object carrying the counts, the class and enum names, the headers and the compile-database report.
 - **A C# backend (`--lang csharp`).** C# reaches native code through P/Invoke, so unlike CPython, Lua and Node there is no host C API a generated translation unit can call: the binding needs a flat C ABI on one side and C# declarations on the other, which is the same shape SWIG's C# module has and for the same reason. The architecture is forced further by a hard limit in P2996 — **reflection cannot declare a function whose name is computed**, and every P/Invoke target needs its own exported symbol — so a generator built with reflection emits the shim as text and an ordinary compile turns that into the shared library. The alternative, one indexed entry point dispatching on a class id, would have cost a jump table on every call, and the point of this project is that the generated path is the code a person would have written. Emitting text turned out to be the right shape for the people who want this most: **the shim contains no reflection at all**, so it rebuilds with whatever compiler they already have, and for anyone on MSVC a shim that needed reflection would have been unusable. Both files come out of one reflection pass over one class list, so a member renamed in C++ renames the exported symbol and the C# property together — there is no second list to keep in step. What crosses today: a default constructor, arithmetic members and parameters, `bool` (as a 32-bit integer on the wire, converted at the edge, because a C++ `bool` is one byte and C# marshals one as four and the mismatch is silent), `std::string` (a UTF-8 heap copy out with an explicit free, `LPUTF8Str` marshalled in, rather than a pointer into the live `std::string` that would dangle the moment anything mutated the object), methods over those types, and `const` members as read-only properties. Generated classes are `IDisposable` with a finalizer. A C++ exception is caught at every entry point and recorded in a thread-local, then raised on the managed side as an exception carrying `what()`, because an exception crossing `extern "C"` is undefined behaviour. Everything that cannot cross yet — a container member, a class-typed return, a second overload of a name — is named in the run output **and** as a comment in the generated C# at the point where the member would have been, because a generator that silently binds a subset leaves the caller unable to tell a missing member from an absent one. Generated code for both files is indented by one brace-depth formatter rather than by the care taken at each emission site; the first version had three different indentations inside a single class because each site had guessed separately.
+### Changed
+- **A `std::vector` data member is a live view of the C++ vector, not a copy.** `obj.items.append(9)` and `obj.items[0] = 9` were both accepted and both silently discarded: the getter built a fresh `array.array` or `list` on every read, the mutation landed on that temporary, and the temporary was dropped at the end of the statement. No exception, no warning, no way to find out. This is the container half of what member views did for class members in PR #32, and it rests on the same fact: a non-static data member is interior to the wrapped object by construction, so the getter can hand back something that borrows the storage and keeps its owner alive, which a method return cannot. The view registers as a `collections.abc.MutableSequence` and supports `len`, indexing, negative indices, iteration, `in`, `==` against any sequence, `append`, `extend`, `insert`, `pop`, `clear`, `del` and `tolist()`. A numeric one also exports the buffer protocol, so `numpy.asarray(obj.xs)` shares the vector's own storage. Not copying also removes an O(n) allocation from every attribute read: measured on a `vector<double>` member, 122 ns to 44 ns at ten elements and 54.0 us to 44 ns at a hundred thousand, where the new cost is flat because it no longer depends on the length. Three cases keep the copy on purpose — a method return, because interiority cannot be established for one; a `const` member, because a writable view would get around what C++ said; and `std::vector<bool>`, which packs its elements and has no element to reference. Resizing is refused with `BufferError` while a `memoryview` or numpy array is outstanding, since it would reallocate the storage they point at; the export count is kept per C++ container rather than per view object, because every attribute read builds a new view of the same vector and a per-view count said yes to exactly the append that invalidates the buffer. **Migration:** code that asserted `isinstance(obj.field, list)` or `isinstance(obj.field, array.array)`, or that passed a member straight to `json.dumps`, wants `list(obj.field)`. This changes a mapping [stability.md](docs/reference/stability.md) lists as stable, which is why it is called out here rather than filed under Fixed.
 
 ### Fixed
 - **Lua and JavaScript could not bind any class with a `const` data member, or with a member whose type has no default constructor.** Both setters declare a local of the member's declared type to convert into and then move into place. For a `const` member that local is a default-initialised const and the assignment a write to a const lvalue; for a type like `nlohmann::detail::dtoa_impl::diyfp`, which declares only `diyfp(uint64_t, int)`, there is no default constructor to declare it with. Either one is ill-formed, so the whole module failed to compile rather than that one attribute failing to assign — and the Python backend has handled both for long enough that `tests/const_members/` documents them in comments. It had only a Python test, which is exactly why nobody saw it. Both setters now refuse such a member by name at runtime, and JavaScript's constructor path had the same shape twice over in two unguarded `new T()` calls, so a class with no default constructor took the module down from there as well. `tests/lua/const_members/` and `tests/js/const_members/` were added, because the gap was never in the code so much as in which languages the test covered. Found while bringing the C# backend to parity: C# had to decide what a const member means, and the answer turned out to be one the other two had never been asked.

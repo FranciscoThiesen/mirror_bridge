@@ -77,13 +77,23 @@ assert o.plain.x == 11.0, o.plain.x
 assert o.leaf_copy().x == 11.0
 print("  ✓ leaf_ref() still returns a copy (documented limitation)")
 
-print("Test 8: non-class members are untouched...")
+print("Test 8: a string member still converts by value...")
 assert o.label == "owner"
 o.label = "renamed"
 assert o.label == "renamed"
+print("  ✓ a string member is still a str")
+
+print("Test 8b: a vector member is a live view, not a copy...")
+# This used to assert isinstance(o.many, list), which was the whole bug: the
+# list was a copy, so o.many.append(Leaf()) was accepted and discarded.
 assert len(o.many) == 2
-assert isinstance(o.many, list)
-print("  ✓ strings and containers convert by value as before")
+assert not isinstance(o.many, list)
+o.many[0].x = 3.0
+assert o.many[0].x == 3.0, o.many[0].x
+o.many.append(mv.Leaf())
+assert len(o.many) == 3, len(o.many)
+assert list(o.many)[0].x == 3.0
+print("  ✓ writing and appending through a vector member reach the owner")
 
 print("Test 9: a view is accepted where the class is expected...")
 # The boundary type gate must recognise a view as a real Leaf.

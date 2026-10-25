@@ -178,6 +178,7 @@ See [the CLI reference](docs/reference/cli.md#csharp-output).
 | **Methods (any arity)** | ✅ | ✅ | ✅ | ✅ |
 | **Constructors** | ✅ | ✅ | ✅ | ✅ |
 | **Containers (vector/array)** | ✅ | ✅ | ✅ | ⚠️ |
+| **Live `std::vector` members** | ✅ | ❌ | ❌ | ✅ |
 | **Maps (map/unordered_map)** | ✅ | ✅ | ✅ | ❌ |
 | **Sets (set/unordered_set)** | ✅ | ✅ | ✅ | ❌ |
 | **Tuples (tuple/pair)** | ✅ | ✅ | ✅ | ❌ |
