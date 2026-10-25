@@ -828,6 +828,22 @@ public:
         p.header = header ? header : "";
         p.default_constructible = std::is_default_constructible_v<T>;
         if (!p.header.empty()) headers_.insert(p.header);
+        if constexpr (complete_v<T>) {
+            if constexpr (!std::is_destructible_v<std::remove_cvref_t<T>>) {
+                // The shim deletes through this handle and SafeHandle has
+                // nothing else to call, so a class whose destructor is deleted
+                // or not public cannot be owned from C#. Refusing it keeps the
+                // module building and reports it; binding it borrow-only, with
+                // no constructor and no deleter, is a real option but is an
+                // ownership-model change rather than a guard.
+                refused_.push_back({cs_name, cs_name,
+                    "its destructor is deleted or not public, so C# cannot own "
+                    "one: the handle's release path has nothing it may call, and "
+                    "a class freed by an owning pool would be double-freed the "
+                    "first time it was disposed"});
+                return;
+            }
+        }
         if constexpr (!core::type_key_is_distinctive<std::remove_cvref_t<T>>()) {
             // Leave it out of the ledger rather than give it an identity it
             // does not own. Anything referring to this class then reports "a
@@ -957,6 +973,14 @@ public:
         for (const auto& c : classes_) skipped += c.skipped.size();
         std::fprintf(out, "csharp: %zu class(es), %zu member(s) or method(s) left out\n",
                      classes_.size(), skipped);
+        // A refused CLASS is reported first and counted apart, because it is a
+        // different fact from a skipped member: the class is absent from the
+        // .cs entirely, so a reader who does not see it named here has no way
+        // to tell it from a class the headers never had.
+        for (const auto& r : refused_) {
+            std::fprintf(out, "  %s: the whole class is not bound -- %s\n",
+                         r.name.c_str(), r.reason.c_str());
+        }
         for (const auto& c : classes_) {
             for (const auto& r : c.renamed) {
                 std::fprintf(out, "  %s.%s renamed to %s: the generated class "
@@ -974,6 +998,9 @@ private:
     std::string module_;
     std::string namespace_;
     std::vector<ClassPlan> classes_;
+    // Classes that could not be bound at all, as opposed to members left out
+    // of a class that was.
+    std::vector<Skipped> refused_;
     std::vector<EnumPlan> enums_;
     // Keyed on display_string_of, which is the only spelling the emission
     // sites and the registration site can both compute from the type alone.

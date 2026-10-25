@@ -271,6 +271,19 @@ struct Pair {
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
 };
 
+// Freed by an owning pool, so its destructor is not public. tinyxml2's
+// XMLElement and box2d's bodies are both this shape. mb_<C>_delete was emitted
+// unconditionally and SafeHandle's release path has nothing else to call, so
+// this did not compile -- and had it compiled it would have been a double free
+// the first time C# disposed one. The whole class is refused and named.
+struct PoolOwned {
+    int id = 11;
+    int doubled() const { return id * 2; }
+
+protected:
+    ~PoolOwned() = default;
+};
+
 // An abstract interface. Every member call is qualified with its declaring
 // class to disambiguate an inherited name, and a qualified call suppresses
 // virtual dispatch -- which for a PURE virtual means naming a symbol that

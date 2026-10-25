@@ -540,6 +540,18 @@ truthy("one overload of each pair is refused",
 truthy("and of each static pair",
        cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
 
+print("\n=== a class C# cannot own is refused, and named ===")
+# A refused CLASS is a different fact from a skipped member: the class is
+# absent from the .cs entirely, so a reader who does not see it named has no
+# way to tell it from a class the headers never had.
+truthy("the class is named in the run output",
+       re.search(r"PoolOwned: the whole class is not bound", run.stdout) is not None)
+truthy("and the reason names the ownership problem",
+       "double-freed" in run.stdout)
+check("it gets no C# class", "class PoolOwned" in cs, False)
+check("and no deleter it could never call", "mb_PoolOwned_delete" in shim_src, False)
+truthy("while the class beside it still binds", "public sealed class Forward" in cs)
+
 print("\n=== a pure virtual is called through the vtable, not by name ===")
 # A qualified call suppresses dispatch, and a pure virtual has no definition
 # anywhere, so `self->Iface::kind()` was an undefined reference that took the
