@@ -1734,6 +1734,10 @@ private:
     }
 
     template<typename M>
+    // Find-only on purpose, because it is const: it cannot register a plan.
+    // A caller that may be the FIRST to mention a container type has to
+    // register it first, or this answers with the bare wire type. See
+    // ret_slot, where getting that order wrong was a defect.
     std::string cs_name_for(Wire w) const {
         if (w == Wire::Opt) {
             const OptPlan op = opt_plan<M>();
@@ -1932,6 +1936,23 @@ private:
             r.captures = false;
             r.shim_return = "MB_I;\n";
             return r;
+        }
+
+        // Registration has to happen BEFORE cs_name_for is asked. That
+        // function resolves a container through a find-only lookup and answers
+        // "IntPtr" for a plan nobody has registered yet, which produces a
+        // method declared IntPtr whose body returns an MbIntVector -- CS0029,
+        // in generated code, pointing at a line the reader did not write.
+        //
+        // The 25-class fixture cannot catch this: some other member there
+        // always registers the element type first. It took a scaffolded
+        // single-class project whose only std::vector<int> was this very
+        // return, which is why tests/test_cli_init.sh compiles what it
+        // scaffolds instead of only checking that the files exist.
+        if constexpr (rw == Wire::Vector) {
+            (void)vector_plan<Ret>();
+        } else if constexpr (rw == Wire::Map) {
+            (void)map_plan<Ret>();
         }
 
         r.c_ret = c_type(rw);
