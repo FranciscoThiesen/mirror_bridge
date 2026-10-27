@@ -592,6 +592,14 @@ struct Joined {
                 cs_types, prologue;
 };
 
+// Whether Marshal.Copy has an (IntPtr, T[], int, int) overload for this C#
+// element type. Where it does not, ToArray reads element by element instead:
+// correct for any type, and the bulk path stays for the six that have one.
+inline bool marshal_copy_has_overload(const std::string& cs_elem) {
+    return cs_elem == "byte" || cs_elem == "short" || cs_elem == "int"
+        || cs_elem == "long" || cs_elem == "float" || cs_elem == "double";
+}
+
 inline void slot_append(std::string& into, const std::string& what,
                         const char* sep) {
     if (what.empty()) return;
@@ -1761,7 +1769,9 @@ private:
               // One bulk copy out of the vector's own storage instead of a
               // P/Invoke per element. The shim already exported the data
               // pointer for this and nothing had declared it.
-              : std::string("if (n > 0) {\n")
+              : !marshal_copy_has_overload(E)
+                ? std::string("for (int i = 0; i < n; i++) a[i] = this[i];\n")
+                : std::string("if (n > 0) {\n")
                 + "var p = VData(P());\n"
                 + "if (p == IntPtr.Zero) throw MbNative.LastError(\"" + N + ".ToArray\");\n"
                 + "Marshal.Copy(p, a, 0, n);\n"

@@ -540,6 +540,27 @@ truthy("one overload of each pair is refused",
 truthy("and of each static pair",
        cs.count("an earlier overload already has the C# signature static spick(long)") == 2)
 
+print("\n=== a bulk copy is only used where Marshal.Copy has an overload ===")
+# Its (IntPtr, T[], int, int) overloads are Byte, Char, Double, Int16, Int32,
+# Int64, IntPtr and Single only. sbyte, ushort, uint and ulong have none, so
+# emitting the bulk copy for them was CS1503 -- a hard failure under the
+# -warnaserror gate, on the element types index buffers and mesh topology use.
+def view_class_body(name):
+    at = cs.find("public sealed class " + name + " :")
+    if at < 0:
+        return ""
+    nxt = cs.find("public sealed class ", at + 1)
+    return cs[at:nxt if nxt > 0 else len(cs)]
+
+truthy("an unsigned vector has a view class at all",
+       view_class_body("MbUintVector") != "")
+check("and it never calls a Marshal.Copy overload that does not exist",
+      "Marshal.Copy" in view_class_body("MbUintVector"), False)
+truthy("while a double vector still takes the bulk path",
+       "Marshal.Copy" in view_class_body("MbDoubleVector"))
+check("and nor does a size_t one", "Marshal.Copy" in view_class_body("MbUlongVector"), False)
+truthy("and a size_t vector binds", "public MbUlongVector offsets {" in cs)
+
 print("\n=== a class C# cannot own is refused, and named ===")
 # A refused CLASS is a different fact from a skipped member: the class is
 # absent from the .cs entirely, so a reader who does not see it named has no
