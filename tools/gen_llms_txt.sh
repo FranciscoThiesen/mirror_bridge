@@ -60,6 +60,7 @@ link "docs/reference/type-conversion.md"  "Type Conversion"     "Supported C++ t
 link "docs/reference/errors.md"           "Errors"              "Error messages and troubleshooting reference"
 link "docs/internals/architecture.md"     "Architecture"        "How the reflection-driven generator works internally"
 link "docs/internals/features.md"         "Feature Matrix"      "Verified features across all supported languages"
+link "docs/internals/csharp-design.md"    "C# Backend Design"   "Why C# generation is two-stage, the decisions behind the generated surface, and the gaps and unmeasured claims stated plainly"
 
 echo "" >> "$INDEX"
 echo "## Examples" >> "$INDEX"

@@ -23,6 +23,7 @@
 - [Errors](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/reference/errors.md): Error messages and troubleshooting reference
 - [Architecture](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/architecture.md): How the reflection-driven generator works internally
 - [Feature Matrix](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/features.md): Verified features across all supported languages
+- [C# Backend Design](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/docs/internals/csharp-design.md): Why C# generation is two-stage, the decisions behind the generated surface, and the gaps and unmeasured claims stated plainly
 
 ## Examples
 - [Examples](https://github.com/FranciscoThiesen/mirror_bridge/blob/main/examples/README.md): Progressive examples from beginner to production
