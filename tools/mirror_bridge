@@ -3346,15 +3346,25 @@ CS_EOF
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
 
   <!-- The generated build/${module_name}.cs needs no entry here: the SDK's
        default **/*.cs glob already picks it up. The native library is not a
-       compile item, so it is copied beside the assembly instead. -->
+       compile item, so it is copied beside the assembly instead.
+
+       All three platform spellings, because the shim is built wherever you
+       generate: a Linux-only item made `dotnet run` a DllNotFoundException on
+       macOS and Windows, on a project this tool had just scaffolded. -->
   <ItemGroup>
     <None Include="build/lib${module_name}.so"
           Condition="Exists('build/lib${module_name}.so')"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="build/lib${module_name}.dylib"
+          Condition="Exists('build/lib${module_name}.dylib')"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="build/${module_name}.dll"
+          Condition="Exists('build/${module_name}.dll')"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

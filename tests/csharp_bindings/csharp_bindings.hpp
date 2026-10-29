@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <compare>
@@ -269,6 +270,51 @@ struct Pair {
     int n = 0;
     Pair(std::vector<double> xs) : which(1), n(static_cast<int>(xs.size())) {}
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
+};
+
+// A destructor counter, so "was the C++ object actually deleted?" is
+// observable from C#. Without it a leak and a merely-deferred release look
+// identical, and the two have different severities.
+//
+// The defect this pins: a borrowed view held a ref on its owner's handle for
+// the view's whole lifetime and returned it only in Dispose, and the view
+// classes had no finalizer -- so a view collected undisposed left the owner's
+// refcount above zero and the C++ object was never deleted, even once
+// everything was unreachable. Measured before and after on the same probe:
+// destroyed=0 before, destroyed=1 after. A foreach over a vector member
+// without a using was enough to trigger it.
+inline int& mb_tracked_destroyed() {
+    static int n = 0;
+    return n;
+}
+
+struct Tracked {
+    std::vector<double> items{1.0, 2.0};
+    ~Tracked() { ++mb_tracked_destroyed(); }
+
+    int tag() const { return 7; }
+    static int destroyed() { return mb_tracked_destroyed(); }
+};
+
+// Marshal.Copy has an (IntPtr, T[], int, int) overload for exactly Byte, Char,
+// Double, Int16, Int32, Int64, IntPtr and Single. Our wire mapping also
+// produces sbyte, ushort, uint and ulong, which have none -- so ToArray on one
+// of those emitted Marshal.Copy(p, uint[], 0, n) and the module died on CS1503
+// while the run said "0 member(s) left out".
+//
+// The 34-class fixture had vector<double>, <string>, <bool>, <int>, <long> and
+// <long long> and so could never catch it. These are index-buffer and
+// mesh-topology shaped, which is to say most of graphics and geometry: keep
+// them here so the bulk-copy path stays gated on the overload existing.
+struct Widths2 {
+    std::vector<unsigned> indices{1u, 2u, 3u};
+    std::vector<std::size_t> offsets{0, 3};
+    std::vector<unsigned short> small{7, 8};
+    std::vector<signed char> tiny{1, 2};
+
+    unsigned index_sum() const {
+        return indices[0] + indices[1] + indices[2];
+    }
 };
 
 // Freed by an owning pool, so its destructor is not public. tinyxml2's
