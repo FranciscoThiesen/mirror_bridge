@@ -272,6 +272,30 @@ struct Pair {
     Pair(bool b) : which(2), n(b ? 1 : 0) {}
 };
 
+// A destructor counter, so "was the C++ object actually deleted?" is
+// observable from C#. Without it a leak and a merely-deferred release look
+// identical, and the two have different severities.
+//
+// The defect this pins: a borrowed view held a ref on its owner's handle for
+// the view's whole lifetime and returned it only in Dispose, and the view
+// classes had no finalizer -- so a view collected undisposed left the owner's
+// refcount above zero and the C++ object was never deleted, even once
+// everything was unreachable. Measured before and after on the same probe:
+// destroyed=0 before, destroyed=1 after. A foreach over a vector member
+// without a using was enough to trigger it.
+inline int& mb_tracked_destroyed() {
+    static int n = 0;
+    return n;
+}
+
+struct Tracked {
+    std::vector<double> items{1.0, 2.0};
+    ~Tracked() { ++mb_tracked_destroyed(); }
+
+    int tag() const { return 7; }
+    static int destroyed() { return mb_tracked_destroyed(); }
+};
+
 // Marshal.Copy has an (IntPtr, T[], int, int) overload for exactly Byte, Char,
 // Double, Int16, Int32, Int64, IntPtr and Single. Our wire mapping also
 // produces sbyte, ushort, uint and ulong, which have none -- so ToArray on one

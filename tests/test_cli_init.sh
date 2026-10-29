@@ -69,6 +69,16 @@ check "the .csproj copies the native library beside the assembly" \
     file_contains "$TMPDIR/proj_csharp/proj_csharp.csproj" "libproj_csharp.so"
 check "the .csproj builds an executable" \
     file_contains "$TMPDIR/proj_csharp/proj_csharp.csproj" "<OutputType>Exe</OutputType>"
+# net8.0 goes out of support 2026-11-10, so a scaffold emitting it hands a new
+# project an unsupported runtime on day one.
+check "the .csproj targets a supported framework" \
+    file_contains "$TMPDIR/proj_csharp/proj_csharp.csproj" "<TargetFramework>net10.0</TargetFramework>"
+# The shim is built wherever you generate, so a Linux-only item made dotnet run
+# a DllNotFoundException on macOS and Windows -- on a project this tool wrote.
+check "and copies the macOS native library too" \
+    file_contains "$TMPDIR/proj_csharp/proj_csharp.csproj" "libproj_csharp.dylib"
+check "and the Windows one" \
+    file_contains "$TMPDIR/proj_csharp/proj_csharp.csproj" "proj_csharp.dll"
 check "the C# README gives the .NET SDK route" \
     file_contains "$TMPDIR/proj_csharp/README.md" "dotnet run"
 check "the C# README gives the mono route the container can run" \
