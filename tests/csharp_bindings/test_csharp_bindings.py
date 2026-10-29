@@ -229,6 +229,25 @@ class Driver {
         using (var _sv = Shared.spread(3)) {
             Console.WriteLine($"static vec return: Count={_sv.Count} [1]={_sv[1]}");
         }
+        using (var li = new Device()) {
+            li.samples.Clear();
+            li.samples.Add(10.0);
+            li.samples.Add(30.0);
+            li.samples.Insert(1, 20.0);
+            Console.WriteLine($"ilist insert: count={li.samples.Count} [1]={li.samples[1]}");
+            Console.WriteLine($"ilist indexof: {li.samples.IndexOf(30.0)} contains={li.samples.Contains(20.0)}");
+            var removed = li.samples.Remove(20.0);
+            Console.WriteLine($"ilist remove: {removed} count={li.samples.Count} sum={li.sum_of(li.samples)}");
+            li.samples.RemoveAt(0);
+            Console.WriteLine($"ilist removeat: count={li.samples.Count} [0]={li.samples[0]}");
+            var dst = new double[3];
+            li.samples.CopyTo(dst, 1);
+            Console.WriteLine($"ilist copyto: {dst[0]},{dst[1]} readonly={li.samples.IsReadOnly}");
+            // The view composes with an API that asks for IList<T>, which the
+            // read-only-only declaration made impossible.
+            System.Collections.Generic.IList<double> asList = li.samples;
+            Console.WriteLine($"ilist composes: count={asList.Count}");
+        }
         using (var wa = new WithArray()) {
             Console.WriteLine($"fixed view: Count={wa.@fixed.Count} IsFixedSize={wa.@fixed.IsFixedSize} [1]={wa.@fixed[1]}");
             wa.@fixed[2] = 7.0;
@@ -241,6 +260,11 @@ class Driver {
             Expect<ArgumentException>(() => wa.sum_of_fixed(new double[] { 1.0 }),
                                       "array param wrong length");
             Expect<NotSupportedException>(() => wa.@fixed.Add(1.0), "fixed Add");
+            Expect<NotSupportedException>(() => wa.@fixed.Insert(0, 1.0), "fixed Insert");
+            Expect<NotSupportedException>(() => wa.@fixed.RemoveAt(0), "fixed RemoveAt");
+            // Not read-only though: the ELEMENTS are writable, only the length
+            // is fixed, which is what IList<T> says a fixed-size list is.
+            Console.WriteLine($"fixed readonly={wa.@fixed.IsReadOnly} indexof={wa.@fixed.IndexOf(2.0)}");
             Expect<NotSupportedException>(() => wa.@fixed.Clear(), "fixed Clear");
         }
         using (var vfix = new Device()) {
@@ -872,7 +896,25 @@ truthy("and tests it with a memory read", "Marshal.ReadInt32(s)" in cs)
 
 print("\n=== containers: a member is the live vector, a return is a copy ===")
 truthy("a view class is generated per element type",
-       "public sealed class MbDoubleVector : IReadOnlyList<double>, IDisposable" in cs)
+       "public sealed class MbDoubleVector :" in cs)
+# Both, as List<T> itself does: IList<T> is what the mutators mean, and
+# IReadOnlyList<T> is what a read-only consumer asks for. Declaring only the
+# read-only one while having Add, Clear and a settable indexer was a lie that
+# also stopped the view composing with an API taking IList<double>.
+truthy("declaring IList<T> so the mutators it has are honest",
+       "IList<double>" in cs)
+truthy("and IReadOnlyList<T> so a read-only consumer can still take it",
+       "IReadOnlyList<double>" in cs)
+truthy("with the rest of IList<T> actually implemented",
+       "public int IndexOf(double item)" in cs
+       and "public void CopyTo(double[] array, int arrayIndex)" in cs
+       and "public bool IsReadOnly => false;" in cs)
+# Insert and RemoveAt are backed by vector::insert and vector::erase, not by
+# NotSupportedException: throwing on a growable vector would claim the
+# fixed-size contract for something that merely had no helper.
+truthy("Insert and RemoveAt reach real C++ operations",
+       "_insert(void* v, int64_t i," in shim_src
+       and "vec->erase(vec->begin()" in shim_src)
 truthy("and for strings too", "public sealed class MbStringVector" in cs)
 truthy("one set of element helpers serves every class that uses that vector type",
        shim_src.count("mb_vec_double_size") == 1)
@@ -1257,6 +1299,26 @@ if MCS and MONO:
         # and wait cycles in the driver.
         truthy("an undisposed borrowed view does not leak its owner",
                "pin before: destroyed=0" in out and "pin after: destroyed=1" in out)
+        # IList<T>'s mutators reach vector::insert and vector::erase, so they
+        # work on a growable view rather than throwing the fixed-size
+        # exception for something that merely had no helper.
+        truthy("Insert puts an element in the middle of the C++ vector",
+               "ilist insert: count=3 [1]=20" in out)
+        truthy("IndexOf and Contains find it",
+               "ilist indexof: 2 contains=True" in out)
+        truthy("Remove takes it out and C++ sees the new length",
+               "ilist remove: True count=2 sum=40" in out)
+        truthy("RemoveAt too", "ilist removeat: count=1 [0]=30" in out)
+        truthy("CopyTo honours the destination offset",
+               "ilist copyto: 0,30 readonly=False" in out)
+        truthy("and the view composes with an IList<T> parameter",
+               "ilist composes: count=1" in out)
+        # The fixed view refuses exactly the length-changing operations.
+        truthy("a fixed view refuses Insert",
+               "fixed Insert -> NotSupportedException" in out)
+        truthy("and RemoveAt", "fixed RemoveAt -> NotSupportedException" in out)
+        truthy("but is not read-only, because its elements are writable",
+               "fixed readonly=False indexof=1" in out)
         # The expected value comes from each fixture's DECLARATION ORDER, not
         # from a literal: the first-declared overload is the one bound, and a
         # single-order test passes by luck because on LP64 the accidental
