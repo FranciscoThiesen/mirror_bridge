@@ -317,6 +317,30 @@ struct Widths2 {
     }
 };
 
+// An abstract class that DECLARES a constructor. emit_constructors enumerates
+// constructors by reflection, and a declared constructor is not the same thing
+// as a constructible class: the shim emitted `new Abstract(name)` and the whole
+// module failed with "allocating an object of abstract class type".
+//
+// pmp-library's BasePropertyArray is the real one -- explicit
+// BasePropertyArray(std::string) beside virtual void reserve(size_t) = 0 -- and
+// it cost pmp-library its module. Iface below did not catch it, because its
+// default constructor is implicit and reflection does not report one.
+struct AbstractWithCtor {
+    int tag = 0;
+    explicit AbstractWithCtor(int t) : tag(t) {}
+    virtual ~AbstractWithCtor() = default;
+    virtual int measure() const = 0;
+    int doubled_tag() const { return tag * 2; }
+};
+
+// Concrete, so it binds the ordinary way and gives the abstract base something
+// to be a view of.
+struct ConcreteOfAbstract : AbstractWithCtor {
+    ConcreteOfAbstract() : AbstractWithCtor(5) {}
+    int measure() const override { return 42; }
+};
+
 // A MUTABLE char* is an out-buffer, not a string. core::StringLike admits one,
 // so the generator read `buf` as a string parameter, emitted `const char*` for
 // it on the wire, and passed that to a char* -- "no matching member function",

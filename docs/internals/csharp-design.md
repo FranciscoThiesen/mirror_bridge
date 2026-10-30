@@ -268,21 +268,27 @@ not a workaround for a facility we ignored.
 
 ### Scale
 
-- **The generator translation unit is the heaviest thing this backend compiles,
-  and it is the one corpus failure left.** The other three backends emit one
-  binding per class into a module; this one instantiates an `Emitter` method per
-  class, over the full reflection surface, in a single TU — then that TU *runs*
-  to write the shim. pmp-library (32 classes over Eigen) exhausts the constexpr
-  budget and still fails after the escalation to
-  `-fconstexpr-steps=2000000000`.
+- **Reflection discovery exhausts the constexpr budget on a codebase of real
+  size, and the escalation is not always enough.** pmp-library (32 classes over
+  Eigen) runs out at `-fconstexpr-steps=100000000`, the CLI escalates to
+  `2000000000`, and it *still* falls back to scanning header text. That fallback
+  is shared with the other three backends and is not C#-specific, but the C#
+  generator translation unit is the heaviest thing here: the others emit one
+  binding per class into a module, while this one instantiates an `Emitter`
+  method per class over the full reflection surface in a single TU and then
+  *runs* it.
 
-  This is the gap that matters most for a large codebase, because it is the one
-  that gets worse with size rather than with the shapes a library uses. Nothing
-  about it is diagnosed beyond the budget: whether the cost is in discovery, in
-  `add_class` instantiation or in one pathological type is unmeasured, and
-  `--discover-only` already separates the first of those. Splitting the
-  generator across translation units — one per header, say — is the obvious
-  shape and is untried.
+  Nothing about where the cost sits is measured. `--discover-only` already
+  separates discovery from generation, which is the obvious first experiment.
+  Splitting the generator across translation units — one per header, say — is
+  the obvious second and is untried.
+
+  **This is a gap, not the cause of any corpus failure.** It was written up as
+  pmp-library's cause and that was wrong: the budget is real and pmp-library
+  still falls back to a text scan, but the text-scan path now binds all 32 of
+  its classes. What had actually stopped the module was an abstract class — see
+  below. The cost of the fallback is a slower build and a class list that cannot
+  see a name declared through an export macro, not a failure.
 
 ### Type coverage
 
@@ -295,7 +301,7 @@ design: its halves are already `VectorPlan`s, and a string half has a wire.
 ## What the corpus says, as of 2026-10-30
 
 Pointing `compatibility/run_compatibility.py --lang csharp` at the **seven**
-libraries that bind under the Python backend: **6 of 7 bind usefully**, every one
+libraries that bind under the Python backend: **7 of 7 bind usefully**, every one
 of them with the `must_export` names the manifest demands.
 
 | library | verdict | classes | API the manifest requires |
@@ -306,14 +312,14 @@ of them with the `must_export` names the manifest demands.
 | cxxopts | **ok** | 27 | `Options`, `ParseResult` |
 | SQLiteCpp | **ok** | 9 | `Database`, `Statement`, `Column` |
 | tinyobjloader | **ok** | 26 | `ObjReader`, `attrib_t`, `shape_t` |
-| pmp-library | `reflection-tu-failed` | 32 discovered | — |
+| pmp-library | **ok** | 32 | `SurfaceMesh`, `Vertex` |
 
 Which of these six were genuinely broken, and how certainly:
 
-- **cxxopts, pugixml and tinyobjloader** were real failures this branch fixed,
-  attributed with certainty because the compiler error was read directly — a
-  `CS0102`, a mutable `char*` passed to a `char*`, and an unqualified class name
-  in two translation units.
+- **cxxopts, pugixml, tinyobjloader and pmp-library** were real failures this
+  branch fixed, attributed with certainty because the compiler error was read
+  directly — a `CS0102`, a mutable `char*` passed to a `char*`, an unqualified
+  class name in two translation units, and `new` on an abstract class.
 - **jsoncpp and SQLiteCpp** both printed `✗ the generated shim did not build`
   before the `char*` fix and build after it. That makes it the likely cause, but
   it was not isolated and is not claimed as certain.
@@ -372,12 +378,38 @@ failure *proves* discovery and codegen both worked, so the override no longer
 applies to it. This matters for C# specifically, because `--no-undefined` makes
 the case reachable at **build** time rather than at import.
 
-**pmp-library is a genuine generator-stage limit, and it is the one real thing
-left on this list.** It exhausts the constexpr budget and still fails after the
-escalation to `-fconstexpr-steps=2000000000`, with the namespace fix above in
-place. The C# generator TU is heavier than a Python binding TU — it instantiates
-an `Emitter` method per class rather than a binding per class — so it is the
-stage most exposed to this, and 32 classes over Eigen is what exposes it.
+**pmp-library was a declared constructor on an abstract class, and I called it
+a scale limit before reading the error.** Its row said `reflection-tu-failed`
+and the budget part of that is true — discovery does exhaust
+`-fconstexpr-steps=2000000000` and fall back to a text scan, and still does. But
+the thing that stopped the module was one line further on:
+
+```
+pmp_compat_shim.cpp:665:22: error: allocating an object of abstract class
+                                   type 'BasePropertyArray'
+```
+
+`BasePropertyArray` declares `explicit BasePropertyArray(std::string)` and also
+`virtual void reserve(size_t) = 0`. `emit_constructors` enumerates constructors
+by **reflection**, and a declared constructor is not the same thing as a
+constructible class, so the shim wrote `new BasePropertyArray(...)`.
+
+That is the **third** time this one site has emitted an ill-formed `new` — after
+a parameter type that could not cross, and after an inaccessible destructor. So
+the fix is a gate on the actual condition rather than a third enumerated reason:
+`std::is_constructible_v<T, Args...>`, which is false for an abstract class, a
+deleted constructor and an inaccessible destructor alike. The borrow-only gate
+stays ahead of it only because the ownership message is more useful.
+
+With that gate in place pmp-library **binds**: 32 classes, with `SurfaceMesh`
+and `Vertex`, over a text-scan class list.
+
+The lesson for the gap list above: **read the first error before naming a
+cause.** A row's category is the classifier's best guess from matched text, and
+a category that is *partly* right — discovery really did fail here — is the kind
+that stops you looking. Both of the two libraries I was ready to write off as
+generator-stage limits were ordinary codegen bugs with a real discovery failure
+in front of them.
 
 ### How this number was wrong, and in which direction
 

@@ -3483,6 +3483,30 @@ private:
                  && param_ref_ok<typename [:ctor_param_type<T, Index, Ps>():]>()) && ... && true);
     }
 
+    // Whether the shim may write `new T(args...)` AT ALL.
+    //
+    // emit_constructors enumerates constructors by reflection, and a declared
+    // constructor is not the same thing as a constructible class. pmp-library's
+    // BasePropertyArray declares `explicit BasePropertyArray(std::string)` and
+    // also `virtual void reserve(size_t) = 0`, so it is abstract: the shim
+    // emitted `new BasePropertyArray(...)` and the whole module failed with
+    // "allocating an object of abstract class type".
+    //
+    // This is the THIRD time this one site has emitted an ill-formed `new`.
+    // The first two were enumerated reasons -- an inaccessible destructor, and
+    // before that a parameter type that could not cross -- so this is a gate on
+    // the actual condition instead of a third special case:
+    // is_constructible_v<T, Args...> is false for an abstract class, for a
+    // deleted constructor, and for an inaccessible destructor alike.
+    //
+    // A borrow-only class is refused earlier, by name, because the ownership
+    // reason is the more useful message; this would refuse it too.
+    template<typename T, std::size_t Index, std::size_t... Ps>
+    static consteval bool ctor_is_constructible(std::index_sequence<Ps...>) {
+        return std::is_constructible_v<T,
+            std::remove_cvref_t<typename [:ctor_param_type<T, Index, Ps>():]>...>;
+    }
+
     template<typename T, std::size_t Index, std::size_t... Ps>
     bool ctor_param_enum_unregistered(std::index_sequence<Ps...>) const {
         bool bad = false;
@@ -3495,7 +3519,16 @@ private:
     void emit_constructor(ClassPlan& p, std::ostringstream& shim,
                           std::ostringstream& externs, std::ostringstream& body) {
         constexpr std::size_t argc = ctor_argc<T, Index>();
-        if constexpr (!ctor_params_ok<T, Index>(std::make_index_sequence<argc>{})) {
+        if constexpr (!ctor_is_constructible<T, Index>(std::make_index_sequence<argc>{})) {
+            p.skipped.push_back({p.cs_name,
+                p.cs_name + "(" + std::to_string(argc) + " args)",
+                std::is_abstract_v<T>
+                    ? "the class is abstract, so the shim cannot allocate one: "
+                      "it declares a constructor but has a pure virtual member"
+                    : "the shim cannot allocate one with these arguments, even "
+                      "though a constructor taking them is declared"});
+            return;
+        } else if constexpr (!ctor_params_ok<T, Index>(std::make_index_sequence<argc>{})) {
             p.skipped.push_back({p.cs_name,
                 p.cs_name + "(" + std::to_string(argc) + " args)",
                 "a constructor parameter type does not cross the C ABI yet. A "

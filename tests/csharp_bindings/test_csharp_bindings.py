@@ -719,6 +719,24 @@ truthy("while a double vector still takes the bulk path",
 check("and nor does a size_t one", "Marshal.Copy" in view_class_body("MbUlongVector"), False)
 truthy("and a size_t vector binds", "public MbUlongVector offsets {" in cs)
 
+print("\n=== a declared constructor is not a constructible class ===")
+# emit_constructors enumerates constructors by reflection. pmp-library's
+# BasePropertyArray declares one AND has a pure virtual, so the shim emitted
+# `new BasePropertyArray(...)` and the module died on "allocating an object of
+# abstract class type". Third time this one site emitted an ill-formed `new`,
+# hence a gate on is_constructible rather than a third enumerated reason.
+check("no entry point allocates the abstract class",
+      "mb_AbstractWithCtor_new" in shim_src, False)
+truthy("and the refusal says it is abstract",
+       re.search(r"AbstractWithCtor\.AbstractWithCtor\(1 args\): the class is "
+                 r"abstract", run.stdout) is not None)
+# Refusing the constructor must not refuse the class: an abstract base is still
+# reachable as a view, which is the whole point of binding one.
+truthy("the class itself still binds",
+       "public sealed class AbstractWithCtor" in cs)
+truthy("and its concrete subclass constructs",
+       "public ConcreteOfAbstract()" in cs)
+
 print("\n=== a mutable char* is an out-buffer, not a string ===")
 # core::StringLike admits char*, which cost pugixml its whole module: the
 # parameter was read as a string, emitted as `const char*` on the wire, and
