@@ -56,6 +56,40 @@ class TestUsabilityBar(unittest.TestCase):
         self.assertEqual(v["status"], "token-binding")
 
 
+class TestLinkFailureIsNotADiscoveryFailure(unittest.TestCase):
+    """A link failure proves discovery and codegen both worked.
+
+    tinyobjloader was published as "reflection could not read these headers"
+    when the truth is that it is not header-only. Two bugs stacked: the
+    classifier had no rule for `undefined reference`, so clang's "linker
+    command failed with exit code 1" matched the generic \berror\b rule, and
+    then the text-scan override replaced that with reflection-tu-failed.
+    """
+
+    LINK = ("tinyobj_compat_shim.cpp:(.text+0x8238): undefined reference to "
+            "`vtable for tinyobj::MaterialFileReader'\n"
+            "clang++: error: linker command failed with exit code 1\n")
+
+    def test_undefined_reference_is_needs_linking(self):
+        category, reason, _ = rc.classify_failure(None, self.LINK)
+        self.assertEqual(category, "needs-linking")
+        self.assertIn("link-args", reason)
+
+    # The rule has to sit ABOVE the generic one, or clang's own summary line
+    # wins because it contains the word error.
+    def test_it_beats_the_generic_compile_error_rule(self):
+        category, _, _ = rc.classify_failure(
+            None, "clang++: error: linker command failed with exit code 1\n"
+                  "/usr/bin/ld: undefined symbol: foo\n")
+        self.assertEqual(category, "needs-linking")
+
+    def test_a_real_compile_error_is_still_a_compile_error(self):
+        category, _, _ = rc.classify_failure(
+            None, "shim.cpp:12:3: error: no matching member function for call "
+                  "to 'evaluate_string'\n")
+        self.assertEqual(category, "compile-error")
+
+
 class TestArtifactName(unittest.TestCase):
     """Which file existing means "a module was built", per backend.
 

@@ -87,6 +87,22 @@ FAILURE_SIGNATURES = [
      r"template instantiation depth|recursive template instantiation",
      "template instantiation runs away during binding",
      re.I),
+    # A LINK failure, which proves discovery and codegen both worked: the shim
+    # calls functions declared in the headers and defined in the library's own
+    # sources, so the library is not header-only and its objects have to be
+    # linked in. That is `generate --link-args`, and it is the caller's to
+    # supply, so it is not a mirror_bridge failure.
+    #
+    # It has to sit above the generic rule, because clang's "linker command
+    # failed with exit code 1" contains the word error and was being published
+    # as an unclassified compile failure. For the C# backend it is reachable at
+    # BUILD time rather than at import, because --no-undefined refuses to
+    # produce a .so that cannot be loaded -- so this is the only place such a
+    # library can be recognised.
+    ("needs-linking",
+     r"undefined reference to|undefined symbol",
+     "not header-only: pass the built library to `generate --link-args`",
+     re.I),
     # The admission that something is not yet classified. The pattern is the
     # compiler's own marker rather than "any line", because matching the first
     # line of output just reported the CLI's banner as the cause.
@@ -488,7 +504,13 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
 
     if not built:
         category, reason, line = classify_failure(cli_json, combined)
-        if row["discovery"] == "text-scan":
+        # A link failure is not a discovery failure, whatever the discovery
+        # field says: the shim could not have referenced the library's symbols
+        # unless reflection had read its headers. tinyobjloader was published
+        # as "reflection could not read these headers" when the truth was that
+        # it is not header-only -- a damning cause for an innocent library, and
+        # the override is what produced it.
+        if row["discovery"] == "text-scan" and category != "needs-linking":
             category = "reflection-tu-failed"
             # Terse on purpose: this is the most common row, the Discovery
             # column already says `text-scan`, and the page explains what that

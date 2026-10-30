@@ -290,14 +290,29 @@ of them with the `must_export` names the manifest demands.
 | pmp-library | `reflection-tu-failed` | 32 discovered | — |
 | tinyobjloader | `reflection-tu-failed` | 26 discovered | — |
 
-The two failures are **generator-stage**, not C# codegen: the reflection
-translation unit that writes the shim does not compile. pmp-library exhausts the
-constexpr budget and still fails after the escalation to
-`-fconstexpr-steps=2000000000`; tinyobjloader fails in three seconds, which is
-too fast to be a budget problem. The C# generator TU is heavier than a Python
-binding TU — it instantiates an `Emitter` method per class rather than a
-binding per class — so it is the stage most exposed to this, and these two are
-the next thing to diagnose.
+Neither of the two misses is C# codegen, and `reflection-tu-failed` was the
+wrong cause for one of them.
+
+**tinyobjloader is not header-only.** Reproducing it shows discovery working
+and the *link* failing: `undefined reference to tinyobj::ObjReader::ParseFromFile`
+and three more of its own symbols. The shim calls functions declared in the
+headers and defined in the library's sources, so its objects have to be linked
+in — `generate --link-args`, the caller's to supply, and its manifest entry
+gives none. Two bugs stacked to publish that as a reflection failure: the
+classifier had no rule for `undefined reference`, so clang's "linker command
+failed with exit code 1" matched the generic `\berror\b` rule, and then the
+`text-scan → reflection-tu-failed` override replaced even that. A link failure
+*proves* discovery and codegen both worked, so the override no longer applies
+to it. This matters beyond one row: for C# the case is reachable at **build**
+time rather than at import, because `--no-undefined` refuses to produce a `.so`
+that cannot be loaded, so the build-time classifier is the only place such a
+library can be recognised at all.
+
+**pmp-library is a genuine generator-stage limit.** It exhausts the constexpr
+budget and still fails after the escalation to `-fconstexpr-steps=2000000000`.
+The C# generator TU is heavier than a Python binding TU — it instantiates an
+`Emitter` method per class rather than a binding per class — so it is the stage
+most exposed to this, and it is the one real thing left on this list.
 
 ### How this number was wrong, and in which direction
 
