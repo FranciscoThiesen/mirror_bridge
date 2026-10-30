@@ -56,6 +56,37 @@ class TestUsabilityBar(unittest.TestCase):
         self.assertEqual(v["status"], "token-binding")
 
 
+class TestArtifactName(unittest.TestCase):
+    """Which file existing means "a module was built", per backend.
+
+    This had one answer, Python's, so `os.path.isfile(<module>.so)` was False
+    for every C# library whether or not the build succeeded -- and "0/32 bind"
+    was a statement about that line rather than about the backend. Adding
+    --lang threaded the flag through run_one and left this behind.
+    """
+
+    def test_python_and_lua_emit_a_plain_so(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "python"),
+                         "jsoncpp_compat.so")
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "lua"),
+                         "jsoncpp_compat.so")
+
+    def test_node_emits_a_node_addon(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "js"),
+                         "jsoncpp_compat.node")
+
+    # The whole point: C# writes lib<module>.so, so the Python spelling can
+    # never match and the row can never say built.
+    def test_csharp_emits_a_lib_prefixed_so(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "csharp"),
+                         "libjsoncpp_compat.so")
+
+    def test_no_backend_shares_csharp_spelling(self):
+        for lang in ("python", "lua", "js"):
+            self.assertNotEqual(rc.module_artifact("m", lang),
+                                rc.module_artifact("m", "csharp"))
+
+
 class TestRegressionLadder(unittest.TestCase):
     def test_ranks_are_ordered(self):
         self.assertGreater(rc.outcome_rank("ok"), rc.outcome_rank("partial-binding"))

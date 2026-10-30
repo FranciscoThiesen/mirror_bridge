@@ -356,6 +356,19 @@ def build_library(lib, checkout, build_dir, timeout):
     return None
 
 
+# The file whose existence means "a module was built", per backend. Python and
+# Lua both emit <module>.so, Node emits <module>.node, and C# emits
+# lib<module>.so beside the <module>.cs a dotnet project compiles -- the shared
+# library is the right thing to test for, because the .cs is written before the
+# shim is compiled and so exists even for a build that failed at the link.
+def module_artifact(module, lang):
+    if lang == "js":
+        return module + ".node"
+    if lang == "csharp":
+        return "lib" + module + ".so"
+    return module + ".so"
+
+
 def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     row = {
         "name": lib["name"], "ref": lib["ref"], "shape": lib.get("shape", "oo"),
@@ -458,11 +471,20 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     row["classes_found"] = len(classes)
     row["class_names"] = sorted({c.get("name", "") for c in classes})[:12]
 
-    module = os.path.join(out, lib["module"] + ".so")
+    # Each backend names its artifact differently, and this check used to know
+    # only Python's. A C# build writes lib<module>.so, so os.path.isfile of
+    # <module>.so was False for EVERY C# library whether or not the build
+    # succeeded -- which made "0/32 bind" a statement about this function
+    # rather than about the backend. Adding --lang threaded the flag through
+    # and left this behind, which is this project's recurring defect: one fact
+    # about the build recorded in two places.
+    module = os.path.join(out, module_artifact(lib["module"], lang))
     built = os.path.isfile(module)
     row["module_built"] = built
     row["module_bytes"] = os.path.getsize(module) if built else 0
-    row["stub_written"] = os.path.isfile(os.path.join(out, lib["module"] + ".pyi"))
+    row["module_artifact"] = os.path.basename(module)
+    row["stub_written"] = (lang == "python"
+                           and os.path.isfile(os.path.join(out, lib["module"] + ".pyi")))
 
     if not built:
         category, reason, line = classify_failure(cli_json, combined)
@@ -487,7 +509,14 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
         row.update(status="failed", category=category, reason=reason, detail=line)
         return row
 
-    # Built is not the bar: a module that will not import is not usable.
+    # Built is not the bar: a module that will not load is not usable. For
+    # Python, Lua and Node that means importing it. For C# there is nothing to
+    # import -- the artifact is a plain shared library a dotnet project
+    # P/Invokes into -- so the equivalent is that it dlopens and that the
+    # entry points for the API are really exported.
+    if lang == "csharp":
+        return finish_csharp(row, lib, out, module)
+
     # The names come back too, not just the count, because `must_export` below
     # has to be checked against them.
     probe = subprocess.run(
@@ -527,6 +556,53 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     # library's own documentation rather than from what happens to bind.
     verdict = classify_exports(lib.get("must_export") or [], exported)
     row.update(verdict)
+    return row
+
+
+# The C# half of "is this usable". Two questions, in order: does the library
+# load at all, and does the generated API actually name the classes a caller
+# needs.
+#
+# dlopen rather than a symbol listing, because an undefined symbol or a missing
+# dependency is exactly the failure --no-undefined exists to catch and a symbol
+# table would not see it. Then the class list from the generated .cs, because
+# that is the surface a C# caller writes against -- and because a borrow-only
+# class deliberately has no mb_<Class>_delete symbol, so the symbol table is no
+# longer a complete index of what bound.
+def finish_csharp(row, lib, out, module):
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import ctypes, sys; ctypes.CDLL(sys.argv[1]); print('ok')", module],
+        capture_output=True, text=True, timeout=120)
+    if probe.returncode != 0:
+        err = strip_ansi(probe.stderr or "").strip()
+        last = err.splitlines()[-1][:200] if err else ""
+        if "undefined symbol" in err:
+            row.update(status="needs-linking", category="needs-linking",
+                       reason="not header-only: pass the built library to "
+                              "`generate --link-args`",
+                       detail=last)
+        else:
+            row.update(status="imports-failed", category="imports-failed",
+                       reason="the library built but will not load",
+                       detail=last)
+        return row
+
+    cs_path = os.path.join(out, lib["module"] + ".cs")
+    try:
+        with open(cs_path, encoding="utf-8", errors="replace") as f:
+            cs = f.read()
+    except OSError as exc:
+        row.update(status="imports-failed", category="imports-failed",
+                   reason="the library loaded but the generated C# is missing",
+                   detail=str(exc)[:200])
+        return row
+
+    exported = sorted(set(re.findall(r"public sealed class (\w+)", cs))
+                      - {"MbPin"})
+    row["exported_names"] = len(exported)
+    row["exported_sample"] = exported[:40]
+    row.update(classify_exports(lib.get("must_export") or [], exported))
     return row
 
 
