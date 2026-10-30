@@ -42,6 +42,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <algorithm>
@@ -2055,6 +2056,63 @@ private:
         }
     }
 
+    // The C# statements that turn one IReadOnlyList<string> into the three
+    // wire slots mb_strv and mb_strarr read: a UTF-8 blob, a byte count per
+    // element, and the element count.
+    //
+    // Shared by the vector and the fixed-array arms, which differ only in the
+    // C++ expression they build from the result. Every local but the loop
+    // counter is prefixed with the argument's own name, so a SIBLING
+    // parameter is what could collide with one -- see is_generated_local,
+    // which owns the list of suffixes used here.
+    static std::string str_blob_prologue(const std::string& an) {
+        std::ostringstream o;
+        o << "var " << an << "_sa = " << an << " as string[];\n"
+          << "if (" << an << "_sa == null) {\n"
+          << "if (" << an << " == null) throw new ArgumentNullException(nameof("
+          << an << "));\n"
+          << an << "_sa = new string[" << an << ".Count];\n"
+          << "for (int i = 0; i < " << an << "_sa.Length; i++) "
+          << an << "_sa[i] = " << an << "[i];\n"
+          << "}\n"
+          << "var " << an << "_lens = new long[" << an << "_sa.Length];\n"
+          // Total bytes while the blob is being sized, then the write cursor
+          // into it. One name rather than two, because every name here is a
+          // parameter name a caller cannot use -- see is_generated_local.
+          << "long " << an << "_nb = 0;\n"
+          << "for (int i = 0; i < " << an << "_sa.Length; i++) {\n"
+          << an << "_lens[i] = System.Text.Encoding.UTF8.GetByteCount("
+          << an << "_sa[i] ?? string.Empty);\n"
+          << an << "_nb += " << an << "_lens[i];\n"
+          << "}\n"
+          // One byte past the end, so a list of only empty strings -- or an
+          // empty list -- still marshals as a pointer the shim can walk
+          // harmlessly, rather than a zero-length array whose marshalled
+          // address is not guaranteed to be anything in particular.
+          << "var " << an << "_blob = new byte[" << an << "_nb + 1];\n"
+          << an << "_nb = 0;\n"
+          << "for (int i = 0; i < " << an << "_sa.Length; i++) {\n"
+          << "string " << an << "_str = " << an << "_sa[i] ?? string.Empty;\n"
+          << an << "_nb += System.Text.Encoding.UTF8.GetBytes(" << an << "_str, 0, "
+          << an << "_str.Length, " << an << "_blob, (int)" << an << "_nb);\n"
+          << "}\n";
+        return o.str();
+    }
+
+    // The three wire slots themselves, identical on both sides of the
+    // vector/array split.
+    static void fill_str_blob_slots(ArgSlot& a, const std::string& an,
+                                    const std::string& cn) {
+        a.c_params = {"const char* " + cn + "_blob",
+                      "const int64_t* " + cn + "_lens",
+                      "int64_t " + cn + "_n"};
+        a.cs_ext_params = {"[In] byte[] " + an + "_blob",
+                           "[In] long[] " + an + "_lens",
+                           "long " + an + "_n"};
+        a.call_args = {an + "_blob", an + "_lens", an + "_sa.LongLength"};
+        a.prologue = str_blob_prologue(an);
+    }
+
     // One parameter, as slots. `an` is the C# spelling (keyword-escaped, renamed
     // off a generated local); `cn` is what C++ declared it. The two differ on
     // purpose -- see cpp_arg_name.
@@ -2093,11 +2151,21 @@ private:
             using E = std::remove_cvref_t<typename AE::type>;
             const VectorPlan* ap = vector_plan<std::vector<E>>();
             const std::string n = std::to_string(AE::size);
-            // The same two wire slots a vector parameter uses, and the same
-            // view class, so an array and a vector of one element type share
+            // The same wire slots a vector parameter uses, and the same view
+            // class, so an array and a vector of one element type share
             // everything inbound as well as outbound.
             a.cs_type = "IReadOnlyList<" + std::string(ap ? ap->cs_elem : "") + ">";
             a.cs_sig_param = a.cs_type + " " + an;
+            // std::array has no range constructor, so the count has to be
+            // checked and the elements copied. mb_to_array and mb_strarr do
+            // both and throw on the wrong count, which reaches C# as an
+            // ordinary exception rather than a silently short array.
+            if (ap && ap->is_string) {
+                fill_str_blob_slots(a, an, cn);
+                a.fwd_arg = "mb_strarr<" + n + ">(" + cn + "_blob, " + cn
+                          + "_lens, " + cn + "_n)";
+                return a;
+            }
             a.c_params = {std::string("const ") + (ap ? ap->cpp_elem : "") + "* "
                           + cn + "_data",
                           std::string("int64_t ") + cn + "_n"};
@@ -2105,15 +2173,13 @@ private:
                                + "[] " + an + "_data",
                                std::string("long ") + an + "_n"};
             a.call_args = {an + "_arr", an + "_arr.LongLength"};
-            // std::array has no range constructor, so the count has to be
-            // checked and the elements copied. mb_to_array does both and
-            // throws on the wrong count, which reaches C# as an ordinary
-            // exception rather than a silently short array.
             a.fwd_arg = "mb_to_array<" + std::string(ap ? ap->cpp_elem : "")
                       + ", " + n + ">(" + cn + "_data, " + cn + "_n)";
             a.prologue = "var " + an + "_arr = " + an + " as "
                        + std::string(ap ? ap->cs_elem : "") + "[];\n"
                        + "if (" + an + "_arr == null) {\n"
+                       + "if (" + an + " == null) throw new ArgumentNullException(nameof("
+                       + an + "));\n"
                        + an + "_arr = new " + std::string(ap ? ap->cs_elem : "")
                        + "[" + an + ".Count];\n"
                        + "for (int i = 0; i < " + an + "_arr.Length; i++) "
@@ -2126,6 +2192,11 @@ private:
             const VectorPlan* pv = vector_plan<PT>();
             a.cs_type = "IReadOnlyList<" + pv->cs_elem + ">";
             a.cs_sig_param = a.cs_type + " " + an;
+            if (pv->is_string) {
+                fill_str_blob_slots(a, an, cn);
+                a.fwd_arg = "mb_strv(" + cn + "_blob, " + cn + "_lens, " + cn + "_n)";
+                return a;
+            }
             a.c_params = {std::string("const ") + pv->cpp_elem + "* " + cn + "_data",
                           std::string("int64_t ") + cn + "_n"};
             a.cs_ext_params = {std::string("[In] ") + pv->cs_elem + "[] " + an + "_data",
@@ -2138,6 +2209,8 @@ private:
             // member passes straight through without a second copy.
             a.prologue = "var " + an + "_arr = " + an + " as " + pv->cs_elem + "[];\n"
                        + "if (" + an + "_arr == null) {\n"
+                       + "if (" + an + " == null) throw new ArgumentNullException(nameof("
+                       + an + "));\n"
                        + an + "_arr = new " + pv->cs_elem + "[" + an + ".Count];\n"
                        + "for (int i = 0; i < " + an + "_arr.Length; i++) "
                        + an + "_arr[i] = " + an + "[i];\n"
@@ -2405,7 +2478,24 @@ private:
     static bool is_generated_local(const std::string& n) {
         static const std::set<std::string> taken = {"r", "p", "i", "_has"};
         if (taken.count(n)) return true;
-        return n.size() > 4 && n.compare(n.size() - 4, 4, "_arr") == 0;
+        // Every suffix the generated code appends to a parameter's OWN name,
+        // whether for a C# local or for a wire slot in the DllImport. A
+        // parameter ending in one of these collides with what a SIBLING
+        // parameter generates: `f(vector<string> parts, string parts_sa)` would
+        // declare `parts_sa` twice, and `f(vector<double> a, double a_n)` would
+        // give the extern two parameters called `a_n`.
+        //
+        // The list has to be complete, because an omission is a duplicate name
+        // in the consumer's build. It renames more than strictly necessary --
+        // a sibling has to exist for a real collision, and arg_name cannot see
+        // one -- so the generated locals are named to keep that set small.
+        static const char* const suffixes[] = {"_arr", "_data", "_n", "_sa",
+                                               "_lens", "_nb", "_blob", "_str"};
+        for (const char* sx : suffixes) {
+            const std::size_t k = std::strlen(sx);
+            if (n.size() > k && n.compare(n.size() - k, k, sx) == 0) return true;
+        }
+        return false;
     }
 
     static std::string arg_name(const char* ident, std::size_t pos) {
@@ -3438,12 +3528,6 @@ private:
             p.skipped.push_back({p.cs_name, name + "()",
                 "a parameter type does not cross the C ABI yet"});
             return;
-        } else if (method_has_string_vector_param<T, I>(std::make_index_sequence<argc>{})) {
-            p.skipped.push_back({p.cs_name, name + "()",
-                "takes a container of strings; a vector of a scalar crosses "
-                "inward as a pointer and a length, a vector of strings would "
-                "need an array of char* and does not yet"});
-            return;
         } else if (object_unregistered<Ret>()) {
             p.skipped.push_back({p.cs_name, name + "()",
                 "returns a class this module does not bind"});
@@ -3556,23 +3640,6 @@ private:
         }
     }
 
-    // Only the string-element case is still refused. is_wire_vector already
-    // kept out vector<bool> and vectors of unbound classes.
-    template<typename V>
-    static consteval bool is_string_vector() {
-        using U = std::remove_cvref_t<V>;
-        if constexpr (!is_wire_vector<U>()) return false;
-        else return wire_of<std::remove_cvref_t<typename vector_element<U>::type>>()
-                  == Wire::Utf8;
-    }
-
-    template<typename T, std::size_t I, std::size_t... Ps>
-    static consteval bool method_has_string_vector_param(std::index_sequence<Ps...>) {
-        return (is_string_vector<std::remove_cvref_t<
-                    typename [:get_method_param_type<T, I, Ps>():]>>()
-                || ... || false);
-    }
-
     template<typename T, std::size_t Index, std::size_t... Ps>
     bool ctor_param_object_unregistered(std::index_sequence<Ps...>) const {
         bool bad = false;
@@ -3652,6 +3719,49 @@ private:
           << "}\n"
           << "std::array<E, N> a{};\n"
           << "for (std::size_t i = 0; i < N; ++i) a[i] = p[i];\n"
+          << "return a;\n"
+          << "}\n\n"
+          // Emitted once for the same reason: an inbound container of strings
+          // needs them, an unused inline function costs nothing.
+          << "// A container of strings crosses INWARD as one contiguous UTF-8\n"
+          << "// blob plus a byte count per element, rather than as an array of\n"
+          << "// char*. Two reasons, and both are about what the other side can\n"
+          << "// do: C# can hand the P/Invoke marshaller two blittable arrays,\n"
+          << "// which it pins for the duration of the call with no GCHandle and\n"
+          << "// no unsafe block in the generated code; and an explicit length\n"
+          << "// carries an embedded NUL, which a NUL-terminated char** cannot.\n"
+          << "// The blob is declared const char* because that is what\n"
+          << "// std::string::assign takes; C# passes a byte[], which is the\n"
+          << "// same pointer.\n"
+          << "static inline std::vector<std::string> mb_strv(const char* blob,\n"
+          << "const int64_t* lens, int64_t n) {\n"
+          << "std::vector<std::string> v;\n"
+          << "if (n < 0) n = 0;\n"
+          << "v.reserve(static_cast<std::size_t>(n));\n"
+          << "const char* p = blob;\n"
+          << "for (int64_t i = 0; i < n; ++i) {\n"
+          << "const std::size_t len = static_cast<std::size_t>(lens[i]);\n"
+          << "v.emplace_back(p, len);\n"
+          << "p += len;\n"
+          << "}\n"
+          << "return v;\n"
+          << "}\n\n"
+          << "// The fixed-size counterpart, checking the count the way\n"
+          << "// mb_to_array does.\n"
+          << "template <std::size_t N>\n"
+          << "static inline std::array<std::string, N> mb_strarr(const char* blob,\n"
+          << "const int64_t* lens, int64_t n) {\n"
+          << "if (n != static_cast<int64_t>(N)) {\n"
+          << "throw std::length_error(\"expected exactly \" + std::to_string(N)\n"
+          << "+ \" elements, got \" + std::to_string(n));\n"
+          << "}\n"
+          << "std::array<std::string, N> a{};\n"
+          << "const char* p = blob;\n"
+          << "for (std::size_t i = 0; i < N; ++i) {\n"
+          << "const std::size_t len = static_cast<std::size_t>(lens[i]);\n"
+          << "a[i].assign(p, len);\n"
+          << "p += len;\n"
+          << "}\n"
           << "return a;\n"
           << "}\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";

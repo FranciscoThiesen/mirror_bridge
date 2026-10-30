@@ -92,6 +92,28 @@ map's snapshot halves *are* vector plans. Keyed on the C++ type and not the C#
 spelling, because `long` and `long long` both spell `long` in C# and would
 otherwise collide into one set of symbols.
 
+### A container of strings crosses inward as a blob plus byte counts
+
+`vector<string>` and `array<string,N>` take **three** wire slots for one C#
+argument: a contiguous UTF-8 `const char*`, a `const int64_t*` of one byte count
+per element, and the count. Not `char**`, which is the obvious encoding and was
+the one named in this file as the missing piece.
+
+Two reasons, and both are about what the managed side can do without help. The
+blob and the counts are blittable arrays, so the P/Invoke marshaller pins them
+for the duration of the call and the generated C# holds no `GCHandle`, needs no
+`finally`, and compiles without `AllowUnsafeBlocks` — where `string[]` as
+`char**` would mean either an `ArraySubType` the built-in marshaller does not
+accept for UTF-8, or hand-pinning one buffer per element. And an explicit length
+carries an embedded NUL, which a NUL-terminated `char**` cannot; this is the one
+place in the backend where a `std::string` does **not** truncate.
+
+The gate this replaced lived on methods only, so the same C++ signature on a
+constructor or a static method was emitted as `const std::string*` against a C#
+`string[]` — a `char**` read as `std::string` objects. It is the clearest case
+in the backend for deleting a refusal rather than copying it: a gate in one of
+three places is worse than no gate at all.
+
 ### Errors cross as a kind plus a message
 
 C++ exceptions are caught at the ABI boundary; the kind and message go into a
@@ -120,35 +142,21 @@ not a workaround for a facility we ignored.
   184 hard errors with `TreatWarningsAsErrors`. The `init` scaffold hides this
   only because its hand-written csproj omits `<Nullable>`, making the scaffold
   *less* idiomatic than the template a .NET developer would use.
-- **The collection views declare the wrong interface.** They are
-  `IReadOnlyList<T>`/`IReadOnlyDictionary<K,V>` but have `Add`, `Clear`, `Remove`
-  and a settable indexer. The behaviour already matches `IList<T>`'s documented
-  contract exactly (`Add` on a fixed-size view throws `NotSupportedException`,
-  which is what `IList<T>.Add` specifies) — only the declaration is wrong, and
-  the bespoke `IsFixedSize` reinventing `IList.IsFixedSize` is the tell. It also
-  does not compose: an API taking `IList<double>` cannot accept it.
 - **`std::optional<std::string>` surfaces as `string`, not `string?`**, and the
   getter body returns `null`. Scalars are correct (`int?`, `double?`, `Mode?`).
   The annotation must land together with replacing the C# gate: `#nullable enable`
   is a fatal CS1024 on mcs 6.8, which is currently the only compiler in the
   build.
-- **TFM is net8.0**, which goes out of support 2026-11-10.
 - **The scaffolded csproj's native-library item is Linux-only**, so `dotnet run`
   on macOS or Windows is a `DllNotFoundException`.
 
 ### Correctness and resource gaps
 
-- **A borrowed view that is never disposed leaks its owner permanently.** The
-  view's `DangerousAddRef` has exactly one matching release, inside `Dispose`,
-  and the view classes have no finalizer — so a collected-undisposed view leaves
-  the owner's refcount above zero and `ReleaseHandle` never runs. A `foreach`
-  over a vector member without a `using` is enough. Fix that keeps the
-  no-finalizer guidance intact: make the outstanding ref a small
-  SafeHandle-derived token whose `ReleaseHandle` does the release, so it inherits
-  a critical finalizer.
-- **`std::string` truncates at an embedded NUL** in both directions, because the
-  wire is a NUL-terminated `const char*`. Lua and JavaScript carry the length and
-  do not lose data.
+- **`std::string` truncates at an embedded NUL on the way OUT**, because the
+  outbound wire is a NUL-terminated `const char*`. Lua and JavaScript carry the
+  length and do not lose data. A *container* of strings inbound does carry
+  lengths, so the asymmetry is now within one backend: the fix for a scalar
+  string is the same shape, a pointer plus a byte count.
 - **A class whose destructor is not public is refused wholesale.** That is safe
   but costly: `tinyxml2::XMLElement` and box2d's bodies are freed by an owning
   pool, and `XMLElement` is most of what tinyxml2 is for. Binding such a class
@@ -163,10 +171,9 @@ not a workaround for a facility we ignored.
 ### Type coverage
 
 No `std::set`, `std::variant`, `std::expected`, smart pointers or
-`vector<BoundClass>`. A `std::map` or `std::array` **parameter** does not cross
-inward, though a `std::vector` or `std::array` does. `map<string, V>` inbound
-needs `char**` marshalling, which is the same blocker that refuses
-`vector<string>` parameters — solving it once unblocks both.
+`vector<BoundClass>`. A `std::map` **parameter** does not cross inward, though
+every other container now does, including a container of strings — see the
+string-blob wire below.
 
 ## What has never been measured
 

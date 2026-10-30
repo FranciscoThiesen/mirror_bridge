@@ -505,4 +505,60 @@ struct Judge {
     double weigh(const Tagged& t) const { return t.weight; }
 };
 
+// A container of strings INBOUND. A vector of a scalar crosses as a pointer
+// and a length; a vector of strings used to be refused outright on methods and,
+// because the gate lived only there, emitted as a std::string* on constructors
+// and static methods -- a char** read as std::string objects. All four shapes
+// are here so the one wire is exercised from every emitter.
+struct Joiner {
+    std::string joined;
+    std::size_t parts_seen = 0;
+    std::array<std::string, 3> fixed_parts{};
+
+    Joiner() = default;
+    explicit Joiner(const std::vector<std::string>& parts) { take(parts); }
+
+    void take(const std::vector<std::string>& parts) {
+        parts_seen = parts.size();
+        joined.clear();
+        for (const std::string& s : parts) {
+            if (!joined.empty()) joined += "|";
+            joined += s;
+        }
+    }
+
+    void take_fixed(const std::array<std::string, 3>& three) {
+        fixed_parts = three;
+        joined = three[0] + "/" + three[1] + "/" + three[2];
+    }
+
+    // The wire carries a byte count per element rather than relying on a NUL
+    // terminator, so a string with an embedded NUL arrives whole. Reported as
+    // a size because the way back out is still a const char* and would
+    // truncate it again.
+    std::size_t byte_total(const std::vector<std::string>& parts) const {
+        std::size_t t = 0;
+        for (const std::string& s : parts) t += s.size();
+        return t;
+    }
+
+    static std::string shout(const std::vector<std::string>& parts) {
+        std::string out;
+        for (const std::string& s : parts) out += s;
+        out += "!";
+        return out;
+    }
+};
+
+// A parameter whose own name ends in a suffix the generated prologue appends to
+// a SIBLING parameter's name. Without the rename, `tail_sa` here and the local
+// declared for `tail` would be one identifier.
+struct Shadower {
+    std::string seen;
+    void mix(const std::vector<std::string>& tail, const std::string& tail_sa) {
+        seen = tail_sa;
+        for (const std::string& s : tail) seen += s;
+    }
+};
+
 }  // namespace csb
