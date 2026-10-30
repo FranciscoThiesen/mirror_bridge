@@ -290,8 +290,19 @@ of them with the `must_export` names the manifest demands.
 | tinyobjloader | **ok** | 26 | `ObjReader`, `attrib_t`, `shape_t` |
 | pmp-library | `reflection-tu-failed` | 32 discovered | — |
 
-Two of those six were failing when this work started. One of the two
-original misses is fixed; the other is a real limit.
+Which of these six were genuinely broken, and how certainly:
+
+- **cxxopts, pugixml and tinyobjloader** were real failures this branch fixed,
+  attributed with certainty because the compiler error was read directly — a
+  `CS0102`, a mutable `char*` passed to a `char*`, and an unqualified class name
+  in two translation units.
+- **jsoncpp and SQLiteCpp** both printed `✗ the generated shim did not build`
+  before the `char*` fix and build after it. That makes it the likely cause, but
+  it was not isolated and is not claimed as certain.
+- **clipper2** was never broken. It built the whole time; the harness could not
+  see its module, and the *escalation notice* for the constexpr budget — a
+  notice, not an error — was read as the cause. That is the case that shows what
+  the harness bug was doing.
 
 **tinyobjloader was a real bug, two translation units deep.** Its row read
 `reflection-tu-failed`, which was accurate as far as it went: reflection
