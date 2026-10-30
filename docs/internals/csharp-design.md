@@ -129,13 +129,20 @@ not a workaround for a facility we ignored.
 
 ### Not idiomatic .NET yet
 
-- **315 `DllImport`, zero `LibraryImport`.** Nothing blocks the migration. The
-  diff: containing types become `partial` (ours are not, including the nested
-  handle classes), externs become `static partial`, `ExactSpelling` is dropped
-  (no equivalent), `CallingConvention.Cdecl` becomes `[UnmanagedCallConv]`, and
-  the scaffold needs `AllowUnsafeBlocks`. SafeHandle parameters survive —
+- **315 `DllImport`, zero `LibraryImport`.** The diff is known and small:
+  containing types become `partial` (ours are not, including the nested handle
+  classes), externs become `static partial`, `ExactSpelling` is dropped (no
+  equivalent), `CallingConvention.Cdecl` becomes `[UnmanagedCallConv]`, and the
+  scaffold needs `AllowUnsafeBlocks`. SafeHandle parameters survive —
   `SafeHandleMarshaller<T>` exists in net8.0+ and the parameterless-constructor
   requirement applies only to `ref`/`out`/return.
+
+  What blocks it is the build, not the design. `LibraryImport` is a Roslyn
+  **source generator**: it writes the P/Invoke stub at compile time. mcs 6.8
+  does not run source generators, so switching would leave every `static
+  partial` extern without a body under the only C# compiler this repo has.
+  Same root cause as the nullability item below, and the same fix — a real .NET
+  SDK in the build.
 - **A default `dotnet new` project does not build the output.** Both templates
   write `Nullable=enable`; the generated `.cs` has no `#nullable` directive and
   inherits it, producing **184 warnings** (81 CS8618, 46 CS8625, 2 CS8603) — and
@@ -146,9 +153,8 @@ not a workaround for a facility we ignored.
   getter body returns `null`. Scalars are correct (`int?`, `double?`, `Mode?`).
   The annotation must land together with replacing the C# gate: `#nullable enable`
   is a fatal CS1024 on mcs 6.8, which is currently the only compiler in the
-  build.
-- **The scaffolded csproj's native-library item is Linux-only**, so `dotnet run`
-  on macOS or Windows is a `DllNotFoundException`.
+  build. These two items and the `LibraryImport` one are one piece of work:
+  install a .NET SDK, then generate for it.
 
 ### Correctness and resource gaps
 
@@ -173,7 +179,8 @@ not a workaround for a facility we ignored.
 No `std::set`, `std::variant`, `std::expected`, smart pointers or
 `vector<BoundClass>`. A `std::map` **parameter** does not cross inward, though
 every other container now does, including a container of strings — see the
-string-blob wire below.
+string-blob wire above. A map parameter is now mostly vocabulary rather than
+design: its halves are already `VectorPlan`s, and a string half has a wire.
 
 ## What has never been measured
 
