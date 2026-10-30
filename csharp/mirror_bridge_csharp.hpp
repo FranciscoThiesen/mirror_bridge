@@ -412,14 +412,41 @@ consteval bool param_ref_ok() {
     }
 }
 
+// A method returning T*, where T is a class this backend can bind, hands back a
+// BORROW: the pointer is to an object the receiver owns, or owns transitively,
+// and the generated view pins the receiver for its whole lifetime instead of
+// copying. That is the shape of every factory-style C++ API --
+// XMLDocument::RootElement(), b2World::GetBodyList() -- and refusing it is why
+// a bound XMLDocument exported 19 of 79 methods and not one of them yielded an
+// element.
+//
+// Only where there IS a receiver. A static method, a free function or an
+// operator has nothing to pin, so a borrow minted there would be unowned by
+// construction; ret_type_ok takes that as a parameter rather than letting each
+// emitter decide, because the asymmetry is the design and not an oversight.
+template<typename P>
+consteval bool is_borrowed_pointer() {
+    if constexpr (!std::is_pointer_v<P>) {
+        return false;
+    } else {
+        using Pointee = std::remove_cv_t<std::remove_pointer_t<P>>;
+        // complete_v first: wire_of asks NestedBindable, which a
+        // forward-declared class can still satisfy, and the arms past it need a
+        // definition. Same trap as typeid, one layer out.
+        if constexpr (!complete_v<Pointee>) return false;
+        else return wire_of<Pointee>() == Wire::Object;
+    }
+}
+
 // And what can be RETURNED, which excludes a fixed array for a different
 // reason than the parameter case: an array returned by value has no identity
 // apart from its storage, so a view of it would be a view of a temporary.
 // The honest surface is a copied T[], which needs an out-buffer signature
 // rather than a handle, and that is its own change.
-template<typename Ret>
+template<typename Ret, bool HasReceiver>
 consteval bool ret_type_ok() {
     using U = std::remove_cvref_t<Ret>;
+    if constexpr (is_borrowed_pointer<U>()) return HasReceiver;
     constexpr Wire rw = wire_of<U>();
     if constexpr (rw == Wire::Array) {
         using E = std::remove_cvref_t<typename array_element<U>::type>;
@@ -571,6 +598,11 @@ struct RetSlot {
     // other than what the call returned, which is why this is a string and not
     // derivable from the wire type.
     std::string cs_post;
+    // Doc comment for the public method, emitted before its signature. Only a
+    // borrowed return uses it, and it is not decoration: the lifetime rule a
+    // borrow carries is the thing a caller most needs told, and there is
+    // nowhere else in the generated API to tell them.
+    std::string doc;
     std::string zero = "0";  // what the shim's catch blocks hand back
     bool captures = true;    // false for void: there is no `var r =`
 };
@@ -653,6 +685,11 @@ struct ClassPlan {
     std::string handle;       // the SafeHandle subclass name
     std::string header;
     bool default_constructible = false;
+    // The class cannot be OWNED from C#: its destructor is deleted, private or
+    // protected, which is how a factory-style API says "the pool frees these".
+    // Such a class is still bindable, as a borrowed handle and nothing else.
+    // See the borrow-only invariant in docs/internals/csharp-design.md.
+    bool borrow_only = false;
     std::string shim;         // extern "C" definitions
     std::string externs;      // C# DllImport declarations
     std::string body;         // C# properties and methods
@@ -838,19 +875,41 @@ public:
         p.default_constructible = std::is_default_constructible_v<T>;
         if (!p.header.empty()) headers_.insert(p.header);
         if constexpr (complete_v<T>) {
-            if constexpr (!std::is_destructible_v<std::remove_cvref_t<T>>) {
-                // The shim deletes through this handle and SafeHandle has
-                // nothing else to call, so a class whose destructor is deleted
-                // or not public cannot be owned from C#. Refusing it keeps the
-                // module building and reports it; binding it borrow-only, with
-                // no constructor and no deleter, is a real option but is an
-                // ownership-model change rather than a guard.
-                refused_.push_back({cs_name, cs_name,
-                    "its destructor is deleted or not public, so C# cannot own "
-                    "one: the handle's release path has nothing it may call, and "
-                    "a class freed by an owning pool would be double-freed the "
-                    "first time it was disposed"});
-                return;
+            // A deleted, private or protected destructor is how a factory-style
+            // API says the caller does not free these. Such a class used to be
+            // refused whole, which cost tinyxml2 XMLElement -- most of what
+            // tinyxml2 is for -- and box2d its bodies.
+            //
+            // It is bound borrow-only instead: no constructor, no deleter, and
+            // a handle that can only ever be created with ownsHandle: false, so
+            // ReleaseHandle is a path the runtime never takes. The three other
+            // ways an owned handle could be minted are already closed, because
+            // is_default_constructible, is_copy_constructible and
+            // is_constructible are each variable-definition checks and a
+            // variable definition needs an accessible destructor -- measured
+            // for the private, protected and deleted spellings alike. The guard
+            // below is there because that is a fact about the language rather
+            // than about this code, and the failure if it stopped holding would
+            // be a leak, not a compile error.
+            using U = std::remove_cvref_t<T>;
+            if constexpr (!std::is_destructible_v<U>) {
+                if constexpr (std::is_default_constructible_v<U>
+                              || std::is_copy_constructible_v<U>) {
+                    // Never seen: both traits are variable-definition checks and
+                    // a variable definition needs an accessible destructor, for
+                    // the private, protected and deleted spellings alike. If a
+                    // compiler ever disagrees, the borrow-only invariant has a
+                    // hole -- C# could hold an owned handle with no deleter --
+                    // so refuse the class rather than bind it on an assumption.
+                    // A refusal keeps the module building; a static_assert here
+                    // would take the whole module down instead.
+                    refused_.push_back({cs_name, cs_name,
+                        "it has no accessible destructor and yet reports itself "
+                        "default- or copy-constructible, which would let C# own "
+                        "one with nothing able to free it"});
+                    return;
+                }
+                p.borrow_only = true;
             }
         }
         if constexpr (!core::type_key_is_distinctive<std::remove_cvref_t<T>>()) {
@@ -1933,11 +1992,30 @@ private:
     template<typename M>
     bool object_unregistered() const {
         using U = std::remove_cvref_t<M>;
+        // A borrowed pointer return is judged by its POINTEE. Without this the
+        // pointer is not NestedBindable, so this answered false and a T* to an
+        // unbound class reached ret_slot, which would have emitted a view class
+        // with no name.
+        if constexpr (is_borrowed_pointer<U>()) return pointee_ref<U>() == nullptr;
         // An optional or a vector is a class by NestedBindable's definition and
         // is not an opaque handle, so it must not be judged by this.
-        if constexpr (is_wire_optional<U>() || is_wire_vector<U>()) return false;
+        else if constexpr (is_wire_optional<U>() || is_wire_vector<U>()) return false;
         else if constexpr (core::NestedBindable<U>) return class_ref<M>() == nullptr;
         return false;
+    }
+
+    // The ClassRef for what a pointer points AT. class_ref itself answers
+    // nullptr for T*, because NestedBindable is false for a pointer -- which
+    // is right for every other caller and wrong for a borrowed return.
+    template<typename P>
+    const ClassRef* pointee_ref() const {
+        using Pointee = std::remove_cv_t<
+            std::remove_pointer_t<std::remove_cvref_t<P>>>;
+        if constexpr (std::is_pointer_v<std::remove_cvref_t<P>>) {
+            return class_ref<Pointee>();
+        } else {
+            return nullptr;
+        }
     }
 
     // Declared but not defined here, which is a different problem from an
@@ -2332,6 +2410,51 @@ private:
             r.cs_post = "if (r == IntPtr.Zero) throw MbNative.LastError(\"MB_N\");\n"
                         "return new " + std::string(mp ? mp->cs_name : "")
                       + "(r, true, null);\n";
+        } else if constexpr (is_borrowed_pointer<std::remove_cvref_t<Ret>>()) {
+            const ClassRef* cr = pointee_ref<Ret>();
+            const std::string cpp = cr ? cr->cpp_name : "MB_CLASS_UNREGISTERED";
+            r.c_ret = "void*";
+            r.cs_ret = "IntPtr";
+            r.cs_surface = cr ? cr->cs_name : "MB_CLASS_UNREGISTERED";
+            r.zero = "nullptr";
+            // No copy, which is the whole difference from the by-value arm
+            // below: the pointer IS the object the receiver owns, and a copy
+            // would be a different object. const_cast because a const T*
+            // cannot static_cast to void*, and C# has no const to carry the
+            // distinction into anyway -- the same information this backend
+            // already drops for a `const T&` member.
+            r.shim_return = "return static_cast<void*>(const_cast<" + cpp
+                          + "*>(MB_I));\n";
+            // A null pointer is a VALUE here, not a failure: that is how
+            // FirstChildElement() says there is none. A C++ exception has
+            // already become a C# one by the time cs_post runs, so this arm
+            // must not also treat null as an error the way the owned arm does.
+            //
+            // `false` and `this`: the view does not own the pointer, and the
+            // receiver is what keeps it alive -- MbPin takes a ref on this
+            // object's handle for the view's whole lifetime.
+            r.cs_post = "if (r == IntPtr.Zero) return null;\n"
+                        "return new " + (cr ? cr->cs_name : std::string())
+                      + "(r, false, this);\n";
+            // The hazard the pin does NOT cover, said where a caller will read
+            // it. Lifting it from the design notes into the generated API is
+            // the point: a borrow follows C++ lifetime rules, and a reader of
+            // the .cs has no other way to learn that.
+            r.doc = "/// <summary>A borrowed view of an object this one owns. Not a "
+                    "copy:\n"
+                    "/// writes through it reach the C++ object.</summary>\n"
+                    "/// <returns>null if the C++ call returned a null "
+                    "pointer.</returns>\n"
+                    "/// <remarks>The view keeps this object alive for as long as "
+                    "the view\n"
+                    "/// lives, so it cannot outlive its owner. It does NOT survive "
+                    "the C++\n"
+                    "/// side destroying the pointee while this object is still "
+                    "alive -- a\n"
+                    "/// clear() or a destroy-child call on the owner -- after which "
+                    "reading\n"
+                    "/// the view is undefined. A borrow follows C++ lifetime "
+                    "rules.</remarks>\n";
         } else if constexpr (rw == Wire::Object) {
             const ClassRef* cr = class_ref<Ret>();
             // A pointer to the temporary would dangle the moment the shim
@@ -2541,29 +2664,52 @@ private:
         return base + std::to_string(++it->second);
     }
 
-    // A C# property X compiles to hidden get_X and set_X methods, so declaring
-    // a property `x` and a method `get_x` is "a member is already reserved" --
-    // a C# error the native symbol ledger cannot see, because the two names do
-    // not collide on the C++ side at all. Properties are emitted before
-    // methods, so reserving the accessor spellings here is enough.
-    static std::string claim_property_name(ClassPlan& p, const std::string& cpp_name) {
-        const std::string out = claim_cs_name(p, cpp_name);
-        const std::string bare = (!out.empty() && out.front() == '@')
-                               ? out.substr(1) : out;
-        p.taken_names.insert("get_" + bare);
-        p.taken_names.insert("set_" + bare);
-        return out;
+    // A @-escaped keyword is still the plain identifier in metadata, so the
+    // accessor names a property reserves are built from the unescaped form.
+    static std::string unescaped(const std::string& n) {
+        return (!n.empty() && n.front() == '@') ? n.substr(1) : n;
     }
 
-    static std::string claim_cs_name(ClassPlan& p, const std::string& cpp_name) {
+    // A C# property X compiles to hidden get_X and set_X methods. Declaring a
+    // property `x` beside a method `get_x` -- or beside a property called
+    // `get_x` -- is CS0102, "already contains a definition", a collision the
+    // native symbol ledger cannot see because the two names do not clash on the
+    // C++ side at all.
+    //
+    // All THREE names have to be free, and the check has to run BEFORE the name
+    // is claimed. Reserving the accessors afterwards only covered one direction:
+    // cxxopts::values::parser_tool::ArguDesc declares `set_value` before
+    // `value`, so `set_value` was claimed as an ordinary property name and then
+    // `value` claimed a name whose hidden setter was already taken. That cost
+    // cxxopts its whole module, as a CS0102 in generated code pointing at a
+    // property accessor the reader never wrote.
+    static std::string claim_property_name(ClassPlan& p, const std::string& cpp_name) {
+        return claim_cs_name(p, cpp_name, true);
+    }
+
+    static std::string claim_cs_name(ClassPlan& p, const std::string& cpp_name,
+                                     bool is_property = false) {
         const auto seen = p.cs_name_of.find(cpp_name);
         if (seen != p.cs_name_of.end()) return seen->second;
 
+        const auto free = [&](const std::string& cand) {
+            if (cs_name_is_reserved(cand) || p.taken_names.count(cand)) return false;
+            if (!is_property) return true;
+            const std::string bare = unescaped(cand);
+            return !p.taken_names.count("get_" + bare)
+                && !p.taken_names.count("set_" + bare);
+        };
+
         const std::string desired = cs_member_name(cpp_name);
         std::string out = desired;
-        while (cs_name_is_reserved(out) || p.taken_names.count(out)) out += "_";
+        while (!free(out)) out += "_";
         if (out != desired) p.renamed.emplace_back(cpp_name, out);
         p.taken_names.insert(out);
+        if (is_property) {
+            const std::string bare = unescaped(out);
+            p.taken_names.insert("get_" + bare);
+            p.taken_names.insert("set_" + bare);
+        }
         p.cs_name_of[cpp_name] = out;
         return out;
     }
@@ -2587,7 +2733,17 @@ private:
         claim_symbol(p, "mb_" + sym + "_new");
         claim_symbol(p, "mb_" + sym + "_delete");
 
-        if (p.default_constructible) {
+        if (p.borrow_only) {
+            // Stated as its own reason rather than "no default constructor":
+            // the class may well have one, and the caller needs to know the
+            // module declines to OWN one of these, not that C++ cannot make
+            // one. is_default_constructible is false here anyway -- see
+            // add_class -- so this is the message, not an extra gate.
+            p.skipped.push_back({p.cs_name, "<constructor>",
+                "its destructor is deleted or not public, so nothing in C# may "
+                "own one: this class is reachable only as a borrowed view of an "
+                "object the C++ side owns"});
+        } else if (p.default_constructible) {
             shim << "MB_EXPORT void* mb_" << sym << "_new(void) {\n"
                  << "mb_clear_error();\n"
                  << "try { return new " << cpp << "(); }\n"
@@ -2603,18 +2759,25 @@ private:
                                  "no default constructor, so C# cannot create one"});
         }
 
-        // The one entry point that was not catching, against the shim's own
-        // stated invariant. A throwing destructor crossing extern "C" is
-        // undefined behaviour, and swallowing is right here specifically: this
-        // runs from a critical finalizer, there is no caller able to act on it,
-        // and terminating the process is worse than leaking.
-        shim << "MB_EXPORT void mb_" << sym << "_delete(void* self) {\n"
-             << "try { delete static_cast<" << cpp << "*>(self); }\n"
-             << "catch (...) {}\n"
-             << "}\n\n";
-        externs << "[DllImport(Lib, EntryPoint = \"mb_" << sym
-                << "_delete\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
-                << "private static extern void Delete(IntPtr self);\n\n";
+        // A borrow-only class gets no deleter AT ALL -- not an empty one, and
+        // not one guarded at run time. `delete` through an inaccessible
+        // destructor is ill-formed, so the symbol cannot be written; and the
+        // absence is the invariant, because a deleter that exists is a deleter
+        // something can call.
+        if (!p.borrow_only) {
+            // The one entry point that was not catching, against the shim's own
+            // stated invariant. A throwing destructor crossing extern "C" is
+            // undefined behaviour, and swallowing is right here specifically:
+            // this runs from a critical finalizer, there is no caller able to
+            // act on it, and terminating the process is worse than leaking.
+            shim << "MB_EXPORT void mb_" << sym << "_delete(void* self) {\n"
+                 << "try { delete static_cast<" << cpp << "*>(self); }\n"
+                 << "catch (...) {}\n"
+                 << "}\n\n";
+            externs << "[DllImport(Lib, EntryPoint = \"mb_" << sym
+                    << "_delete\", ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]\n"
+                    << "private static extern void Delete(IntPtr self);\n\n";
+        }
 
         // A SafeHandle rather than a raw IntPtr, and not for tidiness: with an
         // IntPtr field the last read of `this` is inside the argument list, so
@@ -2631,7 +2794,13 @@ private:
              << "}\n"
              << "public override bool IsInvalid => handle == IntPtr.Zero;\n"
              << "protected override bool ReleaseHandle() {\n"
-             << "Delete(handle);\n"
+             // A borrow-only handle is only ever constructed with
+             // ownsHandle: false, so the runtime never reaches here. It still
+             // has to compile, and what it must not contain is a free: there is
+             // no deleter for this class and nothing here may invent one.
+             << (p.borrow_only
+                 ? "// unreachable: a handle to this class never owns its pointer\n"
+                 : "Delete(handle);\n")
              << "return true;\n"
              << "}\n"
              << "}\n\n"
@@ -2648,7 +2817,12 @@ private:
              << "private volatile bool _disposed;\n\n"
              << "/// <summary>Wraps a pointer this object does not own.</summary>\n"
              << "internal " << p.cs_name << "(IntPtr self, bool owned, object parent) {\n"
-             << "_h = new " << p.handle << "(self, owned);\n"
+             // `owned` is ignored for a borrow-only class rather than asserted
+             // against: hard-coding false here means no code path exists that
+             // could free this pointer, which is a stronger statement than a
+             // check every caller has to be trusted to not trip.
+             << "_h = new " << p.handle << "(self, "
+             << (p.borrow_only ? "false" : "owned") << ");\n"
              << "_parent = parent;\n"
              << "// Pinned for this wrapper's whole lifetime, not just around\n"
              << "// one call: checking the owner and then calling is a race, and\n"
@@ -3201,6 +3375,21 @@ private:
     void emit_constructors(ClassPlan& p, std::ostringstream& shim,
                            std::ostringstream& externs, std::ostringstream& body) {
         constexpr std::size_t n = ctor_count<T>();
+        // The one owned-handle path a non-public destructor does NOT already
+        // close. is_default_constructible and is_copy_constructible are both
+        // false for such a class, so `new T()` and a by-value return are
+        // refused without help -- but a reflected parameterised constructor
+        // reaches `new T(args...)` in the shim, and that expression is
+        // well-formed with an inaccessible destructor. It would hand C# an
+        // owned pointer with nothing able to free it.
+        if (p.borrow_only) {
+            if (n > 0) {
+                p.skipped.push_back({p.cs_name, "<constructor>",
+                    "it would hand back a pointer C# owns, and this class has no "
+                    "deleter: its destructor is deleted or not public"});
+            }
+            return;
+        }
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
             (emit_constructor<T, Is>(p, shim, externs, body), ...);
         }(std::make_index_sequence<n>{});
@@ -3367,10 +3556,20 @@ private:
         constexpr std::size_t argc = get_static_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!ret_type_ok<Ret>()) {
+        // false: a static method has no receiver, so a borrowed pointer return
+        // would have nothing to pin and the view would be unowned by
+        // construction. The emitters do not each decide this -- they pass it.
+        if constexpr (!ret_type_ok<Ret, false>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_static_method_return_type<T, I>()).data();
-            if constexpr (wire_of<Ret>() == Wire::Object) {
+            if constexpr (is_borrowed_pointer<Ret>()) {
+                p.skipped.push_back({p.cs_name, "static " + name + "()",
+                    std::string("returns ") + rname
+                    + ", a pointer to an object this call does not own. An "
+                      "instance method can hand that back as a borrowed view "
+                      "pinned to its receiver; a static method has no receiver, "
+                      "so the view would have nothing keeping it alive"});
+            } else if constexpr (wire_of<Ret>() == Wire::Object) {
                 p.skipped.push_back({p.cs_name, "static " + name + "()",
                     std::string("returns ") + rname
                     + (complete_v<Ret>
@@ -3504,7 +3703,8 @@ private:
         constexpr std::size_t argc = get_method_param_count<T, I>();
         const std::string name(std::meta::identifier_of(func));
 
-        if constexpr (!ret_type_ok<Ret>()) {
+        // true: `this` is the receiver a borrowed pointer return pins.
+        if constexpr (!ret_type_ok<Ret, true>()) {
             constexpr const char* rname =
                 std::meta::display_string_of(get_method_return_type<T, I>()).data();
             if constexpr (wire_of<Ret>() == Wire::Object) {
@@ -3627,7 +3827,8 @@ private:
                     << "private static extern " << rs.cs_ret << " "
                     << ext_name << "(" << j2.cs_ext_params << ");\n\n";
 
-            body << "public " << rs.cs_surface << " " << claim_cs_name(p, name)
+            body << rs.doc
+                 << "public " << rs.cs_surface << " " << claim_cs_name(p, name)
                  << "(" << cs_sig_params << ") {\n"
                  << vec_prologue
                  << rs.cs_pre;

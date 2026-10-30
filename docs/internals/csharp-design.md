@@ -92,6 +92,102 @@ map's snapshot halves *are* vector plans. Keyed on the C++ type and not the C#
 spelling, because `long` and `long long` both spell `long` in C# and would
 otherwise collide into one set of symbols.
 
+### A property's hidden accessors are names in the ledger
+
+A C# property `X` compiles to hidden `get_X` and `set_X` methods. So a C++ class
+with members `value` and `set_value` is CS0102, "already contains a definition",
+with no collision on the C++ side at all — and the error points at a property
+accessor the reader never wrote.
+
+The ledger reserves those spellings. What matters is that it checks them
+**before** claiming a name, not after: reserving the accessors afterwards covers
+only the direction where the property comes first.
+`cxxopts::values::parser_tool::ArguDesc` declares `set_value` before `value`,
+which is the other direction, and it cost cxxopts its whole module.
+
+The first claimant keeps the plain name and the later one gains a `_`, which is
+the same tie-break the native symbol ledger and the helper-tag ledger use:
+declaration order decides, so a rename is stable across builds.
+
+### A class C# cannot own binds borrow-only
+
+A deleted, private or protected destructor is how a factory-style C++ API says
+the caller does not free these. `tinyxml2::XMLElement`, `b2Body`, `b2Joint` —
+ten classes in the 11-library corpus, every one central API. Such a class used
+to be refused whole, which for tinyxml2 meant refusing most of what the library
+is for.
+
+It binds borrow-only now, under one invariant:
+
+> No C# code may ever hold an *owned* handle to a borrow-only class.
+
+Enforced one site per way an owned handle could appear:
+
+| Site | What closes it |
+|---|---|
+| `mb_T_new` + `public T()` | `is_default_constructible_v` is false |
+| a return of `T` **by value** (the shim heap-copies) | `is_copy_constructible_v` is false |
+| a reflected parameterised constructor | **a gate** — this is the only one not already closed |
+| `mb_T_delete` + `ReleaseHandle` | not emitted at all |
+
+The first two are free, and the reason is worth knowing: each of those traits is
+a *variable-definition* check, and a variable definition needs an accessible
+destructor. Measured for the private, protected and deleted spellings alike.
+There is a guard in `add_class` for the case where a compiler disagrees, because
+that is a fact about the language rather than about this code and the failure if
+it stopped holding would be a leak, not a compile error.
+
+The third is not closed, because `new T(args...)` is well-formed with an
+inaccessible destructor. It would hand C# an owned pointer with nothing able to
+free it, so it is refused by name.
+
+The fourth is the one C# gets for free where Python did not. Python's blocker
+(issue #48) was `py_dealloc<T>` spelling the free as a runtime `if`, which
+instantiates `delete T*` for every bound `T` — a compile hazard that forced a
+class-level gate. Here the deleter is generated *text*: the generator either
+writes `mb_T_delete` or does not. And `SafeHandle` with `ownsHandle: false`
+never calls `ReleaseHandle`, so a borrowed handle is already a thing that cannot
+free. **The absence of the deleter is the invariant** — not an empty one, not a
+guarded one, none — because a deleter that exists is a deleter something can
+call.
+
+### A pointer return is a borrow pinned to its receiver
+
+Half one alone would be a lie. A by-value member of a borrow-only class would
+make its *owner* non-destructible too, so the owner would become borrow-only in
+turn and nothing would be reachable. A pointer return is the only route to one —
+which is also how the real libraries are shaped: `XMLDocument::RootElement()`,
+`FirstChildElement()`, `b2World::GetBodyList()`.
+
+So an **instance method** returning `T*`, where `T` is a bound class, hands back
+a borrowed view: no copy, `ownsHandle: false`, and `MbPin` takes a ref on the
+receiver's handle for the view's whole lifetime. `const T*` crosses the same way,
+const-cast at the boundary, because C# has no const to carry the distinction into
+— the same information this backend already drops for a `const T&` member.
+
+A null pointer is a **value** here, not a failure: that is how
+`FirstChildElement()` says there is none, so it becomes `null`. The owned-return
+arm reads a null as an error, and conflating the two would turn "no such child"
+into an exception.
+
+**Instance methods only.** A static method, a free function or an operator has
+no receiver, so a borrow minted there would be unowned by construction. The
+emitters do not each decide this; `ret_type_ok<Ret, HasReceiver>` takes it as a
+parameter, because the asymmetry is the design and a predicate in one of three
+emitters is how the string-container gate became a live defect.
+
+**The hazard, stated plainly and also in the generated API.** The pin covers
+"the C# view outlives its owner". It does *not* cover "the owner is alive and
+C++ destroyed the pointee" — `XMLDocument::Clear()`, `b2World::DestroyBody()`.
+After that, reading the view is undefined. Closing it needs a generation counter
+on the owner, which is a larger design. A borrow is a borrow, with C++ lifetime
+rules, and the generated `<remarks>` on every such method says so, because the
+`.cs` is the only place a caller will look.
+
+Related: a `T*` that *transfers* ownership (`T* clone()`) is bound as a borrow
+and leaks. The policy is right for the corpus and wrong for that shape, and the
+type alone cannot tell them apart.
+
 ### A container of strings crosses inward as a blob plus byte counts
 
 `vector<string>` and `array<string,N>` take **three** wire slots for one C#
@@ -163,12 +259,6 @@ not a workaround for a facility we ignored.
   length and do not lose data. A *container* of strings inbound does carry
   lengths, so the asymmetry is now within one backend: the fix for a scalar
   string is the same shape, a pointer plus a byte count.
-- **A class whose destructor is not public is refused wholesale.** That is safe
-  but costly: `tinyxml2::XMLElement` and box2d's bodies are freed by an owning
-  pool, and `XMLElement` is most of what tinyxml2 is for. Binding such a class
-  **borrow-only** — no constructor, no deleter, reachable only as a member or
-  return view — is what these libraries need. It is an ownership-model change
-  where a mistake is a double free rather than a compile error.
 - **The C++ runtime is not statically linked.** A clang-built shim needs
   `libc++.so.1`, `libc++abi.so.1` and `libunwind.so.1`, and the CLI has no
   static-link option. A GCC 16 generator stage would link `libstdc++.so.6`
@@ -181,6 +271,39 @@ No `std::set`, `std::variant`, `std::expected`, smart pointers or
 every other container now does, including a container of strings — see the
 string-blob wire above. A map parameter is now mostly vocabulary rather than
 design: its halves are already `VectorPlan`s, and a string half has a wire.
+
+## What the corpus says, as of 2026-10-30
+
+Pointing `compatibility/run_compatibility.py --lang csharp` at the **seven**
+libraries that bind under the Python backend: **0 of 7**.
+
+| | |
+|---|---|
+| `compile-error` | 4 — jsoncpp, pugixml, cxxopts, SQLiteCpp |
+| `reflection-tu-failed` | 2 — pmp-library, tinyobjloader |
+| `constexpr-limit` | 1 — clipper2 |
+
+The useful part is what it rules out. None of these is an ownership problem, a
+type-coverage problem or a marshalling problem: the generated code does not
+compile, or the generator stage does not. That is the work queue, and it is a
+different queue from the gap list below.
+
+Each of the four `compile-error` libraries was reproduced and its first error
+read. They are four different bugs, not one:
+
+| | |
+|---|---|
+| **cxxopts** | one `CS0102` on a property accessor. **Fixed** — see the name-ledger decision above. It now builds a loadable module, the first real library this backend has produced one for. |
+| **pugixml** | the shim does not compile: `no matching member function for call to 'evaluate_string'`. An overload set the generated call resolves wrongly. |
+| **jsoncpp** | two bound classes with the same unqualified name, which `docs/reference/errors.md` already documents as a class of failure. |
+| **SQLiteCpp** | the shim does not build; the first error is not yet read. |
+
+Reproducing one takes a few minutes each and is the only way to get this
+information — it cannot be reasoned out from the type system.
+
+Run it against a **copy** of the tree, not the live mount: the dev container
+sees the working directory, so an edit made while a corpus run is in flight is
+a result about neither version.
 
 ## What has never been measured
 

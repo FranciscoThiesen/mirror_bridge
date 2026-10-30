@@ -317,17 +317,110 @@ struct Widths2 {
     }
 };
 
+// A C# property X compiles to hidden get_X and set_X methods, so these four
+// members are three name collisions C++ cannot see. Declaration order matters:
+// `set_value` comes BEFORE `value`, which is the direction that used to slip
+// through -- the accessor names were reserved after the name was claimed, so
+// `value` claimed a name whose setter was already a property.
+//
+// cxxopts::values::parser_tool::ArguDesc is exactly this, and it cost cxxopts
+// its whole module with one CS0102 in generated code.
+struct Accessors {
+    bool set_value = true;
+    std::string value = "v";
+    double get_scale = 1.5;
+    int scale = 4;
+};
+
 // Freed by an owning pool, so its destructor is not public. tinyxml2's
-// XMLElement and box2d's bodies are both this shape. mb_<C>_delete was emitted
-// unconditionally and SafeHandle's release path has nothing else to call, so
-// this did not compile -- and had it compiled it would have been a double free
-// the first time C# disposed one. The whole class is refused and named.
+// XMLElement and box2d's bodies are both this shape, and the whole class used
+// to be refused -- which for tinyxml2 is most of what the library is for.
+//
+// It binds borrow-only now: no constructor, no deleter, and a handle that is
+// only ever created with ownsHandle: false. The three other ways C# could come
+// to own one are closed by the language: is_default_constructible,
+// is_copy_constructible and is_constructible are variable-definition checks
+// and a variable definition needs an accessible destructor.
 struct PoolOwned {
     int id = 11;
     int doubled() const { return id * 2; }
+    // Reflected, and `new PoolOwned(7)` compiles even with a protected
+    // destructor -- so this is the ONE owned-handle path the language does not
+    // close, and the only one that needs a gate.
+    explicit PoolOwned(int n) : id(n) {}
+    PoolOwned() = default;
 
 protected:
     ~PoolOwned() = default;
+};
+
+// The pool. Destructible, so it binds the ordinary way and C# can own one,
+// which is what makes a borrow observable: the counters say whether disposing
+// a borrowed view destroyed anything.
+struct Node {
+    int value = 0;
+    // Destructible on purpose. A pool whose nodes could not be destroyed
+    // could not free them either, and then the counter could never move --
+    // so this is the fixture that can actually catch a borrow that frees.
+    Node() { ++live_; }
+    explicit Node(int v) : value(v) { ++live_; }
+    ~Node() { --live_; ++destroyed_; }
+    Node(const Node&) = delete;
+
+    int doubled() const { return value * 2; }
+
+    static int live() { return live_; }
+    static int destroyed() { return destroyed_; }
+
+private:
+    static inline int live_ = 0;
+    static inline int destroyed_ = 0;
+};
+
+// A factory-style owner: it hands back pointers to objects it owns and frees
+// them itself. Every shape of pointer return is here.
+struct Pool {
+    Pool() { nodes_.push_back(new Node(21)); }
+    ~Pool() { for (Node* n : nodes_) delete n; }
+    Pool(const Pool&) = delete;
+
+    Node* first() { return nodes_.empty() ? nullptr : nodes_.front(); }
+    // Null is a VALUE here, the way FirstChildElement() says there is none,
+    // and must not be mistaken for the failure the owned-return arm reads it as.
+    Node* at(int i) {
+        return (i < 0 || i >= static_cast<int>(nodes_.size())) ? nullptr : nodes_[i];
+    }
+    const Node* first_const() const {
+        return nodes_.empty() ? nullptr : nodes_.front();
+    }
+    Node* grow(int v) { nodes_.push_back(new Node(v)); return nodes_.back(); }
+    int count() const { return static_cast<int>(nodes_.size()); }
+
+    // No receiver, so this stays refused however bindable Node is. It is here
+    // to pin the design decision rather than the implementation.
+    static Node* orphan() { return nullptr; }
+
+private:
+    std::vector<Node*> nodes_;
+};
+
+// A borrow-only class reached by pointer, which is the combination tinyxml2
+// actually is: the document is ownable, the element is not, and the only route
+// to an element is a pointer off the document.
+//
+// It has to be a pointer. A by-value PoolOwned member would make the ENCLOSING
+// class non-destructible too -- destroying it would have to destroy the member
+// -- so it would become borrow-only in turn and nothing would be reachable.
+// That is why half of this feature is pointer returns and not an option.
+struct PoolOwner {
+    // Allocated once and never freed: from C#'s side that is exactly what an
+    // owning pool looks like, and leaking one object in a test binary is the
+    // honest way to have a borrow-only instance to point at.
+    PoolOwner() : held_(new PoolOwned(33)) {}
+    PoolOwned* borrowed() { return held_; }
+
+private:
+    PoolOwned* held_;
 };
 
 // An abstract interface. Every member call is qualified with its declaring
