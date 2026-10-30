@@ -103,7 +103,9 @@ The ledger reserves those spellings. What matters is that it checks them
 **before** claiming a name, not after: reserving the accessors afterwards covers
 only the direction where the property comes first.
 `cxxopts::values::parser_tool::ArguDesc` declares `set_value` before `value`,
-which is the other direction, and it cost cxxopts its whole module.
+which is the other direction, and it cost cxxopts its whole module — a `CS0102`
+the CLI's own `-warnaserror` compile of the generated `.cs` reported directly,
+so this one is attributed with certainty rather than inferred from a corpus row.
 
 The first claimant keeps the plain name and the later one gains a `_`, which is
 the same tie-break the native symbol ledger and the helper-tag ledger use:
@@ -275,39 +277,49 @@ design: its halves are already `VectorPlan`s, and a string half has a wire.
 ## What the corpus says, as of 2026-10-30
 
 Pointing `compatibility/run_compatibility.py --lang csharp` at the **seven**
-libraries that bind under the Python backend: **0 of 7**.
+libraries that bind under the Python backend: **5 of 7 bind usefully**, every one
+of them with the `must_export` names the manifest demands.
 
-| | |
-|---|---|
-| `compile-error` | 4 — jsoncpp, pugixml, cxxopts, SQLiteCpp |
-| `reflection-tu-failed` | 2 — pmp-library, tinyobjloader |
-| `constexpr-limit` | 1 — clipper2 |
+| library | verdict | classes | API the manifest requires |
+|---|---|---|---|
+| jsoncpp | **ok** | 23 | `Value`, `Reader`, `StreamWriterBuilder` |
+| pugixml | **ok** | 19 | `xml_document`, `xml_node` |
+| clipper2 | **ok** | 20 | `Clipper64`, `ClipperOffset` |
+| cxxopts | **ok** | 27 | `Options`, `ParseResult` |
+| SQLiteCpp | **ok** | 9 | `Database`, `Statement`, `Column` |
+| pmp-library | `reflection-tu-failed` | 32 discovered | — |
+| tinyobjloader | `reflection-tu-failed` | 26 discovered | — |
 
-The useful part is what it rules out. None of these is an ownership problem, a
-type-coverage problem or a marshalling problem: the generated code does not
-compile, or the generator stage does not. That is the work queue, and it is a
-different queue from the gap list below.
+The two failures are **generator-stage**, not C# codegen: the reflection
+translation unit that writes the shim does not compile. pmp-library exhausts the
+constexpr budget and still fails after the escalation to
+`-fconstexpr-steps=2000000000`; tinyobjloader fails in three seconds, which is
+too fast to be a budget problem. The C# generator TU is heavier than a Python
+binding TU — it instantiates an `Emitter` method per class rather than a
+binding per class — so it is the stage most exposed to this, and these two are
+the next thing to diagnose.
 
-Each of the four `compile-error` libraries was reproduced and its first error
-read. They are four different bugs, not one:
+### How this number was wrong, and in which direction
 
-| | |
-|---|---|
-| **cxxopts** | one `CS0102` on a property accessor. **Fixed** — see the name-ledger decision above. It now builds a loadable module, the first real library this backend has produced one for. |
-| **pugixml** | a mutable `char*` read as a string. The bug is **fixed** (see below) and `evaluate_string` is declined by name rather than taking the module down; whether pugixml now binds is a separate question from whether that bug is gone, and is being measured. |
-| **jsoncpp** | two bound classes with the same unqualified name, which `docs/reference/errors.md` already documents as a class of failure. |
-| **SQLiteCpp** | the shim does not build; the first error is not yet read. |
+The first run of this said **0 of 7**, and that was a statement about one line
+in the harness rather than about the backend:
 
-Reproducing one takes a few minutes each and is the only way to get this
-information — it cannot be reasoned out from the type system. They were four
-unrelated bugs, which is itself the useful finding: there was no single thing
-standing between this backend and a real library.
+```python
+module = os.path.join(out, lib["module"] + ".so")   # C# writes lib<module>.so
+```
 
-A caution learned here: a generator bug being fixed is not the same claim as a
-library binding. Running the CLI by hand without `--link-args` reproduces the
-codegen but not the link, so a shim that compiles cleanly by hand can still fail
-the corpus — go back through `run_compatibility.py` to say whether a library
-binds.
+`module_built` was therefore False for every C# library whatever the build did,
+and every row then went down `classify_failure`, which read *warnings* out of
+the output and published them as the cause. Two of the four "compile errors"
+that produced were real, diagnosed and fixed. The other two were libraries that
+had already built.
+
+The lesson is not "measure"; it is that a measurement harness is code and needs
+its own test. `tests/compatibility_matrix/test_classify.py` now pins the
+artifact name for all four backends, including the property that made the bug
+invisible: no other backend shares C#'s spelling.
+
+Two real bugs did come out of it, both of which took a whole module down:
 
 ### A mutable `char*` is an out-buffer, not a string
 

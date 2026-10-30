@@ -598,11 +598,25 @@ def finish_csharp(row, lib, out, module):
                    detail=str(exc)[:200])
         return row
 
-    exported = sorted(set(re.findall(r"public sealed class (\w+)", cs))
-                      - {"MbPin"})
-    row["exported_names"] = len(exported)
-    row["exported_sample"] = exported[:40]
-    row.update(classify_exports(lib.get("must_export") or [], exported))
+    declared = set(re.findall(r"public sealed class (\w+)", cs))
+
+    # The .cs also declares one <Class>Handle per bound class and the Mb*
+    # collection views, so the raw count overstates the API: jsoncpp's 23
+    # classes read as 45. Filtered for the published count, UNFILTERED for the
+    # verdict, because a library whose own class is called FooHandle or MbFoo
+    # must not be judged by a heuristic -- a wrong count is a cosmetic error
+    # and a wrong verdict is not.
+    def generated(name):
+        if name == "MbPin":
+            return True
+        if name.endswith("Handle") and name[:-len("Handle")] in declared:
+            return True
+        return len(name) > 2 and name.startswith("Mb") and name[2].isupper()
+
+    api = sorted(n for n in declared if not generated(n))
+    row["exported_names"] = len(api)
+    row["exported_sample"] = api[:40]
+    row.update(classify_exports(lib.get("must_export") or [], sorted(declared)))
     return row
 
 
