@@ -317,6 +317,32 @@ struct Widths2 {
     }
 };
 
+// A MUTABLE char* is an out-buffer, not a string. core::StringLike admits one,
+// so the generator read `buf` as a string parameter, emitted `const char*` for
+// it on the wire, and passed that to a char* -- "no matching member function",
+// and the whole module failed to build rather than this one method.
+//
+// pugixml is the real one: char_t is char, and it declares
+// size_t evaluate_string(char_t* buffer, size_t capacity, const xpath_node&).
+struct Buffers {
+    std::string text = "hi";
+
+    // Refused, by name.
+    std::size_t fill(char* buf, std::size_t cap) const {
+        const std::size_t n = text.size() < cap ? text.size() : cap;
+        for (std::size_t i = 0; i < n; ++i) buf[i] = text[i];
+        return n;
+    }
+
+    // Still bound: a const char* IS a string, and the const has to be tested
+    // before remove_cv or these two cannot be told apart.
+    std::size_t measure(const char* s) const {
+        std::size_t n = 0;
+        while (s && s[n]) ++n;
+        return n;
+    }
+};
+
 // A C# property X compiles to hidden get_X and set_X methods, so these four
 // members are three name collisions C++ cannot see. Declaration order matters:
 // `set_value` comes BEFORE `value`, which is the direction that used to slip

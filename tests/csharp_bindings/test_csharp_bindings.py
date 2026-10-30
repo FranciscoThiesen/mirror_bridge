@@ -719,6 +719,22 @@ truthy("while a double vector still takes the bulk path",
 check("and nor does a size_t one", "Marshal.Copy" in view_class_body("MbUlongVector"), False)
 truthy("and a size_t vector binds", "public MbUlongVector offsets {" in cs)
 
+print("\n=== a mutable char* is an out-buffer, not a string ===")
+# core::StringLike admits char*, which cost pugixml its whole module: the
+# parameter was read as a string, emitted as `const char*` on the wire, and
+# passed to a char*. The shim did not compile, so no method bound, not just
+# this one.
+truthy("a char* parameter is refused by name",
+       re.search(r"Buffers\.fill\(\)", run.stdout) is not None)
+check("so no entry point is emitted for it",
+      "mb_Buffers_fill" in shim_src, False)
+# The distinction is the whole point: const char* is a string and must survive,
+# which means the const has to be tested before remove_cv erases it.
+truthy("while a const char* parameter still binds",
+       "public ulong measure([MarshalAs(UnmanagedType.LPUTF8Str)] string s)" in cs
+       or "public ulong measure(string s)" in cs)
+truthy("and the class itself still binds", "public sealed class Buffers" in cs)
+
 print("\n=== a property's hidden accessors are names too ===")
 # A C# property X compiles to get_X and set_X, so `value` and `set_value` in one
 # class is CS0102 -- a collision with no C++ counterpart. The first claimant

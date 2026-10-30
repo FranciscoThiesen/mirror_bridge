@@ -96,6 +96,25 @@ enum class Wire {
 template<typename T>
 consteval Wire wire_of();
 
+// core::StringLike admits a MUTABLE char*, which is not a string: it is an
+// out-buffer, and nothing in this backend can marshal one. pugixml spells its
+// character type char_t, which is char, and declares
+//
+//     size_t evaluate_string(char_t* buffer, size_t capacity, const xpath_node&)
+//
+// so the generator read `buffer` as a string parameter, emitted `const char*`
+// for it, and passed that to a char* -- the shim did not compile and pugixml
+// lost its whole module. The Python backend learned the same thing from the
+// same library; this is the C# half of it.
+//
+// The const has to be tested BEFORE remove_cv, because remove_cv erases the
+// very thing being asked about: `const char*` keeps its const under
+// remove_cvref_t (the const is on the pointee, not the pointer) while
+// `char* const` correctly loses it and is refused.
+template<typename T>
+concept WireString = core::StringLike<T>
+                  && !std::is_same_v<std::remove_cvref_t<T>, char*>;
+
 // std::optional<T> where T itself crosses. A scalar needs a separate
 // has-value flag on the wire; a string does not, because a null pointer is
 // already the natural spelling of "no value".
@@ -117,7 +136,7 @@ consteval bool is_wire_optional() {
         return false;
     } else {
         using E = std::remove_cvref_t<typename OE::type>;
-        return std::is_arithmetic_v<E> || core::StringLike<E> || std::is_enum_v<E>;
+        return std::is_arithmetic_v<E> || WireString<E> || std::is_enum_v<E>;
     }
 }
 
@@ -237,7 +256,7 @@ consteval bool is_wire_array() {
     } else {
         using E = std::remove_cvref_t<typename AE::type>;
         if constexpr (std::is_same_v<E, bool>) return false;
-        else return std::is_arithmetic_v<E> || core::StringLike<E>;
+        else return std::is_arithmetic_v<E> || WireString<E>;
     }
 }
 
@@ -250,9 +269,9 @@ consteval bool is_wire_map() {
         using K = std::remove_cvref_t<typename MK::key>;
         using V = std::remove_cvref_t<typename MK::mapped>;
         constexpr bool k_ok = (std::is_arithmetic_v<K> && !std::is_same_v<K, bool>)
-                              || core::StringLike<K>;
+                              || WireString<K>;
         constexpr bool v_ok = (std::is_arithmetic_v<V> && !std::is_same_v<V, bool>)
-                              || core::StringLike<V>;
+                              || WireString<V>;
         return k_ok && v_ok;
     }
 }
@@ -266,7 +285,7 @@ consteval bool is_wire_vector() {
         return false;
     } else {
         using E = std::remove_cvref_t<typename VE::type>;
-        return std::is_arithmetic_v<E> || core::StringLike<E>;
+        return std::is_arithmetic_v<E> || WireString<E>;
     }
 }
 
@@ -279,7 +298,7 @@ consteval Wire wire_of() {
     // generated API typed rather than a pile of ints -- see cs_name_for.
     else if constexpr (std::is_enum_v<U>) return wire_of<std::underlying_type_t<U>>();
     else if constexpr (std::is_same_v<U, bool>) return Wire::Bool;
-    else if constexpr (StringLike<U>) return Wire::Utf8;
+    else if constexpr (WireString<U>) return Wire::Utf8;
     // A bound class crosses as an opaque handle. Whether that handle is owned
     // or borrowed is decided at the call site, not by the type: a member is
     // borrowed from its owner, a value returned by a method is the caller's.
@@ -450,7 +469,7 @@ consteval bool ret_type_ok() {
     constexpr Wire rw = wire_of<U>();
     if constexpr (rw == Wire::Array) {
         using E = std::remove_cvref_t<typename array_element<U>::type>;
-        return !core::StringLike<E>;
+        return !WireString<E>;
     } else if constexpr (rw == Wire::Object) {
         // complete_v FIRST. is_copy_constructible has to instantiate the type
         // to answer, so asking it about an undefined template is a hard error
@@ -492,7 +511,7 @@ struct Skipped {
 template<typename E>
 consteval const char* cpp_type_name() {
     using U = std::remove_cvref_t<E>;
-    if constexpr (core::StringLike<U>)                     return "std::string";
+    if constexpr (WireString<U>)                           return "std::string";
     else if constexpr (std::is_same_v<U, bool>)            return "bool";
     else if constexpr (std::is_same_v<U, char>)            return "char";
     else if constexpr (std::is_same_v<U, signed char>)     return "signed char";

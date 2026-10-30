@@ -294,12 +294,41 @@ read. They are four different bugs, not one:
 | | |
 |---|---|
 | **cxxopts** | one `CS0102` on a property accessor. **Fixed** — see the name-ledger decision above. It now builds a loadable module, the first real library this backend has produced one for. |
-| **pugixml** | the shim does not compile: `no matching member function for call to 'evaluate_string'`. An overload set the generated call resolves wrongly. |
+| **pugixml** | a mutable `char*` read as a string. **Fixed** — see below. |
 | **jsoncpp** | two bound classes with the same unqualified name, which `docs/reference/errors.md` already documents as a class of failure. |
 | **SQLiteCpp** | the shim does not build; the first error is not yet read. |
 
 Reproducing one takes a few minutes each and is the only way to get this
-information — it cannot be reasoned out from the type system.
+information — it cannot be reasoned out from the type system. Two down, two to
+go, and they were four unrelated bugs, which is itself the useful finding: there
+was no single thing standing between this backend and a real library.
+
+### A mutable `char*` is an out-buffer, not a string
+
+`core::StringLike` admits `char*` as well as `const char*`. A mutable `char*` is
+not a string, though — it is somewhere to write — and nothing in this backend
+can marshal one. pugixml spells its character type `char_t`, which is `char`,
+and declares
+
+```cpp
+size_t evaluate_string(char_t* buffer, size_t capacity, const xpath_node&) const;
+```
+
+so the generator read `buffer` as a string parameter, emitted `const char*` for
+it on the wire, and passed that to a `char*`. The shim did not compile, which
+means pugixml lost *every* method, not this one.
+
+The C# classifier asks `WireString` now, which is `StringLike` minus mutable
+`char*`, at all eight sites that used to ask `StringLike` — including the
+container element and map-half predicates, where a `vector<char*>` would
+otherwise have reached the wire as a poison spelling.
+
+The const has to be tested **before** `remove_cv`, because `remove_cv` erases
+the very thing being asked about: `const char*` keeps its const under
+`remove_cvref_t` (the const is on the pointee), while `char* const` correctly
+loses it and is refused. The Python backend learned this from the same library;
+this is the C# half of the same lesson, which is the characteristic shape of
+this project's bugs — one thing classified in two places.
 
 Run it against a **copy** of the tree, not the live mount: the dev container
 sees the working directory, so an edit made while a corpus run is in flight is
