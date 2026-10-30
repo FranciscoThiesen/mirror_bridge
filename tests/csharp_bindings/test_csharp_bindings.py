@@ -230,6 +230,21 @@ class Driver {
         using (var _sv = Shared.spread(3)) {
             Console.WriteLine($"static vec return: Count={_sv.Count} [1]={_sv[1]}");
         }
+        using (var dm = new Registry()) {
+            dm.counts.Add("z", 50);
+            Console.WriteLine($"idict add: total={dm.total()} count={dm.counts.Count}");
+            Expect<ArgumentException>(() => dm.counts.Add("z", 1), "idict dup");
+            var kvHit = new System.Collections.Generic.KeyValuePair<string, int>("z", 50);
+            var kvMiss = new System.Collections.Generic.KeyValuePair<string, int>("z", 99);
+            Console.WriteLine($"idict contains: hit={dm.counts.Contains(kvHit)} wrongvalue={dm.counts.Contains(kvMiss)}");
+            Console.WriteLine($"idict removepair wrongvalue={dm.counts.Remove(kvMiss)} still={dm.counts.ContainsKey("z")}");
+            Console.WriteLine($"idict removepair right={dm.counts.Remove(kvHit)} gone={!dm.counts.ContainsKey("z")}");
+            var pairs = new System.Collections.Generic.KeyValuePair<string, int>[dm.counts.Count + 1];
+            dm.counts.CopyTo(pairs, 1);
+            Console.WriteLine($"idict copyto: first={pairs[0].Key ?? "null"} readonly={dm.counts.IsReadOnly}");
+            System.Collections.Generic.IDictionary<string, int> asDict = dm.counts;
+            Console.WriteLine($"idict composes: count={asDict.Count} keys={asDict.Keys.Count}");
+        }
         using (var li = new Device()) {
             li.samples.Clear();
             li.samples.Add(10.0);
@@ -674,10 +689,36 @@ check("no static method mentions the unhandled-wire poison",
       "MB_WIRE_UNHANDLED" in shim_src, False)
 
 print("\n=== maps cross as a live view, and a set is not one ===")
-truthy("a string-keyed map is an IReadOnlyDictionary",
-       "public sealed class MbStringIntMap : IReadOnlyDictionary<string, int>" in cs)
-truthy("a string-valued one too",
-       "public sealed class MbStringStringMap : IReadOnlyDictionary<string, string>" in cs)
+def map_class_body(name):
+    at = cs.find("public sealed class " + name + " :")
+    if at < 0:
+        return ""
+    nxt = cs.find("public sealed class ", at + 1)
+    return cs[at:nxt if nxt > 0 else len(cs)]
+
+truthy("a string-keyed map view exists", map_class_body("MbStringIntMap") != "")
+truthy("a string-valued one too", map_class_body("MbStringStringMap") != "")
+# Both, as Dictionary<K,V> does. Declaring only the read-only one while having
+# a settable indexer, Remove and Clear was the same lie IList<T> fixed.
+truthy("declaring IDictionary<K,V> so its mutators are honest",
+       "IDictionary<string, int>" in cs)
+truthy("and IReadOnlyDictionary<K,V> for a read-only consumer",
+       "IReadOnlyDictionary<string, int>" in cs)
+# Keys is ICollection on one interface and IEnumerable on the other, and C#
+# matches a property by its exact type, so the read-only pair is explicit --
+# which is what Dictionary<K,V> itself does.
+truthy("Keys and Values satisfy both interfaces",
+       "public ICollection<string> Keys {" in cs
+       and "IEnumerable<string> IReadOnlyDictionary<string, int>.Keys => Keys;" in cs)
+# Add must reject a duplicate, unlike the indexer which is insert_or_assign.
+# Conflating them would lose data silently.
+truthy("Add refuses a duplicate key rather than overwriting",
+       "the key is already present" in cs)
+# And the two Removes differ on purpose: the pair overload must match the
+# value too.
+truthy("Remove(pair) matches the value, Remove(key) does not",
+       "public bool Remove(KeyValuePair<string, int> item)" in cs
+       and "if (!Contains(item)) return false;" in cs)
 truthy("an unordered_map is named apart from an ordered one",
        "class MbIntDoubleHashMap" in cs)
 truthy("the member is the live map", "public MbStringIntMap counts {" in cs)
@@ -1327,6 +1368,23 @@ if MCS and MONO:
                "ilist copyto: 0,30 readonly=False" in out)
         truthy("and the view composes with an IList<T> parameter",
                "ilist composes: count=1" in out)
+        # IDictionary<K,V>.Add must REFUSE a duplicate, where the indexer is
+        # insert_or_assign and overwrites. Conflating them loses data quietly.
+        truthy("a dictionary Add reaches C++",
+               "idict add: total=56 count=4" in out)
+        truthy("and refuses a duplicate key",
+               "idict dup -> ArgumentException" in out)
+        # Remove(pair) must match the VALUE too, unlike Remove(key).
+        truthy("Contains compares the value, not just the key",
+               "idict contains: hit=True wrongvalue=False" in out)
+        truthy("Remove(pair) leaves a wrong-valued pair alone",
+               "idict removepair wrongvalue=False still=True" in out)
+        truthy("and removes it when the pair matches",
+               "idict removepair right=True gone=True" in out)
+        truthy("CopyTo honours the destination offset",
+               "idict copyto: first=null readonly=False" in out)
+        truthy("and the view composes with an IDictionary<K,V> parameter",
+               "idict composes: count=3 keys=3" in out)
         # The fixed view refuses exactly the length-changing operations.
         truthy("a fixed view refuses Insert",
                "fixed Insert -> NotSupportedException" in out)
