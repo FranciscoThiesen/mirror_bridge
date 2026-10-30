@@ -294,14 +294,20 @@ read. They are four different bugs, not one:
 | | |
 |---|---|
 | **cxxopts** | one `CS0102` on a property accessor. **Fixed** — see the name-ledger decision above. It now builds a loadable module, the first real library this backend has produced one for. |
-| **pugixml** | a mutable `char*` read as a string. **Fixed** — see below. |
+| **pugixml** | a mutable `char*` read as a string. The bug is **fixed** (see below) and `evaluate_string` is declined by name rather than taking the module down; whether pugixml now binds is a separate question from whether that bug is gone, and is being measured. |
 | **jsoncpp** | two bound classes with the same unqualified name, which `docs/reference/errors.md` already documents as a class of failure. |
 | **SQLiteCpp** | the shim does not build; the first error is not yet read. |
 
 Reproducing one takes a few minutes each and is the only way to get this
-information — it cannot be reasoned out from the type system. Two down, two to
-go, and they were four unrelated bugs, which is itself the useful finding: there
-was no single thing standing between this backend and a real library.
+information — it cannot be reasoned out from the type system. They were four
+unrelated bugs, which is itself the useful finding: there was no single thing
+standing between this backend and a real library.
+
+A caution learned here: a generator bug being fixed is not the same claim as a
+library binding. Running the CLI by hand without `--link-args` reproduces the
+codegen but not the link, so a shim that compiles cleanly by hand can still fail
+the corpus — go back through `run_compatibility.py` to say whether a library
+binds.
 
 ### A mutable `char*` is an out-buffer, not a string
 
