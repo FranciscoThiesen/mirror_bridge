@@ -56,6 +56,55 @@ class TestUsabilityBar(unittest.TestCase):
         self.assertEqual(v["status"], "token-binding")
 
 
+class TestWorkDirLock(unittest.TestCase):
+    """Two runs sharing a --work-dir must refuse, not corrupt.
+
+    run_one rmtree's <work-dir>/<library> before each build, so concurrent runs
+    delete each other's output. The symptom is a library "failing" for a
+    plausible reason: comparing a branch against main, cxxopts came back
+    `failed [reflection-tu-failed] (28 classes)` from one of two concurrent runs
+    and `ok (27 classes)` from the same code alone -- 28 is the text-scan count
+    and 27 the reflection one, so it reads exactly like a discovery regression.
+
+    The lock itself is taken in main(), which needs a manifest and a toolchain;
+    what is testable here is the primitive it rests on, and that it is
+    EXCLUSIVE rather than check-then-create.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_the_second_holder_is_refused(self):
+        lock = os.path.join(self.dir, ".run.lock")
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"pid 1\n")
+        os.close(fd)
+        with self.assertRaises(FileExistsError):
+            os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
+    def test_the_pid_is_recoverable_from_the_lock(self):
+        lock = os.path.join(self.dir, ".run.lock")
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, ("pid %d\n" % os.getpid()).encode())
+        os.close(fd)
+        with open(lock) as f:
+            self.assertIn(str(os.getpid()), f.read())
+
+    # The help text is what a reader hits first, and the reason the lock exists
+    # is not guessable from its presence.
+    def test_the_work_dir_help_says_why(self):
+        import inspect
+        src = inspect.getsource(rc.main) if hasattr(rc, "main") else ""
+        if not src:
+            self.skipTest("main() not introspectable")
+        self.assertIn("concurrent runs", src)
+
+
 class TestLinkFailureIsNotADiscoveryFailure(unittest.TestCase):
     """A link failure proves discovery and codegen both worked.
 

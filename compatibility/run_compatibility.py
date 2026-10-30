@@ -11,6 +11,7 @@ Writes one JSON object to --out. compatibility/format_matrix.py renders it.
 """
 
 import argparse
+import atexit
 import fnmatch
 import json
 import os
@@ -695,7 +696,12 @@ def main():
     ap.add_argument("--manifest", default=os.path.join(os.path.dirname(__file__), "libraries.json"))
     ap.add_argument("--cli", default=None, help="path to tools/mirror_bridge")
     ap.add_argument("--cache-dir", default="/tmp/mb-compat-cache")
-    ap.add_argument("--work-dir", default="/tmp/mb-compat-work")
+    ap.add_argument("--work-dir", default="/tmp/mb-compat-work",
+                    help="scratch for checkouts' build output. Two runs must "
+                         "not share one: run_one rmtree's <work-dir>/<library> "
+                         "before each build, so concurrent runs delete each "
+                         "other's output. A lock makes that refuse rather than "
+                         "corrupt.")
     ap.add_argument("--out", default="compatibility/results.json")
     ap.add_argument("--only", action="append", default=[],
                     help="run just this library (repeatable)")
@@ -725,6 +731,36 @@ def main():
 
     os.makedirs(args.cache_dir, exist_ok=True)
     os.makedirs(args.work_dir, exist_ok=True)
+
+    # Two runs sharing a --work-dir corrupt each other, because run_one
+    # rmtree's <work-dir>/<library> before each build. The symptom is a library
+    # "failing" for a plausible reason: comparing a branch against main, cxxopts
+    # came back `failed [reflection-tu-failed] (28 classes)` from one of two
+    # concurrent runs and `ok (27 classes)` from the same code alone -- 28 is
+    # the text-scan count and 27 the reflection one, so it reads exactly like a
+    # discovery regression and cost an hour.
+    #
+    # O_EXCL rather than a check-then-create, because the race this guards is
+    # the whole point. The pid is in the file so a stale lock can be identified
+    # rather than merely cursed at.
+    lock = os.path.join(args.work_dir, ".run.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            with open(lock) as f:
+                held = f.read().strip() or "unknown"
+        except OSError:
+            held = "unknown"
+        sys.exit("another corpus run holds %s (%s). Two runs sharing a "
+                 "--work-dir delete each other's builds, so this refuses "
+                 "rather than corrupting both. Pass a different --work-dir, or "
+                 "remove the lock if that pid is gone." % (lock, held))
+    try:
+        os.write(fd, ("pid %d\n" % os.getpid()).encode())
+    finally:
+        os.close(fd)
+    atexit.register(lambda: os.path.exists(lock) and os.unlink(lock))
 
     if args.validate:
         bad = 0
