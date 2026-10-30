@@ -317,17 +317,160 @@ struct Widths2 {
     }
 };
 
+// An abstract class that DECLARES a constructor. emit_constructors enumerates
+// constructors by reflection, and a declared constructor is not the same thing
+// as a constructible class: the shim emitted `new Abstract(name)` and the whole
+// module failed with "allocating an object of abstract class type".
+//
+// pmp-library's BasePropertyArray is the real one -- explicit
+// BasePropertyArray(std::string) beside virtual void reserve(size_t) = 0 -- and
+// it cost pmp-library its module. Iface below did not catch it, because its
+// default constructor is implicit and reflection does not report one.
+struct AbstractWithCtor {
+    int tag = 0;
+    explicit AbstractWithCtor(int t) : tag(t) {}
+    virtual ~AbstractWithCtor() = default;
+    virtual int measure() const = 0;
+    int doubled_tag() const { return tag * 2; }
+};
+
+// Concrete, so it binds the ordinary way and gives the abstract base something
+// to be a view of.
+struct ConcreteOfAbstract : AbstractWithCtor {
+    ConcreteOfAbstract() : AbstractWithCtor(5) {}
+    int measure() const override { return 42; }
+};
+
+// A MUTABLE char* is an out-buffer, not a string. core::StringLike admits one,
+// so the generator read `buf` as a string parameter, emitted `const char*` for
+// it on the wire, and passed that to a char* -- "no matching member function",
+// and the whole module failed to build rather than this one method.
+//
+// pugixml is the real one: char_t is char, and it declares
+// size_t evaluate_string(char_t* buffer, size_t capacity, const xpath_node&).
+struct Buffers {
+    std::string text = "hi";
+
+    // Refused, by name.
+    std::size_t fill(char* buf, std::size_t cap) const {
+        const std::size_t n = text.size() < cap ? text.size() : cap;
+        for (std::size_t i = 0; i < n; ++i) buf[i] = text[i];
+        return n;
+    }
+
+    // Still bound: a const char* IS a string, and the const has to be tested
+    // before remove_cv or these two cannot be told apart.
+    std::size_t measure(const char* s) const {
+        std::size_t n = 0;
+        while (s && s[n]) ++n;
+        return n;
+    }
+};
+
+// A C# property X compiles to hidden get_X and set_X methods, so these four
+// members are three name collisions C++ cannot see. Declaration order matters:
+// `set_value` comes BEFORE `value`, which is the direction that used to slip
+// through -- the accessor names were reserved after the name was claimed, so
+// `value` claimed a name whose setter was already a property.
+//
+// cxxopts::values::parser_tool::ArguDesc is exactly this, and it cost cxxopts
+// its whole module with one CS0102 in generated code.
+struct Accessors {
+    bool set_value = true;
+    std::string value = "v";
+    double get_scale = 1.5;
+    int scale = 4;
+};
+
 // Freed by an owning pool, so its destructor is not public. tinyxml2's
-// XMLElement and box2d's bodies are both this shape. mb_<C>_delete was emitted
-// unconditionally and SafeHandle's release path has nothing else to call, so
-// this did not compile -- and had it compiled it would have been a double free
-// the first time C# disposed one. The whole class is refused and named.
+// XMLElement and box2d's bodies are both this shape, and the whole class used
+// to be refused -- which for tinyxml2 is most of what the library is for.
+//
+// It binds borrow-only now: no constructor, no deleter, and a handle that is
+// only ever created with ownsHandle: false. The three other ways C# could come
+// to own one are closed by the language: is_default_constructible,
+// is_copy_constructible and is_constructible are variable-definition checks
+// and a variable definition needs an accessible destructor.
 struct PoolOwned {
     int id = 11;
     int doubled() const { return id * 2; }
+    // Reflected, and `new PoolOwned(7)` compiles even with a protected
+    // destructor -- so this is the ONE owned-handle path the language does not
+    // close, and the only one that needs a gate.
+    explicit PoolOwned(int n) : id(n) {}
+    PoolOwned() = default;
 
 protected:
     ~PoolOwned() = default;
+};
+
+// The pool. Destructible, so it binds the ordinary way and C# can own one,
+// which is what makes a borrow observable: the counters say whether disposing
+// a borrowed view destroyed anything.
+struct Node {
+    int value = 0;
+    // Destructible on purpose. A pool whose nodes could not be destroyed
+    // could not free them either, and then the counter could never move --
+    // so this is the fixture that can actually catch a borrow that frees.
+    Node() { ++live_; }
+    explicit Node(int v) : value(v) { ++live_; }
+    ~Node() { --live_; ++destroyed_; }
+    Node(const Node&) = delete;
+
+    int doubled() const { return value * 2; }
+
+    static int live() { return live_; }
+    static int destroyed() { return destroyed_; }
+
+private:
+    static inline int live_ = 0;
+    static inline int destroyed_ = 0;
+};
+
+// A factory-style owner: it hands back pointers to objects it owns and frees
+// them itself. Every shape of pointer return is here.
+struct Pool {
+    Pool() { nodes_.push_back(new Node(21)); }
+    ~Pool() { for (Node* n : nodes_) delete n; }
+    Pool(const Pool&) = delete;
+
+    Node* first() { return nodes_.empty() ? nullptr : nodes_.front(); }
+    // Null is a VALUE here, the way FirstChildElement() says there is none,
+    // and must not be mistaken for the failure the owned-return arm reads it as.
+    Node* at(int i) {
+        return (i < 0 || i >= static_cast<int>(nodes_.size())) ? nullptr : nodes_[i];
+    }
+    const Node* first_const() const {
+        return nodes_.empty() ? nullptr : nodes_.front();
+    }
+    Node* grow(int v) { nodes_.push_back(new Node(v)); return nodes_.back(); }
+    int count() const { return static_cast<int>(nodes_.size()); }
+
+    // No receiver, so this stays refused however bindable Node is. It is here
+    // to pin the design decision rather than the implementation.
+    static Node* orphan() { return nullptr; }
+
+private:
+    std::vector<Node*> nodes_;
+};
+
+// A borrow-only class reached by pointer, which is the combination tinyxml2
+// actually is: the document is ownable, the element is not, and the only route
+// to an element is a pointer off the document.
+//
+// It has to be a pointer. A by-value PoolOwned member would make the ENCLOSING
+// class non-destructible too -- destroying it would have to destroy the member
+// -- so it would become borrow-only in turn and nothing would be reachable.
+// That is why half of this feature is pointer returns and not an option.
+struct PoolOwner {
+    // Allocated once and never freed: from C#'s side that is exactly what an
+    // owning pool looks like, and leaking one object in a test binary is the
+    // honest way to have a borrow-only instance to point at.
+    PoolOwner() : held_(new PoolOwned(33)) {}
+    PoolOwned* borrowed() { return held_; }
+
+private:
+    PoolOwned* held_;
 };
 
 // An abstract interface. Every member call is qualified with its declaring
@@ -503,6 +646,62 @@ struct Square : Tagged, ShapeBase {
 struct Judge {
     int count(const ShapeBase& s) const { return s.sides; }
     double weigh(const Tagged& t) const { return t.weight; }
+};
+
+// A container of strings INBOUND. A vector of a scalar crosses as a pointer
+// and a length; a vector of strings used to be refused outright on methods and,
+// because the gate lived only there, emitted as a std::string* on constructors
+// and static methods -- a char** read as std::string objects. All four shapes
+// are here so the one wire is exercised from every emitter.
+struct Joiner {
+    std::string joined;
+    std::size_t parts_seen = 0;
+    std::array<std::string, 3> fixed_parts{};
+
+    Joiner() = default;
+    explicit Joiner(const std::vector<std::string>& parts) { take(parts); }
+
+    void take(const std::vector<std::string>& parts) {
+        parts_seen = parts.size();
+        joined.clear();
+        for (const std::string& s : parts) {
+            if (!joined.empty()) joined += "|";
+            joined += s;
+        }
+    }
+
+    void take_fixed(const std::array<std::string, 3>& three) {
+        fixed_parts = three;
+        joined = three[0] + "/" + three[1] + "/" + three[2];
+    }
+
+    // The wire carries a byte count per element rather than relying on a NUL
+    // terminator, so a string with an embedded NUL arrives whole. Reported as
+    // a size because the way back out is still a const char* and would
+    // truncate it again.
+    std::size_t byte_total(const std::vector<std::string>& parts) const {
+        std::size_t t = 0;
+        for (const std::string& s : parts) t += s.size();
+        return t;
+    }
+
+    static std::string shout(const std::vector<std::string>& parts) {
+        std::string out;
+        for (const std::string& s : parts) out += s;
+        out += "!";
+        return out;
+    }
+};
+
+// A parameter whose own name ends in a suffix the generated prologue appends to
+// a SIBLING parameter's name. Without the rename, `tail_sa` here and the local
+// declared for `tail` would be one identifier.
+struct Shadower {
+    std::string seen;
+    void mix(const std::vector<std::string>& tail, const std::string& tail_sa) {
+        seen = tail_sa;
+        for (const std::string& s : tail) seen += s;
+    }
 };
 
 }  // namespace csb

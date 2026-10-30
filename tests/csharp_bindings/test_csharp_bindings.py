@@ -332,6 +332,96 @@ class Driver {
             r.counts.Clear();
             Console.WriteLine($"map clear reaches C++: total={r.total()} Count={r.counts.Count}");
         }
+        using (var j = new Joiner()) {
+            var three = new string[] { "alpha", "beta", "gamma" };
+            j.take(three);
+            Console.WriteLine($"strv method: joined={j.joined} seen={j.parts_seen}");
+
+            // A List<string> is not a string[], so this takes the copying arm
+            // of the prologue rather than the cast.
+            var lst = new List<string>();
+            lst.Add("x");
+            lst.Add("");
+            lst.Add("ünïcø∂é 🚀");
+            j.take(lst);
+            Console.WriteLine($"strv from List: joined={j.joined} seen={j.parts_seen}");
+
+            j.take(new string[0]);
+            Console.WriteLine($"strv empty: joined=[{j.joined}] seen={j.parts_seen}");
+
+            j.take(new string[] { null, "after" });
+            Console.WriteLine($"strv null element: joined={j.joined} seen={j.parts_seen}");
+
+            var fixed3 = new string[] { "a", "bb", "ccc" };
+            j.take_fixed(fixed3);
+            var mid = j.fixed_parts[1];
+            Console.WriteLine($"strarr: joined={j.joined} mid={mid}");
+
+            var two = new string[] { "only", "two" };
+            Expect<ArgumentException>(() => j.take_fixed(two), "strarr wrong count");
+            Expect<ArgumentNullException>(() => j.take(null), "strv null list");
+
+            // Two code units with a NUL between them. The wire carries a byte
+            // count per element, so this is 3; a NUL-terminated char** would
+            // have reported 1.
+            var nul = new string[] { "a" + (char)0 + "b" };
+            Console.WriteLine($"embedded NUL survives: bytes={j.byte_total(nul)}");
+
+            var hola = Joiner.shout(new string[] { "ho", "la" });
+            Console.WriteLine($"strv static: {hola}");
+        }
+        using (var j2 = new Joiner(new string[] { "ctor", "arg" })) {
+            Console.WriteLine($"strv ctor: joined={j2.joined} seen={j2.parts_seen}");
+        }
+        using (var sh2 = new Shadower()) {
+            sh2.mix(new string[] { "-tail" }, "head");
+            Console.WriteLine($"shadowed arg name: seen={sh2.seen}");
+        }
+        using (var pool = new Pool()) {
+            var before = Node.destroyed();
+            using (var n = pool.first()) {
+                Console.WriteLine($"borrow: value={n.value} doubled={n.doubled()}");
+                n.value = 50;
+            }
+            // The assertion that matters: a borrow must destroy nothing, ever.
+            Console.WriteLine($"disposing a borrow destroyed nothing: before={before} after={Node.destroyed()}");
+            using (var again = pool.first())
+                Console.WriteLine($"and the write reached C++: value={again.value}");
+            var missing = pool.at(99);
+            Console.WriteLine($"a null pointer is null, not an exception: {missing == null}");
+            using (var g = pool.grow(7))
+                Console.WriteLine($"pointer to a new node: count={pool.count()} value={g.value}");
+            using (var c = pool.first_const())
+                Console.WriteLine($"a const pointer borrows too: value={c.value}");
+        }
+        // The pool's own destructor freed its nodes, which is the point: the
+        // C++ side owns them and C# never did.
+        Console.WriteLine($"the owner freed its nodes: {Node.destroyed() >= 2}");
+
+        using (var owner = new PoolOwner()) {
+            var held = owner.borrowed();
+            Console.WriteLine($"borrow-only class is reachable: id={held.id} doubled={held.doubled()}");
+            held.id = 44;
+            using (var again2 = owner.borrowed())
+                Console.WriteLine($"and writable through the borrow: id={again2.id}");
+            // Disposing a view of a class with no deleter must be a no-op
+            // rather than a free. It would crash if ReleaseHandle freed.
+            held.Dispose();
+            held.Dispose();
+            using (var after = owner.borrowed())
+                Console.WriteLine($"disposing a borrow-only view twice is safe: id={after.id}");
+        }
+
+        var outer = new Pool();
+        var leaked = outer.first();
+        outer.Dispose();
+        Expect<ObjectDisposedException>(() => { var _ = leaked.value; },
+                                        "borrow of a disposed owner");
+        using (var ac = new Accessors()) {
+            // Each of the four has to reach its OWN C++ member: the renames are
+            // only correct if value_ is `value` and scale_ is `scale`.
+            Console.WriteLine($"accessors: set_value={ac.set_value} value={ac.value_} get_scale={ac.get_scale} scale={ac.scale_}");
+        }
         return 0;
     }
 }
@@ -629,17 +719,110 @@ truthy("while a double vector still takes the bulk path",
 check("and nor does a size_t one", "Marshal.Copy" in view_class_body("MbUlongVector"), False)
 truthy("and a size_t vector binds", "public MbUlongVector offsets {" in cs)
 
-print("\n=== a class C# cannot own is refused, and named ===")
-# A refused CLASS is a different fact from a skipped member: the class is
-# absent from the .cs entirely, so a reader who does not see it named has no
-# way to tell it from a class the headers never had.
-truthy("the class is named in the run output",
-       re.search(r"PoolOwned: the whole class is not bound", run.stdout) is not None)
-truthy("and the reason names the ownership problem",
-       "double-freed" in run.stdout)
-check("it gets no C# class", "class PoolOwned" in cs, False)
-check("and no deleter it could never call", "mb_PoolOwned_delete" in shim_src, False)
+print("\n=== a declared constructor is not a constructible class ===")
+# emit_constructors enumerates constructors by reflection. pmp-library's
+# BasePropertyArray declares one AND has a pure virtual, so the shim emitted
+# `new BasePropertyArray(...)` and the module died on "allocating an object of
+# abstract class type". Third time this one site emitted an ill-formed `new`,
+# hence a gate on is_constructible rather than a third enumerated reason.
+check("no entry point allocates the abstract class",
+      "mb_AbstractWithCtor_new" in shim_src, False)
+truthy("and the refusal says it is abstract",
+       re.search(r"AbstractWithCtor\.AbstractWithCtor\(1 args\): the class is "
+                 r"abstract", run.stdout) is not None)
+# Refusing the constructor must not refuse the class: an abstract base is still
+# reachable as a view, which is the whole point of binding one.
+truthy("the class itself still binds",
+       "public sealed class AbstractWithCtor" in cs)
+truthy("and its concrete subclass constructs",
+       "public ConcreteOfAbstract()" in cs)
+
+print("\n=== a mutable char* is an out-buffer, not a string ===")
+# core::StringLike admits char*, which cost pugixml its whole module: the
+# parameter was read as a string, emitted as `const char*` on the wire, and
+# passed to a char*. The shim did not compile, so no method bound, not just
+# this one.
+truthy("a char* parameter is refused by name",
+       re.search(r"Buffers\.fill\(\)", run.stdout) is not None)
+check("so no entry point is emitted for it",
+      "mb_Buffers_fill" in shim_src, False)
+# The distinction is the whole point: const char* is a string and must survive,
+# which means the const has to be tested before remove_cv erases it.
+truthy("while a const char* parameter still binds",
+       "public ulong measure([MarshalAs(UnmanagedType.LPUTF8Str)] string s)" in cs
+       or "public ulong measure(string s)" in cs)
+truthy("and the class itself still binds", "public sealed class Buffers" in cs)
+
+print("\n=== a property's hidden accessors are names too ===")
+# A C# property X compiles to get_X and set_X, so `value` and `set_value` in one
+# class is CS0102 -- a collision with no C++ counterpart. The first claimant
+# keeps the plain name, which makes declaration order the tie-break, the same
+# convention the symbol ledger and the helper-tag ledger already use.
+truthy("the first-declared member keeps the plain name",
+       "public bool set_value {" in cs)
+truthy("and the one whose hidden setter it took is renamed",
+       "public string value_ {" in cs)
+# The getter direction, which worked for a METHOD named get_x before this and
+# not for a property.
+truthy("the getter direction too", "public double get_scale {" in cs)
+truthy("so the plain scale is renamed", "public int scale_ {" in cs)
+truthy("and each rename is reported by name",
+       re.search(r"Accessors\.value renamed to value_", run.stdout) is not None
+       and re.search(r"Accessors\.scale renamed to scale_", run.stdout) is not None)
+
+print("\n=== a class C# cannot own binds borrow-only ===")
+# A non-public destructor is how a factory API says the caller does not free
+# these. The class used to be refused whole; it binds now, and the invariant is
+# that nothing in the generated code can ever own one.
+truthy("the class binds", "public sealed class PoolOwned" in cs)
+# The absence IS the invariant: a deleter that exists is a deleter something
+# can call, and `delete` through an inaccessible destructor would not compile
+# anyway. Not an empty one, not a guarded one -- none.
+check("no deleter is emitted for it at all",
+      "mb_PoolOwned_delete" in shim_src, False)
+truthy("and its release path calls nothing",
+       "return true;" in view_class_body("PoolOwnedHandle")
+       and "Delete(" not in view_class_body("PoolOwnedHandle"))
+# The one owned-handle path the language does not close. is_default_constructible
+# and is_copy_constructible are variable-definition checks and so already false;
+# `new T(args)` is well-formed with an inaccessible destructor, so the reflected
+# constructor needs a gate of its own.
+truthy("a reflected constructor on it is refused, and says why",
+       re.search(r"PoolOwned\.<constructor>: it would hand back a pointer C# owns",
+                 run.stdout) is not None)
+check("so it gets no public constructor",
+      "public PoolOwned(" in cs, False)
 truthy("while the class beside it still binds", "public sealed class Impl" in cs)
+
+print("\n=== a pointer return is a borrow pinned to its receiver ===")
+# The other half, and it is not optional: a by-value member of a borrow-only
+# class would make its OWNER non-destructible too, so a pointer return is the
+# only route to one.
+truthy("an instance method returning T* hands back the bound class",
+       "public Node first() {" in cs)
+truthy("the shim hands back the pointer rather than a copy",
+       "return static_cast<void*>(const_cast<csb::Node*>("
+       "static_cast<csb::Pool*>(self)->Pool::first()));" in shim_src)
+truthy("the view does not own it and names the receiver as its owner",
+       "return new Node(r, false, this);" in cs)
+# A null pointer is a VALUE here -- FirstChildElement() says "there is none"
+# that way -- and the owned-return arm reads null as a failure.
+truthy("a null pointer becomes null rather than an exception",
+       "if (r == IntPtr.Zero) return null;" in cs)
+truthy("a const pointer borrows too, const-cast at the boundary",
+       "public Node first_const() {" in cs)
+# Pins the DESIGN decision, not the implementation: a static method has no
+# receiver, so a borrow minted there would be unowned by construction.
+truthy("a static method returning T* is still refused",
+       re.search(r"Pool\.static orphan\(\): returns ", run.stdout) is not None)
+truthy("and the reason is the missing receiver, not the pointer",
+       "a static method has no receiver" in run.stdout)
+# The lifetime rule has to reach the caller, and the generated XML doc is the
+# only place in the API that can carry it.
+truthy("the generated doc comment states the lifetime rule",
+       "A borrow follows C++ lifetime rules." in cs)
+truthy("including the hazard the pin does not cover",
+       "It does NOT survive the C++" in cs)
 
 print("\n=== a pure virtual is called through the vtable, not by name ===")
 # A qualified call suppresses dispatch, and a pure virtual has no definition
@@ -1119,10 +1302,25 @@ truthy("the shim builds the vector from the range",
        "std::vector<double>(values_data, values_data + values_n)" in shim_src)
 truthy("a list that is already an array is passed without a second copy",
        "values as double[]" in cs)
-# A vector of strings would need an array of char* with its own marshalling.
-# Refusing half the feature by name beats refusing both.
-truthy("a container of strings is refused and says which half is missing",
-       "count_names() --" in cs and "array of char*" in cs)
+# A container of strings crosses as one UTF-8 blob plus a byte count per
+# element -- three wire slots for one C# argument, rather than the char** this
+# used to refuse. The blob and the counts are blittable arrays, which the
+# P/Invoke marshaller pins for the call on its own, so the generated code holds
+# no GCHandle and needs no unsafe block.
+# The slot ORDER is the correctness condition -- it is why ArgSlot exists --
+# so this one assertion is deliberately about the ordered triple, and nothing
+# else about the declaration it sits in.
+truthy("a vector of strings takes three wire slots in order",
+       "[In] byte[] who_blob, [In] long[] who_lens, long who_n" in cs)
+truthy("and the shim rebuilds the vector from exactly those three",
+       "mb_strv(who_blob, who_lens, who_n)" in shim_src)
+truthy("the C# surface is the same read-only list a scalar vector takes",
+       "public int count_names(IReadOnlyList<string> who)" in cs)
+truthy("nothing on the managed side has to be pinned or freed by hand",
+       "GCHandle" not in cs and "Marshal.FreeCoTaskMem" not in cs
+       and "unsafe" not in cs)
+truthy("a fixed array of strings crosses the same way, with its count checked",
+       "mb_strarr<3>(" in shim_src)
 
 print("\n=== a Derived can be passed where a Base is expected ===")
 # A generated class is sealed with no C# base type, so without this a class
@@ -1421,6 +1619,60 @@ if MCS and MONO:
                "array param: sum=6" in out)
         truthy("and the wrong number of elements raises rather than binding short",
                "array param wrong length -> ArgumentException" in out)
+        # A container of strings inbound. The wire is a UTF-8 blob plus a byte
+        # count per element, not an array of char*, so these also pin the two
+        # properties that shape buys: an embedded NUL survives, and nothing on
+        # the managed side had to pin or free anything.
+        truthy("a vector of strings crosses inward on a method",
+               "strv method: joined=alpha|beta|gamma seen=3" in out)
+        truthy("an IReadOnlyList that is not a string[] is copied first",
+               "strv from List: joined=x||ünïcø∂é 🚀 seen=3" in out)
+        truthy("an empty list is an empty vector, not a null pointer",
+               "strv empty: joined=[] seen=0" in out)
+        truthy("a null element crosses as an empty string",
+               "strv null element: joined=after seen=2" in out)
+        truthy("a std::array of strings crosses inward too",
+               "strarr: joined=a/bb/ccc mid=bb" in out)
+        truthy("and the wrong number of elements raises",
+               "strarr wrong count -> ArgumentException" in out)
+        truthy("a null list raises ArgumentNullException, not NullReference",
+               "strv null list -> ArgumentNullException" in out)
+        # The length-carrying wire is the point: a char** would have stopped
+        # at the NUL and reported 1.
+        truthy("an embedded NUL survives the trip inward",
+               "embedded NUL survives: bytes=3" in out)
+        truthy("a static method takes one", "strv static: hola!" in out)
+        truthy("so does a constructor",
+               "strv ctor: joined=ctor|arg seen=2" in out)
+        truthy("a parameter named after a sibling's generated local is renamed",
+               "shadowed arg name: seen=head-tail" in out)
+        # The one that matters most: a borrow must destroy nothing, ever. The
+        # counter is in C++, so this is not a claim about the generated code --
+        # it is the pool reporting what happened.
+        truthy("a borrowed pointer reads the C++ object",
+               "borrow: value=21 doubled=42" in out)
+        truthy("disposing a borrow destroys nothing",
+               "disposing a borrow destroyed nothing: before=0 after=0" in out)
+        truthy("and a write through it reaches the C++ object",
+               "and the write reached C++: value=50" in out)
+        truthy("a null pointer comes back as null",
+               "a null pointer is null, not an exception: True" in out)
+        truthy("a pointer to a newly made node borrows the same way",
+               "pointer to a new node: count=2 value=7" in out)
+        truthy("so does a const pointer",
+               "a const pointer borrows too: value=50" in out)
+        truthy("and the C++ owner is what frees them",
+               "the owner freed its nodes: True" in out)
+        truthy("a class C# cannot own is reachable through a borrow",
+               "borrow-only class is reachable: id=33 doubled=66" in out)
+        truthy("and writable through it",
+               "and writable through the borrow: id=44" in out)
+        truthy("disposing a view with no deleter frees nothing, twice over",
+               "disposing a borrow-only view twice is safe: id=44" in out)
+        truthy("a borrow of a disposed owner raises rather than reading freed memory",
+               "borrow of a disposed owner -> ObjectDisposedException" in out)
+        truthy("a renamed property still reaches its own C++ member",
+               "accessors: set_value=True value=v get_scale=1.5 scale=4" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:

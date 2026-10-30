@@ -254,7 +254,7 @@ ${YELLOW}Required:${NC}
   <src_dir>           Directory containing C++ headers
   --module NAME       Output module name
   --lang LANG         Target language: python, lua, js, csharp, or all
-                      (csharp is not part of `all`: it writes a .cs source
+                      (csharp is not part of \`all\`: it writes a .cs source
                       file to add to a dotnet project plus the shared library
                       it loads, rather than a module the CLI can import)
 
@@ -902,6 +902,15 @@ build_csharp() {
         fi
     done
 
+    # The class names below come from the discovery pass, and when that fell
+    # back to scanning header text they are UNQUALIFIED -- so add_class<Foo>
+    # does not name anything and the generator does not compile. The other
+    # three backends have had these directives for as long as the text scan
+    # has; this backend did not, and tinyobjloader is what that cost.
+    echo "" >> "$gen_src"
+    MB_NS_FOUND=()
+    emit_namespace_directives "$gen_src" "$src_dir" "${cs_headers[@]}"
+
     local cs_namespace
     cs_namespace="$(cs_namespace_for "$module_name")"
 
@@ -911,6 +920,16 @@ build_csharp() {
         echo "    if (argc < 2) { std::fprintf(stderr, \"usage: %s <out-dir>\\n\", argv[0]); return 2; }"
         echo "    mirror_bridge::csharp::Emitter emitter(\"$module_name\", \"$cs_namespace\");"
     } >> "$gen_src"
+
+    # The shim is its own translation unit, compiled without the directives
+    # above, and the class names the emitter was handed are the same
+    # unqualified ones -- so static_cast<texture_option_t*> in the shim fails
+    # exactly as add_class<texture_option_t> did in the generator. These carry
+    # the namespaces into the shim's preamble.
+    local ns
+    for ns in "${MB_NS_FOUND[@]:-}"; do
+        [ -n "$ns" ] && echo "    emitter.add_using(\"$ns\");" >> "$gen_src"
+    done
 
     # Enums first: a class member of enum type is reported as not crossing
     # unless its enum is already registered, so registration order matters.
@@ -1084,6 +1103,130 @@ build_csharp() {
 }
 
 
+# Emit `using namespace X;` for every namespace the headers open, so that an
+# UNQUALIFIED class name from the text scan resolves.
+#
+# Shared by the Python/Lua/JS binding file and the C# generator source, because
+# only the first had it: tinyobjloader's reflection discovery fails, the scan
+# reports `texture_option_t` rather than `tinyobj::texture_option_t`, and the
+# C# generator was emitted as `add_class<texture_option_t>(...)` -- eight
+# `unknown type name` errors where the other three backends compiled. One
+# mechanism in one place, which is the shape this project keeps having to
+# relearn.
+#
+# A no-op when reflection read the headers: it reports names in full
+# (nlohmann::json_abi_v3_11_3::detail2::end_tag), so the directives buy nothing
+# and are read off header text that cannot see a namespace a macro opens.
+emit_namespace_directives() {
+    #
+    # Only for the text scan. The directives exist so that an unqualified
+    # class name from the scan resolves; reflection reports names in full
+    # (nlohmann::json_abi_v3_11_3::detail2::end_tag), so they buy nothing
+    # there and they are read off the header text, which cannot see a
+    # namespace a macro opens.
+    #
+    # nlohmann-json is the case that showed it. Its namespaces come from
+    # NLOHMANN_JSON_NAMESPACE_BEGIN, so the scan never sees `namespace
+    # nlohmann {` or its closing brace: names stack instead of popping and the
+    # enclosing namespace is missing entirely, giving
+    #
+    #     using namespace detail;
+    #     using namespace detail::detail;
+    #     using namespace detail::detail::detail;
+    #
+    # none of which name anything. Seventeen errors before the first line of
+    # real binding code. With them gone the same module gets as far as three
+    # errors about one member type, which is an ordinary declined-class
+    # problem rather than a module-killing one.
+    local out_file="$1" src_dir="$2"
+    shift 2
+    local -a ns_headers=("$@")
+    declare -A ns_seen
+    [ "${DISCOVERY_SOURCE:-text scan}" = "reflection" ] && return 0
+    local ns_script
+    ns_script=$(cat <<'PYSCRIPT'
+import re, sys
+seen = set()
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    except Exception:
+        continue
+    text = re.sub(r'//[^\n]*', '', text)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    # A namespace opened inside a macro body does not exist until the macro is
+    # expanded, and this scan cannot expand it. googletest's
+    # GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST opens an empty
+    # `gtest_do_not_use_outside_namespace_scope`, and emitting a using
+    # directive for it put `error: expected namespace name` at the top of the
+    # generated binding.
+    text = re.sub(r'^[ \t]*#(?:[^\n\\]|\\\n|\\.)*', '', text, flags=re.M)
+    depth = 0
+    ns_stack = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            while ns_stack and ns_stack[-1][1] >= depth:
+                ns_stack.pop()
+        elif ch == 'n':
+            m = re.match(r'namespace\s+([a-zA-Z_][a-zA-Z0-9_:]*)\s*\{', text[i:])
+            if m:
+                ns_name = m.group(1)
+                if ns_name != 'std':
+                    ns_stack.append((ns_name, depth))
+                    fqn = '::'.join(n for n, _ in ns_stack)
+                    if fqn and fqn not in seen:
+                        seen.add(fqn)
+                        print(fqn)
+                depth += 1
+                i += m.end()
+                continue
+        i += 1
+PYSCRIPT
+    )
+
+    local -a ns_paths=()
+    for header in "${ns_headers[@]}"; do
+        # Header may be relative to src_dir OR to an include root.
+        # Try each form.
+        local full_path=""
+        if [ -f "$src_dir/$header" ]; then
+            full_path="$src_dir/$header"
+        elif [ -f "$header" ]; then
+            full_path="$header"
+        else
+            # Try each -I include dir
+            for inc in "${_INCLUDE_DIRS[@]:-}"; do
+                if [ -n "$inc" ] && [ -f "$inc/$header" ]; then
+                    full_path="$inc/$header"; break
+                fi
+            done
+        fi
+        [ -n "$full_path" ] && ns_paths+=("$full_path")
+    done
+
+    # Also published as MB_NS_FOUND, because the C# backend needs the same
+    # directives in a SECOND translation unit: the generator compiles with them
+    # and then WRITES a shim that carries the same unqualified names, and the
+    # shim is compiled on its own. The names have to travel into the shim's own
+    # preamble, which only the emitter can write.
+    MB_NS_FOUND=()
+    if [ ${#ns_paths[@]} -gt 0 ]; then
+        while IFS= read -r fqn; do
+            if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
+                echo "using namespace $fqn;" >> "$out_file"
+                ns_seen["$fqn"]=1
+                MB_NS_FOUND+=("$fqn")
+            fi
+        done < <(python3 -c "$ns_script" "${ns_paths[@]}" 2>/dev/null)
+    fi
+}
+
 generate_binding_file() {
     local lang="$1"
     local module_name="$2"
@@ -1157,106 +1300,8 @@ EOF
 
     echo "" >> "$output_file"
 
-    # Detect namespaces and emit using directives, using a Python helper that
-    # tracks brace depth properly. Collect all files in one invocation.
-    #
-    # Only for the text scan. The directives exist so that an unqualified
-    # class name from the scan resolves; reflection reports names in full
-    # (nlohmann::json_abi_v3_11_3::detail2::end_tag), so they buy nothing
-    # there and they are read off the header text, which cannot see a
-    # namespace a macro opens.
-    #
-    # nlohmann-json is the case that showed it. Its namespaces come from
-    # NLOHMANN_JSON_NAMESPACE_BEGIN, so the scan never sees `namespace
-    # nlohmann {` or its closing brace: names stack instead of popping and the
-    # enclosing namespace is missing entirely, giving
-    #
-    #     using namespace detail;
-    #     using namespace detail::detail;
-    #     using namespace detail::detail::detail;
-    #
-    # none of which name anything. Seventeen errors before the first line of
-    # real binding code. With them gone the same module gets as far as three
-    # errors about one member type, which is an ordinary declined-class
-    # problem rather than a module-killing one.
-    declare -A ns_seen
-    local emit_using_directives=1
-    [ "${DISCOVERY_SOURCE:-text scan}" = "reflection" ] && emit_using_directives=0
-    local ns_script
-    ns_script=$(cat <<'PYSCRIPT'
-import re, sys
-seen = set()
-for path in sys.argv[1:]:
-    try:
-        with open(path, encoding='utf-8', errors='ignore') as f:
-            text = f.read()
-    except Exception:
-        continue
-    text = re.sub(r'//[^\n]*', '', text)
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-    # A namespace opened inside a macro body does not exist until the macro is
-    # expanded, and this scan cannot expand it. googletest's
-    # GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST opens an empty
-    # `gtest_do_not_use_outside_namespace_scope`, and emitting a using
-    # directive for it put `error: expected namespace name` at the top of the
-    # generated binding.
-    text = re.sub(r'^[ \t]*#(?:[^\n\\]|\\\n|\\.)*', '', text, flags=re.M)
-    depth = 0
-    ns_stack = []
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            while ns_stack and ns_stack[-1][1] >= depth:
-                ns_stack.pop()
-        elif ch == 'n':
-            m = re.match(r'namespace\s+([a-zA-Z_][a-zA-Z0-9_:]*)\s*\{', text[i:])
-            if m:
-                ns_name = m.group(1)
-                if ns_name != 'std':
-                    ns_stack.append((ns_name, depth))
-                    fqn = '::'.join(n for n, _ in ns_stack)
-                    if fqn and fqn not in seen:
-                        seen.add(fqn)
-                        print(fqn)
-                depth += 1
-                i += m.end()
-                continue
-        i += 1
-PYSCRIPT
-    )
+    emit_namespace_directives "$output_file" "$src_dir" "${headers[@]}"
 
-    local -a ns_paths=()
-    for header in "${headers[@]}"; do
-        # Header may be relative to src_dir OR to an include root.
-        # Try each form.
-        local full_path=""
-        if [ -f "$src_dir/$header" ]; then
-            full_path="$src_dir/$header"
-        elif [ -f "$header" ]; then
-            full_path="$header"
-        else
-            # Try each -I include dir
-            for inc in "${_INCLUDE_DIRS[@]:-}"; do
-                if [ -n "$inc" ] && [ -f "$inc/$header" ]; then
-                    full_path="$inc/$header"; break
-                fi
-            done
-        fi
-        [ -n "$full_path" ] && ns_paths+=("$full_path")
-    done
-
-    if [ $emit_using_directives -eq 1 ] && [ ${#ns_paths[@]} -gt 0 ]; then
-        while IFS= read -r fqn; do
-            if [ -n "$fqn" ] && [ -z "${ns_seen["$fqn"]}" ]; then
-                echo "using namespace $fqn;" >> "$output_file"
-                ns_seen["$fqn"]=1
-            fi
-        done < <(python3 -c "$ns_script" "${ns_paths[@]}" 2>/dev/null)
-    fi
 
     echo "" >> "$output_file"
 
