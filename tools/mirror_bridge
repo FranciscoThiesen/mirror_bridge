@@ -254,7 +254,7 @@ ${YELLOW}Required:${NC}
   <src_dir>           Directory containing C++ headers
   --module NAME       Output module name
   --lang LANG         Target language: python, lua, js, csharp, or all
-                      (csharp is not part of `all`: it writes a .cs source
+                      (csharp is not part of \`all\`: it writes a .cs source
                       file to add to a dotnet project plus the shared library
                       it loads, rather than a module the CLI can import)
 

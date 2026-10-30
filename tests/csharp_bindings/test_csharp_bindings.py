@@ -332,6 +332,51 @@ class Driver {
             r.counts.Clear();
             Console.WriteLine($"map clear reaches C++: total={r.total()} Count={r.counts.Count}");
         }
+        using (var j = new Joiner()) {
+            var three = new string[] { "alpha", "beta", "gamma" };
+            j.take(three);
+            Console.WriteLine($"strv method: joined={j.joined} seen={j.parts_seen}");
+
+            // A List<string> is not a string[], so this takes the copying arm
+            // of the prologue rather than the cast.
+            var lst = new List<string>();
+            lst.Add("x");
+            lst.Add("");
+            lst.Add("ünïcø∂é 🚀");
+            j.take(lst);
+            Console.WriteLine($"strv from List: joined={j.joined} seen={j.parts_seen}");
+
+            j.take(new string[0]);
+            Console.WriteLine($"strv empty: joined=[{j.joined}] seen={j.parts_seen}");
+
+            j.take(new string[] { null, "after" });
+            Console.WriteLine($"strv null element: joined={j.joined} seen={j.parts_seen}");
+
+            var fixed3 = new string[] { "a", "bb", "ccc" };
+            j.take_fixed(fixed3);
+            var mid = j.fixed_parts[1];
+            Console.WriteLine($"strarr: joined={j.joined} mid={mid}");
+
+            var two = new string[] { "only", "two" };
+            Expect<ArgumentException>(() => j.take_fixed(two), "strarr wrong count");
+            Expect<ArgumentNullException>(() => j.take(null), "strv null list");
+
+            // Two code units with a NUL between them. The wire carries a byte
+            // count per element, so this is 3; a NUL-terminated char** would
+            // have reported 1.
+            var nul = new string[] { "a" + (char)0 + "b" };
+            Console.WriteLine($"embedded NUL survives: bytes={j.byte_total(nul)}");
+
+            var hola = Joiner.shout(new string[] { "ho", "la" });
+            Console.WriteLine($"strv static: {hola}");
+        }
+        using (var j2 = new Joiner(new string[] { "ctor", "arg" })) {
+            Console.WriteLine($"strv ctor: joined={j2.joined} seen={j2.parts_seen}");
+        }
+        using (var sh2 = new Shadower()) {
+            sh2.mix(new string[] { "-tail" }, "head");
+            Console.WriteLine($"shadowed arg name: seen={sh2.seen}");
+        }
         return 0;
     }
 }
@@ -1119,10 +1164,25 @@ truthy("the shim builds the vector from the range",
        "std::vector<double>(values_data, values_data + values_n)" in shim_src)
 truthy("a list that is already an array is passed without a second copy",
        "values as double[]" in cs)
-# A vector of strings would need an array of char* with its own marshalling.
-# Refusing half the feature by name beats refusing both.
-truthy("a container of strings is refused and says which half is missing",
-       "count_names() --" in cs and "array of char*" in cs)
+# A container of strings crosses as one UTF-8 blob plus a byte count per
+# element -- three wire slots for one C# argument, rather than the char** this
+# used to refuse. The blob and the counts are blittable arrays, which the
+# P/Invoke marshaller pins for the call on its own, so the generated code holds
+# no GCHandle and needs no unsafe block.
+# The slot ORDER is the correctness condition -- it is why ArgSlot exists --
+# so this one assertion is deliberately about the ordered triple, and nothing
+# else about the declaration it sits in.
+truthy("a vector of strings takes three wire slots in order",
+       "[In] byte[] who_blob, [In] long[] who_lens, long who_n" in cs)
+truthy("and the shim rebuilds the vector from exactly those three",
+       "mb_strv(who_blob, who_lens, who_n)" in shim_src)
+truthy("the C# surface is the same read-only list a scalar vector takes",
+       "public int count_names(IReadOnlyList<string> who)" in cs)
+truthy("nothing on the managed side has to be pinned or freed by hand",
+       "GCHandle" not in cs and "Marshal.FreeCoTaskMem" not in cs
+       and "unsafe" not in cs)
+truthy("a fixed array of strings crosses the same way, with its count checked",
+       "mb_strarr<3>(" in shim_src)
 
 print("\n=== a Derived can be passed where a Base is expected ===")
 # A generated class is sealed with no C# base type, so without this a class
@@ -1421,6 +1481,33 @@ if MCS and MONO:
                "array param: sum=6" in out)
         truthy("and the wrong number of elements raises rather than binding short",
                "array param wrong length -> ArgumentException" in out)
+        # A container of strings inbound. The wire is a UTF-8 blob plus a byte
+        # count per element, not an array of char*, so these also pin the two
+        # properties that shape buys: an embedded NUL survives, and nothing on
+        # the managed side had to pin or free anything.
+        truthy("a vector of strings crosses inward on a method",
+               "strv method: joined=alpha|beta|gamma seen=3" in out)
+        truthy("an IReadOnlyList that is not a string[] is copied first",
+               "strv from List: joined=x||ünïcø∂é 🚀 seen=3" in out)
+        truthy("an empty list is an empty vector, not a null pointer",
+               "strv empty: joined=[] seen=0" in out)
+        truthy("a null element crosses as an empty string",
+               "strv null element: joined=after seen=2" in out)
+        truthy("a std::array of strings crosses inward too",
+               "strarr: joined=a/bb/ccc mid=bb" in out)
+        truthy("and the wrong number of elements raises",
+               "strarr wrong count -> ArgumentException" in out)
+        truthy("a null list raises ArgumentNullException, not NullReference",
+               "strv null list -> ArgumentNullException" in out)
+        # The length-carrying wire is the point: a char** would have stopped
+        # at the NUL and reported 1.
+        truthy("an embedded NUL survives the trip inward",
+               "embedded NUL survives: bytes=3" in out)
+        truthy("a static method takes one", "strv static: hola!" in out)
+        truthy("so does a constructor",
+               "strv ctor: joined=ctor|arg seen=2" in out)
+        truthy("a parameter named after a sibling's generated local is renamed",
+               "shadowed arg name: seen=head-tail" in out)
         if runp.returncode != 0:
             print(out[-1200:]); print(runp.stderr[-600:])
 else:
