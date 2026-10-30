@@ -266,6 +266,24 @@ not a workaround for a facility we ignored.
   static-link option. A GCC 16 generator stage would link `libstdc++.so.6`
   instead, which is far more commonly present — *plausible, unverified*.
 
+### Scale
+
+- **The generator translation unit is the heaviest thing this backend compiles,
+  and it is the one corpus failure left.** The other three backends emit one
+  binding per class into a module; this one instantiates an `Emitter` method per
+  class, over the full reflection surface, in a single TU — then that TU *runs*
+  to write the shim. pmp-library (32 classes over Eigen) exhausts the constexpr
+  budget and still fails after the escalation to
+  `-fconstexpr-steps=2000000000`.
+
+  This is the gap that matters most for a large codebase, because it is the one
+  that gets worse with size rather than with the shapes a library uses. Nothing
+  about it is diagnosed beyond the budget: whether the cost is in discovery, in
+  `add_class` instantiation or in one pathological type is unmeasured, and
+  `--discover-only` already separates the first of those. Splitting the
+  generator across translation units — one per header, say — is the obvious
+  shape and is untried.
+
 ### Type coverage
 
 No `std::set`, `std::variant`, `std::expected`, smart pointers or
