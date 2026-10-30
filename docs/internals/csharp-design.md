@@ -277,7 +277,7 @@ design: its halves are already `VectorPlan`s, and a string half has a wire.
 ## What the corpus says, as of 2026-10-30
 
 Pointing `compatibility/run_compatibility.py --lang csharp` at the **seven**
-libraries that bind under the Python backend: **5 of 7 bind usefully**, every one
+libraries that bind under the Python backend: **6 of 7 bind usefully**, every one
 of them with the `must_export` names the manifest demands.
 
 | library | verdict | classes | API the manifest requires |
@@ -287,32 +287,68 @@ of them with the `must_export` names the manifest demands.
 | clipper2 | **ok** | 20 | `Clipper64`, `ClipperOffset` |
 | cxxopts | **ok** | 27 | `Options`, `ParseResult` |
 | SQLiteCpp | **ok** | 9 | `Database`, `Statement`, `Column` |
+| tinyobjloader | **ok** | 26 | `ObjReader`, `attrib_t`, `shape_t` |
 | pmp-library | `reflection-tu-failed` | 32 discovered | — |
-| tinyobjloader | `reflection-tu-failed` | 26 discovered | — |
 
-Neither of the two misses is C# codegen, and `reflection-tu-failed` was the
-wrong cause for one of them.
+Two of those six were failing when this work started. One of the two
+original misses is fixed; the other is a real limit.
 
-**tinyobjloader is not header-only.** Reproducing it shows discovery working
-and the *link* failing: `undefined reference to tinyobj::ObjReader::ParseFromFile`
-and three more of its own symbols. The shim calls functions declared in the
-headers and defined in the library's sources, so its objects have to be linked
-in — `generate --link-args`, the caller's to supply, and its manifest entry
-gives none. Two bugs stacked to publish that as a reflection failure: the
-classifier had no rule for `undefined reference`, so clang's "linker command
-failed with exit code 1" matched the generic `\berror\b` rule, and then the
-`text-scan → reflection-tu-failed` override replaced even that. A link failure
-*proves* discovery and codegen both worked, so the override no longer applies
-to it. This matters beyond one row: for C# the case is reachable at **build**
-time rather than at import, because `--no-undefined` refuses to produce a `.so`
-that cannot be loaded, so the build-time classifier is the only place such a
-library can be recognised at all.
+**tinyobjloader was a real bug, two translation units deep.** Its row read
+`reflection-tu-failed`, which was accurate as far as it went: reflection
+discovery fails on those headers and the CLI falls back to scanning header text.
+What the truncated `detail` field hid is what happens next.
 
-**pmp-library is a genuine generator-stage limit.** It exhausts the constexpr
-budget and still fails after the escalation to `-fconstexpr-steps=2000000000`.
-The C# generator TU is heavier than a Python binding TU — it instantiates an
-`Emitter` method per class rather than a binding per class — so it is the stage
-most exposed to this, and it is the one real thing left on this list.
+A text scan reports **unqualified** names, because it cannot see the
+preprocessor or resolve a scope. The CLI has had a fix for that since
+nlohmann-json — it emits `using namespace tinyobj;` ahead of the generated
+binding so those names resolve — and **only the Python, Lua and JavaScript
+binding file got it.** So:
+
+```
+Discovered 26 classes (text scan)
+..._csharp_gen.cpp:9:23: error: unknown type name 'texture_option_t'
+```
+
+Adding the directives to the C# generator source moved the error exactly one
+stage later, which is the useful kind of failure:
+
+```
+..._shim.cpp:616:22: error: unknown type name 'texture_option_t'
+```
+
+The shim is a **translation unit of its own**, compiled without those
+directives, and the class names it contains are the same unqualified ones. Only
+the emitter can write the shim's preamble, so the namespaces have to travel
+there: `Emitter::add_using`, called once per namespace by the CLI and only on
+the text-scan path, since reflection reports names in full and there would be
+nothing to open.
+
+With both stages fixed, tinyobjloader **binds**: 26 classes, with `ObjReader`,
+`attrib_t` and `shape_t` — the API its manifest demands — all present.
+
+Worth noting what that does and does not mean. A hand run that *succeeds* at
+reflection discovery finds 17 classes and fails at the **link** with
+`undefined reference to tinyobj::ObjReader::ParseFromFile`, because the library
+is not header-only and its manifest gives no `link_args`. The text-scan path
+binds 26 and links, because the methods that would have needed those symbols
+are declined for other reasons. Two paths, two different subsets, both over the
+manifest's bar — and a reminder that "binds" is a claim about a class list, not
+about a library.
+
+The investigation also surfaced a classifier gap, fixed on its own merits: there
+was no rule for `undefined reference`, so clang's "linker command failed with
+exit code 1" matched the generic `\berror\b` rule, and the
+`text-scan → reflection-tu-failed` override then replaced even that. A link
+failure *proves* discovery and codegen both worked, so the override no longer
+applies to it. This matters for C# specifically, because `--no-undefined` makes
+the case reachable at **build** time rather than at import.
+
+**pmp-library is a genuine generator-stage limit, and it is the one real thing
+left on this list.** It exhausts the constexpr budget and still fails after the
+escalation to `-fconstexpr-steps=2000000000`, with the namespace fix above in
+place. The C# generator TU is heavier than a Python binding TU — it instantiates
+an `Emitter` method per class rather than a binding per class — so it is the
+stage most exposed to this, and 32 classes over Eigen is what exposes it.
 
 ### How this number was wrong, and in which direction
 

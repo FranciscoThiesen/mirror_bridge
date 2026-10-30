@@ -848,6 +848,23 @@ public:
     Emitter(std::string module, std::string ns)
         : module_(std::move(module)), namespace_(std::move(ns)) {}
 
+    // Open a namespace in the generated shim.
+    //
+    // The shim is a translation unit of its own, and the class names it
+    // contains are the ones this Emitter was handed. When discovery fell back
+    // to scanning header text those names are UNQUALIFIED, so
+    // `static_cast<texture_option_t*>` in the shim names nothing even after
+    // the CLI has put `using namespace tinyobj;` in front of the generator --
+    // that directive only fixes the generator's own compile. tinyobjloader is
+    // the case: the generator stage went green and the shim then failed with
+    // the identical error one stage later.
+    //
+    // The CLI calls this once per namespace it detected, and only for the text
+    // scan: reflection reports names in full, so there is nothing to open.
+    void add_using(const char* ns) {
+        if (ns && *ns) usings_.push_back(ns);
+    }
+
     // cpp_name is passed in rather than read off the reflection. The only
     // spelling certainly valid in the shim's own translation unit is the fully
     // qualified one the caller already has: display_string_of gives an
@@ -1112,6 +1129,10 @@ private:
     std::map<std::string, std::size_t> map_key_;
     std::deque<MapPlan> maps_;
     std::set<std::string> headers_;
+    // Namespaces to open in the SHIM's preamble. Needed only when the class
+    // list came from a text scan, which reports unqualified names -- see
+    // add_using.
+    std::vector<std::string> usings_;
 
     // The type the C# caller sees. For an enum that is the registered enum
     // name rather than the integer it travels as, so the generated API stays
@@ -3985,6 +4006,8 @@ private:
           << "return a;\n"
           << "}\n\n";
         for (const auto& h : headers_) o << "#include \"" << h << "\"\n";
+        // After the headers, so the namespaces they declare exist.
+        for (const auto& ns : usings_) o << "using namespace " << ns << ";\n";
         o << "\n"
           << "#if defined(_WIN32)\n"
           << "#  define MB_EXPORT extern \"C\" __declspec(dllexport)\n"
