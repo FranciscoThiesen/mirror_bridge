@@ -431,6 +431,29 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         )
     endif()
 
+    # Constructor dispatch: arguments no constructor accepts are refused, the
+    # three call spellings agree, and constructors that cannot be called are
+    # not offered
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/constructors)
+        mirror_bridge_lua_module(constructors_lua
+            lua/constructors/constructors_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/constructors
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
+        )
+        set_target_properties(constructors_lua PROPERTIES OUTPUT_NAME constructors)
+    endif()
+
+    # Smart pointers, std::array/std::span and container elements either
+    # convert or are refused
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/composites)
+        mirror_bridge_lua_module(composites_lua
+            lua/composites/composites_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/composites
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
+        )
+        set_target_properties(composites_lua PROPERTIES OUTPUT_NAME composites)
+    endif()
+
 endif()
 
 # ============================================================================
@@ -487,6 +510,22 @@ if(MIRROR_BRIDGE_BUILD_JS AND NAPI_FOUND)
         mirror_bridge_js_module(const_members_js
             js/const_members/const_members_js_binding.cpp
             INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/const_members
+        )
+    endif()
+
+    # Constructor dispatch (the JavaScript half of lua/constructors)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/js/constructors)
+        mirror_bridge_js_module(constructors_js
+            js/constructors/constructors_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/constructors
+        )
+    endif()
+
+    # Composite conversions (the JavaScript half of lua/composites)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/js/composites)
+        mirror_bridge_js_module(composites_js
+            js/composites/composites_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/composites
         )
     endif()
 
