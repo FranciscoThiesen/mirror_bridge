@@ -1,6 +1,13 @@
 // The harness builds every module into build/, the same way every other
 // JavaScript test here finds its addon.
-const m = require('../../../build/const_members_js.node');
+// Resolution order: NODE_PATH (set by ctest to the CMake build tree), then
+// the bash harness output
+let m;
+try {
+    m = require('const_members_js');
+} catch (e) {
+    m = require('../../../build/const_members_js.node');
+}
 
 console.log("=== const and non-assignable members, JavaScript ===");
 const assert = require('assert');

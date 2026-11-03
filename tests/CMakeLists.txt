@@ -297,6 +297,14 @@ if(MIRROR_BRIDGE_BUILD_PYTHON)
         )
     endif()
 
+    # A std::vector data member is a live view of the C++ vector, not a copy
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sequence_views)
+        mirror_bridge_python_module(sequence_views
+            sequence_views/sequence_views_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/sequence_views
+        )
+    endif()
+
     # P3394 annotations, which both supported toolchains implement under
     # different names. The runtime behaviour is what matters and had no test:
     # a compile-only check cannot tell an honoured [[=exclude{}]] from an
@@ -413,6 +421,16 @@ if(MIRROR_BRIDGE_BUILD_LUA AND LUA_FOUND)
         set_target_properties(type_safety_lua PROPERTIES OUTPUT_NAME type_safety)
     endif()
 
+    # A const member, and one whose type has no default constructor, bind as
+    # readable and refuse assignment instead of failing the module
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lua/const_members)
+        mirror_bridge_lua_module(const_members_lua
+            lua/const_members/const_members_lua_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/lua/const_members
+            OUTPUT_DIRECTORY ${LUA_TEST_OUTPUT_DIR}
+        )
+    endif()
+
 endif()
 
 # ============================================================================
@@ -464,6 +482,14 @@ if(MIRROR_BRIDGE_BUILD_JS AND NAPI_FOUND)
         add_dependencies(type_safety_js foreign_addon)
     endif()
 
+    # const and non-assignable members (the JavaScript half of lua/const_members)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/js/const_members)
+        mirror_bridge_js_module(const_members_js
+            js/const_members/const_members_js_binding.cpp
+            INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/js/const_members
+        )
+    endif()
+
 endif()
 
 # ============================================================================
@@ -476,17 +502,17 @@ endif()
 # excluded here — they are still exercised by CI's bash jobs. To promote
 # one into ctest, add its module via mirror_bridge_python_module() above
 # and remove its directory from this pattern.
+# One string, not one per entry: set() with several strings makes a CMake list,
+# and the ';' that joins them lands inside the regex. When batch_methods and
+# columnar each added a copy of this line, the join turned "^batch_methods"
+# into "^batch_methods;auto_discovery", which matches nothing, and ctest
+# registered test_batched.py with no module to import.
+# batch_methods' and columnar's modules only exist when built with
+# -DMIRROR_BRIDGE_BATCH_METHODS and -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which
+# their own scripts do; the glob below would otherwise register each .py as a
+# standalone test with nothing to import.
 set(MB_PYTHON_BASH_ONLY_PATTERN
-    # batch_methods' module only exists when built with
-    # -DMIRROR_BRIDGE_BATCH_METHODS, which its own script does; the glob below
-    # would otherwise register the .py as a standalone test with nothing to
-    # import.
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^batch_methods"
-    # columnar's module only exists when built with
-    # -DMIRROR_BRIDGE_COLUMNAR_VECTORS, which its own script does; the glob
-    # below would otherwise register the .py as a standalone test with nothing
-    # to import.
-    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^columnar"
+    "auto_discovery|auto_trampoline|^trampoline|^readme|^inheritance|^exceptions|^expected|^bulk_transfer|^kwargs_defaults|^smart_ptr_wrapper|custom_converter|e2e/features|^template_instantiation|^export_macro|^batch_methods|^columnar"
 )
 
 # The same contract for the other two backends. These were spelled out at
@@ -632,6 +658,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/macro_namespace/build_and_test.sh
     )
     set_tests_properties(cli_macro_namespace PROPERTIES
+        ENVIRONMENT "MB_CXX=${CMAKE_CXX_COMPILER}"
+    )
+endif()
+
 # A struct's layout read off the type, checked against what numpy makes of it.
 # Not a binding, and it needs numpy, which the test skips itself without.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/columnar)
