@@ -40,6 +40,19 @@ const v = new vec3.Vec3();
 assert(v.x === 0 && v.y === 0 && v.z === 0, "Default constructor failed");
 console.log("  PASS: Default constructor works");
 
+// Constructor arguments are used, and arguments no constructor takes are
+// refused: new Vec3(1, 2) used to return (0, 0, 0)
+const built = new vec3.Vec3(1, 2, 3);
+assert(built.x === 1 && built.y === 2 && built.z === 3, "new Vec3(1, 2, 3) did not use its arguments");
+let refusedTwo = false;
+try {
+    new vec3.Vec3(1, 2);
+} catch (e) {
+    refusedTwo = e instanceof TypeError && e.message.includes("no constructor takes 2 arguments");
+}
+assert(refusedTwo, "new Vec3(1, 2) matched no constructor and was accepted anyway");
+console.log("  PASS: constructor arguments are used, and a count no constructor takes is refused");
+
 // Test 2: Setting values
 v.x = 1.0;
 v.y = 2.0;

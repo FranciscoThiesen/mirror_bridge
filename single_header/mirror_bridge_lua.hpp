@@ -222,6 +222,8 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -234,6 +236,7 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 #include <mutex>
 #include <typeindex>
 #include <shared_mutex>
+#include <utility>
 
 
 // ============================================================================
@@ -976,6 +979,267 @@ consteval bool has_parameterized_constructor() {
 }
 
 // ============================================================================
+// Constructors a Value-Converting Binding Can Call
+// ============================================================================
+//
+// Lua and JavaScript construct an object the same way: convert each host
+// argument into a default-constructed std::remove_cvref_t<P>, then call
+// `new T(std::move(arg)...)`. What follows is the one list of constructors
+// both offer, the one test of whether a constructor can be called that way,
+// and the one dispatcher that turns host arguments into an object or a
+// reason. Each backend used to carry its own copy of all three, and that is
+// how the Python backend's fixes for deleted overloads and for silently
+// default-constructing never reached either of them.
+
+template<typename T>
+struct ConstructorCache {
+    // Public (members_of under the current access context), at least one
+    // parameter -- the zero-argument case is `new T()`, which
+    // is_default_constructible_v decides -- and neither copy, move nor
+    // deleted. A deleted overload is still a declared member, so
+    // `Celsius(int) = delete` used to be offered, and the `new Celsius(int)`
+    // it instantiated failed the whole module.
+    static consteval bool is_offered(std::meta::info member) {
+        return std::meta::is_constructor(member) &&
+               !std::meta::is_copy_constructor(member) &&
+               !std::meta::is_move_constructor(member) &&
+               !std::meta::is_deleted(member) &&
+               !std::meta::parameters_of(member).empty();
+    }
+
+    static consteval std::vector<std::meta::info> collect() {
+        std::vector<std::meta::info> result;
+        for (auto member : std::meta::members_of(^^T, std::meta::access_context::current())) {
+            if (is_offered(member)) result.push_back(member);
+        }
+        return result;
+    }
+
+    static constexpr auto constructors = std::define_static_array(collect());
+    static constexpr std::size_t count = constructors.size();
+};
+
+template<typename T, std::size_t C>
+consteval std::size_t constructor_arity() {
+    return std::meta::parameters_of(ConstructorCache<T>::constructors[C]).size();
+}
+
+template<typename T, std::size_t C, std::size_t P>
+consteval std::meta::info constructor_param_type() {
+    return std::meta::type_of(std::meta::parameters_of(ConstructorCache<T>::constructors[C])[P]);
+}
+
+// Alias-template form, for the pack expansions below (see the note on splice
+// hoisting above method_param_t).
+template<typename T, std::size_t C, std::size_t P>
+using constructor_param_t = typename [:constructor_param_type<T, C, P>():];
+
+// Whether constructor C can be called the way Lua and JavaScript call it.
+//
+// Reflection reports a *declared* constructor; this asks whether it is
+// *callable*, in three clauses. is_param_bindable is the per-parameter gate
+// the method path already uses: it refuses a raw pointer to a user type and a
+// smart pointer to an incomplete one, for which no converter exists.
+// is_constructible_v asks whether `T t(std::move(arg)...)` is well formed,
+// with an rvalue of each std::remove_cvref_t<P> -- the same overload
+// resolution as the `new T(...)` both backends make. And the arguments are
+// held in a default-constructed tuple while they convert, so each parameter
+// type must be default constructible.
+//
+// That rules out an abstract class (pmp-library's BasePropertyArray declares
+// `explicit BasePropertyArray(std::string)` beside a pure virtual), a
+// constructor that needs an lvalue (`Widget(Config&)`), one taking a class
+// with no default constructor (even by const reference), and one taking a
+// `Node*`: each used to be instantiated anyway and fail the whole module.
+// A variable definition also needs an accessible destructor, so the answer is
+// false for a class whose destructor is not public too, although `new T(args)`
+// would compile; such a class cannot be bound by these backends at all,
+// because the wrapper's finalizer deletes it.
+template<typename T, std::size_t C>
+consteval bool constructor_callable_with_values() {
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_param_bindable<constructor_param_t<T, C, Is>>() && ...) &&
+               std::is_constructible_v<T, std::remove_cvref_t<constructor_param_t<T, C, Is>>...> &&
+               (std::is_default_constructible_v<std::remove_cvref_t<constructor_param_t<T, C, Is>>> && ...);
+    }(std::make_index_sequence<constructor_arity<T, C>()>{});
+}
+
+template<typename T>
+consteval std::size_t callable_constructor_count() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        return (std::size_t{0} + ... + (constructor_callable_with_values<T, Cs>() ? 1 : 0));
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// The argument counts a constructor call can succeed with: bit n is set when
+// a callable constructor takes n arguments, and bit 0 when T is default
+// constructible. An error message uses it to say what would have worked.
+template<typename T>
+consteval std::uint64_t callable_constructor_arities() {
+    std::uint64_t mask = std::is_default_constructible_v<T> ? 1u : 0u;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() < 64) {
+                mask |= std::uint64_t{1} << constructor_arity<T, Cs>();
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    return mask;
+}
+
+// The most arguments any callable constructor takes. Computed from the
+// constructors themselves rather than from the mask above, which cannot
+// record an arity of 64 or more: a backend sizes an argument buffer from
+// this, and the dispatcher would still reach such a constructor.
+template<typename T>
+consteval std::size_t max_callable_constructor_arity() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        std::size_t highest = 0;
+        ((highest = constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() > highest
+                        ? constructor_arity<T, Cs>() : highest), ...);
+        return highest;
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// "2", "0 or 2", "1, 2 or 3": the argument counts set in `mask`.
+inline void format_arities(std::uint64_t mask, char* out, std::size_t out_size) {
+    if (out_size == 0) return;
+    out[0] = '\0';
+    int counts[64];
+    int n = 0;
+    for (int i = 0; i < 64; ++i) {
+        if ((mask >> i) & 1u) counts[n++] = i;
+    }
+    std::size_t used = 0;
+    for (int i = 0; i < n && used < out_size; ++i) {
+        const char* separator = i == 0 ? "" : (i == n - 1 ? " or " : ", ");
+        const int written = std::snprintf(out + used, out_size - used, "%s%d", separator, counts[i]);
+        if (written < 0) break;
+        used += static_cast<std::size_t>(written);
+    }
+}
+
+// Why a constructor call produced no object.
+struct ConstructorRefusal {
+    enum Kind : unsigned char {
+        none,
+        abstract_class,       // T is abstract
+        needs_arguments,      // no arguments, and T has no default constructor
+        not_constructible,    // nothing at all is callable
+        takes_no_arguments,   // arguments, but no callable parameterized constructor
+        no_such_arity,        // no callable constructor takes that many arguments
+        bad_argument,         // the one constructor taking that many refused an argument
+        no_overload_accepts,  // several take that many, and every one refused
+    };
+    Kind kind = none;
+    int position = 0;               // bad_argument: which argument, counting from 1
+    const char* expected = nullptr; // bad_argument: the backend's token for what it should have been
+};
+
+// Construct a T from `nargs` host arguments, or record why not.
+//
+// Each attempt must leave the host's arguments as it found them, because the
+// next candidate converts the same ones. The Lua half converts copies for
+// exactly that reason.
+//
+// `convert_and_new` is the backend's half. Called as
+// `convert_and_new.template operator()<C>(attempt)` for each callable
+// constructor C that takes exactly `nargs` arguments, in declaration order,
+// it converts the arguments and returns `new T(...)`, or returns nullptr after
+// recording in `attempt` which argument refused. The first that converts wins.
+//
+// Arguments that no constructor accepts are refused; they never fall back to
+// `new T()`. That fallback made Vec3(1, 2, 3) a (0, 0, 0) with no error in
+// both backends, for a wrong count, for a value that would not convert, and
+// for a class with no parameterized constructor at all, such as an aggregate.
+// The Python backend stopped doing it in 2ff003e; this is the same contract.
+template<typename T, typename ConvertAndNew>
+T* construct_from_host_arguments(std::size_t nargs, ConstructorRefusal& refusal,
+                                 ConvertAndNew&& convert_and_new) {
+    if (nargs == 0) {
+        if constexpr (std::is_default_constructible_v<T>) {
+            return new T();
+        } else if constexpr (std::is_abstract_v<T>) {
+            refusal.kind = ConstructorRefusal::abstract_class;
+        } else if constexpr (callable_constructor_count<T>() > 0) {
+            refusal.kind = ConstructorRefusal::needs_arguments;
+        } else {
+            refusal.kind = ConstructorRefusal::not_constructible;
+        }
+        return nullptr;
+    }
+
+    T* object = nullptr;
+    int attempts = 0;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>()) {
+                if (object || nargs != constructor_arity<T, Cs>()) return;
+                ConstructorRefusal attempt;
+                object = convert_and_new.template operator()<Cs>(attempt);
+                if (!object && attempts++ == 0) refusal = attempt;
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    if (object) return object;
+
+    if constexpr (callable_constructor_count<T>() == 0) {
+        refusal.kind = std::is_abstract_v<T>              ? ConstructorRefusal::abstract_class
+                     : std::is_default_constructible_v<T> ? ConstructorRefusal::takes_no_arguments
+                                                          : ConstructorRefusal::not_constructible;
+    } else {
+        refusal.kind = attempts == 0 ? ConstructorRefusal::no_such_arity
+                     : attempts == 1 ? ConstructorRefusal::bad_argument
+                                     : ConstructorRefusal::no_overload_accepts;
+    }
+    return nullptr;
+}
+
+// The sentence for a refusal that needs nothing from the host but the class's
+// name. bad_argument and no_overload_accepts describe host values, so each
+// backend words those itself, with its own describer.
+template<typename T>
+void describe_constructor_refusal(const ConstructorRefusal& refusal, const char* class_name,
+                                  const char* host, std::size_t nargs,
+                                  char* out, std::size_t out_size) {
+    char arities[96];
+    format_arities(callable_constructor_arities<T>(), arities, sizeof arities);
+    switch (refusal.kind) {
+        case ConstructorRefusal::abstract_class:
+            std::snprintf(out, out_size,
+                          "%s is abstract in C++ and cannot be constructed; "
+                          "construct a concrete derived class", class_name);
+            return;
+        case ConstructorRefusal::needs_arguments:
+            std::snprintf(out, out_size,
+                          "%s has no default constructor in C++; pass its constructor "
+                          "arguments (constructors take %s)", class_name, arities);
+            return;
+        // "declares": a constructor inherited through `using Base::Base;` is
+        // not a member reflection lists, so it is not offered, and saying the
+        // class *has* no such constructor would be false.
+        case ConstructorRefusal::not_constructible:
+            std::snprintf(out, out_size,
+                          "%s cannot be constructed from %s: it has no default constructor "
+                          "and declares no constructor %s can call", class_name, host, host);
+            return;
+        case ConstructorRefusal::takes_no_arguments:
+            std::snprintf(out, out_size,
+                          "%s takes no constructor arguments (it declares no constructor %s "
+                          "can call with arguments); construct it with none and assign its members",
+                          class_name, host);
+            return;
+        case ConstructorRefusal::no_such_arity:
+            std::snprintf(out, out_size, "%s: no constructor takes %zu argument%s (constructors take %s)",
+                          class_name, nargs, nargs == 1 ? "" : "s", arities);
+            return;
+        default:
+            std::snprintf(out, out_size, "%s: no constructor accepts these arguments", class_name);
+            return;
+    }
+}
+
+// ============================================================================
 // Type Signature Generation (for change detection)
 // ============================================================================
 
@@ -1263,6 +1527,7 @@ extern "C" {
 #include <lauxlib.h>
 #include <lualib.h>
 }
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -1296,6 +1561,134 @@ struct LuaWrapper {
     T* cpp_object;
     bool owns_memory;
 };
+
+// ============================================================================
+// Custom Type Converter Extension Point
+// ============================================================================
+//
+// Users can add conversion support for custom types by defining to_lua/from_lua
+// overloads in the mirror_bridge::lua namespace, or by specializing
+// CustomLuaConverter.
+//
+// Example:
+//   namespace mirror_bridge::lua {
+//       void to_lua(lua_State* L, const MyType& v) { ... }
+//       bool from_lua(lua_State* L, int idx, MyType& v) { ... }
+//   }
+
+template<typename T, typename Enable = void>
+struct CustomLuaConverter {
+    static constexpr bool has_custom_conversion = false;
+};
+
+template<typename T>
+concept HasCustomLuaConverter = requires {
+    { CustomLuaConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
+} && CustomLuaConverter<T>::has_custom_conversion;
+
+// The two overloads that route to a CustomLuaConverter specialization are
+// defined after the composite converters, further down, on purpose: see the
+// note at the end of the declaration block.
+
+// ============================================================================
+// Converter Declarations
+// ============================================================================
+//
+// Every to_lua/from_lua overload this file defines is declared here, before
+// any of them is defined, and a new overload belongs on this list.
+//
+// The composite converters -- containers, pair, tuple, optional, variant,
+// smart pointers -- convert each element with an unqualified call whose
+// argument type depends on the template. Such a call sees only the overloads
+// declared before the composite's own definition, plus whatever
+// argument-dependent lookup finds when it is instantiated, and ADL cannot
+// help: the element is a user's class in the global namespace or the user's
+// own, never in mirror_bridge::lua. So every overload defined below its
+// caller was invisible to it. std::vector<Point> failed to compile the whole
+// module, because the vector converter could not see the class converter
+// defined far below it, and so did std::array<Point, N>,
+// std::vector<std::optional<int>>, std::vector<std::shared_ptr<T>> and
+// std::vector<std::pair<K, V>>. Declared up front, the set every element
+// call sees is the set a top-level call sees.
+
+template<Arithmetic T>
+void to_lua(lua_State* L, const T& value);
+template<EnumType T>
+void to_lua(lua_State* L, const T& value);
+template<StringLike T>
+void to_lua(lua_State* L, const T& value);
+template<Container T>
+void to_lua(lua_State* L, const T& container);
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>
+>
+to_lua(lua_State* L, const T& obj);
+template<SmartPointer T>
+void to_lua(lua_State* L, const T& ptr);
+template<typename K, typename V, typename... Args>
+void to_lua(lua_State* L, const std::map<K, V, Args...>& map);
+template<typename K, typename V, typename... Args>
+void to_lua(lua_State* L, const std::unordered_map<K, V, Args...>& map);
+template<typename V, typename... Args>
+void to_lua(lua_State* L, const std::set<V, Args...>& set);
+template<typename V, typename... Args>
+void to_lua(lua_State* L, const std::unordered_set<V, Args...>& set);
+template<typename... Ts>
+void to_lua(lua_State* L, const std::tuple<Ts...>& t);
+template<typename T1, typename T2>
+void to_lua(lua_State* L, const std::pair<T1, T2>& p);
+template<typename... Ts>
+void to_lua(lua_State* L, const std::variant<Ts...>& v);
+template<typename T>
+void to_lua(lua_State* L, const std::optional<T>& opt);
+
+template<Arithmetic T>
+bool from_lua(lua_State* L, int idx, T& out);
+template<EnumType T>
+bool from_lua(lua_State* L, int idx, T& out);
+template<StringLike T>
+bool from_lua(lua_State* L, int idx, T& out);
+template<typename E, std::size_t N>
+    requires (!HasCustomLuaConverter<std::array<E, N>>)
+bool from_lua(lua_State* L, int idx, std::array<E, N>& arr);
+template<Container T>
+bool from_lua(lua_State* L, int idx, T& container);
+// The class converter a top-level parameter or member uses is deliberately
+// not declared here. It reads a table leniently -- a missing field keeps its
+// default -- so it accepts every table, and a composite that asks "does this
+// convert?" needs a strict answer: std::variant<Point, Color> keeps the first
+// alternative that converts, and std::optional<Point> must refuse {}. A class
+// element of a composite is read by the converter below instead, from a
+// wrapper or from a table that has every field.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    bool
+>
+from_lua(lua_State* L, int idx, T& out);
+template<SmartPointer T>
+bool from_lua(lua_State* L, int idx, T& out);
+template<typename K, typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::map<K, V, Args...>& map);
+template<typename K, typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::unordered_map<K, V, Args...>& map);
+template<typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::set<V, Args...>& set);
+template<typename V, typename... Args>
+bool from_lua(lua_State* L, int idx, std::unordered_set<V, Args...>& set);
+template<typename... Ts>
+bool from_lua(lua_State* L, int idx, std::tuple<Ts...>& t);
+template<typename T1, typename T2>
+bool from_lua(lua_State* L, int idx, std::pair<T1, T2>& p);
+template<typename... Ts>
+bool from_lua(lua_State* L, int idx, std::variant<Ts...>& v);
+template<typename T>
+bool from_lua(lua_State* L, int idx, std::optional<T>& out);
+template<typename T, typename E>
+bool from_lua(lua_State* L, int idx, std::expected<T, E>& out);
+// Not declared here either: the CustomLuaConverter overloads, which are
+// defined after the composites (see the comment there).
 
 // ============================================================================
 // Type Conversion: C++ → Lua
@@ -1333,24 +1726,23 @@ void to_lua(lua_State* L, const T& value) {
 // Containers → Lua tables (with numeric indices starting at 1)
 template<Container T>
 void to_lua(lua_State* L, const T& container) {
+    using ValueType = typename std::remove_cvref_t<T>::value_type;
     lua_createtable(L, container.size(), 0);
 
     int index = 1;  // Lua arrays start at 1
     for (const auto& item : container) {
-        to_lua(L, item);
+        // Iterating libc++'s std::vector<bool> yields a bit-reference proxy,
+        // not a bool. The generic class converter would take the proxy for a
+        // class and emit an empty table for every element, so convert the
+        // value it stands for instead.
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(item)>, ValueType>) {
+            to_lua(L, item);
+        } else {
+            to_lua(L, static_cast<ValueType>(item));
+        }
         lua_rawseti(L, -2, index++);
     }
 }
-
-// Forward declaration for Bindable types. Must precede the SmartPointer
-// overload: the pointee is typically a user class in the global namespace,
-// so the dependent to_lua(L, *ptr) call below finds this only through the
-// declaration context, never through ADL.
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>
->
-to_lua(lua_State* L, const T& obj);
 
 // Smart pointers
 template<SmartPointer T>
@@ -1396,15 +1788,55 @@ bool from_lua(lua_State* L, int idx, T& out) {
     if (!lua_isstring(L, idx)) return false;
 
     size_t len;
-    const char* str = lua_tolstring(L, idx, &len);
-
     using BaseType = std::remove_cvref_t<T>;
     if constexpr (std::is_same_v<BaseType, std::string>) {
+        // lua_tolstring turns a number into a string in place, and a failed
+        // conversion must leave the caller's value as it found it: the
+        // constructor dispatcher tries overloads one after another on the
+        // same slots, so Foo(5, 6) reached Foo(int, int) holding "5" after a
+        // Foo(std::string, std::vector<int>) attempt, and was refused. It also
+        // corrupts a map key mid-traversal, which lua_next documents. A
+        // std::string owns its bytes, so converting a copy costs nothing.
+        lua_pushvalue(L, idx);
+        const char* str = lua_tolstring(L, -1, &len);
         out = std::string(str, len);
-    } else if constexpr (std::is_same_v<BaseType, std::string_view>) {
-        out = std::string_view(str, len);
+        lua_pop(L, 1);
     } else {
-        out = str;
+        // A string_view or const char* borrows the bytes, so they have to stay
+        // on the stack for the call: the slot itself is converted.
+        const char* str = lua_tolstring(L, idx, &len);
+        if constexpr (std::is_same_v<BaseType, std::string_view>) {
+            out = std::string_view(str, len);
+        } else {
+            out = str;
+        }
+    }
+    return true;
+}
+
+// std::array from a Lua table of exactly N elements, filled in place.
+//
+// The generic container converter below can only append, and a std::array
+// has no push_back or insert, so it used to convert every element, drop it,
+// and report success. A std::array member was then assigned the setter's
+// uninitialised local -- body.pos = {1, 2, 3} read back as 9.3e-310 -- a
+// std::array parameter arrived as zeros, and any length was accepted. The
+// Python backend requires the exact length (since 4fd587d).
+//
+// A std::array type with a CustomLuaConverter specialization is left to the
+// extension point. Partial ordering would otherwise pick this overload over
+// it, silently, where before there was an ambiguity error to say so.
+template<typename E, std::size_t N>
+    requires (!HasCustomLuaConverter<std::array<E, N>>)
+bool from_lua(lua_State* L, int idx, std::array<E, N>& arr) {
+    if (!lua_istable(L, idx)) return false;
+    if (lua_rawlen(L, idx) != N) return false;
+
+    for (std::size_t i = 0; i < N; ++i) {
+        lua_rawgeti(L, idx, static_cast<lua_Integer>(i + 1));
+        const bool converted = from_lua(L, -1, arr[i]);
+        lua_pop(L, 1);
+        if (!converted) return false;
     }
     return true;
 }
@@ -1412,9 +1844,24 @@ bool from_lua(lua_State* L, int idx, T& out) {
 // Containers from Lua tables
 template<Container T>
 bool from_lua(lua_State* L, int idx, T& container) {
-    if (!lua_istable(L, idx)) return false;
-
     using ValueType = typename std::remove_cvref_t<T>::value_type;
+
+    // Two shapes that look like containers and cannot be filled from a table.
+    // A type can have begin, end, size and value_type and still offer no way
+    // to put an element in -- std::span, a fixed-size Eigen vector, a custom
+    // range -- and converting into one used to convert each element, drop it
+    // and report success, so a std::span<const double> parameter computed
+    // over nothing. And an element type with no default constructor cannot
+    // be converted into, because each element is built in a local first;
+    // reaching that local was a compile error that failed the whole module.
+    // Both now decline, which turns the call into an error naming the
+    // argument, as the Python backend does.
+    constexpr bool can_append = requires(T& c, ValueType v) { c.push_back(std::move(v)); };
+    constexpr bool can_insert = requires(T& c, ValueType v) { c.insert(std::move(v)); };
+    if constexpr ((!can_append && !can_insert) || !std::is_default_constructible_v<ValueType>) {
+        return false;
+    } else {
+    if (!lua_istable(L, idx)) return false;
 
     if constexpr (requires { container.clear(); }) {
         container.clear();
@@ -1435,9 +1882,9 @@ bool from_lua(lua_State* L, int idx, T& container) {
             return false;
         }
 
-        if constexpr (requires { container.push_back(cpp_item); }) {
+        if constexpr (can_append) {
             container.push_back(std::move(cpp_item));
-        } else if constexpr (requires { container.insert(cpp_item); }) {
+        } else {
             container.insert(std::move(cpp_item));
         }
 
@@ -1445,17 +1892,8 @@ bool from_lua(lua_State* L, int idx, T& container) {
     }
 
     return true;
+    }  // close the fillable-container branch
 }
-
-// Forward declaration for Bindable types. Must precede the SmartPointer
-// overload for the same lookup reason as to_lua above: the pointee class
-// lives in the global namespace, so ADL can't find a later declaration.
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
-    bool
->
-from_lua(lua_State* L, int idx, T& out);
 
 // Smart pointers from Lua
 template<SmartPointer T>
@@ -1467,13 +1905,18 @@ bool from_lua(lua_State* L, int idx, T& out) {
         return true;
     }
 
-    // Mirrors the Python backend: an abstract or non-default-constructible
-    // pointee can't be materialized from a Lua table by value, and trying
-    // would be a compile error. Only nil→reset is supported for those.
+    // An abstract, non-default-constructible or non-copy-assignable pointee
+    // cannot be materialised from a Lua value, so nil (handled above) is the
+    // only value that converts. This branch used to report success without
+    // writing `out`, which handed C++ a null pointer for any argument at
+    // all: scene:area_of(circle) dereferenced it, and scene.shape = circle
+    // silently cleared the member. The Python backend refuses here
+    // (091bb2d); a bound derived object becoming a shared_ptr<Base> needs
+    // shared ownership with the Lua object, which is issue #54.
     if constexpr (std::is_abstract_v<ElementType> ||
                   !std::is_default_constructible_v<ElementType> ||
                   !std::is_copy_assignable_v<ElementType>) {
-        return true;
+        return false;
     } else {
         ElementType value;
         if (!from_lua(L, idx, value)) return false;
@@ -1520,6 +1963,11 @@ template<typename K, typename V, typename... Args>
 bool from_lua(lua_State* L, int idx, std::map<K, V, Args...>& map) {
     if (!lua_istable(L, idx)) return false;
 
+    // lua_pushnil below shifts every relative index, and a container element
+    // arrives as -1: lua_next would then read the nil as the table. That
+    // crashed a std::vector<std::map<...>> on its first element, and a
+    // nested struct holding a map assigned from a table.
+    idx = lua_absindex(L, idx);
     map.clear();
 
     lua_pushnil(L);  // First key
@@ -1544,6 +1992,7 @@ template<typename K, typename V, typename... Args>
 bool from_lua(lua_State* L, int idx, std::unordered_map<K, V, Args...>& map) {
     if (!lua_istable(L, idx)) return false;
 
+    idx = lua_absindex(L, idx);   // see the std::map converter above
     map.clear();
 
     lua_pushnil(L);
@@ -1866,30 +2315,15 @@ bool from_lua(lua_State* L, int idx, std::expected<T, E>& out) {
     }
 }
 
-// ============================================================================
-// Custom Type Converter Extension Point
-// ============================================================================
-//
-// Users can add conversion support for custom types by defining to_lua/from_lua
-// overloads in the mirror_bridge::lua namespace, or by specializing
-// CustomLuaConverter.
-//
-// Example:
-//   namespace mirror_bridge::lua {
-//       void to_lua(lua_State* L, const MyType& v) { ... }
-//       bool from_lua(lua_State* L, int idx, MyType& v) { ... }
-//   }
-
-template<typename T, typename Enable = void>
-struct CustomLuaConverter {
-    static constexpr bool has_custom_conversion = false;
-};
-
-template<typename T>
-concept HasCustomLuaConverter = requires {
-    { CustomLuaConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
-} && CustomLuaConverter<T>::has_custom_conversion;
-
+// The overloads behind a CustomLuaConverter specialization. They come after
+// every composite converter, so a composite never sees them: their
+// constraint neither subsumes nor is subsumed by Arithmetic, EnumType,
+// StringLike or Container, so a composite element of a custom-converted
+// enum or string would be an ambiguous call, where without them it compiles
+// and the element converts the built-in way. Top-level calls, which are all
+// defined below, do see them. (A plain to_lua/from_lua overload declared
+// before this header, as tests/lua/custom_converter does, is visible
+// everywhere and beats every template here.)
 template<typename T>
     requires HasCustomLuaConverter<T>
 void to_lua(lua_State* L, const T& value) {
@@ -2599,154 +3033,129 @@ int lua_gc(lua_State* L) {
 }
 
 // ============================================================================
-// Constructor Support (Parameterized)
+// Constructor Support
 // ============================================================================
+//
+// Which constructors are offered, which can be called, and what a call with
+// the wrong arguments says are decided in core (construct_from_host_arguments)
+// and shared with the JavaScript backend. What is Lua's own: reading the
+// arguments off the stack, and raising the refusal safely.
 
-// Count constructors (exclude default, copy, move)
-template<typename T>
-consteval std::size_t get_lua_constructor_count() {
-    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-    std::size_t count = 0;
-    for (auto member : all_members) {
-        if (std::meta::is_constructor(member) &&
-            !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
-            auto params = std::meta::parameters_of(member);
-            if (params.size() > 0) {
-                count++;
-            }
-        }
-    }
-    return count;
-}
+// Convert the Lua arguments for constructor C and call it. On a conversion
+// failure, return nullptr and record which argument refused; the argument
+// tuple is destroyed on the way out, before anything raises.
+//
+// The arguments are converted from copies pushed for this attempt. A
+// converter may rewrite the value it reads -- lua_tolstring turns a number
+// into a string in place -- and the next candidate reads the same arguments,
+// so an attempt that failed part way through used to hand it "5" for 5, or
+// 1/3 rounded to fourteen digits. The copies stay on the stack until the
+// constructor returns, which also keeps the bytes of a string_view or
+// const char* argument alive for the call.
+template<typename T, std::size_t C, std::size_t... Is>
+T* convert_lua_constructor_args(lua_State* L, int arg_base, std::index_sequence<Is...>,
+                                core::ConstructorRefusal& attempt) {
+    const int top = lua_gettop(L);
+    if (!lua_checkstack(L, static_cast<int>(sizeof...(Is)))) return nullptr;
+    (lua_pushvalue(L, arg_base + 1 + static_cast<int>(Is)), ...);
 
-// Get the Nth non-default constructor
-template<typename T, std::size_t Index>
-consteval auto get_lua_constructor() {
-    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-    std::size_t ctor_index = 0;
-    for (auto member : all_members) {
-        if (std::meta::is_constructor(member) &&
-            !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
-            auto params = std::meta::parameters_of(member);
-            if (params.size() > 0) {
-                if (ctor_index == Index) {
-                    return member;
-                }
-                ctor_index++;
-            }
-        }
-    }
-    return all_members[0];
-}
+    std::tuple<std::remove_cvref_t<core::constructor_param_t<T, C, Is>>...> cpp_args;
 
-// Get constructor parameter count
-template<typename T, std::size_t CtorIndex>
-consteval std::size_t get_lua_constructor_param_count() {
-    constexpr auto ctor = get_lua_constructor<T, CtorIndex>();
-    return std::meta::parameters_of(ctor).size();
-}
-
-// Get constructor parameter type
-template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
-consteval auto get_lua_constructor_param_type() {
-    constexpr auto ctor = get_lua_constructor<T, CtorIndex>();
-    auto params = std::meta::parameters_of(ctor);
-    return std::meta::type_of(params[ParamIndex]);
-}
-
-// Alias-template form: pack expansions must use this instead of splicing
-// inline (GCC rejects packs that appear only inside a splice; see the note
-// in core/mirror_bridge_core.hpp).
-template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
-using lua_constructor_param_t = typename [:get_lua_constructor_param_type<T, CtorIndex, ParamIndex>():];
-
-// Call constructor with Lua arguments
-template<typename T, std::size_t CtorIndex, std::size_t... Is>
-T* call_lua_constructor_impl(lua_State* L, int arg_offset, std::index_sequence<Is...>) {
-    using ParamTypes = std::tuple<
-        std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...
-    >;
-
-    std::tuple<std::remove_cvref_t<lua_constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
-
-    bool success = true;
+    bool converted = true;
     ([&] {
-        if (!success) return;
-        // Lua stack indices are 1-based, and we skip the class table (arg_offset accounts for this)
-        int lua_idx = arg_offset + Is + 1;
-        if (!from_lua(L, lua_idx, std::get<Is>(cpp_args))) {
-            success = false;
+        if (!converted) return;
+        if (!from_lua(L, top + 1 + static_cast<int>(Is), std::get<Is>(cpp_args))) {
+            converted = false;
+            attempt.position = static_cast<int>(Is) + 1;
+            attempt.expected = core::type_key<core::constructor_param_t<T, C, Is>>;
         }
     }(), ...);
-
-    if (!success) {
+    if (!converted) {
+        lua_settop(L, top);
         return nullptr;
     }
 
-    return new T(std::move(std::get<Is>(cpp_args))...);
+    T* object = new T(std::move(std::get<Is>(cpp_args))...);
+    lua_settop(L, top);
+    return object;
 }
 
-// ============================================================================
-// Constructor
-// ============================================================================
+// The Lua values at arg_base+1 .. arg_base+nargs, described as "number, table".
+inline void describe_lua_arguments(lua_State* L, int arg_base, int nargs,
+                                   char* out, std::size_t out_size) {
+    std::size_t used = 0;
+    out[0] = '\0';
+    for (int i = 1; i <= nargs && used < out_size; ++i) {
+        char one[256];
+        describe_lua_value(L, arg_base + i, one, sizeof one);
+        const int written = std::snprintf(out + used, out_size - used, "%s%s",
+                                          i == 1 ? "" : ", ", one);
+        if (written < 0) break;
+        used += static_cast<std::size_t>(written);
+    }
+}
 
+// luaL_error long-jumps out of here, so the class name and the message are
+// built in plain buffers and nothing with a destructor is live.
 template<typename T>
-int lua_constructor(lua_State* L) {
-    int nargs = lua_gettop(L) - 1;
+int raise_lua_constructor_refusal(lua_State* L, const core::ConstructorRefusal& refusal,
+                                  int arg_base, int nargs) {
+    char name[256];
+    copy_lua_registered_name(L, core::type_key<T>, name, sizeof name);
+
+    if (refusal.kind == core::ConstructorRefusal::bad_argument) {
+        return lua_bad_argument_error(L, name, refusal.position, refusal.expected,
+                                      arg_base + refusal.position);
+    }
+
+    char message[1024];
+    if (refusal.kind == core::ConstructorRefusal::no_overload_accepts) {
+        char got[512];
+        describe_lua_arguments(L, arg_base, nargs, got, sizeof got);
+        std::snprintf(message, sizeof message, "%s: no constructor taking %d arguments accepts (%s)",
+                      name, nargs, got);
+    } else {
+        core::describe_constructor_refusal<T>(refusal, name, "Lua",
+                                              static_cast<std::size_t>(nargs),
+                                              message, sizeof message);
+    }
+    return luaL_error(L, "%s", message);
+}
+
+// Construct a T from the Lua values above arg_base: arg_base is 1 when slot 1
+// holds the class table (Cls(...) and Cls:new(...)) and 0 when it does not
+// (Cls.new(...)).
+//
+// Every outcome is decided inside the try block and raised after it.
+// luaL_error long-jumps, so it must not run while the argument tuple (which
+// can own strings and vectors) is alive, nor inside a catch handler, whose
+// exception object would never be released.
+template<typename T>
+int lua_construct(lua_State* L, int arg_base) {
+    const int nargs = lua_gettop(L) - arg_base;
 
     T* cpp_object = nullptr;
+    core::ConstructorRefusal refusal;
+    char exception_text[512];
+    bool threw = false;
 
     try {
-        if (nargs == 0) {
-            if constexpr (std::is_default_constructible_v<T>) {
-                cpp_object = new T();
-            } else {
-                return luaL_error(L, "This class requires constructor arguments");
-            }
-        } else {
-            constexpr std::size_t ctor_count = get_lua_constructor_count<T>();
-
-            if constexpr (ctor_count > 0) {
-                bool found = false;
-                [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-                    ([&] {
-                        if (found) return;
-
-                        constexpr std::size_t param_count = get_lua_constructor_param_count<T, Is>();
-                        if (nargs == static_cast<int>(param_count)) {
-                            T* obj = call_lua_constructor_impl<T, Is>(L, 1,
-                                std::make_index_sequence<param_count>{});
-
-                            if (obj) {
-                                cpp_object = obj;
-                                found = true;
-                            }
-                        }
-                    }(), ...);
-                }(std::make_index_sequence<ctor_count>{});
-
-                if (!found && !cpp_object) {
-                    if constexpr (std::is_default_constructible_v<T>) {
-                        cpp_object = new T();
-                    } else {
-                        return luaL_error(L, "No matching constructor found for %d arguments", nargs);
-                    }
-                }
-            } else {
-                if constexpr (std::is_default_constructible_v<T>) {
-                    cpp_object = new T();
-                } else {
-                    return luaL_error(L, "This class has no constructors accepting arguments");
-                }
-            }
-        }
+        cpp_object = core::construct_from_host_arguments<T>(
+            static_cast<std::size_t>(nargs), refusal,
+            [&]<std::size_t C>(core::ConstructorRefusal& attempt) -> T* {
+                return convert_lua_constructor_args<T, C>(
+                    L, arg_base, std::make_index_sequence<core::constructor_arity<T, C>()>{}, attempt);
+            });
     } catch (const std::exception& e) {
-        return luaL_error(L, "C++ constructor exception: %s", e.what());
+        threw = true;
+        std::snprintf(exception_text, sizeof exception_text, "C++ constructor exception: %s", e.what());
     } catch (...) {
-        return luaL_error(L, "Unknown C++ exception in constructor");
+        threw = true;
+        std::snprintf(exception_text, sizeof exception_text, "Unknown C++ exception in constructor");
     }
+
+    if (threw) return luaL_error(L, "%s", exception_text);
+    if (!cpp_object) return raise_lua_constructor_refusal<T>(L, refusal, arg_base, nargs);
 
     // Allocate userdata for wrapper
     LuaWrapper<T>* wrapper = static_cast<LuaWrapper<T>*>(lua_newuserdata(L, sizeof(LuaWrapper<T>)));
@@ -2762,6 +3171,49 @@ int lua_constructor(lua_State* L) {
     lua_setmetatable(L, -2);
 
     return 1;
+}
+
+// Cls(...) arrives through the class table's __call metamethod, which passes
+// the class table itself first.
+template<typename T>
+int lua_constructor_call(lua_State* L) {
+    return lua_construct<T>(L, 1);
+}
+
+// Whether the value at idx is the table at class_idx, or a table that
+// inherits from it through a chain of __index metatables -- the receiver of
+// Cls:new(...) or of Sub:new(...) after Sub = setmetatable({}, {__index = Cls}).
+// A struct written as a table has no such chain, so it stays an argument.
+inline bool lua_is_class_or_subclass(lua_State* L, int idx, int class_idx) {
+    if (!lua_istable(L, idx)) return false;
+    if (lua_rawequal(L, idx, class_idx)) return true;
+
+    const int top = lua_gettop(L);
+    bool found = false;
+    lua_pushvalue(L, idx);                          // current
+    for (int depth = 0; depth < 32 && !found; ++depth) {   // a cycle ends here
+        if (!lua_getmetatable(L, -1)) break;        // current, mt
+        lua_pushliteral(L, "__index");
+        lua_rawget(L, -2);                          // current, mt, __index
+        if (!lua_istable(L, -1)) break;
+        found = lua_rawequal(L, -1, class_idx);
+        lua_replace(L, -3);                         // __index, mt
+        lua_pop(L, 1);                              // __index is the new current
+    }
+    lua_settop(L, top);
+    return found;
+}
+
+// Cls.new(...) and Cls:new(...) share one field. The colon form passes its
+// receiver first and the dot form does not, and a single function that
+// always skipped slot 1 -- as __call must -- read Vec3.new(1, 2, 3) as
+// (2, 3). The class table is this closure's upvalue, and slot 1 is skipped
+// only when it is that table or a table inheriting from it, never merely
+// because it is a table: a struct converted from a table is a legitimate
+// first argument.
+template<typename T>
+int lua_constructor_new(lua_State* L) {
+    return lua_construct<T>(L, lua_is_class_or_subclass(L, 1, lua_upvalueindex(1)) ? 1 : 0);
 }
 
 // ============================================================================
@@ -2789,6 +3241,17 @@ struct LuaConversionHelper {
     }
 
     static bool from_lua_impl(lua_State* L, int idx, T& out) {
+        // A wrapper of this class or of one derived from it, which is how a
+        // composite element round-trips: c.points = {p}, or assigning back
+        // what reading c.points returned. Copy assignment is the only way to
+        // take one, so a class without it accepts tables only.
+        if constexpr (std::is_copy_assignable_v<T>) {
+            void* raw = nullptr;
+            if (resolve_lua_wrapper<T>(L, idx, raw)) {
+                out = *static_cast<T*>(raw);
+                return true;
+            }
+        }
         if (!lua_istable(L, idx)) return false;
 
         constexpr std::size_t member_count = get_data_member_count<T>();
@@ -2846,7 +3309,7 @@ to_lua(lua_State* L, const T& obj) {
             wrapper->owns_memory = true;
 
             // Set the metatable, and take the identity from it (see
-            // lua_constructor)
+            // lua_construct)
             luaL_getmetatable(L, LuaTypeRegistry<CleanT>::metatable_name);
             wrapper->class_mt = lua_topointer(L, -1);
             lua_setmetatable(L, -2);
@@ -2935,12 +3398,14 @@ void bind_class(lua_State* L, const char* name) {
 
     // Add constructor as __call on a metatable for the class table
     lua_newtable(L);  // metatable for class table
-    lua_pushcfunction(L, lua_constructor<T>);
+    lua_pushcfunction(L, lua_constructor_call<T>);
     lua_setfield(L, -2, "__call");
     lua_setmetatable(L, -2);  // set metatable on class table
 
-    // Also add constructor directly as "new" method
-    lua_pushcfunction(L, lua_constructor<T>);
+    // Also add constructor directly as "new", closing over the class table so
+    // it can tell Cls:new(...) from Cls.new(...)
+    lua_pushvalue(L, -1);
+    lua_pushcclosure(L, lua_constructor_new<T>, 1);
     lua_setfield(L, -2, "new");
 
     // Add static methods to the class table

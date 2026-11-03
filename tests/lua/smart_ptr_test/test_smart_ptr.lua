@@ -32,6 +32,10 @@ check("shared_ptr return yields usable object", d ~= nil and d.name == "gamma" a
 local holder = mod.ShapeHolder.new()
 check("abstract-pointee holder constructs", holder:has_shape() == false)
 
+-- Anything but nil used to "convert" to a null pointer and report success
+local refused = not pcall(function() holder.shape = { area = 1 } end)
+check("a non-nil value for an abstract pointee is refused", refused)
+
 print("")
 if fail == 0 then
     print("All " .. pass .. " Lua smart pointer tests passed!")

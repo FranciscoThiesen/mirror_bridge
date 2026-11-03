@@ -222,6 +222,8 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -234,6 +236,7 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 #include <mutex>
 #include <typeindex>
 #include <shared_mutex>
+#include <utility>
 
 
 // ============================================================================
@@ -976,6 +979,267 @@ consteval bool has_parameterized_constructor() {
 }
 
 // ============================================================================
+// Constructors a Value-Converting Binding Can Call
+// ============================================================================
+//
+// Lua and JavaScript construct an object the same way: convert each host
+// argument into a default-constructed std::remove_cvref_t<P>, then call
+// `new T(std::move(arg)...)`. What follows is the one list of constructors
+// both offer, the one test of whether a constructor can be called that way,
+// and the one dispatcher that turns host arguments into an object or a
+// reason. Each backend used to carry its own copy of all three, and that is
+// how the Python backend's fixes for deleted overloads and for silently
+// default-constructing never reached either of them.
+
+template<typename T>
+struct ConstructorCache {
+    // Public (members_of under the current access context), at least one
+    // parameter -- the zero-argument case is `new T()`, which
+    // is_default_constructible_v decides -- and neither copy, move nor
+    // deleted. A deleted overload is still a declared member, so
+    // `Celsius(int) = delete` used to be offered, and the `new Celsius(int)`
+    // it instantiated failed the whole module.
+    static consteval bool is_offered(std::meta::info member) {
+        return std::meta::is_constructor(member) &&
+               !std::meta::is_copy_constructor(member) &&
+               !std::meta::is_move_constructor(member) &&
+               !std::meta::is_deleted(member) &&
+               !std::meta::parameters_of(member).empty();
+    }
+
+    static consteval std::vector<std::meta::info> collect() {
+        std::vector<std::meta::info> result;
+        for (auto member : std::meta::members_of(^^T, std::meta::access_context::current())) {
+            if (is_offered(member)) result.push_back(member);
+        }
+        return result;
+    }
+
+    static constexpr auto constructors = std::define_static_array(collect());
+    static constexpr std::size_t count = constructors.size();
+};
+
+template<typename T, std::size_t C>
+consteval std::size_t constructor_arity() {
+    return std::meta::parameters_of(ConstructorCache<T>::constructors[C]).size();
+}
+
+template<typename T, std::size_t C, std::size_t P>
+consteval std::meta::info constructor_param_type() {
+    return std::meta::type_of(std::meta::parameters_of(ConstructorCache<T>::constructors[C])[P]);
+}
+
+// Alias-template form, for the pack expansions below (see the note on splice
+// hoisting above method_param_t).
+template<typename T, std::size_t C, std::size_t P>
+using constructor_param_t = typename [:constructor_param_type<T, C, P>():];
+
+// Whether constructor C can be called the way Lua and JavaScript call it.
+//
+// Reflection reports a *declared* constructor; this asks whether it is
+// *callable*, in three clauses. is_param_bindable is the per-parameter gate
+// the method path already uses: it refuses a raw pointer to a user type and a
+// smart pointer to an incomplete one, for which no converter exists.
+// is_constructible_v asks whether `T t(std::move(arg)...)` is well formed,
+// with an rvalue of each std::remove_cvref_t<P> -- the same overload
+// resolution as the `new T(...)` both backends make. And the arguments are
+// held in a default-constructed tuple while they convert, so each parameter
+// type must be default constructible.
+//
+// That rules out an abstract class (pmp-library's BasePropertyArray declares
+// `explicit BasePropertyArray(std::string)` beside a pure virtual), a
+// constructor that needs an lvalue (`Widget(Config&)`), one taking a class
+// with no default constructor (even by const reference), and one taking a
+// `Node*`: each used to be instantiated anyway and fail the whole module.
+// A variable definition also needs an accessible destructor, so the answer is
+// false for a class whose destructor is not public too, although `new T(args)`
+// would compile; such a class cannot be bound by these backends at all,
+// because the wrapper's finalizer deletes it.
+template<typename T, std::size_t C>
+consteval bool constructor_callable_with_values() {
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_param_bindable<constructor_param_t<T, C, Is>>() && ...) &&
+               std::is_constructible_v<T, std::remove_cvref_t<constructor_param_t<T, C, Is>>...> &&
+               (std::is_default_constructible_v<std::remove_cvref_t<constructor_param_t<T, C, Is>>> && ...);
+    }(std::make_index_sequence<constructor_arity<T, C>()>{});
+}
+
+template<typename T>
+consteval std::size_t callable_constructor_count() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        return (std::size_t{0} + ... + (constructor_callable_with_values<T, Cs>() ? 1 : 0));
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// The argument counts a constructor call can succeed with: bit n is set when
+// a callable constructor takes n arguments, and bit 0 when T is default
+// constructible. An error message uses it to say what would have worked.
+template<typename T>
+consteval std::uint64_t callable_constructor_arities() {
+    std::uint64_t mask = std::is_default_constructible_v<T> ? 1u : 0u;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() < 64) {
+                mask |= std::uint64_t{1} << constructor_arity<T, Cs>();
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    return mask;
+}
+
+// The most arguments any callable constructor takes. Computed from the
+// constructors themselves rather than from the mask above, which cannot
+// record an arity of 64 or more: a backend sizes an argument buffer from
+// this, and the dispatcher would still reach such a constructor.
+template<typename T>
+consteval std::size_t max_callable_constructor_arity() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        std::size_t highest = 0;
+        ((highest = constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() > highest
+                        ? constructor_arity<T, Cs>() : highest), ...);
+        return highest;
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// "2", "0 or 2", "1, 2 or 3": the argument counts set in `mask`.
+inline void format_arities(std::uint64_t mask, char* out, std::size_t out_size) {
+    if (out_size == 0) return;
+    out[0] = '\0';
+    int counts[64];
+    int n = 0;
+    for (int i = 0; i < 64; ++i) {
+        if ((mask >> i) & 1u) counts[n++] = i;
+    }
+    std::size_t used = 0;
+    for (int i = 0; i < n && used < out_size; ++i) {
+        const char* separator = i == 0 ? "" : (i == n - 1 ? " or " : ", ");
+        const int written = std::snprintf(out + used, out_size - used, "%s%d", separator, counts[i]);
+        if (written < 0) break;
+        used += static_cast<std::size_t>(written);
+    }
+}
+
+// Why a constructor call produced no object.
+struct ConstructorRefusal {
+    enum Kind : unsigned char {
+        none,
+        abstract_class,       // T is abstract
+        needs_arguments,      // no arguments, and T has no default constructor
+        not_constructible,    // nothing at all is callable
+        takes_no_arguments,   // arguments, but no callable parameterized constructor
+        no_such_arity,        // no callable constructor takes that many arguments
+        bad_argument,         // the one constructor taking that many refused an argument
+        no_overload_accepts,  // several take that many, and every one refused
+    };
+    Kind kind = none;
+    int position = 0;               // bad_argument: which argument, counting from 1
+    const char* expected = nullptr; // bad_argument: the backend's token for what it should have been
+};
+
+// Construct a T from `nargs` host arguments, or record why not.
+//
+// Each attempt must leave the host's arguments as it found them, because the
+// next candidate converts the same ones. The Lua half converts copies for
+// exactly that reason.
+//
+// `convert_and_new` is the backend's half. Called as
+// `convert_and_new.template operator()<C>(attempt)` for each callable
+// constructor C that takes exactly `nargs` arguments, in declaration order,
+// it converts the arguments and returns `new T(...)`, or returns nullptr after
+// recording in `attempt` which argument refused. The first that converts wins.
+//
+// Arguments that no constructor accepts are refused; they never fall back to
+// `new T()`. That fallback made Vec3(1, 2, 3) a (0, 0, 0) with no error in
+// both backends, for a wrong count, for a value that would not convert, and
+// for a class with no parameterized constructor at all, such as an aggregate.
+// The Python backend stopped doing it in 2ff003e; this is the same contract.
+template<typename T, typename ConvertAndNew>
+T* construct_from_host_arguments(std::size_t nargs, ConstructorRefusal& refusal,
+                                 ConvertAndNew&& convert_and_new) {
+    if (nargs == 0) {
+        if constexpr (std::is_default_constructible_v<T>) {
+            return new T();
+        } else if constexpr (std::is_abstract_v<T>) {
+            refusal.kind = ConstructorRefusal::abstract_class;
+        } else if constexpr (callable_constructor_count<T>() > 0) {
+            refusal.kind = ConstructorRefusal::needs_arguments;
+        } else {
+            refusal.kind = ConstructorRefusal::not_constructible;
+        }
+        return nullptr;
+    }
+
+    T* object = nullptr;
+    int attempts = 0;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>()) {
+                if (object || nargs != constructor_arity<T, Cs>()) return;
+                ConstructorRefusal attempt;
+                object = convert_and_new.template operator()<Cs>(attempt);
+                if (!object && attempts++ == 0) refusal = attempt;
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    if (object) return object;
+
+    if constexpr (callable_constructor_count<T>() == 0) {
+        refusal.kind = std::is_abstract_v<T>              ? ConstructorRefusal::abstract_class
+                     : std::is_default_constructible_v<T> ? ConstructorRefusal::takes_no_arguments
+                                                          : ConstructorRefusal::not_constructible;
+    } else {
+        refusal.kind = attempts == 0 ? ConstructorRefusal::no_such_arity
+                     : attempts == 1 ? ConstructorRefusal::bad_argument
+                                     : ConstructorRefusal::no_overload_accepts;
+    }
+    return nullptr;
+}
+
+// The sentence for a refusal that needs nothing from the host but the class's
+// name. bad_argument and no_overload_accepts describe host values, so each
+// backend words those itself, with its own describer.
+template<typename T>
+void describe_constructor_refusal(const ConstructorRefusal& refusal, const char* class_name,
+                                  const char* host, std::size_t nargs,
+                                  char* out, std::size_t out_size) {
+    char arities[96];
+    format_arities(callable_constructor_arities<T>(), arities, sizeof arities);
+    switch (refusal.kind) {
+        case ConstructorRefusal::abstract_class:
+            std::snprintf(out, out_size,
+                          "%s is abstract in C++ and cannot be constructed; "
+                          "construct a concrete derived class", class_name);
+            return;
+        case ConstructorRefusal::needs_arguments:
+            std::snprintf(out, out_size,
+                          "%s has no default constructor in C++; pass its constructor "
+                          "arguments (constructors take %s)", class_name, arities);
+            return;
+        // "declares": a constructor inherited through `using Base::Base;` is
+        // not a member reflection lists, so it is not offered, and saying the
+        // class *has* no such constructor would be false.
+        case ConstructorRefusal::not_constructible:
+            std::snprintf(out, out_size,
+                          "%s cannot be constructed from %s: it has no default constructor "
+                          "and declares no constructor %s can call", class_name, host, host);
+            return;
+        case ConstructorRefusal::takes_no_arguments:
+            std::snprintf(out, out_size,
+                          "%s takes no constructor arguments (it declares no constructor %s "
+                          "can call with arguments); construct it with none and assign its members",
+                          class_name, host);
+            return;
+        case ConstructorRefusal::no_such_arity:
+            std::snprintf(out, out_size, "%s: no constructor takes %zu argument%s (constructors take %s)",
+                          class_name, nargs, nargs == 1 ? "" : "s", arities);
+            return;
+        default:
+            std::snprintf(out, out_size, "%s: no constructor accepts these arguments", class_name);
+            return;
+    }
+}
+
+// ============================================================================
 // Type Signature Generation (for change detection)
 // ============================================================================
 
@@ -1259,6 +1523,7 @@ consteval bool validate_bindable_members() {
 // Generates Node.js bindings that expose C++ classes to JavaScript.
 
 #include <node_api.h>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -1358,6 +1623,152 @@ static_assert(offsetof(JsWrapperView, magic) == offsetof(JsWrapper<int>, magic) 
               "JsWrapperView must mirror JsWrapper<T>");
 
 // ============================================================================
+// Custom Type Converter Extension Point
+// ============================================================================
+//
+// Users can add conversion support for custom types by defining
+// to_javascript/from_javascript overloads or specializing CustomJsConverter.
+//
+// Example:
+//   namespace mirror_bridge::javascript {
+//       napi_value to_javascript(napi_env env, const MyType& v) { ... }
+//       bool from_javascript(napi_env env, napi_value val, MyType& v) { ... }
+//   }
+
+template<typename T, typename Enable = void>
+struct CustomJsConverter {
+    static constexpr bool has_custom_conversion = false;
+};
+
+template<typename T>
+concept HasCustomJsConverter = requires {
+    { CustomJsConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
+} && CustomJsConverter<T>::has_custom_conversion;
+
+// The two overloads that route to a CustomJsConverter specialization are
+// defined after the composite converters, further down, on purpose: see the
+// note at the end of the declaration block.
+
+// ============================================================================
+// Converter Declarations
+// ============================================================================
+//
+// Every to_javascript/from_javascript overload this file defines, with the
+// two exceptions noted below, is declared here before any of them is
+// defined, and a new overload belongs on this list.
+//
+// The composite converters -- containers, pair, tuple, optional, variant,
+// smart pointers -- convert each element with an unqualified call whose
+// argument type depends on the template. Such a call sees only the overloads
+// declared before the composite's own definition, plus whatever
+// argument-dependent lookup finds when it is instantiated, and ADL cannot
+// help: the element is a user's class in the global namespace or the user's
+// own, never in mirror_bridge::javascript. So every overload defined below
+// its caller was invisible to it. std::vector<Point> failed to compile the
+// whole module, because the array converter could not see the class
+// converter defined far below it, and so did std::array<Point, N>,
+// std::vector<std::optional<int>>, std::vector<std::shared_ptr<T>> and
+// std::vector<std::pair<K, V>>. Declared up front, the set every element
+// call sees is the set a top-level call sees.
+
+template<typename T>
+concept ByteContainer = Container<T> && requires {
+    requires sizeof(typename std::remove_cvref_t<T>::value_type) == 1;
+    requires std::is_trivially_copyable_v<typename std::remove_cvref_t<T>::value_type>;
+} && requires(T t) {
+    { t.data() } -> std::convertible_to<const void*>;  // Must have contiguous storage
+};
+
+template<Arithmetic T>
+napi_value to_javascript(napi_env env, const T& value);
+template<EnumType T>
+napi_value to_javascript(napi_env env, const T& value);
+template<StringLike T>
+napi_value to_javascript(napi_env env, const T& value);
+template<ByteContainer T>
+napi_value to_javascript(napi_env env, const T& container);
+template<Container T>
+    requires (!ByteContainer<T>)
+napi_value to_javascript(napi_env env, const T& container);
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    napi_value
+>
+to_javascript(napi_env env, const T& obj);
+template<SmartPointer T>
+napi_value to_javascript(napi_env env, const T& ptr);
+template<typename K, typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::map<K, V, Args...>& map);
+template<typename K, typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::unordered_map<K, V, Args...>& map);
+template<typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::set<V, Args...>& set);
+template<typename V, typename... Args>
+napi_value to_javascript(napi_env env, const std::unordered_set<V, Args...>& set);
+template<typename... Ts>
+napi_value to_javascript(napi_env env, const std::tuple<Ts...>& t);
+template<typename T1, typename T2>
+napi_value to_javascript(napi_env env, const std::pair<T1, T2>& p);
+template<typename... Ts>
+napi_value to_javascript(napi_env env, const std::variant<Ts...>& v);
+template<typename T>
+napi_value to_javascript(napi_env env, const std::optional<T>& opt);
+template<typename T, typename E>
+napi_value to_javascript(napi_env env, const std::expected<T, E>& exp);
+template<typename T>
+napi_value to_javascript(napi_env env, std::future<T>&& fut);
+template<typename T>
+napi_value to_javascript(napi_env env, const std::shared_future<T>& fut);
+
+template<Arithmetic T>
+bool from_javascript(napi_env env, napi_value value, T& out);
+template<EnumType T>
+bool from_javascript(napi_env env, napi_value value, T& out);
+template<StringLike T>
+bool from_javascript(napi_env env, napi_value value, T& out);
+template<typename E, std::size_t N>
+    requires (!HasCustomJsConverter<std::array<E, N>>)
+bool from_javascript(napi_env env, napi_value value, std::array<E, N>& arr);
+template<Container T>
+bool from_javascript(napi_env env, napi_value value, T& container);
+// One overload is deliberately missing: the wrapper-only class converter
+// defined further down, which a top-level parameter or member uses. A class
+// element of a composite has always been read field by field instead, from
+// a plain object or from a wrapper's accessors -- mgr.set_unique({name: 'a',
+// value: 1}) is the tested shape -- and the wrapper-only overload is more
+// constrained, so declaring it here would make it win in every composite and
+// refuse every plain object. The field-reading converter is the one below.
+template<typename T>
+std::enable_if_t<
+    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
+    bool
+>
+from_javascript(napi_env env, napi_value value, T& out);
+template<SmartPointer T>
+bool from_javascript(napi_env env, napi_value value, T& out);
+template<typename K, typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::map<K, V, Args...>& map);
+template<typename K, typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::unordered_map<K, V, Args...>& map);
+template<typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::set<V, Args...>& set);
+template<typename V, typename... Args>
+bool from_javascript(napi_env env, napi_value value, std::unordered_set<V, Args...>& set);
+template<typename... Ts>
+bool from_javascript(napi_env env, napi_value value, std::tuple<Ts...>& t);
+template<typename T1, typename T2>
+bool from_javascript(napi_env env, napi_value value, std::pair<T1, T2>& p);
+template<typename... Ts>
+bool from_javascript(napi_env env, napi_value value, std::variant<Ts...>& v);
+template<typename T>
+bool from_javascript(napi_env env, napi_value value, std::optional<T>& out);
+template<typename T, typename E>
+bool from_javascript(napi_env env, napi_value value, std::expected<T, E>& out);
+// Not declared here either: the CustomJsConverter overloads, which are
+// defined after the composites (see the comment there).
+
+// ============================================================================
 // Type Conversion: C++ → JavaScript
 // ============================================================================
 
@@ -1402,14 +1813,8 @@ napi_value to_javascript(napi_env env, const T& value) {
 // Byte Container Detection - for optimized bulk transfer
 // ============================================================================
 
-// Concept for containers of byte-like types (uint8_t, int8_t, char, std::byte)
-template<typename T>
-concept ByteContainer = Container<T> && requires {
-    requires sizeof(typename std::remove_cvref_t<T>::value_type) == 1;
-    requires std::is_trivially_copyable_v<typename std::remove_cvref_t<T>::value_type>;
-} && requires(T t) {
-    { t.data() } -> std::convertible_to<const void*>;  // Must have contiguous storage
-};
+// ByteContainer (containers of byte-like types: uint8_t, int8_t, char,
+// std::byte) is defined with the converter declarations above.
 
 // Optimized: Byte containers → JavaScript Uint8Array (bulk memcpy)
 template<ByteContainer T>
@@ -1436,24 +1841,23 @@ napi_value to_javascript(napi_env env, const T& container) {
     napi_value array;
     napi_create_array_with_length(env, container.size(), &array);
 
+    using ValueType = typename std::remove_cvref_t<T>::value_type;
     size_t index = 0;
     for (const auto& item : container) {
-        napi_value js_item = to_javascript(env, item);
+        // Iterating libc++'s std::vector<bool> yields a bit-reference proxy,
+        // not a bool. The generic class converter would take the proxy for a
+        // class and emit an empty table for every element, so convert the
+        // value it stands for instead.
+        napi_value js_item;
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(item)>, ValueType>) {
+            js_item = to_javascript(env, item);
+        } else {
+            js_item = to_javascript(env, static_cast<ValueType>(item));
+        }
         napi_set_element(env, array, index++, js_item);
     }
     return array;
 }
-
-// Forward declaration for Bindable types. Must precede the SmartPointer
-// overload: the pointee is typically a user class in the global namespace,
-// so the dependent to_javascript(env, *ptr) call below finds this only
-// through the declaration context, never through ADL.
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
-    napi_value
->
-to_javascript(napi_env env, const T& obj);
 
 // Smart pointers
 template<SmartPointer T>
@@ -1523,16 +1927,60 @@ bool from_javascript(napi_env env, napi_value value, T& out) {
     return true;
 }
 
+// std::array from a JavaScript array of exactly N elements, filled in place.
+//
+// The generic container converter below can only append, and a std::array
+// has no push_back or insert, so it used to convert every element, drop it,
+// and report success. A std::array member was then assigned the setter's
+// uninitialised local -- body.pos = [1, 2, 3] read back as 3.7e-309 -- a
+// std::array parameter arrived as zeros, and any length was accepted. The
+// Python backend requires the exact length (since 4fd587d).
+//
+// A std::array type with a CustomJsConverter specialization is left to the
+// extension point. Partial ordering would otherwise pick this overload over
+// it, silently, where before there was an ambiguity error to say so.
+template<typename E, std::size_t N>
+    requires (!HasCustomJsConverter<std::array<E, N>>)
+bool from_javascript(napi_env env, napi_value value, std::array<E, N>& arr) {
+    bool is_array = false;
+    if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) return false;
+
+    uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok || length != N) return false;
+
+    for (std::size_t i = 0; i < N; ++i) {
+        napi_value js_item;
+        if (napi_get_element(env, value, static_cast<uint32_t>(i), &js_item) != napi_ok) return false;
+        if (!from_javascript(env, js_item, arr[i])) return false;
+    }
+    return true;
+}
+
 // Containers from JavaScript arrays
 template<Container T>
 bool from_javascript(napi_env env, napi_value value, T& container) {
+    using ValueType = typename std::remove_cvref_t<T>::value_type;
+
+    // Two shapes that look like containers and cannot be filled from an
+    // array. A type can have begin, end, size and value_type and still offer
+    // no way to put an element in -- std::span, a fixed-size Eigen vector, a
+    // custom range -- and converting into one used to convert each element,
+    // drop it and report success, so a std::span<const double> parameter
+    // computed over nothing. And an element type with no default constructor
+    // cannot be converted into, because each element is built in a local
+    // first; reaching that local was a compile error that failed the whole
+    // module. Both now decline, which turns the call into a TypeError naming
+    // the argument, as the Python backend does.
+    constexpr bool can_append = requires(T& c, ValueType v) { c.push_back(std::move(v)); };
+    constexpr bool can_insert = requires(T& c, ValueType v) { c.insert(std::move(v)); };
+    if constexpr ((!can_append && !can_insert) || !std::is_default_constructible_v<ValueType>) {
+        return false;
+    } else {
     bool is_array;
     if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) return false;
 
     uint32_t length;
     if (napi_get_array_length(env, value, &length) != napi_ok) return false;
-
-    using ValueType = typename std::remove_cvref_t<T>::value_type;
 
     if constexpr (requires { container.clear(); }) {
         container.clear();
@@ -1548,24 +1996,15 @@ bool from_javascript(napi_env env, napi_value value, T& container) {
         ValueType cpp_item;
         if (!from_javascript(env, js_item, cpp_item)) return false;
 
-        if constexpr (requires { container.push_back(cpp_item); }) {
+        if constexpr (can_append) {
             container.push_back(std::move(cpp_item));
-        } else if constexpr (requires { container.insert(cpp_item); }) {
+        } else {
             container.insert(std::move(cpp_item));
         }
     }
     return true;
+    }  // close the fillable-container branch
 }
-
-// Forward declaration for Bindable types. Must precede the SmartPointer
-// overload for the same lookup reason as to_javascript above: the pointee
-// class lives in the global namespace, so ADL can't find a later declaration.
-template<typename T>
-std::enable_if_t<
-    Bindable<T> && !StringLike<T> && !Container<T> && !Arithmetic<T> && !SmartPointer<T>,
-    bool
->
-from_javascript(napi_env env, napi_value value, T& out);
 
 // Smart pointers from JavaScript
 template<SmartPointer T>
@@ -1580,13 +2019,19 @@ bool from_javascript(napi_env env, napi_value value, T& out) {
         return true;
     }
 
-    // Mirrors the Python backend: an abstract or non-default-constructible
-    // pointee can't be materialized from a JS object by value, and trying
-    // would be a compile error. Only null/undefined→reset is supported.
+    // An abstract, non-default-constructible or non-copy-assignable pointee
+    // cannot be materialised from a JavaScript value, so null and undefined
+    // (handled above) are the only values that convert. This branch used to
+    // report success without writing `out`, which handed C++ a null pointer
+    // for any argument at all: scene.area_of(circle) dereferenced it, and
+    // scene.shape = circle silently cleared the member. The Python backend
+    // refuses here (091bb2d); a bound derived object becoming a
+    // shared_ptr<Base> needs shared ownership with the JavaScript object,
+    // which is issue #54.
     if constexpr (std::is_abstract_v<ElementType> ||
                   !std::is_default_constructible_v<ElementType> ||
                   !std::is_copy_assignable_v<ElementType>) {
-        return true;
+        return false;
     } else {
         ElementType cpp_value;
         if (!from_javascript(env, value, cpp_value)) return false;
@@ -2015,29 +2460,15 @@ bool from_javascript(napi_env env, napi_value value, std::expected<T, E>& out) {
     }
 }
 
-// ============================================================================
-// Custom Type Converter Extension Point
-// ============================================================================
-//
-// Users can add conversion support for custom types by defining
-// to_javascript/from_javascript overloads or specializing CustomJsConverter.
-//
-// Example:
-//   namespace mirror_bridge::javascript {
-//       napi_value to_javascript(napi_env env, const MyType& v) { ... }
-//       bool from_javascript(napi_env env, napi_value val, MyType& v) { ... }
-//   }
-
-template<typename T, typename Enable = void>
-struct CustomJsConverter {
-    static constexpr bool has_custom_conversion = false;
-};
-
-template<typename T>
-concept HasCustomJsConverter = requires {
-    { CustomJsConverter<T>::has_custom_conversion } -> std::convertible_to<bool>;
-} && CustomJsConverter<T>::has_custom_conversion;
-
+// The overloads behind a CustomJsConverter specialization. They come after
+// every composite converter, so a composite never sees them: their
+// constraint neither subsumes nor is subsumed by Arithmetic, EnumType,
+// StringLike or Container, so a composite element of a custom-converted
+// enum or string would be an ambiguous call, where without them it compiles
+// and the element converts the built-in way. Top-level calls, which are all
+// defined below, do see them. (A plain to_javascript/from_javascript overload
+// declared before this header is visible everywhere and beats every template
+// here.)
 template<typename T>
     requires HasCustomJsConverter<T>
 napi_value to_javascript(napi_env env, const T& value) {
@@ -2645,167 +3076,108 @@ void js_finalizer(napi_env env, void* finalize_data, void* finalize_hint) {
 }
 
 // ============================================================================
-// Constructor Reflection Helpers
+// Constructor
 // ============================================================================
+//
+// Which constructors are offered, which can be called, and what a call with
+// the wrong arguments says are decided in core (construct_from_host_arguments)
+// and shared with the Lua backend. What is JavaScript's own: reading the
+// arguments out of the callback info, and the TypeError.
 
-// Count parameterized constructors (exclude default, copy, move)
-template<typename T>
-consteval std::size_t get_js_constructor_count() {
-    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-    std::size_t count = 0;
-    for (auto member : all_members) {
-        if (std::meta::is_constructor(member) &&
-            !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
-            auto params = std::meta::parameters_of(member);
-            if (params.size() > 0) {
-                count++;
-            }
-        }
-    }
-    return count;
-}
+// Convert the JavaScript arguments for constructor C and call it. On a
+// conversion failure, return nullptr and record which argument refused.
+template<typename T, std::size_t C, std::size_t... Is>
+T* convert_js_constructor_args(napi_env env, napi_value* args, std::index_sequence<Is...>,
+                               core::ConstructorRefusal& attempt) {
+    std::tuple<std::remove_cvref_t<core::constructor_param_t<T, C, Is>>...> cpp_args;
 
-// Get the Nth parameterized constructor
-template<typename T, std::size_t Index>
-consteval auto get_js_constructor() {
-    auto all_members = std::meta::members_of(^^T, std::meta::access_context::current());
-    std::size_t count = 0;
-    for (auto member : all_members) {
-        if (std::meta::is_constructor(member) &&
-            !std::meta::is_copy_constructor(member) &&
-            !std::meta::is_move_constructor(member)) {
-            auto params = std::meta::parameters_of(member);
-            if (params.size() > 0) {
-                if (count == Index) {
-                    return member;
-                }
-                count++;
-            }
-        }
-    }
-    return all_members[0]; // Should never reach here
-}
-
-// Get parameter count for a constructor
-template<typename T, std::size_t CtorIndex>
-consteval std::size_t get_js_constructor_param_count() {
-    constexpr auto ctor = get_js_constructor<T, CtorIndex>();
-    auto params = std::meta::parameters_of(ctor);
-    return params.size();
-}
-
-// Get parameter type for a constructor
-template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
-consteval auto get_js_constructor_param_type() {
-    constexpr auto ctor = get_js_constructor<T, CtorIndex>();
-    auto params = std::meta::parameters_of(ctor);
-    return std::meta::type_of(params[ParamIndex]);
-}
-
-// Alias-template form: pack expansions must use this instead of splicing
-// inline (GCC rejects packs that appear only inside a splice; see the note
-// in core/mirror_bridge_core.hpp).
-template<typename T, std::size_t CtorIndex, std::size_t ParamIndex>
-using js_constructor_param_t = typename [:get_js_constructor_param_type<T, CtorIndex, ParamIndex>():];
-
-// Call constructor with JS arguments
-template<typename T, std::size_t CtorIndex, std::size_t... Is>
-T* call_js_constructor_impl(napi_env env, napi_value* args, std::index_sequence<Is...>, bool& success) {
-    std::tuple<std::remove_cvref_t<js_constructor_param_t<T, CtorIndex, Is>>...> cpp_args;
-
-    success = true;
+    bool converted = true;
     ([&] {
-        if (!success) return;
+        if (!converted) return;
         if (!from_javascript(env, args[Is], std::get<Is>(cpp_args))) {
-            success = false;
+            using Param = std::remove_cvref_t<core::constructor_param_t<T, C, Is>>;
+            converted = false;
+            attempt.position = static_cast<int>(Is) + 1;
+            if constexpr (core::NestedBindable<Param>) {
+                attempt.expected = js_expected_name<Param>();
+            }
         }
     }(), ...);
-
-    if (!success) {
-        return nullptr;
-    }
+    if (!converted) return nullptr;
 
     return new T(std::move(std::get<Is>(cpp_args))...);
 }
 
-// Try to match constructor by parameter count and call it
-template<typename T, std::size_t CtorIndex>
-T* try_js_constructor(napi_env env, napi_value* args, std::size_t nargs, bool& matched) {
-    constexpr std::size_t param_count = get_js_constructor_param_count<T, CtorIndex>();
-    if (nargs == param_count) {
-        matched = true;
-        bool success = true;
-        T* result = call_js_constructor_impl<T, CtorIndex>(env, args, std::make_index_sequence<param_count>{}, success);
-        if (success) {
-            return result;
-        }
-    }
-    matched = false;
-    return nullptr;
-}
+template<typename T>
+void throw_js_constructor_refusal(napi_env env, const core::ConstructorRefusal& refusal,
+                                  napi_value* args, std::size_t nargs) {
+    const char* name = js_expected_name<T>();
 
-// ============================================================================
-// Constructor
-// ============================================================================
+    if (refusal.kind == core::ConstructorRefusal::bad_argument) {
+        throw_js_bad_argument(env, args[refusal.position - 1], name, refusal.position,
+                              refusal.expected);
+        return;
+    }
+
+    char message[1024];
+    if (refusal.kind == core::ConstructorRefusal::no_overload_accepts) {
+        // Every candidate took exactly nargs arguments, so all of them are
+        // within the args buffer.
+        char got[512];
+        std::size_t used = 0;
+        got[0] = '\0';
+        for (std::size_t i = 0; i < nargs && used < sizeof got; ++i) {
+            char one[256];
+            describe_js_value(env, args[i], one, sizeof one);
+            const int written = std::snprintf(got + used, sizeof got - used, "%s%s",
+                                              i == 0 ? "" : ", ", one);
+            if (written < 0) break;
+            used += static_cast<std::size_t>(written);
+        }
+        std::snprintf(message, sizeof message, "%s: no constructor taking %zu arguments accepts (%s)",
+                      name, nargs, got);
+    } else {
+        core::describe_constructor_refusal<T>(refusal, name, "JavaScript", nargs,
+                                              message, sizeof message);
+    }
+    napi_throw_type_error(env, nullptr, message);
+}
 
 template<typename T>
 napi_value js_constructor(napi_env env, napi_callback_info info) {
+    // Room for the longest constructor that can be called, and never zero.
+    // napi_get_cb_info fills at most that many slots and reports the real
+    // count in argc even when it is larger, so a call with too many arguments
+    // is an arity error rather than a read past the buffer -- the fixed
+    // sixteen slots this replaces read sixteen of twenty arguments and then
+    // matched nothing.
+    constexpr std::size_t room = core::max_callable_constructor_arity<T>() > 0
+                                     ? core::max_callable_constructor_arity<T>() : 1;
     napi_value this_arg;
-    size_t argc = 16; // Max expected args
-    napi_value args[16];
+    size_t argc = room;
+    napi_value args[room];
     napi_get_cb_info(env, info, &argc, args, &this_arg, nullptr);
 
     T* cpp_object = nullptr;
+    core::ConstructorRefusal refusal;
 
     try {
-        if (argc == 0) {
-            // A class with no default constructor is still bindable: its other
-            // constructors work and its members read. Calling new T() here
-            // unconditionally made such a class a compile failure for the whole
-            // module -- the same shape as the setter's local, reached from the
-            // constructor instead.
-            if constexpr (std::is_default_constructible_v<T>) {
-                cpp_object = new T();
-            } else {
-                napi_throw_error(env, nullptr,
-                    "This class has no default constructor in C++; pass its arguments");
-                return nullptr;
-            }
-        } else {
-            constexpr std::size_t ctor_count = get_js_constructor_count<T>();
-
-            if constexpr (ctor_count > 0) {
-                [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-                    ([&] {
-                        if (cpp_object != nullptr) return;
-                        bool matched = false;
-                        T* result = try_js_constructor<T, Is>(env, args, argc, matched);
-                        if (result != nullptr) {
-                            cpp_object = result;
-                        }
-                    }(), ...);
-                }(std::make_index_sequence<ctor_count>{});
-            }
-
-            // The fallback when no parameterized constructor matched. Same
-            // guard as above: a class with no default constructor must report
-            // the mismatch rather than make the module uncompilable.
-            if (cpp_object == nullptr) {
-                if constexpr (std::is_default_constructible_v<T>) {
-                    cpp_object = new T();
-                } else {
-                    napi_throw_error(env, nullptr,
-                        "No constructor of this class matches those arguments");
-                    return nullptr;
-                }
-            }
-        }
+        cpp_object = core::construct_from_host_arguments<T>(
+            argc, refusal,
+            [&]<std::size_t C>(core::ConstructorRefusal& attempt) -> T* {
+                return convert_js_constructor_args<T, C>(
+                    env, args, std::make_index_sequence<core::constructor_arity<T, C>()>{}, attempt);
+            });
     } catch (const std::exception& e) {
         napi_throw_error(env, nullptr, e.what());
         return nullptr;
     } catch (...) {
         napi_throw_error(env, nullptr, "Unknown C++ exception in constructor");
+        return nullptr;
+    }
+
+    if (!cpp_object) {
+        throw_js_constructor_refusal<T>(env, refusal, args, argc);
         return nullptr;
     }
 
@@ -2846,6 +3218,23 @@ struct JsConversionHelper {
     }
 
     static bool from_javascript_impl(napi_env env, napi_value js_obj, T& out) {
+        // A wrapper is taken only as what it is: one of this class, or of a
+        // class derived from it. Any other wrapper is refused, as it is at top
+        // level, instead of being read through the accessors of an unrelated
+        // class that happens to have members of the same names -- which is
+        // how a vector<Point2> could be handed a Pixel. A plain object is read
+        // field by field below.
+        if (js_wrapper_view(env, js_obj)) {
+            void* raw = nullptr;
+            if (!resolve_js_wrapper<T>(env, js_obj, raw)) return false;
+            if constexpr (std::is_copy_assignable_v<T>) {
+                out = *static_cast<T*>(raw);
+                return true;
+            }
+            // A class that cannot be copy-assigned is still read member by
+            // member, through the wrapper's accessors.
+        }
+
         constexpr std::size_t member_count = get_data_member_count<T>();
         bool success = true;
 
@@ -2886,11 +3275,16 @@ std::enable_if_t<
 to_javascript(napi_env env, const T& obj) {
     using CleanT = std::remove_cvref_t<T>;
 
-    // Abstract / non-copy-assignable types can't be copied into a fresh
-    // wrapper instance. Mirror the Python backend's graceful fallback:
-    // emit an object snapshot of the members instead of failing to compile
-    // (reachable via e.g. shared_ptr<AbstractBase> members).
-    if constexpr (std::is_abstract_v<CleanT> || !std::is_copy_assignable_v<CleanT>) {
+    // A fresh wrapper is made by calling the class's own constructor with no
+    // arguments and copy-assigning into the result, so a class that cannot
+    // be default-constructed or copy-assigned -- including every abstract
+    // one -- comes back as an object snapshot of its members instead,
+    // mirroring the Python backend's fallback. Without the default-
+    // constructible clause, the constructor call threw, and the instance it
+    // never produced was unwrapped anyway; a std::vector of such a class,
+    // which now compiles, would have reached that on its first read.
+    if constexpr (std::is_abstract_v<CleanT> || !std::is_copy_assignable_v<CleanT> ||
+                  !std::is_default_constructible_v<CleanT>) {
         return JsConversionHelper<T>::to_javascript_impl(env, obj);
     } else {
         // Check if this type has been registered with bind_class
@@ -2899,12 +3293,15 @@ to_javascript(napi_env env, const T& obj) {
             napi_value constructor;
             napi_get_reference_value(env, JsTypeRegistry<CleanT>::constructor_ref, &constructor);
 
-            // Create a new instance
+            // Create a new instance. A constructor that throws leaves the
+            // exception pending and no instance to unwrap.
             napi_value instance;
-            napi_new_instance(env, constructor, 0, nullptr, &instance);
+            if (napi_new_instance(env, constructor, 0, nullptr, &instance) != napi_ok) {
+                return nullptr;
+            }
 
             // Unwrap and copy the object
-            JsWrapper<CleanT>* wrapper;
+            JsWrapper<CleanT>* wrapper = nullptr;
             napi_unwrap(env, instance, reinterpret_cast<void**>(&wrapper));
             if (wrapper && wrapper->cpp_object) {
                 *wrapper->cpp_object = obj;

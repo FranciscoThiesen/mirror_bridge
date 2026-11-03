@@ -284,9 +284,22 @@ is expected, in every backend.
 
 ⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
 `shared_ptr` return gives you a usable object. What does not cross is the
-shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
-parameter is refused. Tracked in
+shared *ownership*: the return is a copy of the pointee. In Python a
+`shared_ptr` parameter is refused; Lua and JavaScript build a fresh pointee
+from a table or object, which is a copy too. A pointee that cannot be built
+that way — abstract, or with no default constructor — converts only from
+`nil`/`null`, and anything else is refused rather than handed to C++ as a null
+pointer. Tracked in
 [#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
+
+✅ **Constructors**: Lua's `Cls(...)`, `Cls:new(...)` and `Cls.new(...)` and
+JavaScript's `new Cls(...)` call the constructor whose parameters the
+arguments convert to. Arguments no constructor takes raise an error naming the
+class and the argument counts that would work — they used to be dropped in
+favour of a default-constructed object — and a deleted constructor, or one an
+abstract class declares, is not offered. A `std::array<T, N>` takes exactly
+`N` elements in every backend, and a container's elements can be anything a
+single value can be, bound classes included.
 
 ### Additional Features
 
