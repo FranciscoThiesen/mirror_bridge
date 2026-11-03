@@ -94,6 +94,12 @@ All languages support:
 - Default constructors: `Rectangle()`
 - Parameterized constructors: `Rectangle(10.0, 5.0)`
 
+Arguments that no constructor accepts raise an error in every language. Lua and
+JavaScript name the class and the argument counts that would work (they used to
+default-construct instead); Python says how many positional arguments matched
+nothing. In Lua, `Rectangle(10.0, 5.0)`,
+`Rectangle:new(10.0, 5.0)` and `Rectangle.new(10.0, 5.0)` are the same call.
+
 ### Methods
 
 ```cpp
@@ -124,7 +130,7 @@ struct VectorTest {
 
 Bidirectional conversion:
 - C++ `vector` <-> Python `list` / Lua `table` / JS `Array`
-- C++ `array` <-> Python `list` / Lua `table` / JS `Array`
+- C++ `array` <-> Python `list` / Lua `table` / JS `Array`, of exactly `N` elements
 
 ### Nested Objects
 
@@ -156,8 +162,9 @@ struct Manager {
 All three languages support smart pointers as members, parameters, and
 return values with deep-copy semantics (the target-language value is
 materialized into a fresh pointee). `None`/`nil`/`null` resets the pointer.
-Smart pointers to abstract types support only the reset round-trip; the
-pointee can't be materialized by value.
+A pointee that can't be materialized by value (abstract, no default
+constructor, or not copy-assignable) supports only the reset round-trip; any
+other value is refused rather than becoming a null pointer.
 
 ## Known Limitations
 

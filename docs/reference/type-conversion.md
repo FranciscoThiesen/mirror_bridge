@@ -101,6 +101,21 @@ c.numbers = [1, 2, 3, 4, 5];
 c.names = ["Alice", "Bob"];
 ```
 
+**A `std::array<T, N>` takes exactly `N` elements**, in every backend. A list,
+table or `Array` of any other length is refused, and so is one holding an
+element that does not convert; a refused assignment leaves the member as it
+was. Lua and JavaScript used to accept any length and keep none of it, so a
+member read back as uninitialised memory and a parameter arrived as zeros.
+
+**An element can be anything a single value can be.** A `std::vector` of a
+bound class, of `std::optional`, `std::pair` or `std::shared_ptr`, a
+`std::array` of a bound class, and `std::vector<bool>` all cross in Lua and
+JavaScript, where each used to fail the whole module to compile. A vector of a
+class with no default constructor reads but refuses assignment, because each
+element is converted into a local first. A `std::span` parameter is refused at
+the call in Lua and JavaScript: a table or `Array` has no storage for it to
+view, and it used to arrive empty.
+
 ### Associative Containers
 
 | C++ Type | Python | Lua | JavaScript |
@@ -185,6 +200,15 @@ m.resource = {"name": "data", "value": 123}
 # None handling for null pointers
 m.resource = None  # Sets to nullptr
 ```
+
+A pointee that cannot be built from a host value — an abstract class, one with
+no default constructor, or one that is not copy-assignable — converts only from
+`None`/`nil`/`null`, which resets the pointer. Anything else is refused. In Lua
+and JavaScript it used to "convert" to a null pointer, so an assignment
+silently cleared the member and a parameter handed C++ `nullptr` to
+dereference. Sharing ownership with a host object — passing a bound `Circle`
+where a `std::shared_ptr<Shape>` is expected — is
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ## Enum Types
 
@@ -327,6 +351,41 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
+## Constructor Calls
+
+In Lua and JavaScript, a call with arguments goes to a constructor taking that
+many, trying the constructors of that arity in declaration order; the first
+whose arguments all convert is called. With no arguments, a
+default-constructible class is default-constructed.
+
+Arguments that no constructor accepts are refused. They used to be dropped in
+favour of a default-constructed object: `Rect(2)` built a 0 x 0 rectangle and
+an aggregate's `Point2(3, 4)` built (0, 0), with no error. The error names the
+class and what would have worked:
+
+```lua
+Rect(2)          -- Rect: no constructor takes 1 argument (constructors take 0 or 2)
+Rect(2, "tall")  -- Rect: argument 2 could not be converted from string
+Point2(3, 4)     -- Point2 takes no constructor arguments (...); construct it with none and assign its members
+Shape()          -- Shape is abstract in C++ and cannot be constructed; construct a concrete derived class
+```
+
+JavaScript raises the same messages as a `TypeError`. In Lua, `Rect(2, 3)`,
+`Rect:new(2, 3)` and `Rect.new(2, 3)` are the same call; the dot form used to
+skip its first argument.
+
+A constructor is offered only if its arguments can be converted and passed the
+way a call converts them. Left out are a deleted one, one an abstract class
+declares, one taking a non-const reference (a converted argument is a
+temporary, which a non-const reference cannot bind), one taking a class with no
+default constructor, and one taking a raw pointer or a smart pointer to an
+incomplete type. The class binds through its other constructors; each of these
+used to fail the whole module to compile. A constructor inherited with
+`using Base::Base;` is not offered either, because reflection does not list it
+as a member of the derived class. The Python backend also honours default
+arguments and keywords in a constructor call; Lua and JavaScript need the exact
+count.
+
 ## Argument Type Checking
 
 A parameter, data member, or container element whose type is a bound C++
@@ -352,6 +411,16 @@ const curve = new pricing.Curve();
 curve.at(2.0);                                  // fine
 pricing.Curve.prototype.at.call(label, 2.0);    // TypeError: at: expected Curve, got Label
 ```
+
+A plain value written in place of an object is a separate question, and the
+backends answer it differently. Lua accepts a table with the class's fields
+wherever a bound class is expected: as a top-level argument or member a missing
+field keeps its default, but inside a composite — a vector, array, optional,
+variant, map or smart pointer — the table must have every field, because a
+variant or an optional is asking whether the table *is* that class. JavaScript
+accepts a plain object with every field inside a composite, and only a wrapper
+at top level. A wrapper of an unrelated class is refused everywhere, even one
+whose members happen to have the same names.
 
 The receiver is checked as well as the arguments. `obj.method(x, ...)` in Lua
 and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as

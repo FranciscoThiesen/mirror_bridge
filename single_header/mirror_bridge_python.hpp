@@ -222,6 +222,8 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <meta>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -234,6 +236,7 @@ consteval std::string synth_name(info tmpl, const std::vector<info>& args) {
 #include <mutex>
 #include <typeindex>
 #include <shared_mutex>
+#include <utility>
 
 
 // ============================================================================
@@ -973,6 +976,267 @@ consteval bool has_default_constructor() {
 template<typename T>
 consteval bool has_parameterized_constructor() {
     return get_constructor_count<T>() > (has_default_constructor<T>() ? 1 : 0);
+}
+
+// ============================================================================
+// Constructors a Value-Converting Binding Can Call
+// ============================================================================
+//
+// Lua and JavaScript construct an object the same way: convert each host
+// argument into a default-constructed std::remove_cvref_t<P>, then call
+// `new T(std::move(arg)...)`. What follows is the one list of constructors
+// both offer, the one test of whether a constructor can be called that way,
+// and the one dispatcher that turns host arguments into an object or a
+// reason. Each backend used to carry its own copy of all three, and that is
+// how the Python backend's fixes for deleted overloads and for silently
+// default-constructing never reached either of them.
+
+template<typename T>
+struct ConstructorCache {
+    // Public (members_of under the current access context), at least one
+    // parameter -- the zero-argument case is `new T()`, which
+    // is_default_constructible_v decides -- and neither copy, move nor
+    // deleted. A deleted overload is still a declared member, so
+    // `Celsius(int) = delete` used to be offered, and the `new Celsius(int)`
+    // it instantiated failed the whole module.
+    static consteval bool is_offered(std::meta::info member) {
+        return std::meta::is_constructor(member) &&
+               !std::meta::is_copy_constructor(member) &&
+               !std::meta::is_move_constructor(member) &&
+               !std::meta::is_deleted(member) &&
+               !std::meta::parameters_of(member).empty();
+    }
+
+    static consteval std::vector<std::meta::info> collect() {
+        std::vector<std::meta::info> result;
+        for (auto member : std::meta::members_of(^^T, std::meta::access_context::current())) {
+            if (is_offered(member)) result.push_back(member);
+        }
+        return result;
+    }
+
+    static constexpr auto constructors = std::define_static_array(collect());
+    static constexpr std::size_t count = constructors.size();
+};
+
+template<typename T, std::size_t C>
+consteval std::size_t constructor_arity() {
+    return std::meta::parameters_of(ConstructorCache<T>::constructors[C]).size();
+}
+
+template<typename T, std::size_t C, std::size_t P>
+consteval std::meta::info constructor_param_type() {
+    return std::meta::type_of(std::meta::parameters_of(ConstructorCache<T>::constructors[C])[P]);
+}
+
+// Alias-template form, for the pack expansions below (see the note on splice
+// hoisting above method_param_t).
+template<typename T, std::size_t C, std::size_t P>
+using constructor_param_t = typename [:constructor_param_type<T, C, P>():];
+
+// Whether constructor C can be called the way Lua and JavaScript call it.
+//
+// Reflection reports a *declared* constructor; this asks whether it is
+// *callable*, in three clauses. is_param_bindable is the per-parameter gate
+// the method path already uses: it refuses a raw pointer to a user type and a
+// smart pointer to an incomplete one, for which no converter exists.
+// is_constructible_v asks whether `T t(std::move(arg)...)` is well formed,
+// with an rvalue of each std::remove_cvref_t<P> -- the same overload
+// resolution as the `new T(...)` both backends make. And the arguments are
+// held in a default-constructed tuple while they convert, so each parameter
+// type must be default constructible.
+//
+// That rules out an abstract class (pmp-library's BasePropertyArray declares
+// `explicit BasePropertyArray(std::string)` beside a pure virtual), a
+// constructor that needs an lvalue (`Widget(Config&)`), one taking a class
+// with no default constructor (even by const reference), and one taking a
+// `Node*`: each used to be instantiated anyway and fail the whole module.
+// A variable definition also needs an accessible destructor, so the answer is
+// false for a class whose destructor is not public too, although `new T(args)`
+// would compile; such a class cannot be bound by these backends at all,
+// because the wrapper's finalizer deletes it.
+template<typename T, std::size_t C>
+consteval bool constructor_callable_with_values() {
+    return []<std::size_t... Is>(std::index_sequence<Is...>) {
+        return (is_param_bindable<constructor_param_t<T, C, Is>>() && ...) &&
+               std::is_constructible_v<T, std::remove_cvref_t<constructor_param_t<T, C, Is>>...> &&
+               (std::is_default_constructible_v<std::remove_cvref_t<constructor_param_t<T, C, Is>>> && ...);
+    }(std::make_index_sequence<constructor_arity<T, C>()>{});
+}
+
+template<typename T>
+consteval std::size_t callable_constructor_count() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        return (std::size_t{0} + ... + (constructor_callable_with_values<T, Cs>() ? 1 : 0));
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// The argument counts a constructor call can succeed with: bit n is set when
+// a callable constructor takes n arguments, and bit 0 when T is default
+// constructible. An error message uses it to say what would have worked.
+template<typename T>
+consteval std::uint64_t callable_constructor_arities() {
+    std::uint64_t mask = std::is_default_constructible_v<T> ? 1u : 0u;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() < 64) {
+                mask |= std::uint64_t{1} << constructor_arity<T, Cs>();
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    return mask;
+}
+
+// The most arguments any callable constructor takes. Computed from the
+// constructors themselves rather than from the mask above, which cannot
+// record an arity of 64 or more: a backend sizes an argument buffer from
+// this, and the dispatcher would still reach such a constructor.
+template<typename T>
+consteval std::size_t max_callable_constructor_arity() {
+    return []<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        std::size_t highest = 0;
+        ((highest = constructor_callable_with_values<T, Cs>() && constructor_arity<T, Cs>() > highest
+                        ? constructor_arity<T, Cs>() : highest), ...);
+        return highest;
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+}
+
+// "2", "0 or 2", "1, 2 or 3": the argument counts set in `mask`.
+inline void format_arities(std::uint64_t mask, char* out, std::size_t out_size) {
+    if (out_size == 0) return;
+    out[0] = '\0';
+    int counts[64];
+    int n = 0;
+    for (int i = 0; i < 64; ++i) {
+        if ((mask >> i) & 1u) counts[n++] = i;
+    }
+    std::size_t used = 0;
+    for (int i = 0; i < n && used < out_size; ++i) {
+        const char* separator = i == 0 ? "" : (i == n - 1 ? " or " : ", ");
+        const int written = std::snprintf(out + used, out_size - used, "%s%d", separator, counts[i]);
+        if (written < 0) break;
+        used += static_cast<std::size_t>(written);
+    }
+}
+
+// Why a constructor call produced no object.
+struct ConstructorRefusal {
+    enum Kind : unsigned char {
+        none,
+        abstract_class,       // T is abstract
+        needs_arguments,      // no arguments, and T has no default constructor
+        not_constructible,    // nothing at all is callable
+        takes_no_arguments,   // arguments, but no callable parameterized constructor
+        no_such_arity,        // no callable constructor takes that many arguments
+        bad_argument,         // the one constructor taking that many refused an argument
+        no_overload_accepts,  // several take that many, and every one refused
+    };
+    Kind kind = none;
+    int position = 0;               // bad_argument: which argument, counting from 1
+    const char* expected = nullptr; // bad_argument: the backend's token for what it should have been
+};
+
+// Construct a T from `nargs` host arguments, or record why not.
+//
+// Each attempt must leave the host's arguments as it found them, because the
+// next candidate converts the same ones. The Lua half converts copies for
+// exactly that reason.
+//
+// `convert_and_new` is the backend's half. Called as
+// `convert_and_new.template operator()<C>(attempt)` for each callable
+// constructor C that takes exactly `nargs` arguments, in declaration order,
+// it converts the arguments and returns `new T(...)`, or returns nullptr after
+// recording in `attempt` which argument refused. The first that converts wins.
+//
+// Arguments that no constructor accepts are refused; they never fall back to
+// `new T()`. That fallback made Vec3(1, 2, 3) a (0, 0, 0) with no error in
+// both backends, for a wrong count, for a value that would not convert, and
+// for a class with no parameterized constructor at all, such as an aggregate.
+// The Python backend stopped doing it in 2ff003e; this is the same contract.
+template<typename T, typename ConvertAndNew>
+T* construct_from_host_arguments(std::size_t nargs, ConstructorRefusal& refusal,
+                                 ConvertAndNew&& convert_and_new) {
+    if (nargs == 0) {
+        if constexpr (std::is_default_constructible_v<T>) {
+            return new T();
+        } else if constexpr (std::is_abstract_v<T>) {
+            refusal.kind = ConstructorRefusal::abstract_class;
+        } else if constexpr (callable_constructor_count<T>() > 0) {
+            refusal.kind = ConstructorRefusal::needs_arguments;
+        } else {
+            refusal.kind = ConstructorRefusal::not_constructible;
+        }
+        return nullptr;
+    }
+
+    T* object = nullptr;
+    int attempts = 0;
+    [&]<std::size_t... Cs>(std::index_sequence<Cs...>) {
+        ([&] {
+            if constexpr (constructor_callable_with_values<T, Cs>()) {
+                if (object || nargs != constructor_arity<T, Cs>()) return;
+                ConstructorRefusal attempt;
+                object = convert_and_new.template operator()<Cs>(attempt);
+                if (!object && attempts++ == 0) refusal = attempt;
+            }
+        }(), ...);
+    }(std::make_index_sequence<ConstructorCache<T>::count>{});
+    if (object) return object;
+
+    if constexpr (callable_constructor_count<T>() == 0) {
+        refusal.kind = std::is_abstract_v<T>              ? ConstructorRefusal::abstract_class
+                     : std::is_default_constructible_v<T> ? ConstructorRefusal::takes_no_arguments
+                                                          : ConstructorRefusal::not_constructible;
+    } else {
+        refusal.kind = attempts == 0 ? ConstructorRefusal::no_such_arity
+                     : attempts == 1 ? ConstructorRefusal::bad_argument
+                                     : ConstructorRefusal::no_overload_accepts;
+    }
+    return nullptr;
+}
+
+// The sentence for a refusal that needs nothing from the host but the class's
+// name. bad_argument and no_overload_accepts describe host values, so each
+// backend words those itself, with its own describer.
+template<typename T>
+void describe_constructor_refusal(const ConstructorRefusal& refusal, const char* class_name,
+                                  const char* host, std::size_t nargs,
+                                  char* out, std::size_t out_size) {
+    char arities[96];
+    format_arities(callable_constructor_arities<T>(), arities, sizeof arities);
+    switch (refusal.kind) {
+        case ConstructorRefusal::abstract_class:
+            std::snprintf(out, out_size,
+                          "%s is abstract in C++ and cannot be constructed; "
+                          "construct a concrete derived class", class_name);
+            return;
+        case ConstructorRefusal::needs_arguments:
+            std::snprintf(out, out_size,
+                          "%s has no default constructor in C++; pass its constructor "
+                          "arguments (constructors take %s)", class_name, arities);
+            return;
+        // "declares": a constructor inherited through `using Base::Base;` is
+        // not a member reflection lists, so it is not offered, and saying the
+        // class *has* no such constructor would be false.
+        case ConstructorRefusal::not_constructible:
+            std::snprintf(out, out_size,
+                          "%s cannot be constructed from %s: it has no default constructor "
+                          "and declares no constructor %s can call", class_name, host, host);
+            return;
+        case ConstructorRefusal::takes_no_arguments:
+            std::snprintf(out, out_size,
+                          "%s takes no constructor arguments (it declares no constructor %s "
+                          "can call with arguments); construct it with none and assign its members",
+                          class_name, host);
+            return;
+        case ConstructorRefusal::no_such_arity:
+            std::snprintf(out, out_size, "%s: no constructor takes %zu argument%s (constructors take %s)",
+                          class_name, nargs, nargs == 1 ? "" : "s", arities);
+            return;
+        default:
+            std::snprintf(out, out_size, "%s: no constructor accepts these arguments", class_name);
+            return;
+    }
 }
 
 // ============================================================================
