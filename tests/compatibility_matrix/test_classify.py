@@ -56,6 +56,120 @@ class TestUsabilityBar(unittest.TestCase):
         self.assertEqual(v["status"], "token-binding")
 
 
+class TestWorkDirLock(unittest.TestCase):
+    """Two runs sharing a --work-dir must refuse, not corrupt.
+
+    run_one rmtree's <work-dir>/<library> before each build, so concurrent runs
+    delete each other's output. The symptom is a library "failing" for a
+    plausible reason: comparing a branch against main, cxxopts came back
+    `failed [reflection-tu-failed] (28 classes)` from one of two concurrent runs
+    and `ok (27 classes)` from the same code alone -- 28 is the text-scan count
+    and 27 the reflection one, so it reads exactly like a discovery regression.
+
+    The lock itself is taken in main(), which needs a manifest and a toolchain;
+    what is testable here is the primitive it rests on, and that it is
+    EXCLUSIVE rather than check-then-create.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_the_second_holder_is_refused(self):
+        lock = os.path.join(self.dir, ".run.lock")
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"pid 1\n")
+        os.close(fd)
+        with self.assertRaises(FileExistsError):
+            os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
+    def test_the_pid_is_recoverable_from_the_lock(self):
+        lock = os.path.join(self.dir, ".run.lock")
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, ("pid %d\n" % os.getpid()).encode())
+        os.close(fd)
+        with open(lock) as f:
+            self.assertIn(str(os.getpid()), f.read())
+
+    # The help text is what a reader hits first, and the reason the lock exists
+    # is not guessable from its presence.
+    def test_the_work_dir_help_says_why(self):
+        import inspect
+        src = inspect.getsource(rc.main) if hasattr(rc, "main") else ""
+        if not src:
+            self.skipTest("main() not introspectable")
+        self.assertIn("concurrent runs", src)
+
+
+class TestLinkFailureIsNotADiscoveryFailure(unittest.TestCase):
+    """A link failure proves discovery and codegen both worked.
+
+    tinyobjloader was published as "reflection could not read these headers"
+    when the truth is that it is not header-only. Two bugs stacked: the
+    classifier had no rule for `undefined reference`, so clang's "linker
+    command failed with exit code 1" matched the generic \berror\b rule, and
+    then the text-scan override replaced that with reflection-tu-failed.
+    """
+
+    LINK = ("tinyobj_compat_shim.cpp:(.text+0x8238): undefined reference to "
+            "`vtable for tinyobj::MaterialFileReader'\n"
+            "clang++: error: linker command failed with exit code 1\n")
+
+    def test_undefined_reference_is_needs_linking(self):
+        category, reason, _ = rc.classify_failure(None, self.LINK)
+        self.assertEqual(category, "needs-linking")
+        self.assertIn("link-args", reason)
+
+    # The rule has to sit ABOVE the generic one, or clang's own summary line
+    # wins because it contains the word error.
+    def test_it_beats_the_generic_compile_error_rule(self):
+        category, _, _ = rc.classify_failure(
+            None, "clang++: error: linker command failed with exit code 1\n"
+                  "/usr/bin/ld: undefined symbol: foo\n")
+        self.assertEqual(category, "needs-linking")
+
+    def test_a_real_compile_error_is_still_a_compile_error(self):
+        category, _, _ = rc.classify_failure(
+            None, "shim.cpp:12:3: error: no matching member function for call "
+                  "to 'evaluate_string'\n")
+        self.assertEqual(category, "compile-error")
+
+
+class TestArtifactName(unittest.TestCase):
+    """Which file existing means "a module was built", per backend.
+
+    This had one answer, Python's, so `os.path.isfile(<module>.so)` was False
+    for every C# library whether or not the build succeeded -- and "0/32 bind"
+    was a statement about that line rather than about the backend. Adding
+    --lang threaded the flag through run_one and left this behind.
+    """
+
+    def test_python_and_lua_emit_a_plain_so(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "python"),
+                         "jsoncpp_compat.so")
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "lua"),
+                         "jsoncpp_compat.so")
+
+    def test_node_emits_a_node_addon(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "js"),
+                         "jsoncpp_compat.node")
+
+    # The whole point: C# writes lib<module>.so, so the Python spelling can
+    # never match and the row can never say built.
+    def test_csharp_emits_a_lib_prefixed_so(self):
+        self.assertEqual(rc.module_artifact("jsoncpp_compat", "csharp"),
+                         "libjsoncpp_compat.so")
+
+    def test_no_backend_shares_csharp_spelling(self):
+        for lang in ("python", "lua", "js"):
+            self.assertNotEqual(rc.module_artifact("m", lang),
+                                rc.module_artifact("m", "csharp"))
+
+
 class TestRegressionLadder(unittest.TestCase):
     def test_ranks_are_ordered(self):
         self.assertGreater(rc.outcome_rank("ok"), rc.outcome_rank("partial-binding"))

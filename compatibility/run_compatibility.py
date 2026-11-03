@@ -11,6 +11,7 @@ Writes one JSON object to --out. compatibility/format_matrix.py renders it.
 """
 
 import argparse
+import atexit
 import fnmatch
 import json
 import os
@@ -86,6 +87,22 @@ FAILURE_SIGNATURES = [
     ("template-depth",
      r"template instantiation depth|recursive template instantiation",
      "template instantiation runs away during binding",
+     re.I),
+    # A LINK failure, which proves discovery and codegen both worked: the shim
+    # calls functions declared in the headers and defined in the library's own
+    # sources, so the library is not header-only and its objects have to be
+    # linked in. That is `generate --link-args`, and it is the caller's to
+    # supply, so it is not a mirror_bridge failure.
+    #
+    # It has to sit above the generic rule, because clang's "linker command
+    # failed with exit code 1" contains the word error and was being published
+    # as an unclassified compile failure. For the C# backend it is reachable at
+    # BUILD time rather than at import, because --no-undefined refuses to
+    # produce a .so that cannot be loaded -- so this is the only place such a
+    # library can be recognised.
+    ("needs-linking",
+     r"undefined reference to|undefined symbol",
+     "not header-only: pass the built library to `generate --link-args`",
      re.I),
     # The admission that something is not yet classified. The pattern is the
     # compiler's own marker rather than "any line", because matching the first
@@ -356,6 +373,19 @@ def build_library(lib, checkout, build_dir, timeout):
     return None
 
 
+# The file whose existence means "a module was built", per backend. Python and
+# Lua both emit <module>.so, Node emits <module>.node, and C# emits
+# lib<module>.so beside the <module>.cs a dotnet project compiles -- the shared
+# library is the right thing to test for, because the .cs is written before the
+# shim is compiled and so exists even for a build that failed at the link.
+def module_artifact(module, lang):
+    if lang == "js":
+        return module + ".node"
+    if lang == "csharp":
+        return "lib" + module + ".so"
+    return module + ".so"
+
+
 def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     row = {
         "name": lib["name"], "ref": lib["ref"], "shape": lib.get("shape", "oo"),
@@ -458,15 +488,30 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     row["classes_found"] = len(classes)
     row["class_names"] = sorted({c.get("name", "") for c in classes})[:12]
 
-    module = os.path.join(out, lib["module"] + ".so")
+    # Each backend names its artifact differently, and this check used to know
+    # only Python's. A C# build writes lib<module>.so, so os.path.isfile of
+    # <module>.so was False for EVERY C# library whether or not the build
+    # succeeded -- which made "0/32 bind" a statement about this function
+    # rather than about the backend. Adding --lang threaded the flag through
+    # and left this behind, which is this project's recurring defect: one fact
+    # about the build recorded in two places.
+    module = os.path.join(out, module_artifact(lib["module"], lang))
     built = os.path.isfile(module)
     row["module_built"] = built
     row["module_bytes"] = os.path.getsize(module) if built else 0
-    row["stub_written"] = os.path.isfile(os.path.join(out, lib["module"] + ".pyi"))
+    row["module_artifact"] = os.path.basename(module)
+    row["stub_written"] = (lang == "python"
+                           and os.path.isfile(os.path.join(out, lib["module"] + ".pyi")))
 
     if not built:
         category, reason, line = classify_failure(cli_json, combined)
-        if row["discovery"] == "text-scan":
+        # A link failure is not a discovery failure, whatever the discovery
+        # field says: the shim could not have referenced the library's symbols
+        # unless reflection had read its headers. tinyobjloader was published
+        # as "reflection could not read these headers" when the truth was that
+        # it is not header-only -- a damning cause for an innocent library, and
+        # the override is what produced it.
+        if row["discovery"] == "text-scan" and category != "needs-linking":
             category = "reflection-tu-failed"
             # Terse on purpose: this is the most common row, the Discovery
             # column already says `text-scan`, and the page explains what that
@@ -487,7 +532,14 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
         row.update(status="failed", category=category, reason=reason, detail=line)
         return row
 
-    # Built is not the bar: a module that will not import is not usable.
+    # Built is not the bar: a module that will not load is not usable. For
+    # Python, Lua and Node that means importing it. For C# there is nothing to
+    # import -- the artifact is a plain shared library a dotnet project
+    # P/Invokes into -- so the equivalent is that it dlopens and that the
+    # entry points for the API are really exported.
+    if lang == "csharp":
+        return finish_csharp(row, lib, out, module)
+
     # The names come back too, not just the count, because `must_export` below
     # has to be checked against them.
     probe = subprocess.run(
@@ -527,6 +579,67 @@ def run_one(lib, cli, cache_dir, work_dir, timeout, lang="python"):
     # library's own documentation rather than from what happens to bind.
     verdict = classify_exports(lib.get("must_export") or [], exported)
     row.update(verdict)
+    return row
+
+
+# The C# half of "is this usable". Two questions, in order: does the library
+# load at all, and does the generated API actually name the classes a caller
+# needs.
+#
+# dlopen rather than a symbol listing, because an undefined symbol or a missing
+# dependency is exactly the failure --no-undefined exists to catch and a symbol
+# table would not see it. Then the class list from the generated .cs, because
+# that is the surface a C# caller writes against -- and because a borrow-only
+# class deliberately has no mb_<Class>_delete symbol, so the symbol table is no
+# longer a complete index of what bound.
+def finish_csharp(row, lib, out, module):
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import ctypes, sys; ctypes.CDLL(sys.argv[1]); print('ok')", module],
+        capture_output=True, text=True, timeout=120)
+    if probe.returncode != 0:
+        err = strip_ansi(probe.stderr or "").strip()
+        last = err.splitlines()[-1][:200] if err else ""
+        if "undefined symbol" in err:
+            row.update(status="needs-linking", category="needs-linking",
+                       reason="not header-only: pass the built library to "
+                              "`generate --link-args`",
+                       detail=last)
+        else:
+            row.update(status="imports-failed", category="imports-failed",
+                       reason="the library built but will not load",
+                       detail=last)
+        return row
+
+    cs_path = os.path.join(out, lib["module"] + ".cs")
+    try:
+        with open(cs_path, encoding="utf-8", errors="replace") as f:
+            cs = f.read()
+    except OSError as exc:
+        row.update(status="imports-failed", category="imports-failed",
+                   reason="the library loaded but the generated C# is missing",
+                   detail=str(exc)[:200])
+        return row
+
+    declared = set(re.findall(r"public sealed class (\w+)", cs))
+
+    # The .cs also declares one <Class>Handle per bound class and the Mb*
+    # collection views, so the raw count overstates the API: jsoncpp's 23
+    # classes read as 45. Filtered for the published count, UNFILTERED for the
+    # verdict, because a library whose own class is called FooHandle or MbFoo
+    # must not be judged by a heuristic -- a wrong count is a cosmetic error
+    # and a wrong verdict is not.
+    def generated(name):
+        if name == "MbPin":
+            return True
+        if name.endswith("Handle") and name[:-len("Handle")] in declared:
+            return True
+        return len(name) > 2 and name.startswith("Mb") and name[2].isupper()
+
+    api = sorted(n for n in declared if not generated(n))
+    row["exported_names"] = len(api)
+    row["exported_sample"] = api[:40]
+    row.update(classify_exports(lib.get("must_export") or [], sorted(declared)))
     return row
 
 
@@ -583,7 +696,12 @@ def main():
     ap.add_argument("--manifest", default=os.path.join(os.path.dirname(__file__), "libraries.json"))
     ap.add_argument("--cli", default=None, help="path to tools/mirror_bridge")
     ap.add_argument("--cache-dir", default="/tmp/mb-compat-cache")
-    ap.add_argument("--work-dir", default="/tmp/mb-compat-work")
+    ap.add_argument("--work-dir", default="/tmp/mb-compat-work",
+                    help="scratch for checkouts' build output. Two runs must "
+                         "not share one: run_one rmtree's <work-dir>/<library> "
+                         "before each build, so concurrent runs delete each "
+                         "other's output. A lock makes that refuse rather than "
+                         "corrupt.")
     ap.add_argument("--out", default="compatibility/results.json")
     ap.add_argument("--only", action="append", default=[],
                     help="run just this library (repeatable)")
@@ -613,6 +731,36 @@ def main():
 
     os.makedirs(args.cache_dir, exist_ok=True)
     os.makedirs(args.work_dir, exist_ok=True)
+
+    # Two runs sharing a --work-dir corrupt each other, because run_one
+    # rmtree's <work-dir>/<library> before each build. The symptom is a library
+    # "failing" for a plausible reason: comparing a branch against main, cxxopts
+    # came back `failed [reflection-tu-failed] (28 classes)` from one of two
+    # concurrent runs and `ok (27 classes)` from the same code alone -- 28 is
+    # the text-scan count and 27 the reflection one, so it reads exactly like a
+    # discovery regression and cost an hour.
+    #
+    # O_EXCL rather than a check-then-create, because the race this guards is
+    # the whole point. The pid is in the file so a stale lock can be identified
+    # rather than merely cursed at.
+    lock = os.path.join(args.work_dir, ".run.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            with open(lock) as f:
+                held = f.read().strip() or "unknown"
+        except OSError:
+            held = "unknown"
+        sys.exit("another corpus run holds %s (%s). Two runs sharing a "
+                 "--work-dir delete each other's builds, so this refuses "
+                 "rather than corrupting both. Pass a different --work-dir, or "
+                 "remove the lock if that pid is gone." % (lock, held))
+    try:
+        os.write(fd, ("pid %d\n" % os.getpid()).encode())
+    finally:
+        os.close(fd)
+    atexit.register(lambda: os.path.exists(lock) and os.unlink(lock))
 
     if args.validate:
         bad = 0
