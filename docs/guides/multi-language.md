@@ -45,7 +45,12 @@ mirror_bridge generate src/ --module calc --lang lua
 # JavaScript
 mirror_bridge generate src/ --module calc --lang js
 
-# All at once
+# C#
+mirror_bridge generate src/ --module calc --lang csharp -o out/
+
+# All at once -- python, lua and js. C# is not included, because its output is
+# a .cs source file to add to a dotnet project rather than a module the CLI can
+# import and verify.
 mirror_bridge generate src/ --module calc --lang all
 ```
 
@@ -83,18 +88,39 @@ console.log(c.value);        // 7.0
 console.log(c.to_string());  // "Calculator(value=7.000000)"
 ```
 
+**C#:** add `out/calc.cs` to a project and put `libcalc.so` where the runtime
+can find it. Names are the C++ names; every bound object is disposable, because
+each one owns a native pointer.
+
+```csharp
+using calc;
+
+using var c = new Calculator();
+c.add(10.0);
+c.subtract(3.0);
+Console.WriteLine(c.value);        // 7
+Console.WriteLine(c.to_string());  // Calculator(value=7.000000)
+```
+
 ## Type Conversion Matrix
 
-| C++ Type | Python | JavaScript | Lua |
-|----------|--------|------------|-----|
-| `int`, `double`, `float` | `int`, `float` | `number` | `number` |
-| `std::string` | `str` | `string` | `string` |
-| `bool` | `bool` | `boolean` | `boolean` |
-| `std::vector<T>` | `list` | `Array` | `table` |
-| `std::array<T, N>` | `list` | `Array` | `table` |
-| `struct {...}` | `dict` | `Object` | `table` |
-| `std::unique_ptr<T>` | Converted value | Converted value | Converted value |
-| `enum` / `enum class` | `int` | `number` | `number` |
+| C++ Type | Python | JavaScript | Lua | C# |
+|----------|--------|------------|-----|----|
+| `int`, `double`, `float` | `int`, `float` | `number` | `number` | `int`, `double`, `float` |
+| `std::string` | `str` | `string` | `string` | `string` |
+| `bool` | `bool` | `boolean` | `boolean` | `bool` |
+| `std::vector<T>` | `list` | `Array` | `table` | an `IList<T>` view; `IReadOnlyList<T>` inbound |
+| `std::array<T, N>` | `list` | `Array` | `table` | a fixed-size `IList<T>` view; `T[]` when returned by value |
+| `struct {...}` | `dict` | `Object` | `table` | a generated class, held by `SafeHandle` |
+| `std::unique_ptr<T>` | Converted value | Converted value | Converted value | not supported |
+| `enum` / `enum class` | `int` | `number` | `number` | a generated `enum` |
+
+The C# column differs in kind, not only in spelling: the other three backends
+**convert** a container to a native value, while C# hands back a *view* of the
+C++ object, so writing through it writes through to C++ and the view is
+disposable. `std::map`/`std::unordered_map` is an `IDictionary<K,V>` view, and
+`std::optional<T>` is `T?` for a scalar or an enum (`optional<string>` is still
+plain `string` until the generated source carries nullable annotations).
 
 ## Architecture
 
@@ -194,6 +220,28 @@ clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
     binding.cpp -o module.node
 ```
 
+**C#:** there is no single command, because generation is two stages. The
+reflection pass is an executable that *writes* a flat C shim, the C# source and
+a C header; a second, ordinary compile turns the shim into the shared library.
+The CLI does both:
+
+```bash
+mirror_bridge generate include/ --module mylib --lang csharp -o out/
+# out/mylib.cs  out/mylib_shim.cpp  out/mylib.h  out/libmylib.so
+```
+
+Run it by hand only to see the seam:
+
+```bash
+clang++ -std=c++2c -freflection -freflection-latest -stdlib=libc++ \
+    -I. generator.cpp -o gen && ./gen        # writes the three files
+c++ -std=c++17 -fPIC -shared -O2 mylib_shim.cpp -o libmylib.so
+```
+
+The second line needs no reflection support at all, which is what makes the
+generated `.h` usable from plain C or C++17 — see
+[issue #3](https://github.com/FranciscoThiesen/mirror_bridge/issues/3).
+
 ## Container Support
 
 **C++:**
@@ -232,6 +280,30 @@ v.names = ["Alice", "Bob"];
 console.log(v.get_sum());     // 15
 console.log(v.count_names()); // 2
 ```
+
+**C#:**
+```csharp
+using var v = new VectorTest();
+// A container member is a live view of the C++ object, not a snapshot, so
+// there is no whole-container setter: writes through the view are the C++
+// writes. Add a C++ setter method if you want to replace one wholesale.
+v.numbers.Add(1); v.numbers.Add(2); v.numbers.Add(3);
+v.names.Add("Alice"); v.names.Add("Bob");
+Console.WriteLine(v.get_sum());        // 6
+Console.WriteLine(v.count_names());    // 2
+```
+
+A container also crosses *inward*. The parameter type is `IReadOnlyList<T>`, so
+a generated view satisfies it directly and one object's member reaches another
+object's method with no copy on the managed side:
+
+```csharp
+// given  double Stats::mean(const std::vector<double>&) const;
+Console.WriteLine(stats.mean(v.numbers));
+```
+
+A container of strings works the same way — `IReadOnlyList<string>`, and a
+plain `string[]` or `List<string>` is accepted too.
 
 ## Nested Object Support
 
