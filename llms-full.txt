@@ -288,9 +288,22 @@ is expected, in every backend.
 
 ⚠️ **Smart pointers**: a class holding a `std::shared_ptr` binds, and a
 `shared_ptr` return gives you a usable object. What does not cross is the
-shared *ownership*: the return is a copy of the pointee, and a `shared_ptr`
-parameter is refused. Tracked in
+shared *ownership*: the return is a copy of the pointee. In Python a
+`shared_ptr` parameter is refused; Lua and JavaScript build a fresh pointee
+from a table or object, which is a copy too. A pointee that cannot be built
+that way — abstract, or with no default constructor — converts only from
+`nil`/`null`, and anything else is refused rather than handed to C++ as a null
+pointer. Tracked in
 [#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
+
+✅ **Constructors**: Lua's `Cls(...)`, `Cls:new(...)` and `Cls.new(...)` and
+JavaScript's `new Cls(...)` call the constructor whose parameters the
+arguments convert to. Arguments no constructor takes raise an error naming the
+class and the argument counts that would work — they used to be dropped in
+favour of a default-constructed object — and a deleted constructor, or one an
+abstract class declares, is not offered. A `std::array<T, N>` takes exactly
+`N` elements in every backend, and a container's elements can be anything a
+single value can be, bound classes included.
 
 ### Additional Features
 
@@ -5004,6 +5017,21 @@ c.numbers = [1, 2, 3, 4, 5];
 c.names = ["Alice", "Bob"];
 ```
 
+**A `std::array<T, N>` takes exactly `N` elements**, in every backend. A list,
+table or `Array` of any other length is refused, and so is one holding an
+element that does not convert; a refused assignment leaves the member as it
+was. Lua and JavaScript used to accept any length and keep none of it, so a
+member read back as uninitialised memory and a parameter arrived as zeros.
+
+**An element can be anything a single value can be.** A `std::vector` of a
+bound class, of `std::optional`, `std::pair` or `std::shared_ptr`, a
+`std::array` of a bound class, and `std::vector<bool>` all cross in Lua and
+JavaScript, where each used to fail the whole module to compile. A vector of a
+class with no default constructor reads but refuses assignment, because each
+element is converted into a local first. A `std::span` parameter is refused at
+the call in Lua and JavaScript: a table or `Array` has no storage for it to
+view, and it used to arrive empty.
+
 ### Associative Containers
 
 | C++ Type | Python | Lua | JavaScript |
@@ -5088,6 +5116,15 @@ m.resource = {"name": "data", "value": 123}
 # None handling for null pointers
 m.resource = None  # Sets to nullptr
 ```
+
+A pointee that cannot be built from a host value — an abstract class, one with
+no default constructor, or one that is not copy-assignable — converts only from
+`None`/`nil`/`null`, which resets the pointer. Anything else is refused. In Lua
+and JavaScript it used to "convert" to a null pointer, so an assignment
+silently cleared the member and a parameter handed C++ `nullptr` to
+dereference. Sharing ownership with a host object — passing a bound `Circle`
+where a `std::shared_ptr<Shape>` is expected — is
+[#54](https://github.com/FranciscoThiesen/mirror_bridge/issues/54).
 
 ## Enum Types
 
@@ -5230,6 +5267,41 @@ try {
 } catch (e) { console.error(e.message); }
 ```
 
+## Constructor Calls
+
+In Lua and JavaScript, a call with arguments goes to a constructor taking that
+many, trying the constructors of that arity in declaration order; the first
+whose arguments all convert is called. With no arguments, a
+default-constructible class is default-constructed.
+
+Arguments that no constructor accepts are refused. They used to be dropped in
+favour of a default-constructed object: `Rect(2)` built a 0 x 0 rectangle and
+an aggregate's `Point2(3, 4)` built (0, 0), with no error. The error names the
+class and what would have worked:
+
+```lua
+Rect(2)          -- Rect: no constructor takes 1 argument (constructors take 0 or 2)
+Rect(2, "tall")  -- Rect: argument 2 could not be converted from string
+Point2(3, 4)     -- Point2 takes no constructor arguments (...); construct it with none and assign its members
+Shape()          -- Shape is abstract in C++ and cannot be constructed; construct a concrete derived class
+```
+
+JavaScript raises the same messages as a `TypeError`. In Lua, `Rect(2, 3)`,
+`Rect:new(2, 3)` and `Rect.new(2, 3)` are the same call; the dot form used to
+skip its first argument.
+
+A constructor is offered only if its arguments can be converted and passed the
+way a call converts them. Left out are a deleted one, one an abstract class
+declares, one taking a non-const reference (a converted argument is a
+temporary, which a non-const reference cannot bind), one taking a class with no
+default constructor, and one taking a raw pointer or a smart pointer to an
+incomplete type. The class binds through its other constructors; each of these
+used to fail the whole module to compile. A constructor inherited with
+`using Base::Base;` is not offered either, because reflection does not list it
+as a member of the derived class. The Python backend also honours default
+arguments and keywords in a constructor call; Lua and JavaScript need the exact
+count.
+
 ## Argument Type Checking
 
 A parameter, data member, or container element whose type is a bound C++
@@ -5255,6 +5327,16 @@ const curve = new pricing.Curve();
 curve.at(2.0);                                  // fine
 pricing.Curve.prototype.at.call(label, 2.0);    // TypeError: at: expected Curve, got Label
 ```
+
+A plain value written in place of an object is a separate question, and the
+backends answer it differently. Lua accepts a table with the class's fields
+wherever a bound class is expected: as a top-level argument or member a missing
+field keeps its default, but inside a composite — a vector, array, optional,
+variant, map or smart pointer — the table must have every field, because a
+variant or an optional is asking whether the table *is* that class. JavaScript
+accepts a plain object with every field inside a composite, and only a wrapper
+at top level. A wrapper of an unrelated class is refused everywhere, even one
+whose members happen to have the same names.
 
 The receiver is checked as well as the arguments. `obj.method(x, ...)` in Lua
 and `Class.prototype.method.call(x, ...)` in JavaScript reach the same code as
@@ -6039,6 +6121,12 @@ All languages support:
 - Default constructors: `Rectangle()`
 - Parameterized constructors: `Rectangle(10.0, 5.0)`
 
+Arguments that no constructor accepts raise an error in every language. Lua and
+JavaScript name the class and the argument counts that would work (they used to
+default-construct instead); Python says how many positional arguments matched
+nothing. In Lua, `Rectangle(10.0, 5.0)`,
+`Rectangle:new(10.0, 5.0)` and `Rectangle.new(10.0, 5.0)` are the same call.
+
 ### Methods
 
 ```cpp
@@ -6069,7 +6157,7 @@ struct VectorTest {
 
 Bidirectional conversion:
 - C++ `vector` <-> Python `list` / Lua `table` / JS `Array`
-- C++ `array` <-> Python `list` / Lua `table` / JS `Array`
+- C++ `array` <-> Python `list` / Lua `table` / JS `Array`, of exactly `N` elements
 
 ### Nested Objects
 
@@ -6101,8 +6189,9 @@ struct Manager {
 All three languages support smart pointers as members, parameters, and
 return values with deep-copy semantics (the target-language value is
 materialized into a fresh pointee). `None`/`nil`/`null` resets the pointer.
-Smart pointers to abstract types support only the reset round-trip; the
-pointee can't be materialized by value.
+A pointee that can't be materialized by value (abstract, no default
+constructor, or not copy-assignable) supports only the reset round-trip; any
+other value is refused rather than becoming a null pointer.
 
 ## Known Limitations
 
@@ -6776,6 +6865,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A link failure was classified as an unclassified compile failure, and then overwritten.** Found while chasing the above. The classifier had no rule for `undefined reference`, so clang's "linker command failed with exit code 1" matched the generic `\berror\b` rule and was published as an unclassified compile failure; then the `text-scan → reflection-tu-failed` override replaced even that. A link failure *proves* discovery and codegen both worked — the shim could not have referenced the library's symbols otherwise — so the override no longer applies to it, and `undefined reference` is now a rule of its own above the generic one. This matters beyond one row: for the C# backend the case is reachable at **build** time rather than at import, because `-Wl,--no-undefined` refuses to produce a `.so` that cannot be loaded, so the build-time classifier is the only place such a library can be recognised at all. Three tests pin it, including that a real compile error is still a compile error.
 - **The compatibility corpus could not see a C# module, so every number it published about C# was about one line in the harness.** `module_built` was `os.path.isfile(out + "/" + module + ".so")`, and the C# backend writes `lib<module>.so` — so it was False for every C# library whatever the build actually did, and every row then went down `classify_failure`, which read *warnings* out of the output and published them as the cause. The reported 0 of 32 and 0 of 7 were artifacts. With the artifact name taken per backend, **all 7 libraries that bind under Python bind under C# too**, each exporting the API its manifest demands: jsoncpp (23 classes), pugixml (19), clipper2 (20), cxxopts (27), SQLiteCpp (9), tinyobjloader (26) and pmp-library (32). Two real bugs were found while chasing the phantom ones and both took a whole module down, so the run was worth making — but the direction of the error is worth recording: a broken measurement understated the backend by five libraries, and nothing in the suite would have caught it, because adding `--lang` threaded the flag through `run_one` and left this check behind. The usability probe needed the same treatment: it imported the module as a Python module, which a C# artifact is not, so for C# it now checks that the library **dlopens** — not a symbol listing, because an undefined symbol or a missing dependency is exactly what `--no-undefined` exists to catch and a symbol table would not see it — and reads the bound class names from the generated `.cs`, which is the surface a C# caller writes against. Not from the symbol table: a borrow-only class deliberately has no `mb_<Class>_delete` symbol, so the symbol table is no longer a complete index of what bound. `tests/compatibility_matrix/test_classify.py` pins the artifact name for all four backends, including the property that made this invisible — that no other backend shares C#'s spelling.
 - **A C# property's hidden accessors were only half in the name ledger, and it cost cxxopts its whole module.** A property `X` compiles to hidden `get_X` and `set_X` methods, so a C++ class with members `value` and `set_value` is `CS0102`, "already contains a definition" — a collision with no counterpart on the C++ side, reported against a property accessor the reader never wrote. The ledger reserved those spellings *after* claiming a name, which covers only the direction where the property comes first. `cxxopts::values::parser_tool::ArguDesc` declares `set_value` before `value`, which is the other direction: `set_value` was claimed as an ordinary property name, then `value` claimed a name whose hidden setter was already taken. All three names are checked before the claim now, and the first claimant keeps the plain name — the same tie-break the native symbol ledger and the helper-tag ledger use, so a rename is stable across builds. Found by pointing the compatibility corpus at `--lang csharp` for the seven libraries that bind under Python. The `CS0102` itself is attributed with certainty, because the CLI's own `-warnaserror` compile of the generated `.cs` reports it directly rather than it being inferred from a corpus row — which matters, because that first corpus run said **0 of 7** and the number turned out to be a bug in the harness rather than in the backend (see below). With this fix, the `char*` one, the namespace-directive one and the abstract-class one, **7 of 7 bind usefully**, each with the `must_export` API its manifest demands.
+- **Lua and JavaScript reported conversions that never happened as success, and C++ received a default, a null pointer or uninitialised memory.** Measured on main before this change: `Rect.new(2, 3)` was a 0 x 0 rectangle in Lua, because the dot form read its arguments one slot too far along; `Rect(2)`, `Rect({}, {})` and an aggregate's `Point2(3, 4)` were all default-constructed with no error, because constructor dispatch fell back to `new T()` whenever nothing matched; `scene.shape = circle` silently cleared a `std::shared_ptr<Shape>` member and `scene:area_of(circle)` handed C++ `nullptr`, because a smart pointer to an abstract pointee reported success without writing anything; and `body.pos = {1, 2, 3}` stored the setter's uninitialised local (it read back as `9e-310`), because the container converter could only append and a `std::array` cannot be appended to. Separately, a `std::vector` of a bound class failed the whole Lua or JavaScript module to compile, and so did `std::array<Point, N>`, `vector<optional<T>>`, `vector<shared_ptr<T>>`, `vector<pair<K, V>>`, libc++'s `vector<bool>`, a deleted constructor overload, an abstract class that declares a constructor, and a constructor taking a non-const reference or a raw pointer: the container converters could not see the converters declared after them, ADL never looks in `mirror_bridge::lua`, and every declared constructor was instantiated whether or not it could be called. Python fixed the constructor and smart-pointer halves in `2ff003e` and `091bb2d` and has required a `std::array`'s exact length since `4fd587d`; the Lua and JavaScript copies were never told, which is why the list of constructors, the test of whether one can be called and the dispatcher that refuses what it cannot use now live once, in core, shared by both. Every converter is declared before any is defined; a composite reads a class element strictly, from a table or object with every field or from a wrapper of that class, so `std::variant<Point, Color>` picks the alternative whose fields the value has and a wrapper of an unrelated class is refused; a `std::array` takes exactly `N` elements; a container that cannot be filled (`std::span`) or whose element has no default constructor declines; and refusals name the class and what would have worked (`Rect: no constructor takes 1 argument (constructors take 0 or 2)`). In Lua, `Sub:new(...)` on a table inheriting the class table is a colon call too, and each constructor attempt converts copies of its arguments, since `lua_tolstring` rewrites a number in place. Two older Lua faults the new reach exposed are fixed with it: a map inside a vector or a struct crashed on its first element, because the map converter read its table through a relative index after pushing, and a `std::string` conversion rewrote the caller's argument. A JavaScript return of a class with no default constructor is a member snapshot, as an abstract one already was, instead of unwrapping an instance its constructor never produced. `tests/{lua,js}/constructors` and `tests/{lua,js}/composites` pin each case, and the Vec3 and smart-pointer tests now fail on the old headers.
+  - **Behaviour change**: Lua and JavaScript code that passed constructor arguments no constructor takes, a non-`nil` value for a smart pointer to an abstract class, or a `std::array` of the wrong length now gets an error instead of a default object, a null pointer or garbage. A `std::span` parameter is refused instead of receiving nothing. In a container, optional, variant or smart pointer, a class element now also accepts a wrapper of that class in Lua, and refuses a wrapper of an unrelated class in JavaScript.
 - **Lua and JavaScript could not bind any class with a `const` data member, or with a member whose type has no default constructor.** Both setters declare a local of the member's declared type to convert into and then move into place. For a `const` member that local is a default-initialised const and the assignment a write to a const lvalue; for a type like `nlohmann::detail::dtoa_impl::diyfp`, which declares only `diyfp(uint64_t, int)`, there is no default constructor to declare it with. Either one is ill-formed, so the whole module failed to compile rather than that one attribute failing to assign — and the Python backend has handled both for long enough that `tests/const_members/` documents them in comments. It had only a Python test, which is exactly why nobody saw it. Both setters now refuse such a member by name at runtime, and JavaScript's constructor path had the same shape twice over in two unguarded `new T()` calls, so a class with no default constructor took the module down from there as well. `tests/lua/const_members/` and `tests/js/const_members/` were added, because the gap was never in the code so much as in which languages the test covered. Found while bringing the C# backend to parity: C# had to decide what a const member means, and the answer turned out to be one the other two had never been asked.
 - **Reflection was silently losing to a text scan on industrial codebases, over one constant.** Discovery walks every class in the codebase at compile time, which makes it the pass most likely to exhaust the compiler's constexpr evaluation limit, and the cost of exhausting it is not a slow build but a wrong answer: the CLI falls back to scanning header text, which cannot see a class declared through an export macro and reports the macro's name instead. `--discover-only` is what surfaced it. OpenCV's core module — 139 headers, 86,273 lines, `CV_EXPORTS` on every public class — reported `source: text scan` in 64 seconds, and the planner log said `constexpr evaluation hit maximum step limit`. The same discovery probe fails at `-fconstexpr-steps=100000000` and compiles clean at `2000000000`. The budget now escalates when the compiler says that is what went wrong, rather than being raised unconditionally, because raising it outright would make a genuinely runaway `constexpr` loop take twenty times as long to fail; `MB_CONSTEXPR_BUDGET` overrides the first tier so the path is testable without a codebase large enough to exhaust a real one. Two things the tests caught first. **GCC never escalated at all**: the guess at its wording, "maximum number of operations", matched nothing, while the real diagnostic is `'constexpr' evaluation operation count exceeds limit of N`, so GCC degraded in silence while clang worked — a bug in the shape that hides longest. And one assertion passed for the wrong reason, grepping stderr for "export macro" when the CLI's *own* text-scan fallback notice says that too, so it was green on a GCC run where nothing had escalated; it now matches a phrase only the escalation message carries. The escalation is reported on the terminal and not only in the log, because on a codebase large enough to need it the retry takes minutes and an unexplained wait of that length is indistinguishable from a hang. **It does not make a large codebase fast**: it converts a silently wrong answer into a correct, slow, self-explaining one, and the remaining cost is the single discovery translation unit rather than anything this fixes. At an absurd limit, incidentally, GCC 16.2 hits an internal compiler error in `coerce_template_parms` instead of reporting the limit, so the test uses measured per-compiler values rather than one small number.
 - **Structural assertions on generated source are not tests, and the C# backend proved it.** Forty-seven checks passed against C# that no compiler accepts: the generated declaration read `private static extern intGet_id(IntPtr self)`, missing a space, which every check was happy with and `mcs` rejected immediately with fourteen errors. Compiling the output also caught the shim declaring `remove_cvref_t<Device>` — `display_string_of` on an alias prints the alias — and an unqualified `Device` in a translation unit with no using directives, since it prints an unqualified name; the fully qualified name is now passed in by the CLI, which had it all along. `mono-mcs` and `mono-runtime` are in the dev container and the test compiles the generated `.cs` and runs it, asserting on what comes out, including that a C++ throw arrives as a C# exception carrying `what()`. Where no C# toolchain exists the test says so explicitly instead of reporting a pass.
@@ -7003,6 +7094,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.3.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FranciscoThiesen/mirror_bridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/FranciscoThiesen/mirror_bridge/releases/tag/v0.1.0
-
 
 

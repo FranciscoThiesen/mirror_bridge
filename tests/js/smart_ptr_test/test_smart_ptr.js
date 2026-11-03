@@ -32,6 +32,11 @@ check('shared_ptr return yields usable object', d !== null && d.name === 'gamma'
 const holder = new mod.ShapeHolder();
 check('abstract-pointee holder constructs', holder.has_shape() === false);
 
+// Anything but null used to "convert" to a null pointer and report success
+let refused = false;
+try { holder.shape = { area: 1 }; } catch (e) { refused = e instanceof TypeError; }
+check('a non-null value for an abstract pointee is refused', refused);
+
 console.log('');
 if (fail === 0) {
     console.log(`All ${pass} JS smart pointer tests passed!`);

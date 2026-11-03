@@ -17,6 +17,24 @@ local v = vec3.Vec3()
 assert(v.x == 0 and v.y == 0 and v.z == 0, "Default constructor failed")
 print("  PASS: Default constructor works")
 
+-- Constructor arguments, in each of Lua's three spellings. Vec3.new(1, 2, 3)
+-- used to skip its first argument, find no two-argument constructor, and
+-- return (0, 0, 0); wrong arguments used to return (0, 0, 0) as well.
+for label, make in pairs({
+    ["Vec3(1, 2, 3)"] = function() return vec3.Vec3(1, 2, 3) end,
+    ["Vec3:new(1, 2, 3)"] = function() return vec3.Vec3:new(1, 2, 3) end,
+    ["Vec3.new(1, 2, 3)"] = function() return vec3.Vec3.new(1, 2, 3) end,
+}) do
+    local built = make()
+    assert(built.x == 1 and built.y == 2 and built.z == 3, label .. " did not use its arguments")
+end
+print("  PASS: Vec3(...), Vec3:new(...) and Vec3.new(...) build from their arguments")
+
+local refused, err = pcall(vec3.Vec3, 1, 2)
+assert(not refused, "Vec3(1, 2) matched no constructor and was accepted anyway")
+assert(tostring(err):find("no constructor takes 2 arguments", 1, true), tostring(err))
+print("  PASS: Vec3(1, 2) is refused instead of default-constructed")
+
 -- Test 2: Setting values
 v.x = 1.0
 v.y = 2.0
